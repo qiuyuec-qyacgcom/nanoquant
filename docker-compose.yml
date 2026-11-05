@@ -1,0 +1,20 @@
+services:
+  nanoquant:
+    build: .
+    image: nanoquant:latest
+    container_name: nanoquant
+    restart: unless-stopped
+    ports:
+      - "8899:8899"
+    environment:
+      NANOQUANT_PORT: 8899
+      NANOQUANT_HOME: /app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8899/api/v1/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
