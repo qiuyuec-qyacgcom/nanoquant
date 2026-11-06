@@ -31,6 +31,8 @@ const logs = ref<string[]>([])
 const keyword = ref('')
 const levelFilter = ref('')
 const checking = ref(false)
+const sidecar = ref<any>(null)
+const testing = ref(false)
 
 const filteredEvents = computed(() =>
   levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
@@ -48,18 +50,47 @@ async function runDiagnostics() {
 }
 
 async function load() {
-  const [i, e, l, a, ar] = await Promise.allSettled([
+  const [i, e, l, a, ar, sc] = await Promise.allSettled([
     http.get('/system/info'),
     http.get('/system/events?limit=120'),
     http.get(`/system/logs?lines=300${keyword.value ? '&keyword=' + encodeURIComponent(keyword.value) : ''}`),
     http.get('/system/alerts/logs?limit=10'),
     http.get('/system/archives'),
+    http.get('/system/exec-sidecar'),
   ])
   if (i.status === 'fulfilled') info.value = i.value
   if (e.status === 'fulfilled') events.value = e.value.items
   if (l.status === 'fulfilled') logs.value = l.value.lines
   if (a.status === 'fulfilled') alerts.value = a.value.items || []
   if (ar.status === 'fulfilled') archives.value = ar.value.items || []
+  if (sc.status === 'fulfilled') sidecar.value = sc.value
+}
+
+async function selfTestSidecar() {
+  testing.value = true
+  try {
+    const res = await http.post('/system/exec-sidecar/self-test', {})
+    if (res.ok) {
+      app.notify(`签名一致（${res.algo} · ${res.compare_ms}ms）`, 'ok')
+    } else {
+      app.notify(res.detail || '自检失败', 'error')
+    }
+    if (res.mode) sidecar.value = res
+    else sidecar.value = await http.get('/system/exec-sidecar')
+  } catch (err: any) {
+    app.notify(err?.message || '自检失败', 'error')
+  } finally {
+    testing.value = false
+  }
+}
+
+async function resetSidecar() {
+  try {
+    sidecar.value = await http.post('/system/exec-sidecar/reset', {})
+    app.notify('比对计数已清零', 'ok')
+  } catch (err: any) {
+    app.notify(err?.message || '清零失败', 'error')
+  }
 }
 
 async function loadLogs() {
@@ -105,6 +136,78 @@ onBeforeUnmount(() => window.clearInterval(timer))
           </div>
           <div v-if="!diag" class="empty">诊断中…</div>
         </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">执行内核（sidecar）</span>
+        <div class="right">
+          <span
+            class="tag"
+            :class="
+              !sidecar || sidecar.mode === 'off'
+                ? 'tag-dim'
+                : sidecar.counts?.mismatched
+                  ? 'tag-warn'
+                  : sidecar.connected
+                    ? 'tag-long'
+                    : 'tag-dim'
+            "
+          >
+            {{ !sidecar || sidecar.mode === 'off' ? '未启用' : sidecar.connected ? '已连接' : '未连接' }}
+          </span>
+          <router-link to="/admin/strategy?group=system" class="btn btn-xs">配置</router-link>
+          <button class="btn btn-xs" :disabled="testing" @click="selfTestSidecar">
+            {{ testing ? '自检中…' : '自检' }}
+          </button>
+          <button class="btn btn-xs" @click="resetSidecar">清零</button>
+        </div>
+      </div>
+      <div class="panel-body stack" style="gap: 10px">
+        <div class="muted" style="font-size: 11px; line-height: 1.7">
+          {{ sidecar?.verdict || '读取中…' }}
+        </div>
+        <table v-if="sidecar" class="table">
+          <tbody>
+            <tr>
+              <td class="muted" style="width: 120px">模式</td>
+              <td class="mono">
+                {{ sidecar.mode }}<span class="muted"> · 抽样 {{ sidecar.sample_pct }}% · 超时 {{ sidecar.timeout_ms }}ms</span>
+              </td>
+            </tr>
+            <tr>
+              <td class="muted">通道</td>
+              <td class="mono" style="white-space: normal">
+                {{ sidecar.target }}
+                <span class="muted">（{{ sidecar.connected ? '已连接' : '未连接' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
+              </td>
+            </tr>
+            <tr>
+              <td class="muted">比对</td>
+              <td class="mono">
+                一致 <span class="up">{{ sidecar.counts.matched }}</span> ·
+                不一致
+                <span :class="sidecar.counts.mismatched ? 'down' : ''">{{ sidecar.counts.mismatched }}</span> ·
+                失败 {{ sidecar.counts.errors }} · 跳过 {{ sidecar.counts.skipped }}
+              </td>
+            </tr>
+            <tr>
+              <td class="muted">比对耗时</td>
+              <td class="mono">
+                p50 {{ sidecar.latency_ms.p50 }}ms · p95 {{ sidecar.latency_ms.p95 }}ms · p99 {{ sidecar.latency_ms.p99 }}ms
+              </td>
+            </tr>
+            <tr v-if="sidecar.cooldown_ms">
+              <td class="muted">掉线静默</td>
+              <td class="mono">剩余 {{ (sidecar.cooldown_ms / 1000).toFixed(1) }}s（期间不投递比对，直接按降级处理）</td>
+            </tr>
+            <tr v-if="sidecar.last_error">
+              <td class="muted">最近错误</td>
+              <td class="mono down" style="white-space: normal">{{ sidecar.last_error }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 

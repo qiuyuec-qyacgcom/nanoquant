@@ -290,6 +290,12 @@ class SystemSettings(BaseModel):
     #: 摘要模式: 开启后 warn 不进即时通道, 攒到间隔后合并成一条 (error 仍然即时)
     alert_digest_enabled: bool = False
     alert_digest_minutes: int = Field(default=60, ge=5, le=1440)
+    #: 执行内核 sidecar (Rust): off=只用 Python 签名; shadow=旁路比对不影响下单;
+    #: enforce=下单前同步比对, 不一致拒绝下单. sidecar 不可用时仍降级回 Python 签名.
+    exec_mode: Literal["off", "shadow", "enforce"] = "off"
+    exec_socket: str = Field(default="", description="留空读 EXEC_SOCKET 环境变量; unix:/path 或 tcp:host:port")
+    exec_sample_pct: int = Field(default=100, ge=1, le=100, description="影子比对抽样比例%")
+    exec_timeout_ms: int = Field(default=500, ge=50, le=5000, description="单次比对超时")
 
 
 class PublicSettings(BaseModel):

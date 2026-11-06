@@ -8,6 +8,12 @@
 - Linux/生产：`unix:/run/nanoquant/exec.sock`
 - 本地开发（Windows 无 asyncio unix socket）：`tcp:127.0.0.1:9101`
 
+实现要点：
+- **长连接复用**：协议是行分隔的请求/响应，一条连接可以连发多个请求；
+  每单重建连接会把握手成本（本地回环 ~0.1ms，跨进程仍不可忽略）加到签名路径上。
+- **串行化**：同一连接上的请求/响应必须一一对应，用 `asyncio.Lock` 保证不交错。
+- **失败即丢弃连接**：超时/断流后不复用，下一次请求重新建连，避免读到上一条的迟到响应。
+
 协议见 docs/EXEC_PROTOCOL.md。
 """
 from __future__ import annotations
@@ -15,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from typing import Any
 
@@ -27,10 +34,32 @@ class ExecSidecarError(RuntimeError):
 
 class ExecSidecar:
     def __init__(self, target: str | None = None, timeout: float = 3.0) -> None:
-        self.target = target or os.getenv("EXEC_SOCKET") or DEFAULT_TARGET
+        self._target = target
         self.timeout = timeout
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._lock: asyncio.Lock | None = None
+        self.connected = False
+        self.algo = ""
+        self.last_error = ""
+        self.last_ms = 0.0
+        self.counters: dict[str, int] = {"requests": 0, "errors": 0, "connects": 0, "timeouts": 0}
 
-    # ---------------------------------------------------------------- transport
+    # ------------------------------------------------------------------ config
+    @property
+    def target(self) -> str:
+        """配置可热更新：每次取，改了 socket 路径不需要重启进程."""
+        return self._target or os.getenv("EXEC_SOCKET") or DEFAULT_TARGET
+
+    def reconfigure(self, target: str | None, timeout: float | None = None) -> None:
+        """热更新地址; 传空串表示"回落到 EXEC_SOCKET 环境变量"."""
+        if target is not None and target != (self._target or ""):
+            self._target = target or None
+            self._drop()
+        if timeout:
+            self.timeout = timeout
+
+    # --------------------------------------------------------------- transport
     async def _connect(self):
         target = self.target
         if target.startswith("tcp:"):
@@ -39,34 +68,77 @@ class ExecSidecar:
         path = target[5:] if target.startswith("unix:") else target
         return await asyncio.open_unix_connection(path)
 
-    # ------------------------------------------------------------------ request
-    async def request(self, op: str, query: str = "") -> dict[str, Any]:
-        req_id = uuid.uuid4().hex[:12]
-        payload = json.dumps({"id": req_id, "op": op, "query": query}) + "\n"
-        try:
-            reader, writer = await asyncio.wait_for(self._connect(), timeout=self.timeout)
-        except (OSError, asyncio.TimeoutError) as exc:
-            raise ExecSidecarError(f"连接 sidecar 失败({self.target}): {exc}") from exc
-        try:
-            writer.write(payload.encode())
-            await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
-        except asyncio.TimeoutError as exc:
-            raise ExecSidecarError("sidecar 响应超时") from exc
-        finally:
-            writer.close()
+    async def _ensure(self) -> None:
+        if self._writer is not None and not self._writer.is_closing():
+            return
+        reader, writer = await self._connect()
+        self._reader = reader
+        self._writer = writer
+        self.connected = True
+        self.counters["connects"] += 1
+
+    def _drop(self) -> None:
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        self.connected = False
+        if writer is not None:
             try:
-                await writer.wait_closed()
+                writer.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _guard(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    # ------------------------------------------------------------------ request
+    async def request(self, op: str, query: str = "") -> dict[str, Any]:
+        payload = json.dumps({"id": uuid.uuid4().hex[:12], "op": op, "query": query}) + "\n"
+        async with self._guard():
+            self.counters["requests"] += 1
+            # 计时从拿到锁开始: 排队时长不是 sidecar 的往返, 算进去会让宕机时的 p99 虚高
+            started = time.perf_counter()
+            try:
+                await asyncio.wait_for(self._ensure(), timeout=self.timeout)
+                assert self._writer is not None and self._reader is not None
+                self._writer.write(payload.encode())
+                await self._writer.drain()
+                line = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout)
+            except asyncio.TimeoutError as exc:
+                self._drop()
+                self.counters["timeouts"] += 1
+                self.counters["errors"] += 1
+                self.last_error = f"sidecar 响应超时({self.timeout * 1000:.0f}ms)"
+                raise ExecSidecarError(self.last_error) from exc
+            except (OSError, ValueError, AttributeError) as exc:
+                self._drop()
+                self.counters["errors"] += 1
+                self.last_error = f"连接 sidecar 失败({self.target}): {exc}"
+                raise ExecSidecarError(self.last_error) from exc
+            finally:
+                self.last_ms = round((time.perf_counter() - started) * 1000, 3)
+
         if not line:
-            raise ExecSidecarError("sidecar 连接被关闭")
+            self._drop()
+            self.counters["errors"] += 1
+            self.last_error = "sidecar 连接被关闭"
+            raise ExecSidecarError(self.last_error)
         try:
             data = json.loads(line.decode())
         except json.JSONDecodeError as exc:
-            raise ExecSidecarError(f"sidecar 返回非 JSON: {line[:80]!r}") from exc
+            self.counters["errors"] += 1
+            self.last_error = f"sidecar 返回非 JSON: {line[:80]!r}"
+            raise ExecSidecarError(self.last_error) from exc
         if not data.get("ok"):
-            raise ExecSidecarError(str(data.get("error") or "sidecar 返回失败"))
+            self.counters["errors"] += 1
+            self.last_error = str(data.get("error") or "sidecar 返回失败")
+            raise ExecSidecarError(self.last_error)
+        if data.get("algo"):
+            self.algo = str(data["algo"])
+        # 在锁内计时, 不含排队等待: 影子比对要的是 sidecar 真实往返, 不是排队时长
+        data["elapsed_ms"] = self.last_ms
         return data
 
     async def health(self) -> dict[str, Any]:
@@ -75,6 +147,15 @@ class ExecSidecar:
     async def sign(self, query: str) -> dict[str, Any]:
         """影子模式：只签名，不发单."""
         return await self.request("plan", query)
+
+    async def close(self) -> None:
+        writer = self._writer
+        self._drop()
+        if writer is not None:
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 sidecar = ExecSidecar()

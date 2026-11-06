@@ -1,6 +1,6 @@
 # NanoQuant 任务跟踪
 
-> 更新日期：2026-11-04
+> 更新日期：2026-11-06
 > 说明：本文件区分「已完成 / 进行中」与「未开始」两部分，记录任务名称、状态、执行过程要点、结果或待办，便于后续跟踪。
 > 状态标记：`✅ 已完成` / `🟡 进行中` / `⬜ 未开始`
 
@@ -685,26 +685,43 @@
   | Rust 侧 | 3 个单测待在 VPS `cargo test` 验证 |
 - **下一步**：VPS 上 `cargo test` → 接 `reqwest` 连接池 → 影子模式与 Python 并行比对 → 灰度切流。
 
+### 55. 影子模式接入真实签名链路（本次执行）
+- **状态**：✅ 已完成（Python 侧 P2 闭环；Rust 侧仍待 VPS 编译）
+- **背景**：此前只有 `scripts/verify_sidecar.py` 的离线比对——真实下单链路上算出来的签名，从来没有和 sidecar 对过。
+- **过程要点**：
+  - `exchange/exec_client.py` 改为**长连接复用** + 串行锁；任何超时/断流都丢弃连接（避免读到上一条的迟到响应）；新增 `requests/errors/timeouts/connects` 计数与**锁内**往返计时。
+  - 新增 `services/exec_shadow.py`：`off / shadow / enforce` 三档。`shadow` 走后台任务（并发上限 32），对下单零影响；`enforce` 同步比对，**只有不一致才 fail-closed**，sidecar 不可用时按协议降级回 Python 签名。
+  - 掉线静默期 5s：掉线后不再为每个签名等一次超时；`skipped` 区分「抽样跳过」与「静默跳过」。
+  - `client._request` 算出签名后立即调用 `exec_shadow.observe()`；`enforce` 不一致转 `-1022`，订单不会发出。
+  - 新增配置：`system.exec_mode / exec_socket / exec_sample_pct / exec_timeout_ms`；参数页新增「执行内核（sidecar）」分区。
+  - 新增 `GET /system/exec-sidecar`、`POST /system/exec-sidecar/self-test`、`POST /system/exec-sidecar/reset`；诊断新增第 9 项「执行内核」；系统诊断页新增面板（模式/通道/比对计数/耗时分位/自检/清零）。
+- **实测**（真实测试网凭证 + mock sidecar 用同一把 Ed25519 私钥）：
+  | 场景 | 结果 |
+  |---|---|
+  | shadow 稳态 | `matched` 10–28、`mismatched` 0；p50 **0.48ms** / p99 **1.79ms**（TCP 回环） |
+  | 自检接口 | `ok=true`，两侧均 88 字符 base64，`compare_ms=0.23` |
+  | sidecar 被杀 | `errors=4 / skipped=6`，verdict 变「不可用…已降级」，引擎 enabled/running 不受影响；max 814ms（单次超时，已排除排队） |
+  | sidecar 恢复 | 自动重连，`matched` 继续增长（15→20） |
+  | enforce | `matched=15 / mismatched=0`，下单链路正常，比对 p99 **0.92ms** |
+  | 回归 | 契约测试 **30 passed**、`vue-tsc` 0 error、`npm run build` 通过 |
+- **顺带修掉**：
+  - 比对延迟口径：改用客户端锁内往返，避免把排队时间算成 sidecar 延迟（宕机时旧口径 p99 虚高到 3s）。
+  - `rust/exec-service/src/sign.rs::normalize_pem` 旧状态机进入 `BEGIN` 后永远退不出（PEM 被清空 → 静默回落 HMAC → 签名必错），改为按 `-----...-----` 标记片段删除。**尚未在本机编译验证**（无 Rust 工具链）。
+- **切流判据**：`counts.mismatched == 0` 且自检 88 字符 base64 一致，才允许把 `exec_mode` 调到 `enforce`。
+
 ---
 
 ## 二、未开始
 
-### 1. 真实下单 p99 采样（需测试网凭证）
-- **状态**：⬜ 未开始（埋点、mock 压测、RTT 采样均已就绪，只差凭证）
-- **目标**：把"应用侧 11ms + RTT"拼成完整端到端基线，并验证并发保护单在真实网络下的收益。
+### 1. Rust sidecar 实机编译与 P3 接管（需 VPS）
+- **状态**：⬜ 未开始（P2 协议、影子比对与观测已完成，见 #54 / #55）
 - **待办**：
-  - 配置模拟盘 API 凭证，启动引擎。
-  - 5 单/分钟与 60 单/分钟两档各采 2 万单，记录 `total/http/persist/protect` 的 p50/p95/p99/p99.9/max。
-  - 与 `scripts/bench_exec.py --delay-ms` 的预测值对比，确认无隐藏长尾。
+  - VPS：`cargo test`（3 个签名向量 + 单行 PEM 用例）→ `cargo build --release`。
+  - 对真实 sidecar 跑 `python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock`。
+  - 面板「自检」通过后切 `enforce` 灰度 24h（`mismatched` 必须恒为 0）。
+  - P3：`reqwest` 连接池 + 订单状态机（Planned → Sent → Acked → Filled）+ 保护单并行 + 单写线程落库。
 
-### 4. 部分止盈的实盘验证（需测试网凭证）
-- **状态**：⬜ 未开始（应用侧边界已用纯函数+测试覆盖）
-- **待办**：
-  - 真实部分平仓一轮，确认 reduce-only 数量与本地 `qty` 一致。
-  - 确认部分止盈后保护单仍按剩余数量生效（`closePosition` 与数量解耦，需实测）。
-  - 部分平仓 `TradeRecord` 与交易所账单逐笔对账。
-
-### 5. 回测 / 实盘同口径对账（需实盘样本）
+### 2. 回测 / 实盘同口径对账（需实盘样本）
 - **状态**：⬜ 未开始（工具已就绪：`scripts/reconcile.py`）
 - **待办**：
   - 积累至少 30 笔实盘成交后运行对账，输出入场价偏差分布。

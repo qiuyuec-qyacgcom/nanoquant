@@ -35,6 +35,7 @@
 | 🌐 **前台 / 后台双端** | 前台公开站点（首页 / 观点 / 关于，响应式）+ 后台管理终端（需登录） |
 | 📈 **前台 K 线（跟随标的池）** | 前台只展示后台已添加的合约，严格按添加顺序排列；空池显示「未添加标的」，增删 10 秒内自动同步，数据直接取币安实时接口 |
 | 🎯 **astra 规则标的池** | 添加前用币安在线合约表校验（USDT 永续 / 交易中），分层派生杠杆与止损，去重 + 容量上限，删除需确认短语且持仓禁删 |
+| 🧩 **执行内核 sidecar** | Rust 只签名不下单：`shadow` 旁路逐字节比对（零阻塞）、`enforce` 不一致直接拒单；掉线自动降级 + 5s 静默 |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
 | 🧰 **一键部署** | `install.sh` / `install.ps1` / Docker Compose，三种方式等价 |
 
@@ -123,6 +124,7 @@ nanoquant/
 │   ├── views/           # 后台页面
 │   ├── components/      # EChart / EnvironmentSwitch / Modal / EventFeed ...
 │   └── layouts/         # SiteLayout（前台）/ ShellLayout（后台）
+├── rust/exec-service/   # 执行内核 sidecar（P2 影子签名：UDS + JSON Lines）
 ├── scripts/             # install / start / stop / status（sh + ps1）
 ├── tests/               # smoke / evolution / ai / news 探测 + 本地 Mock 模型
 ├── docs/RESEARCH.md     # 开源量化系统调研与融合决策
@@ -191,6 +193,7 @@ nanoquant/
 | 资讯 | `GET /news`、`POST /news/refresh`、`GET /news/overview`、`GET /news/diagnostics`、`POST /news/ai-summary` |
 | 备份 | `GET /backup/options`、`POST /backup/create`、`GET /backup/jobs`、`POST /backup/{id}/restore`、`DELETE /backup/{id}`、`GET /backup/{id}/download` |
 | 系统 | `GET /health`、`GET /system/info`、`GET /system/diagnostics`、`GET /system/events`、`GET /system/logs`、`GET/PUT /settings/{group}`、`POST /settings/{group}/reset` |
+| 执行内核 | `GET /system/exec-sidecar`、`POST /system/exec-sidecar/self-test`、`POST /system/exec-sidecar/reset` |
 | 公开 | `GET /public/config`、`/public/overview`、`/public/pool`（按添加顺序）、`/public/klines`、`/public/klines/batch`（仅池内合约）、`/public/news`、`/public/mantras`、`/public/performance` |
 | 实时 | `WS /ws?token=...`（事件流）、`WS /ws/klines?symbol=&interval=`（K 线推送, 服务端复用币安 WebSocket 流, 不占 REST 权重） |
 

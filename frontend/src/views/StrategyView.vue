@@ -202,6 +202,19 @@ const BASE_META: Record<string, FieldMeta> = {
   alert_template: { label: '消息模板', hint: '支持 {level} {category} {message} {time}；留空=默认格式' },
   alert_digest_enabled: { label: '摘要模式', hint: '开启后 warn 攒到间隔合并成一条，error 仍然即时' },
   alert_digest_minutes: { label: '摘要间隔', unit: '分钟' },
+  exec_mode: {
+    label: '执行内核模式',
+    widget: 'seg',
+    hint: 'off 只用 Python 签名；shadow 旁路比对只统计；enforce 不一致直接拒绝下单',
+    options: [
+      ['off', 'OFF'],
+      ['shadow', 'SHADOW'],
+      ['enforce', 'ENFORCE'],
+    ],
+  },
+  exec_socket: { label: 'sidecar 地址', hint: 'unix:/run/nanoquant/exec.sock 或 tcp:127.0.0.1:9101；留空读 EXEC_SOCKET' },
+  exec_sample_pct: { label: '比对抽样', unit: '%', hint: '下单高峰时可只比对一部分，enforce 模式建议 100' },
+  exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为 Python 签名' },
 
   site_enabled: { label: '启用公开前台', hint: '关闭后访客只能看到维护页，后台不受影响' },
   site_title: { label: '站点名称' },
@@ -273,6 +286,11 @@ const SECTIONS: Record<string, SectionDef[]> = {
         'alert_digest_enabled',
         'alert_digest_minutes',
       ],
+    },
+    {
+      title: '执行内核（sidecar）',
+      hint: 'Rust sidecar 只签名不下单：shadow 旁路比对不影响下单，enforce 不一致直接拒绝下单；sidecar 不可用时自动降级为 Python 签名',
+      fields: ['exec_mode', 'exec_socket', 'exec_sample_pct', 'exec_timeout_ms'],
     },
   ],
   public: [

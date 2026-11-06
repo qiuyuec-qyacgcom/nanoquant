@@ -61,9 +61,17 @@ exec-service/
     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
 ```
 
+## 当前状态
+
+- Python 侧已把 sidecar 接进真实签名链路（`off / shadow / enforce` 三档 + 自检 + 诊断面板），
+  细节见 `docs/EXEC_PROTOCOL.md` §5 与 `docs/TASKS.md` #55。
+- `src/sign.rs::normalize_pem` 已改为按 `-----...-----` 标记片段删除（旧状态机无法退出 `BEGIN`，
+  会把 PEM 清空后静默回落 HMAC）；**该修复尚未在本机编译验证**，请在 VPS 上 `cargo test` 确认。
+
 ## 下一步（P3）
 
-1. 接入 `reqwest`（rustls）做 HTTP/2 连接池 + 启动预热；
-2. 订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`；
-3. 保护单并行下发（STOP + TP），参数走 Algo 接口；
-4. 落库改由 Rust 单写线程组提交，Python 只读。
+1. 在 VPS 上 `cargo test`（含单行 PEM 用例）→ `cargo build --release`；
+2. 接入 `reqwest`（rustls）做 HTTP/2 连接池 + 启动预热；
+3. 订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`；
+4. 保护单并行下发（STOP + TP），参数走 Algo 接口；
+5. 落库改由 Rust 单写线程组提交，Python 只读。

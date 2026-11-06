@@ -34,6 +34,7 @@ import httpx
 
 from ..logging_setup import get_logger
 from ..security import decrypt_secret
+from ..services.exec_shadow import ExecShadowError, exec_shadow
 from ..services.settings import get_data, get_engine, normalize_mode
 from .precision import SymbolFilters, parse_exchange_info
 from .ratelimit import OrderRateLimiter, RateLimited, WeightLimiter
@@ -230,6 +231,13 @@ class BinanceClient:
             raise NoCredentials(f"未配置{label}环境的币安 API Key/Secret")
         return self._key, self._secret
 
+    def current_credentials(self) -> tuple[str, str]:
+        """当前环境的 Key/Secret（缺失时返回空串），供 sidecar 自检比对签名."""
+        try:
+            return self._credentials(required=False)
+        except Exception:  # noqa: BLE001
+            return "", ""
+
     def _bases(self) -> list[str]:
         cfg = get_data()
         env = self._ensure_env()
@@ -307,6 +315,11 @@ class BinanceClient:
             payload["recvWindow"] = int(cfg.request_timeout_sec * 1000) if cfg.request_timeout_sec < 6 else 5000
             query = urlencode(payload, doseq=True)
             signature = sign_query(query, secret)
+            # 影子模式: shadow 只投递后台比对; enforce 同步比对, 不一致拒绝下单
+            try:
+                await exec_shadow.observe(query, signature)
+            except ExecShadowError as exc:
+                raise BinanceError(-1022, f"sidecar 校验不一致, 已拒绝下单: {exc}") from exc
             # Ed25519/RSA 的签名是 base64, 含 '+' '/' '=' —— 必须再次编码,
             # 否则 '+' 会被服务端当成空格, 造成"时好时坏"的 -1022。
             query = f"{query}&signature={quote(signature, safe='')}"

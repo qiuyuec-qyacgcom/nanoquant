@@ -253,6 +253,33 @@ async def diagnostics(user: str = Depends(current_user)) -> dict:
     except OSError as exc:
         checks.append({"name": "存储", "ok": False, "detail": str(exc), "latency_ms": 0})
 
+    # 9. 执行内核 (Rust sidecar 影子比对)
+    try:
+        from ...services.exec_shadow import exec_shadow
+
+        shadow = exec_shadow.status()
+        counts = shadow["counts"]
+        if shadow["mode"] == "off":
+            sidecar_ok = True
+            sidecar_detail = "未启用（Python 本地签名）"
+        else:
+            sidecar_ok = counts["mismatched"] == 0 and (shadow["connected"] or counts["matched"] > 0)
+            sidecar_detail = (
+                f"{shadow['verdict']} · 一致 {counts['matched']} / 不一致 {counts['mismatched']} / "
+                f"失败 {counts['errors']} · sidecar {shadow['target']}"
+            )
+        checks.append(
+            {
+                "name": "执行内核",
+                "ok": sidecar_ok,
+                "detail": sidecar_detail[:240],
+                "latency_ms": int(shadow["latency_ms"]["p50"]),
+                "extra": shadow,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        checks.append({"name": "执行内核", "ok": False, "detail": str(exc)[:160], "latency_ms": 0})
+
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,
@@ -410,6 +437,43 @@ def runtime(user: str = Depends(current_user)) -> dict:
     from ...services import runtime_probe
 
     return runtime_probe.summary()
+
+
+@router.get("/system/exec-sidecar")
+def exec_sidecar_status(user: str = Depends(current_user)) -> dict:
+    """执行内核 sidecar 影子比对状态.
+
+    只回观测数据: 模式、连接、比对次数、不一致次数与耗时分位。
+    切流判据是 `counts.mismatched == 0`, 而不是"连上了"。
+    """
+    from ...services.exec_shadow import exec_shadow
+
+    return exec_shadow.status()
+
+
+@router.post("/system/exec-sidecar/self-test")
+async def exec_sidecar_self_test(user: str = Depends(current_user)) -> dict:
+    """用固定 query 自检: health + 与本地签名逐字节比对 (不消耗权重、不下单)."""
+    from ...services.exec_shadow import exec_shadow
+
+    key, secret = binance_client.current_credentials()
+    result = await exec_shadow.self_test(secret)
+    result["has_key"] = bool(key)
+    if result.get("ok"):
+        events.record("info", "exec", f"{user} 执行内核自检通过（{result.get('algo')}）")
+    else:
+        events.record("warn", "exec", f"{user} 执行内核自检失败：{result.get('detail')}")
+    return result
+
+
+@router.post("/system/exec-sidecar/reset")
+def exec_sidecar_reset(user: str = Depends(current_user)) -> dict:
+    """清零比对计数 (切换密钥/环境后重新开始统计, 避免旧的不一致长期挂着)."""
+    from ...services.exec_shadow import exec_shadow
+
+    exec_shadow.reset()
+    events.record("info", "exec", f"{user} 清零执行内核比对计数")
+    return exec_shadow.status()
 
 
 @router.get("/system/write-health")

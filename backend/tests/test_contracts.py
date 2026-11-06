@@ -6,7 +6,8 @@
 - 出场判定的优先级 (止损 / 止盈 / 阶梯止盈 / 移动止损 / 超时);
 - 配置校验 (周期白名单、阶梯升序、部分止盈比例);
 - 分段耗时的分位数计算;
-- 回测引擎能跑通且不产生负数仓位.
+- 回测引擎能跑通且不产生负数仓位;
+- 执行 sidecar 协议/长连接复用与影子比对的判定.
 
 这些用例**不联网、不碰数据库**, 适合放进 CI。
 """
@@ -311,3 +312,212 @@ def test_grid_runs_and_ranks():
     returns = [row["summary"]["total_return_pct"] for row in result["items"]]
     assert returns == sorted(returns, reverse=True)
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
+
+
+# ------------------------------------------------------------ 执行 sidecar 协议
+def test_exec_sidecar_signs_over_reused_connection():
+    """协议: health / plan 都要能走同一条连接 (每单重建连接会把握手塞进签名路径)."""
+    import asyncio
+    import json
+
+    from nanoquant.exchange.client import sign_query
+    from nanoquant.exchange.exec_client import ExecSidecar
+
+    secret = "unit-test-hmac-secret"
+    query = "symbol=BTCUSDT&side=BUY&type=MARKET&timestamp=1700000000000"
+    accepted = {"n": 0}
+
+    async def handler(reader, writer):
+        accepted["n"] += 1
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                req = json.loads(line.decode())
+                if req["op"] == "health":
+                    resp = {"id": req["id"], "ok": True, "algo": "hmac-sha256"}
+                else:
+                    resp = {
+                        "id": req["id"],
+                        "ok": True,
+                        "algo": "hmac-sha256",
+                        "signature": sign_query(req["query"], secret),
+                        "query": req["query"],
+                    }
+                writer.write((json.dumps(resp) + "\n").encode())
+                await writer.drain()
+        finally:
+            writer.close()
+
+    async def run():
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        sidecar = ExecSidecar(f"tcp:127.0.0.1:{port}", timeout=2)
+        try:
+            health = await sidecar.health()
+            assert health["algo"] == "hmac-sha256"
+            first = await sidecar.sign(query)
+            second = await sidecar.sign(query)
+            assert first["signature"] == sign_query(query, secret) == second["signature"]
+            assert first["query"] == query
+            assert sidecar.counters["connects"] == 1
+        finally:
+            await sidecar.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+def test_exec_sidecar_unreachable_raises():
+    import asyncio
+
+    from nanoquant.exchange.exec_client import ExecSidecar, ExecSidecarError
+
+    async def run():
+        # 9 端口在本机恒不可用: 只验证"连接失败要有明确错误", 不依赖外部网络
+        sidecar = ExecSidecar("tcp:127.0.0.1:9", timeout=0.3)
+        try:
+            await sidecar.sign("a=1")
+        except ExecSidecarError as exc:
+            assert "sidecar" in str(exc)
+        else:  # pragma: no cover - 极少数环境 9 端口可写
+            raise AssertionError("不可达地址竟然成功")
+        assert sidecar.counters["errors"] >= 1
+        assert sidecar.connected is False
+
+    asyncio.run(run())
+
+
+# ------------------------------------------------------------ 影子比对判定
+class _FakeSidecar:
+    """最小 sidecar 替身: 只回一个签名, 其余属性对齐 ExecSidecar."""
+
+    def __init__(self, signature: str, *, query_echo: bool = True) -> None:
+        self.signature = signature
+        self.query_echo = query_echo
+        self.timeout = 1.0
+        self.target = "tcp:fake"
+        self.connected = True
+        self.algo = "hmac-sha256"
+        self.last_error = ""
+        self.counters = {"requests": 0, "errors": 0, "connects": 0, "timeouts": 0}
+
+    def reconfigure(self, target, timeout=None):  # noqa: ARG002
+        return None
+
+    async def sign(self, query: str) -> dict:
+        self.counters["requests"] += 1
+        return {
+            "ok": True,
+            "algo": self.algo,
+            "query": query if self.query_echo else query + "x",
+            "signature": self.signature,
+        }
+
+
+def _shadow(client, mode: str):
+    from nanoquant.services.exec_shadow import ExecShadow, ShadowConfig
+
+    return ExecShadow(
+        client=client,
+        config_provider=lambda: ShadowConfig(mode=mode, target="", sample_pct=100, timeout_ms=300),
+        notifier=lambda *_: None,
+    )
+
+
+def test_exec_shadow_enforce_blocks_mismatch():
+    import asyncio
+
+    from nanoquant.services.exec_shadow import ExecShadowError
+
+    fake = _FakeSidecar("not-the-local-signature")
+    shadow = _shadow(fake, "enforce")
+
+    async def run():
+        try:
+            await shadow.observe("a=1", "local-signature")
+        except ExecShadowError:
+            return "blocked"
+        return "passed"
+
+    assert asyncio.run(run()) == "blocked"
+    assert shadow.counts["mismatched"] == 1
+    assert shadow.last_mismatch and shadow.last_mismatch["echo_ok"] is True
+    assert "签名不一致" in shadow.status()["verdict"]
+
+
+def test_exec_shadow_enforce_accepts_match_and_ignores_echo_bug():
+    import asyncio
+
+    fake = _FakeSidecar("same")
+    shadow = _shadow(fake, "enforce")
+
+    assert asyncio.run(shadow.observe("a=1", "same")) is None
+    assert shadow.counts["matched"] == 1
+
+    # 签名一致但 query 回显被改写: 说明协议层串了包, 同样视为不一致
+    from nanoquant.services.exec_shadow import ExecShadowError
+
+    fake2 = _FakeSidecar("same", query_echo=False)
+    shadow2 = _shadow(fake2, "enforce")
+    with pytest.raises(ExecShadowError):
+        asyncio.run(shadow2.observe("a=1", "same"))
+    assert shadow2.counts["mismatched"] == 1
+
+
+def test_exec_shadow_shadow_mode_is_async_and_never_raises():
+    import asyncio
+
+    fake = _FakeSidecar("mismatch")
+    shadow = _shadow(fake, "shadow")
+
+    async def run():
+        await shadow.observe("a=1", "local")
+        assert shadow.counts["inflight"] == 1
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert shadow.counts["matched"] == 0
+    assert shadow.counts["mismatched"] == 1
+    assert shadow.counts["inflight"] == 0
+    assert shadow.counts["skipped"] == 0
+
+
+def test_exec_shadow_verdict_degrades_when_sidecar_down():
+    fake = _FakeSidecar("x")
+    fake.connected = False
+    shadow = _shadow(fake, "shadow")
+    # 历史一致过, 但现在连不上: 判据必须是"当前不可用", 不能继续显示"一致"
+    shadow.counts["matched"] = 3
+    shadow.counts["errors"] = 5
+    shadow.last_error = "sidecar 响应超时(800ms)"
+
+    verdict = shadow.status()["verdict"]
+    assert "不可用" in verdict
+    assert "降级" in verdict
+
+
+def test_exec_shadow_latency_uses_client_roundtrip():
+    """延迟口径必须是 sidecar 往返, 不能把排队时间算进去 (否则宕机时 p99 假性飙高)."""
+    import asyncio
+
+    fake = _FakeSidecar("same")
+    fake.last_ms = 0.25
+    shadow = _shadow(fake, "enforce")
+
+    asyncio.run(shadow.observe("a=1", "same"))
+    assert shadow.status()["latency_ms"]["p50"] == pytest.approx(0.25, abs=0.001)
+
+
+def test_exec_shadow_off_skips_everything():
+    import asyncio
+
+    fake = _FakeSidecar("whatever")
+    shadow = _shadow(fake, "off")
+
+    asyncio.run(shadow.observe("a=1", "local"))
+    assert fake.counters["requests"] == 0
+    assert shadow.counts["matched"] == 0 and shadow.counts["mismatched"] == 0
+    assert "未启用" in shadow.status()["verdict"]

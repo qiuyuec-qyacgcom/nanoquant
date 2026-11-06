@@ -22,42 +22,24 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// 去掉 PEM 头尾与空白；单行 PEM（`-----BEGIN...---- -----END...-----`）也要能处理。
+/// 去掉 PEM 头尾与空白；单行 PEM（`-----BEGIN...----- M... -----END...-----`）也要能处理。
+///
+/// 与 Python 侧 `normalize_pem` 同口径：**按 `-----` 标记片段删除**，而不是按行过滤。
+/// 旧实现用 `skipping` 状态机，进入 BEGIN 后永远退出不了（单行/多行 PEM 都被清空），
+/// 结果 `detect()` 静默回落到 HMAC —— 签名自然是错的。
 pub fn normalize_pem(value: &str) -> String {
-    if !value.contains("-----") {
-        return value.split_whitespace().collect();
+    let mut text = value.trim().to_string();
+    if !text.contains("-----") {
+        return text.split_whitespace().collect();
     }
-    let mut cleaned = String::with_capacity(value.len());
-    let mut skipping = false;
-    let bytes: Vec<char> = value.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == '-' && bytes[i..].starts_with(&['-'; 5]) {
-            let mut j = i;
-            while j < bytes.len() && bytes[j] == '-' {
-                j += 1;
-            }
-            if bytes[j..].starts_with(&['B', 'E', 'G', 'I', 'N']) {
-                // 跳到行尾的 -----
-                skipping = true;
-            }
-            i = j;
-            continue;
-        }
-        if skipping {
-            if bytes[i] == '-' && bytes[i..].starts_with(&['-'; 5]) {
-                skipping = false;
-            }
-            i += 1;
-            continue;
-        }
-        if !bytes[i].is_whitespace() {
-            cleaned.push(bytes[i]);
-        }
-        i += 1;
+    while let Some(start) = text.find("-----") {
+        let Some(offset) = text[start + 5..].find("-----") else {
+            break;
+        };
+        let end = start + 5 + offset + 5;
+        text.replace_range(start..end, "");
     }
-    cleaned.retain(|c| c != '-');
-    cleaned
+    text.split_whitespace().collect()
 }
 
 pub enum Signer {

@@ -41,23 +41,47 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 - 拼 URL 时 `signature` 必须再做一次 URL 编码（`+` 会被服务端当空格）。
 - PEM 粘贴形态（多行 / 单行 / 纯 base64）一律先归一化。
 
-## 5. 影子模式比对流程
+## 5. 影子模式比对流程（已接入，见 TASKS #55）
 
-1. Python 在真实下单前，把同一个 `query` 发给 sidecar 的 `plan`；
-2. 比对 `signature` 与本地 `sign_query()` 是否**完全一致**，`query` 回显是否一致；
-3. 不一致 → 记录差异并**阻断真实下单**（fail closed）；
-4. 连续 N 笔一致后，才允许把 `EXEC_BACKEND` 切到 `rust`。
+配置入口：参数页「系统 → 执行内核（sidecar）」，或 `PUT /settings/system` 的
+`exec_mode / exec_socket / exec_sample_pct / exec_timeout_ms`。
+
+| 模式 | 关键路径影响 | 行为 |
+|---|---|---|
+| `off`（默认） | 无 | 只用 Python 本地签名，不连 sidecar |
+| `shadow` | 后台任务，**零阻塞** | 每次签名另送一份给 sidecar 比对，只统计 |
+| `enforce` | 同步，通常 +0.5–1ms | 不一致**立刻拒绝下单**（转 `-1022`） |
+
+语义约定：
+
+1. `shadow` 下比对投递到后台（并发上限 32），抽样比例由 `exec_sample_pct` 控制；
+2. 比对内容 = `signature` 逐字节 + `query` 回显，任一不一致即计入 `mismatched`；
+3. **只有不一致 fail-closed**；sidecar 不可用（连接失败/超时）一律降级回 Python 签名，
+   并在 5s 静默期内不再投递，避免每个签名都付一次超时；
+4. `enforce` 的切流判据是 `mismatched == 0`，而不是"连上了"；
+5. 观测口径：`latency_ms` 是**锁内测得的 sidecar 往返**（不含排队），
+   因此 sidecar 掉线时最大延迟 ≈ 超时值，不会出现"排队 N 秒"造成的假长尾。
+
+接口：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /system/exec-sidecar` | 模式、连接、algo、一致/不一致/失败/跳过、p50/p95/p99、verdict |
+| `POST /system/exec-sidecar/self-test` | 用固定 query 与当前环境 Secret 做一次比对（不消耗权重、不下单） |
+| `POST /system/exec-sidecar/reset` | 清零计数（换密钥/换环境后重新统计） |
+
+> 侧车只持有 Secret 并回传签名，不接触账户、持仓与订单。
 
 ## 6. 阶段计划
 
 | 阶段 | 内容 | 退出标准 |
 |---|---|---|
-| P2（当前） | 协议 + 签名（影子） | 签名逐字节一致；sidecar 崩溃不影响主流程 |
-| P3 | 接管 `place_order` / 保护单，单写线程落库 | demo 全量跑 24h 无差异 |
+| P2 | 协议 + 签名（影子） | ✅ 已完成：真实 Ed25519 签名逐字节一致（88 字符 base64），sidecar 崩溃不影响主流程 |
+| P3（下一步） | 接管 `place_order` / 保护单，单写线程落库 | demo 全量跑 24h 无差异 |
 | P4 | 多标的并发 + 连接预热 | p99 达标、无重复单 |
 
 ## 7. 风险控制
 
-- sidecar 不可用时 **降级回 Python 签名**（`EXEC_BACKEND=python`），不阻塞交易；
+- sidecar 不可用时 **降级回 Python 签名**（`exec_mode=off` 或自动降级 + 5s 静默），不阻塞交易；
 - 幂等键仍用 `clientOrderId`，sidecar 崩溃重启后按 cid 向交易所查询收敛；
 - 任何签名不一致都必须**拒绝下单**，不能"猜"。
