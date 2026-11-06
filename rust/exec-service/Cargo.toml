@@ -1,0 +1,24 @@
+[package]
+name = "exec-service"
+version = "0.1.0"
+edition = "2021"
+description = "NanoQuant 执行内核 sidecar（UDS，影子模式起步）"
+
+[[bin]]
+name = "exec-service"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"

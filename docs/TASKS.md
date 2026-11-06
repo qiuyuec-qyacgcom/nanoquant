@@ -667,6 +667,24 @@
   | GC 停顿 | 16 次，p99 **7.8ms**，累计 7.8ms |
 - **说明**：Windows 默认定时器粒度约 15.6ms，lag 的 p50 偏高属测量基线，看 max 与 >50ms 计数更有意义。
 
+### 54. Rust 执行内核 sidecar：协议 + 影子签名（本次执行）
+- **状态**：✅ 骨架完成（**未在本机编译**：无 Rust 工具链、无 MSVC/MinGW 链接器、磁盘剩余 0.7GB；需在 VPS 构建）
+- **决策依据**：用户确认将迁移到交易所同区域 VPS → RTT 从 250ms 降到 ~5–40ms，应用侧 10–40ms 抖动将占主导，Rust 收益从 1–3% 提升到 12–40%，值得做。
+- **交付物**：
+  - `rust/exec-service/`：`main.rs`（UDS + 可选 TCP 回环、JSON Lines 分发）、`sign.rs`（HMAC hex / Ed25519 base64，含与 Python 对齐的 3 个向量测试）、`model.rs`。
+  - `docs/EXEC_PROTOCOL.md`：传输（unix/tcp）、帧格式、op（health/plan/sign）、签名规则、影子比对流程、P2–P4 阶段计划与降级策略。
+  - `backend/nanoquant/exchange/exec_client.py`：Python 侧 sidecar 客户端（支持 `unix:` / `tcp:`）。
+  - `scripts/mock_exec_sidecar.py` + `scripts/verify_sidecar.py`：无 Rust 环境也能验证协议与签名一致性。
+- **验证（本机，Python mock sidecar）**：
+  | 项 | 结果 |
+  |---|---|
+  | health | PASS（algo=ed25519） |
+  | 普通下单 query 签名 | PASS（88 字符 base64，与本地 `sign_query` 逐字节一致） |
+  | 保护单 query 签名 | PASS |
+  | 空 query | PASS（被拒绝） |
+  | Rust 侧 | 3 个单测待在 VPS `cargo test` 验证 |
+- **下一步**：VPS 上 `cargo test` → 接 `reqwest` 连接池 → 影子模式与 Python 并行比对 → 灰度切流。
+
 ---
 
 ## 二、未开始

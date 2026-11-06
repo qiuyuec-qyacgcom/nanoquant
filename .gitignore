@@ -20,3 +20,6 @@ node_modules_broken_*/
 .DS_Store
 Thumbs.db
 *.log
+
+# Rust
+rust/**/target/
