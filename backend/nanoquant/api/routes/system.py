@@ -404,6 +404,14 @@ def preview_archive(
     return {"name": name, "count": len(rows), "rows": rows}
 
 
+@router.get("/system/runtime")
+def runtime(user: str = Depends(current_user)) -> dict:
+    """事件循环抖动探针: 判断 Python 自身是否是长尾来源."""
+    from ...services import runtime_probe
+
+    return runtime_probe.summary()
+
+
 @router.get("/system/write-health")
 def write_health(user: str = Depends(current_user)) -> dict:
     """写库健康: 队列统计 + 慢写 + 死信, 并给一句结论.

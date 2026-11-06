@@ -61,11 +61,15 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             log.warning("初始交易所探测失败: %s", exc)
 
+    from .services import runtime_probe
+
+    runtime_probe.start()
     probe_task = asyncio.create_task(_probe())
     await engine.start()
     try:
         yield
     finally:
+        runtime_probe.stop()
         probe_task.cancel()
         await engine.stop()
         # 停机前把队列里的订单写完, 不让已 ack 的成交丢在内存里
