@@ -587,6 +587,29 @@ class BinanceClient:
         """条件单(止损/止盈): 币安已把 closePosition 类订单迁到 Algo 接口."""
         return await self._request("POST", "/fapi/v1/algoOrder", params, weight=1, order=True)
 
+    async def open_algo_orders(self, symbol: str) -> list[dict]:
+        data = await self._request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, weight=1)
+        if isinstance(data, dict):
+            rows = data.get("orders") or data.get("data") or []
+        else:
+            rows = data
+        return rows if isinstance(rows, list) else []
+
+    async def cancel_all_algo(self, symbol: str) -> int:
+        """没有"一键撤全部"接口, 只能列出来逐个撤."""
+        rows = await self.open_algo_orders(symbol)
+        count = 0
+        for row in rows:
+            algo_id = row.get("algoId") if isinstance(row, dict) else None
+            if not algo_id:
+                continue
+            try:
+                await self.cancel_algo(str(algo_id))
+                count += 1
+            except BinanceError:
+                continue
+        return count
+
     async def cancel_algo(self, algo_id: str) -> dict:
         return await self._request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id}, weight=1)
 

@@ -20,7 +20,7 @@ from ..services.exec_metrics import exec_metrics
 from ..services.settings import get_engine, get_risk, normalize_mode
 from . import client as binance_client
 from .client import STAGE_SINK, BinanceError, NoCredentials, UncertainSubmission
-from .precision import SymbolFilters, round_to_tick
+from .precision import SymbolFilters, floor_to_step, round_to_tick
 from .precision import SymbolFilters, floor_to_step
 
 log = get_logger("broker")
@@ -500,6 +500,17 @@ class BinanceBroker:
                 live_qty = float(row.qty)
 
             close_qty = min(live_qty, qty) if qty else live_qty
+            # 平仓数量必须按步进对齐, 否则部分平仓会 -1111 (精度超限)
+            try:
+                fmap = await binance_client.client.symbol_filters()
+                f = fmap.get(position.symbol)
+            except BinanceError:
+                f = None
+            if f is not None and f.qty_step:
+                close_qty = floor_to_step(close_qty, f.qty_step)
+                if close_qty < (f.min_qty or 0) - 1e-12:
+                    _CLOSING.discard(pid)
+                    return ExecResult(False, message=f"平仓数量 {close_qty} 低于最小下单量 {f.min_qty}")
             t0 = time.perf_counter()
             sink_token = STAGE_SINK.set(stage)
             try:
@@ -544,10 +555,13 @@ class BinanceBroker:
             stage["persist_ms"] = (time.perf_counter() - t_persist) * 1000
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
-            try:
-                await binance_client.client.cancel_all(position.symbol)
-            except BinanceError:
-                pass
+            # 只有全平才撤保护单; 部分止盈后剩余仓位仍需止损/止盈保护
+            if close_qty >= live_qty - 1e-12:
+                try:
+                    await binance_client.client.cancel_all(position.symbol)
+                    await binance_client.client.cancel_all_algo(position.symbol)
+                except BinanceError:
+                    pass
             label = "实盘" if self.mode == "live" else "模拟盘"
             return ExecResult(True, price=avg, qty=close_qty, message=f"{label}平仓 {reason}", raw=resp)
         except NoCredentials as exc:
@@ -564,17 +578,19 @@ class BinanceBroker:
         close_side = "SELL" if side == "long" else "BUY"
         try:
             await binance_client.client.cancel_all(symbol)
+            await binance_client.client.cancel_all_algo(symbol)
             params = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": close_side,
                 "type": "STOP_MARKET",
-                "stopPrice": f"{stop_price:.12f}".rstrip("0").rstrip("."),
+                "triggerPrice": f"{stop_price:.8f}".rstrip("0").rstrip("."),
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
-                "newClientOrderId": new_client_order_id("nt"),
+                "clientAlgoId": new_client_order_id("nt"),
             }
-            await binance_client.client.place_order(**params)
+            await binance_client.client.place_algo_order(**params)
             with session_scope() as s:
                 row = (
                     s.query(PositionRecord)
