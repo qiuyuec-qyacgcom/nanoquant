@@ -271,6 +271,62 @@ def orders(limit: int = Query(default=80, ge=1, le=500), user: str = Depends(cur
     return {"items": items}
 
 
+@router.get("/engine/protection")
+async def protection_orders(user: str = Depends(current_user)) -> dict:
+    """交易所侧的保护单(Algo 条件单).
+
+    这部分本地数据库看不到: 下单后挂在交易所, 只有触发/撤销才消失.
+    """
+    try:
+        rows = await binance_client.open_algo_orders()
+    except BinanceError as exc:
+        raise HTTPException(status_code=503, detail=f"查询保护单失败: {exc.message}") from exc
+
+    symbols = sorted({str(r.get("symbol")) for r in rows if isinstance(r, dict) and r.get("symbol")})
+    quotes: dict[str, tuple[float, float]] = {}
+    if symbols:
+        try:
+            quotes = await binance_client.book_tickers(symbols)
+        except BinanceError:
+            quotes = {}
+
+    items: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol") or "")
+        tick = quotes.get(sym)
+        mid = (tick[0] + tick[1]) / 2 if tick else 0.0
+        trigger = float(r.get("triggerPrice") or r.get("stopPrice") or 0)
+        items.append(
+            {
+                "algo_id": str(r.get("algoId") or ""),
+                "client_algo_id": str(r.get("clientAlgoId") or ""),
+                "symbol": sym,
+                "side": str(r.get("side") or ""),
+                "type": str(r.get("orderType") or r.get("type") or ""),
+                "trigger_price": trigger,
+                "mark_price": round(mid, 6),
+                "distance_pct": round((trigger - mid) / mid * 100, 3) if mid and trigger else 0.0,
+                "status": str(r.get("algoStatus") or r.get("status") or ""),
+                "close_position": bool(r.get("closePosition")),
+            }
+        )
+    items.sort(key=lambda x: (x["symbol"], x["type"]))
+    return {"items": items, "count": len(items), "mode": normalize_mode(get_engine().mode)}
+
+
+@router.delete("/engine/protection/{algo_id}")
+async def cancel_protection(algo_id: str, user: str = Depends(current_user)) -> dict:
+    """撤销一条交易所保护单."""
+    try:
+        await binance_client.cancel_algo(algo_id)
+    except BinanceError as exc:
+        raise HTTPException(status_code=400, detail=f"撤单失败: {exc.message}") from exc
+    events.record("warn", "engine", f"手动撤销保护单 {algo_id}", {"algo_id": algo_id})
+    return {"ok": True, "algo_id": algo_id}
+
+
 @router.get("/engine/trades")
 def trades(limit: int = Query(default=60, ge=1, le=500), user: str = Depends(current_user)) -> dict:
     mode = normalize_mode(get_engine().mode)

@@ -15,6 +15,8 @@ const trades = ref<any[]>([])
 const signals = ref<any[]>([])
 const usage = ref<any>(null)
 const stages = ref<any>(null)
+const protection = ref<any[]>([])
+const cancelingId = ref('')
 const busy = ref(false)
 const showPosHelp = ref(false)
 
@@ -120,19 +122,21 @@ const equityOption = computed(() => {
 
 async function load() {
   await app.loadStatus()
-  const [eq, tr, sg, us, ev, ex] = await Promise.allSettled([
+  const [eq, tr, sg, us, ev, ex, pr] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),
     http.get('/ai/usage'),
     app.loadEvents(40),
     http.get('/engine/execution'),
+    http.get('/engine/protection'),
   ])
   if (eq.status === 'fulfilled') equity.value = eq.value.items
   if (tr.status === 'fulfilled') trades.value = tr.value.items
   if (sg.status === 'fulfilled') signals.value = sg.value.items
   if (us.status === 'fulfilled') usage.value = us.value
   if (ex.status === 'fulfilled') stages.value = ex.value
+  if (pr.status === 'fulfilled') protection.value = pr.value.items || []
 }
 
 async function cycleNow() {
@@ -145,6 +149,20 @@ async function cycleNow() {
     app.notify(err.message, 'error')
   } finally {
     busy.value = false
+  }
+}
+
+async function cancelProtection(algoId: string) {
+  if (!confirm('确认撤销这条保护单？撤销后该仓位将失去自动止损/止盈。')) return
+  cancelingId.value = algoId
+  try {
+    await http.del(`/engine/protection/${algoId}`)
+    app.notify('保护单已撤销', 'ok')
+    await load()
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    cancelingId.value = ''
   }
 }
 
@@ -409,6 +427,44 @@ onBeforeUnmount(() => window.clearInterval(timer))
             </tr>
             <tr v-if="!positions.length">
               <td colspan="11" class="empty">暂无持仓 · 引擎会在信号与风控同时满足时自动开仓</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">交易所保护单</span>
+        <div class="right">
+          <span class="tag tag-dim">{{ protection.length }} 条</span>
+          <span class="muted" style="font-size: 10.5px">挂在币安侧的 Algo 条件单，本地账本看不到</span>
+        </div>
+      </div>
+      <div class="panel-body flush table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>标的</th><th>方向</th><th>类型</th><th>触发价</th><th>标记价</th><th>距离</th><th>状态</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="o in protection" :key="o.algo_id">
+              <td class="mono">{{ o.symbol }}</td>
+              <td>{{ o.side === 'SELL' ? '卖出' : '买入' }}</td>
+              <td>{{ o.type === 'STOP_MARKET' ? '止损' : o.type === 'TAKE_PROFIT_MARKET' ? '止盈' : o.type }}</td>
+              <td class="mono">{{ px(o.trigger_price) }}</td>
+              <td class="mono muted">{{ px(o.mark_price) }}</td>
+              <td class="mono" :class="o.distance_pct >= 0 ? 'down' : 'flat'">{{ o.distance_pct }}%</td>
+              <td class="mono muted">{{ o.status }}</td>
+              <td class="right">
+                <button class="btn btn-xs btn-danger" :disabled="cancelingId === o.algo_id" @click="cancelProtection(o.algo_id)">
+                  撤单
+                </button>
+              </td>
+            </tr>
+            <tr v-if="!protection.length">
+              <td colspan="8" class="empty">当前没有挂着保护单 · 开仓成功后会自动挂止损与止盈</td>
             </tr>
           </tbody>
         </table>
