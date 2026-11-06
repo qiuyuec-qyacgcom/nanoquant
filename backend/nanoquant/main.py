@@ -18,7 +18,7 @@ from .db import init_db, session_scope
 from .engine.worker import engine
 from .exchange import client as binance_client
 from .exchange.kline_stream import kline_hub
-from .services import alerts
+from .services import alerts, api_guard
 from .services.db_writer import db_writer
 from .exchange.ticker_stream import ticker_hub
 from .logging_setup import get_logger, setup_logging
@@ -112,6 +112,29 @@ def create_app() -> FastAPI:
         elif not path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
+
+    @app.middleware("http")
+    async def _api_rate_limit(request: Request, call_next):
+        """每 IP 每分钟请求上限（默认关闭）。健康检查与 metrics 不计数，避免探针被误伤。"""
+        path = request.url.path
+        exempt = {"/api/v1/health", "/api/v1/metrics", "/api/openapi.json", "/api/docs"}
+        if not path.startswith("/api/") or path in exempt:
+            return await call_next(request)
+        try:
+            from .services.settings import get_system
+
+            limit = int(get_system().api_rate_limit_per_min)
+        except Exception:  # noqa: BLE001  配置读不到时不能把 API 全部挡掉
+            limit = 0
+        key = request.client.host if request.client else "unknown"
+        allowed, retry = api_guard.limiter.check(key, limit)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "请求过于频繁，请稍后再试"},
+                headers={"Retry-After": str(retry)},
+            )
+        return await call_next(request)
 
     @app.exception_handler(SettingsValidationError)
     async def _settings_error(_: Request, exc: SettingsValidationError) -> JSONResponse:

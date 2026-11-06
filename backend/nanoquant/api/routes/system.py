@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ... import __version__
 from ...config import APP_NAME, paths
@@ -429,6 +429,53 @@ def preview_archive(
             continue
     rows.reverse()
     return {"name": name, "count": len(rows), "rows": rows}
+
+
+@router.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    """Prometheus 文本指标（只读、无需登录、不含任何账户/密钥/持仓数据）.
+
+    只暴露进程内计数与几个状态位，便于 VPS 上用 node_exporter/Prometheus 抓：
+    引擎是否运行、写队列积压/失败、死信、sidecar 比对结果。
+    """
+    from ...engine.worker import engine
+    from ...services import dead_letter
+    from ...services.db_writer import db_writer
+    from ...services.exec_shadow import exec_shadow
+    from ...services.settings import get_system
+
+    if not get_system().metrics_enabled:
+        raise HTTPException(status_code=404, detail="metrics 已关闭")
+
+    queue = db_writer.stats()
+    try:
+        dead = dead_letter.summary()
+    except Exception:  # noqa: BLE001  metrics 抓取不能因为一次查询失败而 500
+        dead = {"pending": 0, "stuck": 0}
+    shadow = exec_shadow.status()
+    counts = shadow["counts"]
+
+    values: list[tuple[str, str, float]] = [
+        ("nanoquant_up", "服务是否在线", 1),
+        ("nanoquant_engine_running", "引擎是否运行", int(bool(engine.running))),
+        ("nanoquant_write_queue_pending", "写队列积压", queue.get("pending", 0)),
+        ("nanoquant_write_queue_unfinished", "写队列未完成", queue.get("unfinished", 0)),
+        ("nanoquant_write_queue_failed", "写队列累计失败", queue.get("failed", 0)),
+        ("nanoquant_write_queue_slow", "慢写次数", queue.get("slow", 0)),
+        ("nanoquant_dead_letters_pending", "待处理死信", dead.get("pending", 0)),
+        ("nanoquant_dead_letters_stuck", "重放卡住的死信", dead.get("stuck", 0)),
+        ("nanoquant_exec_shadow_matched", "sidecar 签名一致次数", counts["matched"]),
+        ("nanoquant_exec_shadow_mismatched", "sidecar 签名不一致次数", counts["mismatched"]),
+        ("nanoquant_exec_shadow_errors", "sidecar 不可用次数", counts["errors"]),
+        ("nanoquant_exec_shadow_skipped", "跳过比对次数", counts["skipped"]),
+        ("nanoquant_exec_sidecar_connected", "sidecar 是否已连接", int(bool(shadow["connected"]))),
+    ]
+    lines: list[str] = []
+    for name, help_text, value in values:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        lines.append(f"{name} {value}")
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 @router.get("/system/runtime")

@@ -225,6 +225,15 @@ const BASE_META: Record<string, FieldMeta> = {
   exec_socket: { label: 'sidecar 地址', hint: 'unix:/run/nanoquant/exec.sock 或 tcp:127.0.0.1:9101；留空读 EXEC_SOCKET' },
   exec_sample_pct: { label: '比对抽样', unit: '%', hint: '下单高峰时可只比对一部分，enforce 模式建议 100' },
   exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为 Python 签名' },
+  api_rate_limit_per_min: {
+    label: 'API 限频',
+    unit: '次/分/IP',
+    hint: '0=关闭；防爆破与刷接口，健康检查与 /metrics 不计数',
+  },
+  metrics_enabled: {
+    label: 'Prometheus 指标',
+    hint: '开放只读 /metrics（仅队列、死信、比对计数与状态位，无账户数据）',
+  },
 
   site_enabled: { label: '启用公开前台', hint: '关闭后访客只能看到维护页，后台不受影响' },
   site_title: { label: '站点名称' },
@@ -313,6 +322,11 @@ const SECTIONS: Record<string, SectionDef[]> = {
       title: '执行内核（sidecar）',
       hint: 'Rust sidecar 只签名不下单：shadow 旁路比对不影响下单，enforce 不一致直接拒绝下单；sidecar 不可用时自动降级为 Python 签名',
       fields: ['exec_mode', 'exec_socket', 'exec_sample_pct', 'exec_timeout_ms'],
+    },
+    {
+      title: '安全与观测',
+      hint: 'API 限频按 IP 计，健康检查与 /metrics 不计数；指标仅含队列、死信与比对计数',
+      fields: ['api_rate_limit_per_min', 'metrics_enabled'],
     },
   ],
   public: [

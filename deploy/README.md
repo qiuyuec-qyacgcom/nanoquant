@@ -40,6 +40,20 @@ curl -s localhost:8899/api/v1/health
 3. `mismatched` 恒为 0 再切 `enforce`（灰度 24h）；
 4. 换 Secret 后必须点「清零」，否则切换窗口内的在途比对会残留不一致计数。
 
+## 监控（可选）
+
+`GET /api/v1/metrics` 是免鉴权的 Prometheus 文本（可在参数页「系统 → 安全与观测」关闭）：
+
+```yaml
+- job_name: nanoquant
+  scrape_interval: 15s
+  metrics_path: /api/v1/metrics
+  static_configs: [{ targets: ['127.0.0.1:8899'] }]
+```
+
+建议告警规则：`nanoquant_up == 0`、`nanoquant_dead_letters_stuck > 0`、
+`nanoquant_exec_shadow_mismatched > 0`（切了 enforce 时尤其重要）。
+
 ## 常用
 
 ```bash

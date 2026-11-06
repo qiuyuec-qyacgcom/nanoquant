@@ -793,6 +793,20 @@
     （`-Python` / `NANOQUANT_VENV` / 仓库 `.venv` / 上级 `.venvtest`），新增 `scripts/stop.ps1`。
 - **验证**：新增 3 条用例（同向计数、缩放钳位、仓位按 scale 减半）；**48 passed**；运行服务返回两个新字段默认值。
 
+### 61. API 限频 + Prometheus 指标 + 启动脚本实测（本次执行）
+- **状态**：✅ 已完成
+- **过程要点**：
+  - `SystemSettings` 新增 `api_rate_limit_per_min`（默认 0=关闭）与 `metrics_enabled`（默认开）。
+  - 新增 `services/api_guard.py`：进程内滑动窗口按 IP 限流，`429` + `Retry-After`；
+    `/health`、`/metrics`、OpenAPI/docs 不计数（探针不能被误伤）；配置读取失败时自动放行，避免把 API 全挡掉。
+  - 新增 `GET /api/v1/metrics`（Prometheus 文本、只读、无需登录、不含账户/密钥/持仓）：
+    `up` / `engine_running` / 写队列 pending·unfinished·failed·slow / 死信 pending·stuck /
+    执行内核 matched·mismatched·errors·skipped·connected。
+  - 参数页新增「安全与观测」分区。
+  - **迁移场景实测** `scripts/start.ps1`：`NANOQUANT_VENV=F:\cb\.venvtest` + 临时 `data/` + 端口 8901
+    → `/api/v1/health` 200，证明 F 盘共享 venv 下的一键启动已恢复。
+- **验证**：新增 3 条用例（指标文本与脱敏、开关 404、限频 429 + 豁免）；**51 passed**。
+
 ---
 
 ## 二、未开始

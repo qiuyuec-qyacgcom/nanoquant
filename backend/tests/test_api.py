@@ -171,3 +171,46 @@ def test_backtest_rejects_bad_cost_params(client):
         json={"symbol": "BTCUSDT", "interval": "5m", "limit": 200, "funding_bps_8h": 999},
     )
     assert res.status_code == 422
+
+
+def test_metrics_is_public_text_without_secrets(client):
+    res = client.get(f"{API}/metrics")
+    assert res.status_code == 200
+    assert "text/plain" in res.headers["content-type"]
+    body = res.text
+    assert "nanoquant_up 1" in body
+    assert "nanoquant_write_queue_pending" in body
+    assert "nanoquant_exec_shadow_mismatched" in body
+    for secret in ("api_key", "secret", "equity", "balance"):
+        assert secret not in body.lower()
+
+
+def test_metrics_can_be_disabled(client):
+    headers = _token(client)
+    client.put(f"{API}/settings/system", headers=headers, json={"patch": {"metrics_enabled": False}})
+    try:
+        assert client.get(f"{API}/metrics").status_code == 404
+    finally:
+        client.put(f"{API}/settings/system", headers=headers, json={"patch": {"metrics_enabled": True}})
+    assert client.get(f"{API}/metrics").status_code == 200
+
+
+def test_api_rate_limit_returns_429_with_retry_after(client):
+    from nanoquant.services.api_guard import limiter
+
+    headers = _token(client)
+    limiter.clear()
+    client.put(f"{API}/settings/system", headers=headers, json={"patch": {"api_rate_limit_per_min": 2}})
+    try:
+        assert client.get(f"{API}/auth/me", headers=headers).status_code == 200
+        assert client.get(f"{API}/auth/me", headers=headers).status_code == 200
+        blocked = client.get(f"{API}/auth/me", headers=headers)
+        assert blocked.status_code == 429
+        assert int(blocked.headers["Retry-After"]) > 0
+        # 健康检查与 metrics 是探针，不该被限频误伤
+        assert client.get(f"{API}/health").status_code == 200
+        assert client.get(f"{API}/metrics").status_code == 200
+    finally:
+        client.put(f"{API}/settings/system", headers=headers, json={"patch": {"api_rate_limit_per_min": 0}})
+        limiter.clear()
+    assert client.get(f"{API}/auth/me", headers=headers).status_code == 200

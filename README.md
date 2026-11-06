@@ -39,7 +39,7 @@
 | 🎯 **astra 规则标的池** | 添加前用币安在线合约表校验（USDT 永续 / 交易中），分层派生杠杆与止损，去重 + 容量上限，删除需确认短语且持仓禁删 |
 | 🧩 **执行内核 sidecar** | Rust 只签名不下单：`shadow` 旁路逐字节比对（零阻塞）、`enforce` 不一致直接拒单；掉线自动降级 + 5s 静默（详见[执行内核](#-执行内核-sidecar)） |
 | 🧪 **回测与样本外验证** | 与实盘共用策略函数：计入手续费/滑点/点差/资金费，部分止盈同口径；参数网格 + walk-forward（前段选参、后段冻结）给出过拟合差距 |
-| 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、事件循环抖动探针 |
+| 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、抖动探针、可选 IP 限频与 `/metrics` |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
 | 🧰 **一键部署** | `install.sh` / `install.ps1` / Docker Compose，三种方式等价 |
 
@@ -229,6 +229,7 @@ nanoquant/
 | 策略 | 周期 / 阈值 / 量比 / ATR% / 最长持仓 | 5m / 0.30 / 0.80 / 0.05–4 / 180 分钟 |
 | 执行 | 盘口点差闸门 / 时间阶梯止盈 | 8 bps / 0min 0.8%、15min 0.6%、30min 0.45%、60min 0.3%、120min 0.2% |
 | 执行内核 | 模式 / 抽样 / 超时 | off / 100% / 500ms |
+| 安全 | API 限频 / Prometheus 指标 | 0 关闭（按 IP 计次） / 开启 |
 | AI | 模式 / 最低置信 / 调用上限 / 月预算 | single / 0.45 / 30 次每小时 / $3 |
 
 > 1 USDT 买不了 BTC：BTCUSDT 最小名义额以币安合约表为准（当前约 50–100 USDT）。小资金请选 DOGE / SOL / ETH 等小面值标的，
@@ -253,6 +254,7 @@ nanoquant/
 | 配置 | `GET /settings`、`GET/PUT /settings/{group}`、`POST /settings/{group}/reset`、`GET/POST/DELETE /settings/credentials/exchange` |
 | 系统 | `GET /health`、`GET /system/info`、`GET /system/diagnostics`、`GET /system/events`、`GET /system/logs`、`GET /system/runtime`、`GET /system/write-health`、`GET /system/archives`、`GET /system/dead-letters`、`POST /system/dead-letters/{id}/replay`、`GET /system/alerts/logs`、`POST /system/alerts/test` |
 | 执行内核 | `GET /system/exec-sidecar`、`POST /system/exec-sidecar/self-test`、`POST /system/exec-sidecar/reset` |
+| 指标 | `GET /metrics`（Prometheus 文本，只读免鉴权；仅队列/死信/比对计数与状态位） |
 | 公开 | `GET /public/config`、`/public/overview`、`/public/pool`（按添加顺序）、`/public/quotes`、`/public/klines`、`/public/klines/batch`（仅池内合约）、`/public/news`、`/public/mantras`、`/public/performance` |
 | 实时 | `WS /ws?token=...`（事件流）、`WS /ws/klines?symbol=&interval=`（K 线推送，服务端复用币安 WebSocket 流，不占 REST 权重） |
 
@@ -264,7 +266,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 39 + 路由 9（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 39 + 路由 12（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -306,6 +308,8 @@ python scripts/mainnet_preflight.py --yes                               # 主网
 - **死信补偿**：写库失败进 `dead_letters`，后台重放或忽略；`/system/write-health` 给出积压与最近耗时。
 - **归档**：过期事件/信号先 gzip 到 `data/archive/` 再批量删除，可在系统页预览。
 - **备份**：选择性打包 + SHA-256 校验，还原前自动快照；主密钥不入包（换机需另行迁移 `data/.master_key`）。
+- **限频与指标**：`system.api_rate_limit_per_min` 按 IP 限流（0=关闭，健康检查与 `/metrics` 豁免）；
+  `GET /metrics` 提供 Prometheus 文本（引擎状态、写队列、死信、sidecar 比对计数），不含任何账户或密钥数据。
 
 ---
 
