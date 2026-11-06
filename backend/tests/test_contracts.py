@@ -221,6 +221,28 @@ def test_sign_query_accepts_pem_private_key():
     priv.public_key().verify(base64.b64decode(sign_query(query, pem)), query.encode())
 
 
+# ------------------------------------------------------- 单行 PEM(真实踩坑)
+def test_single_line_pem_private_key_signs():
+    """币安页面/编辑器常把 PEM 压成一行, 归一化必须按标记片段删除而不是按行过滤."""
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
+
+    from nanoquant.exchange.client import normalize_pem, sign_query
+
+    priv = Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
+    one_line = " ".join(pem.split())
+
+    body = normalize_pem(one_line)
+    assert body and "-----" not in body
+    assert base64.b64decode(body)
+
+    query = "symbol=BTCUSDT&timestamp=1700000000000"
+    priv.public_key().verify(base64.b64decode(sign_query(query, one_line)), query.encode())
+
+
 # ---------------------------------------------------------------- 交易所签名
 def test_sign_query_supports_ed25519_and_hmac():
     import base64

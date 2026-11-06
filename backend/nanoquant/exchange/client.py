@@ -16,13 +16,18 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.serialization import load_der_private_key
 
 import httpx
@@ -36,7 +41,7 @@ from .ratelimit import OrderRateLimiter, RateLimited, WeightLimiter
 log = get_logger("binance")
 
 #: Ed25519 私钥解析结果缓存: base64(secret) -> key 对象
-_ED25519_CACHE: dict[str, Any] = {}
+_KEY_CACHE: dict[str, Any] = {}
 
 
 def normalize_pem(value: str) -> str:
@@ -46,10 +51,13 @@ def normalize_pem(value: str) -> str:
     请求头里塞原始 PEM 会直接触发 -2014。这里统一去掉头尾与空白。
     """
     text = (value or "").strip()
-    if "-----BEGIN" not in text:
+    if "-----" not in text:
         return "".join(text.split())
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("-----")]
-    return "".join(lines)
+    # 有的客户端把 PEM 压成一行: "-----BEGIN PRIVATE KEY----- MC4C... -----END PRIVATE KEY-----"
+    # 所以按"标记片段"删除, 而不是按行过滤
+    text = re.sub(r"-----BEGIN[^-]*-----", "", text)
+    text = re.sub(r"-----END[^-]*-----", "", text)
+    return "".join(text.split())
 
 
 def looks_like_public_key(value: str) -> bool:
@@ -58,7 +66,7 @@ def looks_like_public_key(value: str) -> bool:
     return key.startswith("MCow") and len(key) >= 56
 
 
-def _ed25519_key(secret: str) -> Any | None:
+def _private_key(secret: str) -> Any | None:
     """尝试把 secret 解析成 Ed25519 私钥; 不是就给 None.
 
     币安支持两类 API Key:
@@ -66,28 +74,39 @@ def _ed25519_key(secret: str) -> Any | None:
     - Ed25519: Secret 是 base64(PKCS#8 DER) 私钥, 签名是 base64。
     用"能否按 DER 解析出 Ed25519 私钥"来判定, 避免把普通字符串误判。
     """
-    cached = _ED25519_CACHE.get(secret)
-    if cached is not None:
+    cached = _KEY_CACHE.get(secret, "miss")
+    if cached != "miss":
         return cached
-    try:
-        raw = base64.b64decode(normalize_pem(secret), validate=True)
-        key = load_der_private_key(raw, password=None)
-    except Exception:  # noqa: BLE001
+    body = normalize_pem(secret)
+    key = None
+    for loader in (
+        lambda b: load_der_private_key(b, password=None),
+        lambda b: load_pem_private_key(b, password=None),
+    ):
+        try:
+            key = loader(body.encode() if isinstance(body, str) and b"BEGIN" in body.encode() else base64.b64decode(body, validate=True))
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if key is None or not isinstance(key, (Ed25519PrivateKey, RSAPrivateKey)):
+        _KEY_CACHE[secret] = None
         return None
-    if not isinstance(key, Ed25519PrivateKey):
-        return None
-    if len(_ED25519_CACHE) > 8:
-        _ED25519_CACHE.clear()
-    _ED25519_CACHE[secret] = key
+    if len(_KEY_CACHE) > 8:
+        _KEY_CACHE.clear()
+    _KEY_CACHE[secret] = key
     return key
 
 
 def sign_query(query: str, secret: str) -> str:
-    """按密钥类型签名: Ed25519 → base64, HMAC-SHA256 → hex."""
-    key = _ed25519_key(secret)
-    if key is not None:
+    """按密钥类型签名: Ed25519 / RSA → base64, HMAC-SHA256 → hex."""
+    key = _private_key(secret)
+    if isinstance(key, Ed25519PrivateKey):
         return base64.b64encode(key.sign(query.encode())).decode()
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    if isinstance(key, RSAPrivateKey):
+        return base64.b64encode(
+            key.sign(query.encode(), padding.PKCS1v15(), hashes.SHA256())
+        ).decode()
+    return hmac.new(normalize_pem(secret).encode(), query.encode(), hashlib.sha256).hexdigest()
 
 
 #: 分段耗时采集点: broker 在下单前 set 一个 dict, `_request` 负责填 wait/sign/http
@@ -346,7 +365,7 @@ class BinanceClient:
                         f"{msg}（当前 API Key 是一段公钥；币安要求填的是创建密钥后"
                         "返回的 API Key，公钥只用于在网页上注册）"
                     )
-                elif _ed25519_key(self._secret) is not None:
+                elif _private_key(self._secret) is not None:
                     msg = f"{msg}（Ed25519 私钥格式未被接受，请确认粘贴的是完整的 Secret）"
             if code == -1003:
                 # 先尝试换线路 (不同出口 IP 不会被同一条封禁连累), 换不了才本地熔断
