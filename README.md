@@ -38,7 +38,7 @@
 | 📈 **前台 K 线（跟随标的池）** | 前台只展示后台已添加的合约，严格按添加顺序排列；空池显示「未添加标的」，增删 10 秒内自动同步 |
 | 🎯 **astra 规则标的池** | 添加前用币安在线合约表校验（USDT 永续 / 交易中），分层派生杠杆与止损，去重 + 容量上限，删除需确认短语且持仓禁删 |
 | 🧩 **执行内核 sidecar** | Rust 只签名不下单：`shadow` 旁路逐字节比对（零阻塞）、`enforce` 不一致直接拒单；掉线自动降级 + 5s 静默（详见[执行内核](#-执行内核-sidecar)） |
-| 🧪 **回测与参数网格** | 同一套策略函数跑历史 K 线，网格搜索按收益排序；与实盘共用出场规则，避免"两套逻辑" |
+| 🧪 **回测与样本外验证** | 与实盘共用策略函数：计入手续费/滑点/点差/资金费，部分止盈同口径；参数网格 + walk-forward（前段选参、后段冻结）给出过拟合差距 |
 | 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、事件循环抖动探针 |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
 | 🧰 **一键部署** | `install.sh` / `install.ps1` / Docker Compose，三种方式等价 |
@@ -60,7 +60,7 @@
 | 后台 | `/admin/signals` | 信号审计（评分 / AI / 裁决 / 拒绝原因分布） |
 | 后台 | `/admin/symbols` | 标的池（币安合约表校验、分层/精度/最小下单、删除确认短语） |
 | 后台 | `/admin/chart` | K 线工作站：与前台同源组件，MA/EMA/BOLL + VOL/MACD/RSI，币安推送 + 收盘倒计时 |
-| 后台 | `/admin/backtest` | 回测粗筛：净值曲线、分段统计（小时/星期/区间）、成交明细、参数网格 |
+| 后台 | `/admin/backtest` | 回测：净值曲线、分段统计、成交明细（含资金费/部分止盈）、参数网格、样本外验证 |
 | 后台 | `/admin/news` | 资讯情绪 + 源检测 |
 | 后台 | `/admin/ai` | 模型接入、诊断、决策演练 |
 | 后台 | `/admin/strategy` | 交易环境（模拟盘 / 实盘）+ 引擎/风控/策略/数据源/执行内核等分区参数 |
@@ -148,7 +148,7 @@ nanoquant/
 ├── rust/exec-service/   # 执行内核 sidecar（P2：只签名不下单，UDS + JSON Lines）
 ├── scripts/             # install / start / stop / status + 压测/对账/校验工具
 ├── backend/tests/       # 契约测试 + smoke / evolution / ai / news 探测 + 本地 Mock 模型
-├── docs/                # RESEARCH 调研 / TASKS 任务书 / EXEC_PROTOCOL 执行内核协议
+├── docs/                # RESEARCH 调研 / TASKS 任务书 / EXEC_PROTOCOL 协议 / MAINNET_DRILL 演练手册
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -259,7 +259,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests/test_contracts.py -q   # 语义契约（30 项，不联网、不碰库）
+python -m pytest tests -q         # 契约 36 + 路由 9（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -268,7 +268,9 @@ python tests/news_probe.py        # 资讯源体检
 ```
 
 契约测试覆盖：部分止盈 R 计算、阶梯止盈档位、出场优先级、配置校验、分位耗时、回测与参数网格、
+资金费结算与多付空收、部分止盈记账与保本止损、点差成本、walk-forward 结构、
 单行 PEM 归一化、Ed25519/HMAC 签名、告警静默、写库重试分类、sidecar 协议与影子判定。
+路由测试覆盖鉴权、配置校验与只读观测接口，运行在临时目录（`tests/conftest.py` 强制隔离）。
 
 签名链路与性能工具（需在仓库根目录执行）：
 
@@ -281,10 +283,12 @@ python scripts/p99_real.py --orders 15 --per-minute 5                   # 真实
 python scripts/rtt_probe.py --target testnet --seconds 60               # 交易所 RTT 采样
 python scripts/reconcile.py --self-test                                 # 回测/实盘对账（或 --backtest/--live 传 CSV）
 python scripts/verify_partial_tp.py                                     # 部分止盈边界复核
+python scripts/mainnet_preflight.py --yes                               # 主网演练前只读预检
 ```
 
-> CI：`.github/workflows/ci.yml` 在 push / PR 时跑 `compileall + pytest`（后端）与 `npm ci + typecheck + build`（前端）。
-> Rust sidecar 的 3 个签名向量在 `rust/exec-service/src/sign.rs` 内联，需本地工具链执行 `cargo test`（未纳入 CI）。
+> CI：`.github/workflows/ci.yml` 在 push / PR 时跑 `compileall + pytest tests`（后端）、
+> `npm ci + typecheck + build`（前端）与 `cargo test --release`（Rust sidecar）。
+> 依赖版本由 `backend/requirements.txt` 锁定，源头是同目录的 `requirements.in`。
 
 ---
 
@@ -305,14 +309,17 @@ python scripts/verify_partial_tp.py                                     # 部分
 已完成（细节见 `docs/TASKS.md`）：
 
 - [x] 回测引擎 + 参数网格（与实盘共用出场规则）
+- [x] 回测保真度：资金费 / 部分止盈 / 点差成本 + walk-forward 样本外验证
 - [x] WebSocket K 线推送（服务端复用币安流，不占 REST 权重）
-- [x] 执行内核 P2：UDS 协议 + 影子签名比对 + `enforce` 闸门 + 面板自检
+- [x] 执行内核 P2：UDS 协议 + 影子签名比对 + `enforce` 闸门 + 面板自检（已编译验证）
 - [x] 写库单队列 + 死信补偿 + 事件循环抖动探针
+- [x] 路由层测试 + 依赖锁定 + CI 覆盖 Rust
 
 下一步：
 
-- [ ] 执行内核 P3：接管下单与保护单，单写线程落库
-- [ ] 回测 / 实盘同口径对账（积累 30 笔实盘样本后校准滑点）
+- [ ] **主网小额演练**：按 [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md) 跑开平 / 部分止盈 / 资金费三段
+- [ ] 执行内核 P3：Linux UDS 部署 + systemd，接管下单与保护单
+- [ ] 回测 / 实盘同口径对账（积累 30 笔实盘样本后校准滑点与资金费假设）
 - [ ] 多账户 / 子账户隔离
 - [ ] 更多数据源（OKX / Bybit 合约）
 - [ ] 心法可视化时序（健康度演变）

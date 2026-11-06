@@ -20,6 +20,8 @@ interface TradeRow {
   bars: number
   reason: string
   score: number
+  funding?: number
+  partial_tp?: boolean
 }
 
 const pool = ref<any[]>([])
@@ -29,6 +31,8 @@ const form = ref({
   limit: 1000,
   fee_bps: 5,
   slippage_bps: 2,
+  spread_bps: 0,
+  funding_bps_8h: 1,
   initial_equity: 100,
 })
 const running = ref(false)
@@ -100,6 +104,8 @@ async function runGrid() {
     limit: form.value.limit,
     fee_bps: form.value.fee_bps,
     slippage_bps: form.value.slippage_bps,
+    spread_bps: form.value.spread_bps,
+    funding_bps_8h: form.value.funding_bps_8h,
     initial_equity: form.value.initial_equity,
     entry_threshold: parseList(gridForm.value.entry_threshold),
     sl_atr_mult: parseList(gridForm.value.sl_atr_mult),
@@ -119,6 +125,49 @@ async function runGrid() {
     gridResult.value = null
   } finally {
     gridRunning.value = false
+  }
+}
+
+// ------------------------------------------------------------ 样本外验证
+const wfForm = ref({ folds: 3, train_bars: 600 })
+const wfRunning = ref(false)
+const wfResult = ref<any>(null)
+const wfError = ref('')
+
+async function runWalkforward() {
+  if (!form.value.symbol) {
+    wfError.value = '请先在「标的池」添加合约'
+    return
+  }
+  const payload = {
+    symbol: form.value.symbol,
+    interval: form.value.interval,
+    limit: form.value.limit,
+    fee_bps: form.value.fee_bps,
+    slippage_bps: form.value.slippage_bps,
+    spread_bps: form.value.spread_bps,
+    funding_bps_8h: form.value.funding_bps_8h,
+    initial_equity: form.value.initial_equity,
+    entry_threshold: parseList(gridForm.value.entry_threshold),
+    sl_atr_mult: parseList(gridForm.value.sl_atr_mult),
+    tp_atr_mult: parseList(gridForm.value.tp_atr_mult),
+    trailing_pct: parseList(gridForm.value.trailing_pct),
+    folds: wfForm.value.folds,
+    train_bars: wfForm.value.train_bars,
+  }
+  if (!payload.entry_threshold.length && !payload.sl_atr_mult.length && !payload.tp_atr_mult.length && !payload.trailing_pct.length) {
+    wfError.value = '至少填写一个参数的一组取值（与上方参数网格共用）'
+    return
+  }
+  wfRunning.value = true
+  wfError.value = ''
+  try {
+    wfResult.value = await http.post('/backtest/walkforward', payload)
+  } catch (err: any) {
+    wfError.value = err?.message || '样本外验证失败'
+    wfResult.value = null
+  } finally {
+    wfRunning.value = false
   }
 }
 
@@ -169,8 +218,8 @@ function downloadCsv(name: string, rows: (string | number)[][]) {
 
 function exportTrades() {
   if (!trades.value.length) return
-  const head = ['方向', '开仓时间', '开仓价', '平仓价', '盈亏', '涨跌%', '持仓根数', '出场原因', '评分']
-  const rows = trades.value.map((t) => [
+  const head = ['方向', '开仓时间', '开仓价', '平仓价', '盈亏', '涨跌%', '持仓根数', '资金费', '出场原因', '部分止盈', '评分']
+  const rows = trades.value.map((t: any) => [
     t.side,
     timeStr(t.entry_ts),
     t.entry,
@@ -178,7 +227,9 @@ function exportTrades() {
     t.pnl,
     t.pnl_pct,
     t.bars,
+    t.funding ?? 0,
     EXIT_LABELS[t.reason] || t.reason,
+    t.partial_tp ? '是' : '',
     t.score,
   ])
   downloadCsv(`backtest-${form.value.symbol}-${form.value.interval}.csv`, [head, ...rows])
@@ -217,10 +268,11 @@ onMounted(loadPool)
       </div>
       <div class="panel-body stack" style="gap: 12px">
         <div class="hint">
-          用与实盘相同的五因子打分与出场规则跑历史 K 线，手续费与滑点显式计入。
+          用与实盘相同的五因子打分与出场规则跑历史 K 线，手续费、滑点、点差与资金费显式计入，
+          部分止盈（1R 平一半 + 保本止损）与实盘同口径。
           结果只用于参数粗筛与逻辑回归验证，<b>不能当作实盘收益预期</b>。
         </div>
-        <div class="grid g6 bt-form" style="gap: 10px">
+        <div class="grid g4 bt-form" style="gap: 10px">
           <label class="field">
             <span class="label">标的</span>
             <select v-model="form.symbol" class="input">
@@ -253,6 +305,14 @@ onMounted(loadPool)
           <label class="field">
             <span class="label">滑点 (bps)</span>
             <input v-model.number="form.slippage_bps" class="input mono" type="number" min="0" max="100" />
+          </label>
+          <label class="field">
+            <span class="label">点差成本 (bps)</span>
+            <input v-model.number="form.spread_bps" class="input mono" type="number" min="0" max="100" />
+          </label>
+          <label class="field">
+            <span class="label">资金费 (bps/8h)</span>
+            <input v-model.number="form.funding_bps_8h" class="input mono" type="number" min="-10" max="50" step="0.1" />
           </label>
           <label class="field">
             <span class="label">初始权益</span>
@@ -300,9 +360,9 @@ onMounted(loadPool)
           <div class="kpi-foot">峰值到谷底</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">手续费合计</div>
+          <div class="kpi-label">成本合计</div>
           <div class="kpi-value">{{ summary.fee_total }}</div>
-          <div class="kpi-foot">双边 taker</div>
+          <div class="kpi-foot">手续费 · 资金费 {{ summary.funding_total }} · 部分止盈 {{ summary.partial_tp_count }} 次</div>
         </div>
       </div>
 
@@ -393,6 +453,7 @@ onMounted(loadPool)
                 <th>盈亏</th>
                 <th>涨跌%</th>
                 <th>持仓(根)</th>
+                <th>资金费</th>
                 <th>出场原因</th>
                 <th>评分</th>
               </tr>
@@ -406,7 +467,11 @@ onMounted(loadPool)
                 <td class="mono" :class="numClass(t.pnl)">{{ t.pnl }}</td>
                 <td class="mono" :class="numClass(t.pnl_pct)">{{ t.pnl_pct }}%</td>
                 <td class="mono muted">{{ t.bars }}</td>
-                <td class="muted">{{ EXIT_LABELS[t.reason] || t.reason }}</td>
+                <td class="mono" :class="numClass(t.funding || 0)">{{ (t.funding || 0).toFixed(4) }}</td>
+                <td class="muted">
+                  {{ EXIT_LABELS[t.reason] || t.reason }}
+                  <span v-if="t.partial_tp" class="tag tag-dim" style="margin-left: 4px">部分止盈</span>
+                </td>
                 <td class="mono muted">{{ t.score }}</td>
               </tr>
             </tbody>
@@ -492,6 +557,109 @@ onMounted(loadPool)
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">样本外验证（walk-forward）</span>
+        <div class="right">
+          <span class="tag tag-warn">前段选参 · 后段冻结</span>
+          <span class="tag tag-dim">与上方参数网格共用取值</span>
+        </div>
+      </div>
+      <div class="panel-body stack" style="gap: 12px">
+        <div class="hint">
+          把历史切成若干折：每一折用前面的区间搜参数，再用紧邻的后面区间（参数冻结）检验。
+          「过拟合差距」= 样本内均值 − 样本外均值，差距越大、正收益折数越少，说明参数越可能是在拟合噪声。
+        </div>
+        <div class="grid g4 bt-form" style="gap: 10px">
+          <label class="field">
+            <span class="label">折数</span>
+            <select v-model.number="wfForm.folds" class="input">
+              <option :value="2">2</option>
+              <option :value="3">3</option>
+              <option :value="4">4</option>
+              <option :value="5">5</option>
+              <option :value="6">6</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">训练窗口（根）</span>
+            <input v-model.number="wfForm.train_bars" class="input mono" type="number" min="200" max="2000" step="50" />
+          </label>
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="btn btn-primary" :disabled="wfRunning || !form.symbol" @click="runWalkforward">
+            {{ wfRunning ? '验证中…' : '开始验证' }}
+          </button>
+          <span v-if="wfError" class="muted" style="color: var(--down); font-size: 11.5px">{{ wfError }}</span>
+          <span v-else-if="wfResult" class="muted" style="font-size: 11.5px">
+            {{ wfResult.folds }} 折 · 耗时 {{ wfResult.elapsed_ms }}ms
+          </span>
+        </div>
+
+        <template v-if="wfResult">
+          <div class="kpi-grid">
+            <div class="kpi">
+              <div class="kpi-label">样本外复合收益</div>
+              <div class="kpi-value" :class="pnlClass(wfResult.aggregate.oos_return_pct)">
+                {{ wfResult.aggregate.oos_return_pct }}%
+              </div>
+              <div class="kpi-foot">最差一折 {{ wfResult.aggregate.oos_worst_fold_pct }}%</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">正收益折数</div>
+              <div class="kpi-value">{{ wfResult.aggregate.positive_folds }} / {{ wfResult.folds }}</div>
+              <div class="kpi-foot">一致性 {{ wfResult.aggregate.consistency }}%</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">过拟合差距</div>
+              <div class="kpi-value" :class="wfResult.aggregate.overfit_gap_pct > 0 ? 'down' : 'up'">
+                {{ wfResult.aggregate.overfit_gap_pct }}%
+              </div>
+              <div class="kpi-foot">样本内 {{ wfResult.aggregate.in_sample_avg_pct }}% → 样本外 {{ wfResult.aggregate.oos_avg_return_pct }}%</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi-label">样本外交易数</div>
+              <div class="kpi-value">{{ wfResult.aggregate.oos_trades }}</div>
+              <div class="kpi-foot">每折参数独立选出</div>
+            </div>
+          </div>
+
+          <div class="panel" style="padding: 0">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>折</th>
+                  <th>训练区间</th>
+                  <th>测试区间</th>
+                  <th>选出参数</th>
+                  <th>样本内收益</th>
+                  <th>样本外收益</th>
+                  <th>样本外胜率</th>
+                  <th>样本外笔数</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in wfResult.items" :key="row.fold">
+                  <td class="mono muted">{{ row.fold }}</td>
+                  <td class="mono muted">{{ timeStr(row.train_from_ts) }} → {{ timeStr(row.train_to_ts) }}</td>
+                  <td class="mono muted">{{ timeStr(row.test_from_ts) }} → {{ timeStr(row.test_to_ts) }}</td>
+                  <td class="mono" style="white-space: normal">
+                    <span v-for="(v, k) in row.params" :key="k" class="tag tag-dim" style="margin-right: 4px">
+                      {{ k }}={{ v }}
+                    </span>
+                  </td>
+                  <td class="mono" :class="pnlClass(row.in_sample.total_return_pct)">{{ row.in_sample.total_return_pct }}%</td>
+                  <td class="mono" :class="pnlClass(row.out_sample.total_return_pct)">{{ row.out_sample.total_return_pct }}%</td>
+                  <td class="mono">{{ row.out_sample.win_rate }}%</td>
+                  <td class="mono muted">{{ row.out_sample.trades }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </div>
     </div>
   </div>

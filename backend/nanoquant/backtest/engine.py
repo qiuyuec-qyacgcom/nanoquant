@@ -1,9 +1,14 @@
 """轻量向量化回测 (只回测纯量化部分).
 
-边界必须说清楚:
+保真度边界 (必须说清楚):
 - **不含** AI 复核 (无法复现当时的模型输出);
-- **不含** 盘口点差闸门 (历史 K 线没有买卖价);
-- 手续费与滑点按显式参数计入, 默认 taker 5bps + 滑点 2bps.
+- **不含** 盘口点差**闸门** (历史 K 线没有买卖价, 无法知道当时是否会被拦下),
+  但可以把点差当**成本**计入 (`spread_bps`);
+- 手续费 / 滑点 / 点差按显式参数计入;
+- **资金费**按假设费率 (默认 1bp / 8h) 在每个 8h 结算点从持仓上扣除,
+  多付空收; 历史资金费率没有随 K 线保存, 所以这是一个假设值而非真实结算记录;
+- 部分止盈与实盘同口径: R 达标先平 `partial_tp_ratio`, 剩余仓位止损上移到保本;
+  同一根 K 线内若同时触及止损与部分止盈, **按止损优先**处理 (无法从 OHLC 判断先后, 取保守).
 
 用途只有一个: **参数粗筛**与"逻辑有没有写错"的回归验证,
 不能把这里的收益当成实盘预期。
@@ -17,6 +22,9 @@ from ..engine.strategy import build_features, score_signal
 from ..services.settings import StrategySettings
 
 WARMUP = 60
+
+#: 币安资金费结算周期 (00:00 / 08:00 / 16:00 UTC)
+FUNDING_INTERVAL_MS = 8 * 3600 * 1000
 
 
 @dataclass
@@ -35,6 +43,10 @@ class BacktestTrade:
     sl_pct: float = 0.0
     tp_pct: float = 0.0
     entry_fee: float = 0.0
+    funding: float = 0.0
+    partial_tp: bool = False
+    #: 当前止损价 (部分止盈后上移到保本)
+    stop_price: float = 0.0
 
 
 @dataclass
@@ -76,6 +88,13 @@ def _bar_minutes(candles: list[Any]) -> float:
     return max(1.0, delta / 60000.0) if delta else 1.0
 
 
+def funding_crossings(prev_ts: int, ts: int) -> int:
+    """(prev_ts, ts] 之间跨过几个 8h 结算点 (UTC 00/08/16)."""
+    if ts <= prev_ts:
+        return 0
+    return int(ts // FUNDING_INTERVAL_MS - prev_ts // FUNDING_INTERVAL_MS)
+
+
 def run_backtest(
     candles: list[Any],
     cfg: StrategySettings,
@@ -83,6 +102,8 @@ def run_backtest(
     symbol: str = "",
     fee_bps: float = 5.0,
     slippage_bps: float = 2.0,
+    spread_bps: float = 0.0,
+    funding_bps_8h: float = 1.0,
     initial_equity: float = 100.0,
     risk_per_trade_pct: float = 1.0,
     margin_pct: float = 50.0,
@@ -95,6 +116,9 @@ def run_backtest(
         return result
 
     fee = fee_bps / 10000.0
+    funding_rate = funding_bps_8h / 10000.0
+    # 点差按"穿价"成本计: 开平各承担一半
+    slip = slippage_bps + spread_bps / 2.0
     bar_minutes = _bar_minutes(candles)
     # 24h 成交额近似: 用滚动窗口的 quote volume 之和 (历史 K 线没有独立的 24h 快照),
     # 否则 score_signal 的「24h 成交额偏低」闸门会把所有信号都拦掉.
@@ -107,35 +131,74 @@ def run_backtest(
     peak_equity = equity
     max_dd = 0.0
     fee_total = 0.0
+    funding_total = 0.0
+    partial_count = 0
     hold_limit = max_bars_hold or cfg.max_hold_minutes
+    at_r = float(cfg.partial_tp_at_r or 0.0)
+    ratio = float(cfg.partial_tp_ratio or 0.0)
 
     pos: BacktestTrade | None = None
+    state: dict[str, Any] = {}
     entry_idx = 0
     trail_peak = 0.0
 
-    def close_pos(exit_price: float, idx: int, reason: str) -> None:
-        nonlocal equity, peak_equity, max_dd, fee_total, pos
-        if pos is None:
-            return
-        direction = 1 if pos.side == "long" else -1
-        exit_fill = _fill(exit_price, slippage_bps, direction, opening=False)
-        gross = (exit_fill - pos.entry) * pos.qty * direction
-        exit_fee = exit_fill * pos.qty * fee
-        pnl = gross - exit_fee - pos.entry_fee
-        fee_total += exit_fee
-        equity += pnl
+    def book(amount: float) -> None:
+        """把一笔已实现盈亏记入权益, 并维护回撤."""
+        nonlocal equity, peak_equity, max_dd
+        equity += amount
         peak_equity = max(peak_equity, equity)
         dd = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0.0
         max_dd = max(max_dd, dd)
+
+    def close_pos(exit_price: float, idx: int, reason: str) -> None:
+        nonlocal fee_total, pos
+        if pos is None:
+            return
+        direction = 1 if pos.side == "long" else -1
+        exit_fill = _fill(exit_price, slip, direction, opening=False)
+        gross = (exit_fill - pos.entry) * pos.qty * direction
+        exit_fee = exit_fill * pos.qty * fee
+        entry_share = float(state["entry_fee"]) * (pos.qty / float(state["initial_qty"]))
+        net = gross - exit_fee - entry_share
+        fee_total += exit_fee
+        book(net)
+
+        # 明细里的 qty 用初始仓位 (pnl 已包含部分止盈腿), 否则看起来像"只交易了半仓"
+        pos.qty = float(state["initial_qty"])
         pos.exit = round(exit_fill, 8)
         pos.exit_ts = int(getattr(candles[idx], "open_time", 0))
-        pos.pnl = round(pnl, 6)
+        pos.pnl = round(float(state["realized"]) + net, 6)
         pos.pnl_pct = round((exit_fill / pos.entry - 1) * 100 * direction, 4)
         pos.bars = idx - entry_idx
         pos.reason = reason
+        pos.funding = round(float(state["funding"]), 6)
+        pos.partial_tp = bool(state["partial"])
         result.trades.append(pos)
         result.equity_curve.append(round(equity, 6))
         pos = None
+
+    def take_partial(price: float) -> None:
+        """平掉 ratio 比例的仓位, 剩余止损移到保本 (与实盘 partial_tp 同口径)."""
+        nonlocal fee_total, partial_count
+        if pos is None:
+            return
+        direction = 1 if pos.side == "long" else -1
+        leg_qty = pos.qty * ratio
+        if leg_qty <= 0:
+            return
+        fill = _fill(price, slip, direction, opening=False)
+        gross = (fill - pos.entry) * leg_qty * direction
+        leg_fee = fill * leg_qty * fee
+        entry_share = float(state["entry_fee"]) * (leg_qty / float(state["initial_qty"]))
+        net = gross - leg_fee - entry_share
+        fee_total += leg_fee
+        book(net)
+        state["realized"] = float(state["realized"]) + net
+        state["partial"] = True
+        pos.qty -= leg_qty
+        # 剩余仓位止损上移到保本 (活下来比多赚更重要)
+        pos.stop_price = pos.entry
+        partial_count += 1
 
     for i in range(WARMUP, len(candles) - 1):
         bar = candles[i]
@@ -144,19 +207,43 @@ def run_backtest(
         if pos is not None:
             direction = 1 if pos.side == "long" else -1
             held_bars = i - entry_idx
+            prev_ts = int(getattr(candles[i - 1], "open_time", 0))
 
-            if pos.sl_pct > 0:
-                sl_price = pos.entry * (1 - pos.sl_pct / 100) if direction == 1 else pos.entry * (1 + pos.sl_pct / 100)
-                if (direction == 1 and bar.low <= sl_price) or (direction == -1 and bar.high >= sl_price):
-                    close_pos(sl_price, i, "stop_loss")
+            # 1) 资金费: 跨过 8h 结算点就按当前剩余数量收取
+            crossings = funding_crossings(prev_ts, int(getattr(bar, "open_time", 0)))
+            if crossings > 0 and funding_rate:
+                notional = float(getattr(bar, "open", pos.entry)) * pos.qty
+                delta = -direction * funding_rate * notional * crossings
+                book(delta)
+                funding_total += delta
+                state["realized"] = float(state["realized"]) + delta
+                state["funding"] = float(state["funding"]) + delta
+
+            # 2) 硬止损 (最保守: 同一根 K 线里与部分止盈冲突时以止损为准)
+            #    注意读 pos.stop_price: 部分止盈会把它上移到保本, 用副本会漏掉这次移动
+            stop_price = float(pos.stop_price or 0.0)
+            if stop_price > 0:
+                hit = (direction == 1 and bar.low <= stop_price) or (direction == -1 and bar.high >= stop_price)
+                if hit:
+                    close_pos(stop_price, i, "stop_loss")
                     continue
 
+            # 3) 止盈
             if pos.tp_pct > 0:
                 tp_price = pos.entry * (1 + pos.tp_pct / 100) if direction == 1 else pos.entry * (1 - pos.tp_pct / 100)
                 if (direction == 1 and bar.high >= tp_price) or (direction == -1 and bar.low <= tp_price):
                     close_pos(tp_price, i, "take_profit")
                     continue
 
+            # 4) 部分止盈: R 达标先落袋, 剩余仓位保本
+            if at_r > 0 and ratio > 0 and not state["partial"] and pos.sl_pct > 0:
+                trigger = pos.entry * (1 + direction * at_r * pos.sl_pct / 100)
+                reached = (direction == 1 and bar.high >= trigger) or (direction == -1 and bar.low <= trigger)
+                if reached:
+                    take_partial(trigger)
+                    continue
+
+            # 5) 移动止损
             if cfg.trailing_pct > 0:
                 if direction == 1:
                     trail_peak = max(trail_peak, bar.high)
@@ -169,6 +256,7 @@ def run_backtest(
                         close_pos(bar.close, i, "trailing_stop")
                         continue
 
+            # 6) 时间阶梯止盈
             if cfg.roi_table:
                 target = _roi_target(cfg.roi_table, held_bars * bar_minutes)
                 if target is not None and target > 0:
@@ -177,6 +265,7 @@ def run_backtest(
                         close_pos(bar.close, i, "roi")
                         continue
 
+            # 7) 超时
             if cfg.max_hold_minutes > 0 and held_bars * bar_minutes >= min(hold_limit, cfg.max_hold_minutes):
                 close_pos(bar.close, i, "timeout")
                 continue
@@ -192,7 +281,7 @@ def run_backtest(
 
         direction = 1 if sig.direction == "long" else -1
         next_bar = candles[i + 1]
-        entry = _fill(next_bar.open, slippage_bps, direction, opening=True)
+        entry = _fill(next_bar.open, slip, direction, opening=True)
         sl_pct = sig.sl_pct or 0.0
         if sl_pct <= 0 or entry <= 0:
             continue
@@ -221,7 +310,16 @@ def run_backtest(
             tp_pct=sig.tp_pct or 0.0,
             entry_fee=entry * qty * fee,
         )
-        fee_total += pos.entry_fee
+        entry_fee = pos.entry_fee
+        fee_total += entry_fee
+        state = {
+            "initial_qty": qty,
+            "entry_fee": entry_fee,
+            "realized": 0.0,
+            "funding": 0.0,
+            "partial": False,
+        }
+        pos.stop_price = entry * (1 - direction * sl_pct / 100)
         entry_idx = i + 1
         trail_peak = next_bar.open
 
@@ -229,7 +327,16 @@ def run_backtest(
     if pos is not None:
         close_pos(candles[-1].close, len(candles) - 1, "timeout")
 
-    result.summary = _summarize(result, equity, initial_equity, fee_total, max_dd, bar_minutes)
+    result.summary = _summarize(
+        result,
+        equity,
+        initial_equity,
+        fee_total,
+        max_dd,
+        bar_minutes,
+        funding_total=funding_total,
+        partial_count=partial_count,
+    )
     return result
 
 
@@ -296,6 +403,9 @@ def _summarize(
     fee_total: float,
     max_dd: float,
     bar_minutes: float = 5.0,
+    *,
+    funding_total: float = 0.0,
+    partial_count: int = 0,
 ) -> dict[str, Any]:
     trades = result.trades
     wins = [t for t in trades if t.pnl > 0]
@@ -317,7 +427,9 @@ def _summarize(
         "total_return_pct": round((equity / initial - 1) * 100, 3),
         "max_drawdown_pct": round(max_dd, 3),
         "fee_total": round(fee_total, 6),
+        "funding_total": round(funding_total, 6),
+        "partial_tp_count": partial_count,
         "final_equity": round(equity, 6),
-        "disclaimer": "不含 AI 复核与盘口点差闸门, 仅用于参数粗筛, 不代表实盘收益",
+        "disclaimer": "不含 AI 复核与点差闸门; 资金费为假设费率; 仅用于参数粗筛, 不代表实盘收益",
         **_segments(trades, bar_minutes),
     }

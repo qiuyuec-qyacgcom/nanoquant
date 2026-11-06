@@ -737,6 +737,47 @@
 - **换密钥流程（实测有效）**：换 Secret 必须先 `POST /system/exec-sidecar/reset`——切换窗口内的在途请求会被判为不一致（本次故意用错密钥验证过），清零后立刻恢复 `mismatched=0`。
 - **未覆盖**：UDS（Windows 无此能力）、systemd 守护、`enforce` 24h 灰度。
 
+### 57. 回测保真度：资金费 / 部分止盈 / 点差成本 / 样本外验证（本次执行）
+- **状态**：✅ 已完成（点差"闸门"仍无法回放，见边界）
+- **背景**：回测不含资金费与部分止盈，点差只字未提，滑点 2bps 是拍出来的，参数网格只做样本内排序。
+- **过程要点**：
+  - `backtest/engine.py` 新增三个成本/行为参数：
+    - `funding_bps_8h`（默认 1bp/8h）：按 UTC 00/08/16 结算点，用**当时剩余数量**扣/收（多付空收），
+      记入权益与明细；
+    - `spread_bps`（往返成本，开平各承担一半）；
+    - **部分止盈与实盘同口径**：R 达标先平 `partial_tp_ratio`，剩余止损上移到保本；
+      同一根 K 线内止损与部分止盈冲突时**按止损优先**（OHLC 无法判断先后，取保守）。
+  - 明细/汇总补齐 `funding`、`partial_tp`、`funding_total`、`partial_tp_count`；入场手续费按腿分摊。
+  - 新增 `backtest/walkforward.py` + `POST /backtest/walkforward`：滚动切分「前段选参 → 后段冻结检验」，
+    输出每折参数、样本内/外收益、`overfit_gap_pct`、`consistency`；数据不足自动减折并报所需根数。
+  - 回测页：表单加点差/资金费；明细加资金费列与「部分止盈」标签；新增「样本外验证」面板（KPI + 逐折表）。
+  - `scripts/reconcile.py` 增加 `entry_diff_bps_median_abs` 与 `suggested_slippage_bps`（≥10 笔才给建议）。
+- **验证**：新增 6 条用例（结算点计次、多付空收、半仓+保本、点差使收益下降、walk-forward 结构、短历史报错）；
+  **45 passed**。真实接口当日被测试网 IP 限频（`-1003`，约 2h 封禁），改由桩 K 线覆盖路由与字段契约。
+- **边界**：点差**闸门**（盘口过宽则不开仓）无法回放——历史 K 线没有买卖价，只能按成本近似；AI 复核仍不含。
+
+### 58. 路由层测试 + 依赖锁定 + CI 补 Rust（本次执行）
+- **状态**：✅ 已完成
+- **过程要点**：
+  - `tests/conftest.py` 在任何 nanoquant 导入前把 `NANOQUANT_HOME/DATA_DIR/DB/LOG_DIR/KEY_FILE` 指到临时目录，
+    测试从此**不碰真实 data/ 与主密钥**（此前契约测试虽然没写库，但没有硬隔离）。
+  - 新增 `tests/test_api.py`（9 条）：健康检查、未授权/伪造 token、登录失败、配置越界 400、
+    `engine.mode` 不能绕过确认短语、执行内核/死信/写库健康字段、回测 404/422、
+    桩 K 线跑通回测与 walk-forward（不依赖交易所）。
+  - 依赖锁定：`requirements.in`（直接依赖）→ `requirements.txt`（uv pip compile，Python 3.12 + linux 平台；
+    `uvloop` 手工补 `sys_platform != "win32"`，否则 Windows 装不上）。
+  - CI：后端改跑 `pytest tests -q`；新增 `rust` job（`cargo test --release`）。
+- **验证**：`pytest tests -q` → **45 passed**（约 2.1s）；运行后真实 `data/nanoquant.db` 无测试写入。
+
+### 59. 主网演练手册 + 只读预检（本次执行）
+- **状态**：✅ 文档与工具已完成；**演练本身未执行**（需主网凭证与资金）
+- **交付物**：
+  - `docs/MAINNET_DRILL.md`：前置条件、三段演练（最小名义额开平 / 部分止盈 / 资金费与对账）、
+    判据、预算（≤2 USDT）、停止条件、回滚步骤、记录模板。
+  - `scripts/mainnet_preflight.py --yes`：临时库 + 实盘凭证，**只读**检查连通性 / 账户 / 持仓模式 /
+    遗留挂单 / 每个标的的最小名义额与所需保证金；致命项直接非零退出。
+- **待办（用户侧）**：按手册执行 A/B/C 并回填记录表；把 `partial_tp_at_r` 等临时参数改回默认。
+
 ---
 
 ## 二、未开始
@@ -751,7 +792,8 @@
   - P3：`reqwest` 连接池 + 订单状态机（Planned → Sent → Acked → Filled）+ 保护单并行 + 单写线程落库。
 
 ### 2. 回测 / 实盘同口径对账（需实盘样本）
-- **状态**：⬜ 未开始（工具已就绪：`scripts/reconcile.py`）
+- **状态**：⬜ 未开始（工具已就绪：`scripts/reconcile.py`，含 `suggested_slippage_bps`）
 - **待办**：
   - 积累至少 30 笔实盘成交后运行对账，输出入场价偏差分布。
-  - 用实测滑点校准回测默认的 2bps 假设。
+  - 用输出的 `suggested_slippage_bps`（中位绝对值，≥10 笔才给）替换回测默认的 2bps，
+    并把实测资金费写进 `funding_bps_8h`。

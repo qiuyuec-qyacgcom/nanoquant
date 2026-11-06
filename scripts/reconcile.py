@@ -130,6 +130,8 @@ def match(backtest: list[dict], live: list[dict], tolerance: float) -> dict:
         )
     unmatched_live = [lv for idx, lv in enumerate(live) if idx not in used]
     diffs = [p["diff_bps"] for p in pairs]
+    # 偏差可正可负 (实盘也可能比回测价更好), 用绝对值的均值/中位数估"真实摩擦"
+    abs_diffs = [abs(value) for value in diffs]
     return {
         "backtest": len(backtest),
         "live": len(live),
@@ -139,6 +141,9 @@ def match(backtest: list[dict], live: list[dict], tolerance: float) -> dict:
         "match_rate": round(len(pairs) / len(backtest) * 100, 1) if backtest else 0.0,
         "entry_diff_bps_mean": round(statistics.fmean(diffs), 2) if diffs else 0.0,
         "entry_diff_bps_max": round(max(diffs), 2) if diffs else 0.0,
+        "entry_diff_bps_median_abs": round(statistics.median(abs_diffs), 2) if abs_diffs else 0.0,
+        # 回测默认 slippage_bps=2 就是拍出来的: 样本足够时用它校准
+        "suggested_slippage_bps": round(statistics.median(abs_diffs), 1) if abs_diffs else 0.0,
         "exit_reason_mismatch": sum(1 for p in pairs if not p["reason_same"]),
         "avg_gap_s": round(statistics.fmean([p["gap_s"] for p in pairs]), 1) if pairs else 0.0,
         "pairs": pairs[:10],
@@ -191,9 +196,17 @@ def main() -> int:
         f"({report['match_rate']}%), 未匹配 回测{report['unmatched_backtest']}/实盘{report['unmatched_live']}"
     )
     print(
-        f"入场价偏差: mean={report['entry_diff_bps_mean']}bps max={report['entry_diff_bps_max']}bps | "
+        f"入场价偏差: mean={report['entry_diff_bps_mean']}bps max={report['entry_diff_bps_max']}bps "
+        f"|abs中位数={report['entry_diff_bps_median_abs']}bps | "
         f"出场原因不一致 {report['exit_reason_mismatch']} 笔 | 平均时间差 {report['avg_gap_s']}s"
     )
+    if report["matched"] >= 10:
+        print(
+            f"建议: 把回测 slippage_bps 从默认 2 调整为约 {report['suggested_slippage_bps']}bps "
+            f"（基于 {report['matched']} 笔配对样本）"
+        )
+    else:
+        print(f"样本仅 {report['matched']} 笔, 暂不建议据此校准滑点 (至少 10 笔)")
     for pair in report["pairs"]:
         print(
             f"  {pair['bt']['side']:5s} entry {pair['bt']['entry']}→{pair['live']['entry']} "

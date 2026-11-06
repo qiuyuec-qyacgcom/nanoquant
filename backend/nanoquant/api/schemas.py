@@ -28,6 +28,10 @@ class BacktestIn(BaseModel):
     limit: int = Field(default=1000, ge=200, le=1500)
     fee_bps: float = Field(default=5.0, ge=0, le=100)
     slippage_bps: float = Field(default=2.0, ge=0, le=100)
+    #: 点差成本(往返, 开平各一半); 历史 K 线没有买卖价, 只能按成本近似
+    spread_bps: float = Field(default=0.0, ge=0, le=100)
+    #: 资金费假设(每 8h, 正数=多付空收); 历史资金费率未随 K 线保存
+    funding_bps_8h: float = Field(default=1.0, ge=-10.0, le=50.0)
     initial_equity: float = Field(default=100.0, gt=0)
 
 
@@ -38,6 +42,13 @@ class BacktestGridIn(BacktestIn):
     sl_atr_mult: list[float] = Field(default_factory=list, max_length=4)
     tp_atr_mult: list[float] = Field(default_factory=list, max_length=4)
     trailing_pct: list[float] = Field(default_factory=list, max_length=4)
+
+
+class WalkforwardIn(BacktestGridIn):
+    """滚动样本外验证: 前一段选参数, 后一段冻结检验."""
+
+    folds: int = Field(default=3, ge=2, le=6)
+    train_bars: int = Field(default=600, ge=200, le=2000)
 
 
 class CredentialsIn(BaseModel):

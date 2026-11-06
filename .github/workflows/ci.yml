@@ -33,8 +33,22 @@ jobs:
       - name: Byte-compile
         run: python -m compileall -q nanoquant
 
-      - name: Contract tests
-        run: python -m pytest tests/test_contracts.py -q
+      - name: Tests (contract + api)
+        run: python -m pytest tests -q
+
+  rust:
+    name: rust (sidecar)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/exec-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test
+        run: cargo test --release
 
   frontend:
     name: frontend (build)

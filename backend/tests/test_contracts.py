@@ -314,6 +314,153 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# ------------------------------------------------------------ 回测保真度
+def _flat(n: int, price: float = 100.0, start_ts: int = 0, step_ms: int = 300_000):
+    return [bar(o=price, h=price, l=price, c=price, v=1e6, t=start_ts + i * step_ms) for i in range(n)]
+
+
+def _force_signal(monkeypatch, direction: str = "long", sl_pct: float = 1.0) -> None:
+    import nanoquant.backtest.engine as bt
+
+    monkeypatch.setattr(bt, "build_features", lambda *a, **k: None)
+    monkeypatch.setattr(
+        bt,
+        "score_signal",
+        lambda *a, **k: SimpleNamespace(direction=direction, score=0.9, sl_pct=sl_pct, tp_pct=0.0),
+    )
+
+
+def test_funding_crossings_counts_8h_boundaries():
+    from nanoquant.backtest.engine import FUNDING_INTERVAL_MS as F
+    from nanoquant.backtest.engine import funding_crossings
+
+    assert F == 8 * 3600 * 1000
+    assert funding_crossings(0, F) == 1
+    assert funding_crossings(F, F) == 0
+    assert funding_crossings(F - 1, F + 1) == 1
+    assert funding_crossings(0, 3 * F) == 3
+
+
+def test_funding_charges_long_and_pays_short(monkeypatch):
+    """资金费必须真的扣/收: 多头付、空头收, 且只按跨过的结算点计次."""
+    from nanoquant.backtest.engine import FUNDING_INTERVAL_MS as F
+    from nanoquant.backtest.engine import run_backtest
+
+    step = 300_000
+    start = F - 61 * step  # candles[61].open_time == 结算点
+    candles = _flat(64, start_ts=start, step_ms=step)
+
+    def run(side: str, rate: float) -> float:
+        _force_signal(monkeypatch, direction=side)
+        res = run_backtest(
+            candles,
+            StrategySettings(roi_table=[], trailing_pct=0.0, max_hold_minutes=5),
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            spread_bps=0.0,
+            funding_bps_8h=rate,
+            risk_per_trade_pct=1.0,
+            margin_pct=50.0,
+            leverage=20.0,
+            max_bars_hold=1,
+        )
+        return float(res.summary["funding_total"])
+
+    # 单笔 notional = 权益1% / 止损1% = 100 → 10bps = 0.1
+    assert run("long", 0.0) == 0.0
+    assert run("long", 10.0) == pytest.approx(-0.1, abs=1e-9)
+    assert run("short", 10.0) == pytest.approx(0.1, abs=1e-9)
+
+
+def test_partial_tp_books_half_and_moves_stop_to_breakeven(monkeypatch):
+    from nanoquant.backtest.engine import run_backtest
+
+    _force_signal(monkeypatch, direction="long")
+    candles = _flat(64)
+    # 开仓价 100, 止损 99; 第 61 根冲到 102 (1R=101) → 平一半; 第 62 根回到 100 → 保本止损
+    candles[61] = bar(o=100, h=102, l=100.2, c=101, v=1e6, t=61 * 300_000)
+    candles[62] = bar(o=101, h=101, l=99.5, c=100, v=1e6, t=62 * 300_000)
+
+    res = run_backtest(
+        candles,
+        StrategySettings(roi_table=[], trailing_pct=0.0),
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        spread_bps=0.0,
+        funding_bps_8h=0.0,
+        risk_per_trade_pct=1.0,
+    )
+    assert res.summary["partial_tp_count"] == 1
+    trade = res.trades[0]
+    assert trade.partial_tp is True
+    assert trade.reason == "stop_loss"  # 剩余仓位在保本位被打掉
+    assert trade.qty == pytest.approx(1.0)  # 明细按初始仓位记
+    assert trade.pnl == pytest.approx(0.5, abs=1e-6)  # (101-100)*0.5
+
+    # 关掉部分止盈后, 同一段行情只会在 101 之前被原止损 99 打掉, 不该有 partial
+    res2 = run_backtest(
+        candles,
+        StrategySettings(roi_table=[], trailing_pct=0.0, partial_tp_at_r=0.0),
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        funding_bps_8h=0.0,
+        risk_per_trade_pct=1.0,
+    )
+    assert res2.summary["partial_tp_count"] == 0
+
+
+def test_backtest_spread_is_a_round_trip_cost():
+    """点差按往返计: 同样的行情, 加点差后收益必须更低."""
+    from nanoquant.backtest.engine import run_backtest
+
+    candles = []
+    price = 100.0
+    for i in range(300):
+        price *= 1.0008 if i % 4 else 0.9995
+        candles.append(bar(o=price, h=price * 1.001, l=price * 0.999, c=price, v=1000.0, t=i * 300_000))
+
+    common = dict(symbol="TESTUSDT", fee_bps=0.0, slippage_bps=0.0, funding_bps_8h=0.0)
+    clean = run_backtest(candles, StrategySettings(), **common)
+    costly = run_backtest(candles, StrategySettings(), spread_bps=10.0, **common)
+    assert clean.summary["trades"] and costly.summary["trades"]
+    assert costly.summary["total_return_pct"] < clean.summary["total_return_pct"]
+
+
+# ------------------------------------------------------------ 样本外验证
+def test_walkforward_reports_overfit_gap():
+    from nanoquant.backtest.walkforward import run_walkforward
+
+    candles = []
+    price = 100.0
+    for i in range(420):
+        price *= 1.0006 if i % 3 else 0.9997
+        candles.append(bar(o=price, h=price * 1.001, l=price * 0.999, c=price, v=1000.0, t=i * 300_000))
+
+    result = run_walkforward(
+        candles,
+        StrategySettings(),
+        symbol="TESTUSDT",
+        grid={"entry_threshold": [0.2, 0.4]},
+        folds=2,
+        train_bars=200,
+    )
+    assert result["folds"] == 2
+    assert result["requested_folds"] == 2
+    assert len(result["items"]) == 2
+    for item in result["items"]:
+        assert set(item["params"]) == {"entry_threshold"}
+        assert "total_return_pct" in item["out_sample"]
+    aggregate = result["aggregate"]
+    assert {"oos_return_pct", "overfit_gap_pct", "consistency", "positive_folds"} <= set(aggregate)
+
+
+def test_walkforward_rejects_short_history():
+    from nanoquant.backtest.walkforward import run_walkforward
+
+    result = run_walkforward(_flat(100), StrategySettings(), grid={"entry_threshold": [0.3]}, folds=2)
+    assert "error" in result
+
+
 # ------------------------------------------------------------ 执行 sidecar 协议
 def test_exec_sidecar_signs_over_reused_connection():
     """协议: health / plan 都要能走同一条连接 (每单重建连接会把握手塞进签名路径)."""
