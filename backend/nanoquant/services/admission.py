@@ -210,6 +210,13 @@ async def evaluate() -> dict[str, Any]:
                 "leverage_used": leverage,
                 "min_qty": filters.effective_min_qty(ticker.last),
                 "min_notional": round(min_notional, 4),
+                # 该杠杆下开最小仓所需的保证金 (名义额 / 杠杆), 余额门槛就是它
+                "required_margin": round(min_notional / max(1.0, leverage), 4),
+                # 用该标的允许的最高杠杆时的保证金下限: 余额只有零点几个 U 也能开的场景
+                "max_leverage_used": min(filters.max_leverage, risk_cfg.max_leverage, 100),
+                "required_margin_at_max": round(
+                    min_notional / max(1.0, min(filters.max_leverage, risk_cfg.max_leverage, 100)), 4
+                ),
                 "allocatable_notional": round(allocatable, 4),
                 "qty_if_open": qty,
                 "notional_if_open": round(qty * ticker.last, 4) if qty else 0.0,
@@ -217,6 +224,13 @@ async def evaluate() -> dict[str, Any]:
         )
 
     tradeable = [s for s in symbols if s["tradeable"]]
+    cheapest = min(symbols, key=lambda s: s.get("min_notional", 1e9)) if symbols else None
+    tip = (
+        f"；最低门槛 {cheapest['symbol']} 名义额 {cheapest['min_notional']} U、"
+        f"{cheapest['leverage_used']}x 下需保证金 {cheapest['required_margin']} U"
+        if cheapest
+        else ""
+    )
     steps.append(
         _step(
             "symbols",
@@ -225,10 +239,14 @@ async def evaluate() -> dict[str, Any]:
             (
                 f"{len(tradeable)}/{len(symbols)} 个标的在当前权益下可下单: "
                 + ", ".join(s["symbol"] for s in tradeable[:5])
+                + tip
             )
             if tradeable
             else (
-                "当前权益不足以满足任何标的的最小名义额; 提高杠杆/保证金比例, 或加入 DOGE 等小面值标的"
+                "当前权益不足以满足任何标的的最小名义额"
+                + (f"（最低门槛 {cheapest['symbol']} 需 {cheapest['min_notional']} U 名义额 / "
+                   f"{cheapest['required_margin']} U 保证金）" if cheapest else "")
+                + "; 提高杠杆/保证金比例, 或加入 DOGE 等小面值标的"
                 if symbols
                 else "标的池为空"
             ),

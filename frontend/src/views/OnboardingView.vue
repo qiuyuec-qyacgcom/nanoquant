@@ -23,6 +23,9 @@ interface SymbolRow {
   leverage_used: number
   min_qty: number
   min_notional: number
+  required_margin: number
+  max_leverage_used: number
+  required_margin_at_max: number
   allocatable_notional: number
   qty_if_open: number
   notional_if_open: number
@@ -190,7 +193,8 @@ onMounted(load)
             <thead>
               <tr>
                 <th>标的</th>
-                <th>最小名义额</th>
+                <th title="交易所要求的最小下单名义额">最小名义额</th>
+                <th title="最小名义额 ÷ 当前杠杆，即账户余额至少要有这么多">所需保证金</th>
                 <th>可分配</th>
                 <th>下单量</th>
                 <th class="nowrap">结论</th>
@@ -203,6 +207,12 @@ onMounted(load)
                   <div class="muted mono" style="font-size: 10px">{{ px(s.price) }} · {{ s.leverage_used }}x</div>
                 </td>
                 <td class="mono">{{ fmt(s.min_notional, 2) }}</td>
+                <td class="mono">
+                  {{ fmt(s.required_margin, 4) }}
+                  <span class="muted" style="font-size: 10px" :title="`按 ${s.max_leverage_used}x 最大杠杆计算的保证金下限`">
+                    (最高 {{ s.max_leverage_used }}x: {{ fmt(s.required_margin_at_max, 4) }})
+                  </span>
+                </td>
                 <td class="mono">{{ fmt(s.allocatable_notional, 2) }}</td>
                 <td class="mono">{{ s.qty_if_open || '—' }}</td>
                 <td style="white-space: normal; max-width: 220px">
