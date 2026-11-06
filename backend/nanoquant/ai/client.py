@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -348,21 +349,135 @@ async def _sleep_backoff(attempt: int) -> None:
 ai_client = AiClient()
 
 
-async def list_models(provider: AiProvider) -> tuple[bool, Any]:
-    """拉取 /models 列表 (OpenAI 兼容协议)."""
-    api_key = decrypt_secret(provider.api_key_enc)
-    base = provider.base_url.rstrip("/")
-    url = f"{base}/models" if "/v1" in base or base.count("/") > 2 else f"{base}/v1/models"
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
+def _models_endpoints(base: str, protocol: str) -> list[tuple[str, dict[str, str]]]:
+    """构造候选 /models 地址.
+
+    不同供应商的 Base URL 版本段不一样:
+      https://api.deepseek.com/v1          → /v1/models
+      https://open.bigmodel.cn/api/paas/v4 → /v4/models (不能硬拼 /v1)
+      https://api.anthropic.com            → /v1/models + x-api-key
+    这里按"原样拼接 → 去掉版本段 → 补 /v1"三种候选依次尝试, 避免用户填了正确地址却 404。
+    """
+    base = (base or "").strip().rstrip("/")
+    is_anthropic = "anthropic" in base or protocol.startswith("anthropic")
+    headers: dict[str, str] = {"User-Agent": "NanoQuant/1.0"}
+    if is_anthropic:
+        headers["anthropic-version"] = "2023-06-01"
+
+    candidates: list[str] = []
+    if base.endswith("/models"):
+        candidates.append(base)
+    else:
+        candidates.append(f"{base}/models")
+        if base.endswith("/v1"):
+            candidates.append(f"{base[:-3]}/models")
+        elif not re.search(r"/v\d+$", base):
+            candidates.append(f"{base}/v1/models")
+    return [(url, dict(headers)) for url in dict.fromkeys(candidates)]
+
+
+async def fetch_remote_models(
+    *,
+    base_url: str,
+    api_key: str = "",
+    protocol: str = "openai_chat",
+    timeout: float = 12.0,
+) -> dict[str, Any]:
+    """探测端点, 自动列出可用模型 (OpenAI / Anthropic / 自建网关兼容)."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        return {
+            "ok": False,
+            "models": [],
+            "endpoint": "",
+            "total": 0,
+            "error": "Base URL 必须以 http:// 或 https:// 开头",
+            "tried": [],
+        }
+
+    is_anthropic = "anthropic" in base or protocol.startswith("anthropic")
+    auth_headers = (
+        {"x-api-key": api_key} if is_anthropic and api_key else
+        ({"Authorization": f"Bearer {api_key}"} if api_key else {})
+    )
+
+    tried: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for url, headers in _models_endpoints(base, protocol):
+            headers.update(auth_headers)
+            try:
+                r = await client.get(url, headers=headers)
+            except Exception as exc:  # noqa: BLE001
+                # httpx 的 ConnectError 常常 str 为空, 补上底层原因, 否则面板只显示 "ConnectError:"
+                detail = str(exc) or str(getattr(exc, "__cause__", "") or "")
+                shown = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+                tried.append({"endpoint": url, "error": shown})
+                continue
             if r.status_code != 200:
-                return False, f"HTTP {r.status_code}: {r.text[:160]}"
-            data = r.json()
-            items = data.get("data") or data.get("models") or []
-            return True, sorted({str(i.get("id") or i.get("name")) for i in items if isinstance(i, dict)})
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}"
+                tried.append({"endpoint": url, "status": r.status_code, "error": r.text[:160]})
+                continue
+            try:
+                data = r.json()
+            except Exception:  # noqa: BLE001
+                tried.append({"endpoint": url, "status": r.status_code, "error": "返回不是 JSON"})
+                continue
+
+            if isinstance(data, list):
+                raw = data
+            elif isinstance(data, dict):
+                raw = data.get("data") or data.get("models") or []
+            else:
+                raw = []
+            models: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for item in raw if isinstance(raw, list) else []:
+                if isinstance(item, str):
+                    mid, name, ctx = item, item, None
+                elif isinstance(item, dict):
+                    mid = str(item.get("id") or item.get("name") or "").strip()
+                    if not mid:
+                        continue
+                    name = str(item.get("display_name") or item.get("name") or mid).strip()
+                    ctx = item.get("context_length") or item.get("max_tokens")
+                else:
+                    continue
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                models.append({"id": mid, "name": name, "context": ctx})
+            models.sort(key=lambda m: m["id"])
+            if models:
+                return {
+                    "ok": True,
+                    "models": models,
+                    "endpoint": url,
+                    "total": len(models),
+                    "error": "",
+                    "tried": tried + [{"endpoint": url, "status": 200}],
+                }
+            tried.append({"endpoint": url, "status": r.status_code, "error": "返回里没有模型列表"})
+
+    last = tried[-1] if tried else {}
+    return {
+        "ok": False,
+        "models": [],
+        "endpoint": last.get("endpoint", ""),
+        "total": 0,
+        "error": last.get("error") or "未取到模型列表",
+        "tried": tried,
+    }
+
+
+async def list_models(provider: AiProvider) -> tuple[bool, Any]:
+    """兼容旧调用: 拉取已保存供应商的模型 ID 列表."""
+    result = await fetch_remote_models(
+        base_url=provider.base_url,
+        api_key=decrypt_secret(provider.api_key_enc),
+        protocol=provider.protocol or "openai_chat",
+    )
+    if result["ok"]:
+        return True, [m["id"] for m in result["models"]]
+    return False, result["error"]
 
 
 def dump_json(data: Any) -> str:

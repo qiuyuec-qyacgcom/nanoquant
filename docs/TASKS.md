@@ -497,6 +497,25 @@
 - **结论**：当前 p99 由网络 RTT 主导，换语言的天花板不到 2%；同样的工程量投在"减少往返次数/连接复用"上收益高一个数量级。**Rust sidecar 暂不实施**。
 - **重启条件**（任一满足再评估）：① 应用侧 p99 超过 50ms；② 端到端 p99 目标进入 100ms 以内（需要 colocation/VIP 通道）；③ 出现 GC/HOL 阻塞导致的 >50ms 尖刺（当前 p99 未出现）。
 
+### 44. AI 模型接入：端点探测与一键切换（本次执行）
+- **状态**：✅ 已完成
+- **背景**：原来只能手填模型名；不同供应商的版本段不同（`/v1`、`/v4`、`/api/paas/v4`），填错就 404，且必须先保存供应商才能试。
+- **过程要点**：
+  - `ai/client.fetch_remote_models()`：按「原样拼接 → 去版本段 → 补 `/v1`」生成候选地址；Anthropic 用 `x-api-key` + `anthropic-version`；兼容 `data` / `models` / 顶层数组三种返回；12s 超时；返回实际命中的 `endpoint` 与 `tried` 列表。
+  - 新增 `POST /ai/providers/fetch-models`：可只带 `base_url + api_key` 先探测（不必先保存）；带 `provider_id` 时自动复用已存密钥。
+  - `GET /ai/providers/{id}/models` 升级为富结构（模型带 `name/context`、`endpoint`、`tried`），旧调用方仍可用 `models[].id`。
+  - AI 页面：表单内「探测端点」按钮 → 结果以模型 chips 呈现，点一下填入模型名；列表每行新增「探测」→ 弹窗选择器，点击即 PATCH 保存并刷新。
+  - 连接失败时错误信息补齐底层原因（`ConnectError` 不再只有类型名）。
+- **验证**：
+  | 场景 | 结果 |
+  |---|---|
+  | 本地 mock `/v1/models`（3 个模型） | 表单与弹窗均列出 3 个，`endpoint` 正确 |
+  | 点击 `qwen-plus` | `PATCH` 生效，provider.model 变为 `qwen-plus` |
+  | 非法地址 `ftp://bad` | 返回「Base URL 必须以 http:// 或 https:// 开头」 |
+  | 真实供应商不可达 | 错误显示为 `ConnectError: ...`，并附 `tried` 数量 |
+  | 回归 | 18 passed、`vue-tsc` 0 error |
+- **清理**：测试供应商与本地 mock 已删除，`/ai/providers` 恢复为空。
+
 ---
 
 ## 二、未开始

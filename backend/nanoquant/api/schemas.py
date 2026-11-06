@@ -152,5 +152,14 @@ class ClosePositionIn(BaseModel):
     reason: str = "manual"
 
 
+class FetchModelsIn(BaseModel):
+    """探测端点用: 可以先填地址+密钥试, 不必先保存供应商."""
+
+    base_url: str = ""
+    api_key: str = ""
+    protocol: str = "openai_chat"
+    provider_id: int = 0
+
+
 class TestProviderIn(BaseModel):
     prompt: str = "只回答两个字: 正常"

@@ -19,6 +19,9 @@ const editing = ref<AiProvider | null>(null)
 const diagnoseResult = ref<any>(null)
 const diagnosing = ref(false)
 const testResult = ref<any>(null)
+const probing = ref(false)
+const probe = ref<{ ok: boolean; endpoint: string; error?: string; models: { id: string; name: string; context?: number }[] } | null>(null)
+const probeShown = computed(() => (probe.value?.models || []).slice(0, 40))
 const testingId = ref(0)
 
 const aiCfg = reactive<any>({
@@ -123,6 +126,7 @@ function openCreate() {
     model: 'deepseek-chat', temperature: 0.2, max_tokens: 900, timeout_sec: 45,
     json_mode: true, enabled: true, priority: 100, role: 'primary',
   })
+  probe.value = null
   showForm.value = true
 }
 
@@ -134,6 +138,7 @@ function openEdit(p: AiProvider) {
     timeout_sec: p.timeout_sec, json_mode: p.json_mode, enabled: p.enabled,
     priority: p.priority, role: p.role,
   })
+  probe.value = null
   showForm.value = true
 }
 
@@ -180,6 +185,65 @@ async function toggleProvider(p: AiProvider) {
     await loadAll()
   } catch (err: any) {
     app.notify(err.message, 'error')
+  }
+}
+
+/** 已保存供应商: 探测端点并挑一个模型直接切换 */
+const modelPicker = ref<{ provider: AiProvider; ok: boolean; endpoint: string; error?: string; models: any[] } | null>(null)
+const picking = ref(0)
+
+async function probeProvider(p: AiProvider) {
+  picking.value = p.id
+  try {
+    const res: any = await http.get(`/ai/providers/${p.id}/models`)
+    modelPicker.value = { provider: p, ok: res.ok, endpoint: res.endpoint || '', error: res.error, models: res.models || [] }
+    if (!res.ok) app.notify(res.error || '探测失败', 'error')
+  } catch (err: any) {
+    app.notify(err?.message || '探测失败', 'error')
+  } finally {
+    picking.value = 0
+  }
+}
+
+async function pickModel(m: any) {
+  if (!modelPicker.value) return
+  const provider = modelPicker.value.provider
+  try {
+    await http.patch(`/ai/providers/${provider.id}`, { model: m.id })
+    modelPicker.value = null
+    app.notify(`已切换到 ${m.id}`, 'ok')
+    await loadAll()
+  } catch (err: any) {
+    app.notify(err?.message || '切换失败', 'error')
+  }
+}
+
+/** 探测端点: 自动列出可用模型, 点一下即可填入模型名 */
+async function probeModels() {
+  if (!form.base_url) {
+    app.notify('先填接口地址再探测', 'error')
+    return
+  }
+  probing.value = true
+  probe.value = null
+  try {
+    const res: any = await http.post('/ai/providers/fetch-models', {
+      base_url: form.base_url,
+      api_key: form.api_key,
+      protocol: form.protocol,
+      provider_id: editing.value?.id || 0,
+    })
+    probe.value = res
+    if (res.ok) {
+      app.notify(`探测到 ${res.models.length} 个模型`, 'ok')
+      if (!form.model && res.models.length) form.model = res.models[0].id
+    } else {
+      app.notify(res.error || '探测失败', 'error')
+    }
+  } catch (err: any) {
+    app.notify(err?.message || '探测失败', 'error')
+  } finally {
+    probing.value = false
   }
 }
 
@@ -346,6 +410,7 @@ onMounted(loadAll)
                     {{ testingId === p.id ? '…' : '测试' }}
                   </button>
                   <button class="btn btn-xs" :disabled="diagnosing" @click="diagnose(p)">诊断</button>
+                  <button class="btn btn-xs" @click="probeProvider(p)">探测</button>
                   <button class="btn btn-xs" @click="openEdit(p)">编辑</button>
                   <button class="btn btn-xs btn-danger" @click="removeProvider(p)">删</button>
                 </div>
@@ -450,7 +515,15 @@ onMounted(loadAll)
             </select>
           </div>
           <div class="field" style="grid-column: span 2"><span class="label">接口地址 (base_url)</span><input v-model="form.base_url" class="input mono" /></div>
-          <div class="field"><span class="label">模型名</span><input v-model="form.model" class="input mono" /></div>
+          <div class="field">
+            <span class="label">模型名</span>
+            <div class="row" style="gap: 6px">
+              <input v-model="form.model" class="input mono" style="flex: 1; min-width: 0" />
+              <button class="btn btn-sm" :disabled="probing" @click="probeModels">
+                {{ probing ? '探测中…' : '探测端点' }}
+              </button>
+            </div>
+          </div>
           <div class="field">
             <span class="label">API Key {{ editing ? '(留空则不修改)' : '' }}</span>
             <input v-model="form.api_key" class="input mono" type="password" placeholder="sk-..." />
@@ -470,12 +543,69 @@ onMounted(loadAll)
             <span class="label">启用</span>
           </div>
         </div>
+        <div v-if="probe" class="probe">
+          <div class="row" style="gap: 8px; font-size: 11px; flex-wrap: wrap">
+            <span class="muted">探测地址</span>
+            <span class="mono" style="word-break: break-all">{{ probe.endpoint || '—' }}</span>
+            <span class="tag" :class="probe.ok ? 'tag-long' : 'tag-warn'">
+              {{ probe.ok ? `${probe.models.length} 个模型` : '探测失败' }}
+            </span>
+          </div>
+          <div v-if="probe.ok" class="row" style="gap: 6px; flex-wrap: wrap; margin-top: 8px">
+            <button
+              v-for="m in probeShown"
+              :key="m.id"
+              class="btn btn-xs"
+              :class="{ 'btn-primary': m.id === form.model }"
+              :title="m.name"
+              @click="form.model = m.id"
+            >
+              {{ m.id }}
+            </button>
+            <span v-if="probe.models.length > probeShown.length" class="muted" style="font-size: 11px">
+              等 {{ probe.models.length }} 个，输入框可直接填
+            </span>
+          </div>
+          <div v-else class="muted" style="font-size: 11px; color: var(--down); margin-top: 6px">
+            {{ probe.error }}
+          </div>
+        </div>
         <div class="hint">Key 使用 Fernet 加密后落库, 接口只返回掩码。若服务端不支持 response_format, 系统会自动降级并做容错解析。</div>
       </div>
       <template #footer>
         <button class="btn" @click="showForm = false">取消</button>
         <button class="btn btn-primary" @click="save">保存</button>
       </template>
+    </Modal>
+
+    <Modal v-if="modelPicker" :title="`探测模型 · ${modelPicker.provider.name}`" wide @close="modelPicker = null">
+      <div class="stack" style="gap: 10px">
+        <div class="row" style="gap: 8px; font-size: 11px; flex-wrap: wrap">
+          <span class="muted">探测地址</span>
+          <span class="mono" style="word-break: break-all">{{ modelPicker.endpoint || '—' }}</span>
+          <span class="tag" :class="modelPicker.ok ? 'tag-long' : 'tag-warn'">
+            {{ modelPicker.ok ? `${modelPicker.models.length} 个模型` : '探测失败' }}
+          </span>
+        </div>
+        <div v-if="!modelPicker.ok" class="muted" style="color: var(--down); font-size: 12px">
+          {{ modelPicker.error }}
+        </div>
+        <template v-else>
+          <div class="row" style="gap: 6px; flex-wrap: wrap">
+            <button
+              v-for="m in modelPicker.models"
+              :key="m.id"
+              class="btn btn-xs"
+              :class="{ 'btn-primary': m.id === modelPicker.provider.model }"
+              @click="pickModel(m)"
+            >
+              {{ m.id }}
+            </button>
+          </div>
+          <div class="hint">点击任意模型立即切换并保存；当前使用 {{ modelPicker.provider.model }}</div>
+        </template>
+      </div>
+      <template #footer><button class="btn" @click="modelPicker = null">关闭</button></template>
     </Modal>
 
     <Modal v-if="diagnoseResult" :title="`接口诊断 · ${diagnoseResult.provider || ''}`" wide @close="diagnoseResult = null">

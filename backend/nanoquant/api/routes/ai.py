@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ...ai.client import ai_client, list_models
+from ...ai.client import ai_client, fetch_remote_models, list_models
 from ...ai.decision import analyze
 from ...ai.diagnostics import diagnose
 from ...db import session_scope
@@ -20,7 +20,7 @@ from ...services.settings import get_ai, update_group
 from ...engine.strategy import build_features
 from ...services.settings import get_strategy
 from ..deps import current_user
-from ..schemas import AnalyzeIn, ProviderIn, ProviderPatch, TestProviderIn
+from ..schemas import AnalyzeIn, FetchModelsIn, ProviderIn, ProviderPatch, TestProviderIn
 
 router = APIRouter(tags=["ai"])
 
@@ -118,6 +118,34 @@ def delete_provider(provider_id: int, user: str = Depends(current_user)) -> dict
     return {"ok": True}
 
 
+@router.post("/ai/providers/fetch-models")
+async def fetch_provider_models(payload: FetchModelsIn, user: str = Depends(current_user)) -> dict:
+    """探测端点, 自动列出可用模型.
+
+    三种用法:
+    - 新建: 只传 base_url + api_key, 不必先保存供应商;
+    - 编辑: 传 provider_id, api_key 留空则复用已存密钥;
+    - 换地址: 传 provider_id + base_url 覆盖探测目标。
+    """
+    base = (payload.base_url or "").strip()
+    key = (payload.api_key or "").strip()
+    protocol = payload.protocol or "openai_chat"
+
+    if payload.provider_id:
+        with session_scope() as s:
+            provider = s.get(AiProvider, payload.provider_id)
+            if provider is None:
+                raise HTTPException(status_code=404, detail="模型配置不存在")
+            base = base or provider.base_url
+            protocol = protocol or provider.protocol
+            if not key:
+                key = decrypt_secret(provider.api_key_enc)
+
+    if not base:
+        raise HTTPException(status_code=400, detail="需要填写 Base URL")
+    return await fetch_remote_models(base_url=base, api_key=key, protocol=protocol)
+
+
 @router.post("/ai/providers/{provider_id}/test")
 async def test_provider(provider_id: int, payload: TestProviderIn, user: str = Depends(current_user)) -> dict:
     with session_scope() as s:
@@ -157,8 +185,18 @@ async def provider_models(provider_id: int, user: str = Depends(current_user)) -
         if provider is None:
             raise HTTPException(status_code=404, detail="模型配置不存在")
         s.expunge(provider)
-    ok, models = await list_models(provider)
-    return {"ok": ok, "models": models if ok else [], "error": "" if ok else str(models)}
+    result = await fetch_remote_models(
+        base_url=provider.base_url,
+        api_key=decrypt_secret(provider.api_key_enc),
+        protocol=provider.protocol or "openai_chat",
+    )
+    return {
+        "ok": result["ok"],
+        "models": result["models"],
+        "endpoint": result["endpoint"],
+        "tried": result["tried"],
+        "error": result["error"],
+    }
 
 
 @router.post("/ai/analyze")
