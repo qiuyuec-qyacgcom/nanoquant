@@ -21,7 +21,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -307,7 +307,9 @@ class BinanceClient:
             payload["recvWindow"] = int(cfg.request_timeout_sec * 1000) if cfg.request_timeout_sec < 6 else 5000
             query = urlencode(payload, doseq=True)
             signature = sign_query(query, secret)
-            query = f"{query}&signature={signature}"
+            # Ed25519/RSA 的签名是 base64, 含 '+' '/' '=' —— 必须再次编码,
+            # 否则 '+' 会被服务端当成空格, 造成"时好时坏"的 -1022。
+            query = f"{query}&signature={quote(signature, safe='')}"
             headers["X-MBX-APIKEY"] = key
             url = f"{base}{path}?{query}"
         else:
