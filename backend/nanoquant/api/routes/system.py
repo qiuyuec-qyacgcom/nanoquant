@@ -163,7 +163,7 @@ async def diagnostics(user: str = Depends(current_user)) -> dict:
         started = time.perf_counter()
         reachable = False
         if has_key:
-            reachable = await binance_client.client.ping()
+            reachable = await binance_client.ping()
         checks.append(
             {
                 "name": "交易所接入",

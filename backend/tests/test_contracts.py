@@ -188,6 +188,32 @@ def test_partial_close_qty_rounding_and_min():
     assert partial_close_qty(1.0, 0, 0.001, 0.001) == 0.0
 
 
+# ---------------------------------------------------------------- 交易所签名
+def test_sign_query_supports_ed25519_and_hmac():
+    import base64
+    import hashlib
+    import hmac
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
+
+    from nanoquant.exchange.client import sign_query
+
+    query = "a=1&timestamp=1700000000000"
+
+    # Ed25519: 签名是 base64, 能用公钥验证
+    priv = Ed25519PrivateKey.generate()
+    secret = base64.b64encode(
+        priv.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
+    ).decode()
+    priv.public_key().verify(base64.b64decode(sign_query(query, secret)), query.encode())
+
+    # HMAC: 行为保持不变
+    hmac_secret = "plain-hmac-secret"
+    expect = hmac.new(hmac_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    assert sign_query(query, hmac_secret) == expect
+
+
 # ---------------------------------------------------------------- 告警静默
 def test_quiet_hours_parsing():
     from nanoquant.services.alerts import _in_quiet_hours

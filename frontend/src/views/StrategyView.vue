@@ -635,7 +635,9 @@ onMounted(async () => {
                     >
                       清空
                     </button>
-                    <span class="hint">{{ env === 'demo' ? '币安测试网密钥' : '币安主网密钥' }}</span>
+                    <span class="hint">
+                      {{ env === 'demo' ? '币安测试网密钥（仅支持 HMAC）' : '币安主网密钥（HMAC / Ed25519 均可）' }}
+                    </span>
                   </div>
                 </div>
               </div>

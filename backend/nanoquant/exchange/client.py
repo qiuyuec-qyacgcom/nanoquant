@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import time
@@ -20,6 +21,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import load_der_private_key
 
 import httpx
 
@@ -30,6 +34,42 @@ from .precision import SymbolFilters, parse_exchange_info
 from .ratelimit import OrderRateLimiter, RateLimited, WeightLimiter
 
 log = get_logger("binance")
+
+#: Ed25519 私钥解析结果缓存: base64(secret) -> key 对象
+_ED25519_CACHE: dict[str, Any] = {}
+
+
+def _ed25519_key(secret: str) -> Any | None:
+    """尝试把 secret 解析成 Ed25519 私钥; 不是就给 None.
+
+    币安支持两类 API Key:
+    - HMAC: Key/Secret 都是普通字符串, 签名是 hex;
+    - Ed25519: Secret 是 base64(PKCS#8 DER) 私钥, 签名是 base64。
+    用"能否按 DER 解析出 Ed25519 私钥"来判定, 避免把普通字符串误判。
+    """
+    cached = _ED25519_CACHE.get(secret)
+    if cached is not None:
+        return cached
+    try:
+        raw = base64.b64decode(secret, validate=True)
+        key = load_der_private_key(raw, password=None)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(key, Ed25519PrivateKey):
+        return None
+    if len(_ED25519_CACHE) > 8:
+        _ED25519_CACHE.clear()
+    _ED25519_CACHE[secret] = key
+    return key
+
+
+def sign_query(query: str, secret: str) -> str:
+    """按密钥类型签名: Ed25519 → base64, HMAC-SHA256 → hex."""
+    key = _ed25519_key(secret)
+    if key is not None:
+        return base64.b64encode(key.sign(query.encode())).decode()
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+
 
 #: 分段耗时采集点: broker 在下单前 set 一个 dict, `_request` 负责填 wait/sign/http
 STAGE_SINK: ContextVar[dict[str, float] | None] = ContextVar("nq_stage_sink", default=None)
@@ -227,7 +267,7 @@ class BinanceClient:
             payload["timestamp"] = int((time.time() + self._time_offset) * 1000)
             payload["recvWindow"] = int(cfg.request_timeout_sec * 1000) if cfg.request_timeout_sec < 6 else 5000
             query = urlencode(payload, doseq=True)
-            signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+            signature = sign_query(query, secret)
             query = f"{query}&signature={signature}"
             headers["X-MBX-APIKEY"] = key
             url = f"{base}{path}?{query}"
@@ -280,6 +320,9 @@ class BinanceClient:
                 body = {"code": -1, "msg": r.text[:200]}
             code = int(body.get("code", -1))
             msg = str(body.get("msg", ""))[:300]
+            if code == -2014 and signed and _ed25519_key(self._secret) is not None:
+                # 实测: 测试网对 Ed25519 直接按"格式非法"拒绝, 主网才支持
+                msg = f"{msg}（当前 Key 为 Ed25519 类型，币安测试网不支持，请改用 HMAC 密钥）"
             if code == -1003:
                 # 先尝试换线路 (不同出口 IP 不会被同一条封禁连累), 换不了才本地熔断
                 if _retry and method.upper() == "GET" and self._rotate_base():

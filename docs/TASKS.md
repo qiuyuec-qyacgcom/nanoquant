@@ -516,6 +516,23 @@
   | 回归 | 18 passed、`vue-tsc` 0 error |
 - **清理**：测试供应商与本地 mock 已删除，`/ai/providers` 恢复为空。
 
+### 45. API Key 类型识别：支持 Ed25519 签名（本次执行）
+- **状态**：✅ 已完成
+- **问题**：开仓检查报 `BinanceError: [-2014] API-key format invalid.`。检查配置后发现「Key」以 `MCow...` 开头、长度 60，「Secret」以 `MC4C...` 开头、长度 64——这是**币安 Ed25519 密钥对**（SPKI / PKCS#8 的 base64），而客户端一直只用 HMAC-SHA256 签名，测试网按"格式非法"拒绝。
+- **过程要点**：
+  - `exchange/client.py` 新增 `sign_query()`：用「能否按 base64 DER 解析出 Ed25519 私钥」判定类型——是则 `base64(ed25519_sign(query))`，否则保持 `hex(hmac_sha256)`；私钥解析结果按 secret 缓存，热路径无额外开销。
+  - `-2014` 且识别为 Ed25519 时，错误信息追加「当前 Key 为 Ed25519 类型，币安测试网不支持，请改用 HMAC 密钥」。
+  - 修复诊断项「交易所接入」的 `'BinanceClient' object has no attribute 'client'`（`binance_client.client.ping()` → `binance_client.ping()`），该项从长期误报恢复为真实结果。
+  - 参数页密钥区补充提示：测试网仅支持 HMAC、主网两者皆可。
+- **实测判据**（同一台机器、同一时间窗）：
+  | 密钥类型 | 是否注册 | 测试网返回 |
+  |---|---|---|
+  | Ed25519（格式合法） | 未注册 | `-2014 API-key format invalid` |
+  | HMAC 64 位（格式合法） | 未注册 | `-2015 Invalid API-key, IP, or permissions` |
+  → 说明**测试网在格式层就拒绝 Ed25519**，与密钥是否正确无关。
+- **验证**：自签 Ed25519 能用公钥验签通过；HMAC 结果与原生 `hmac.new` 逐字节一致；契约测试 **19 passed**；诊断「交易所接入」转 True。
+- **待办（用户侧）**：在币安测试网重新生成 **HMAC（System generated）** 密钥后填入「数据源」，交易通道即可连通。
+
 ---
 
 ## 二、未开始
