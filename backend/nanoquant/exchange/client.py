@@ -583,6 +583,13 @@ class BinanceClient:
     async def place_order(self, **params: Any) -> dict:
         return await self._request("POST", "/fapi/v1/order", params, weight=1, order=True)
 
+    async def place_algo_order(self, **params: Any) -> dict:
+        """条件单(止损/止盈): 币安已把 closePosition 类订单迁到 Algo 接口."""
+        return await self._request("POST", "/fapi/v1/algoOrder", params, weight=1, order=True)
+
+    async def cancel_algo(self, algo_id: str) -> dict:
+        return await self._request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id}, weight=1)
+
     async def place_test_order(self, **params: Any) -> dict:
         return await self._request("POST", "/fapi/v1/order/test", params, weight=1)
 

@@ -6,6 +6,7 @@ Engine 只依赖 Broker 协议, 因此可以在同一套风控与策略下切换
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -19,6 +20,7 @@ from ..services.exec_metrics import exec_metrics
 from ..services.settings import get_engine, get_risk, normalize_mode
 from . import client as binance_client
 from .client import STAGE_SINK, BinanceError, NoCredentials, UncertainSubmission
+from .precision import SymbolFilters, round_to_tick
 from .precision import SymbolFilters, floor_to_step
 
 log = get_logger("broker")
@@ -100,7 +102,11 @@ def _persist_close(payload: dict[str, Any], position_id: int) -> None:
                     qty=qty_before,
                     notional=qty_before * row.entry_price,
                     pnl=round(pnl - entry_fee, 8),
-                    pnl_pct=round((avg / row.entry_price - 1) * 100 * direction, 6),
+                    pnl_pct=(
+                        round((avg / row.entry_price - 1) * 100 * direction, 6)
+                        if row.entry_price
+                        else 0.0
+                    ),
                     roi_pct=round((pnl - entry_fee) / max(1e-9, row.margin) * 100, 4),
                     fees=round(entry_fee + fee, 8),
                 )
@@ -119,7 +125,11 @@ def _persist_close(payload: dict[str, Any], position_id: int) -> None:
                         qty=close_qty,
                         notional=close_qty * row.entry_price,
                         pnl=round(pnl - entry_fee, 8),
-                        pnl_pct=round((avg / row.entry_price - 1) * 100 * direction, 6),
+                        pnl_pct=(
+                            round((avg / row.entry_price - 1) * 100 * direction, 6)
+                            if row.entry_price
+                            else 0.0
+                        ),
                         roi_pct=round((pnl - entry_fee) / max(1e-9, margin_part) * 100, 4),
                         fees=round(entry_fee + fee, 8),
                     )
@@ -212,11 +222,28 @@ class BinanceBroker:
 
     def __init__(self) -> None:
         self._configured: set[str] = set()
+        self._one_way: bool | None = None
         self._dual: bool | None = None
 
     @property
     def mode(self) -> str:
         return normalize_mode(get_engine().mode)
+
+    async def _ensure_position_mode(self) -> None:
+        """策略按"单向持仓"实现, 账户若是双向(hedge)会报 -4061.
+
+        首次下单前检查一次: 双向模式则自动切换为单向(无持仓时才能切, 失败只记日志)。
+        """
+        if self._one_way:
+            return
+        try:
+            dual = await binance_client.client.get_position_mode()
+            if dual:
+                await binance_client.client.set_position_mode(False)
+                log.warning("账户为双向持仓模式, 已切换为单向持仓")
+        except BinanceError as exc:
+            log.warning("持仓模式检查/切换失败: %s", exc)
+        self._one_way = True
 
     async def _ensure_symbol(self, symbol: str, leverage: int) -> None:
         if symbol in self._configured:
@@ -289,6 +316,7 @@ class BinanceBroker:
         t_call = time.perf_counter()
         stage: dict[str, float] = {}
         try:
+            await self._ensure_position_mode()
             await self._ensure_symbol(symbol, int(leverage))
             cid = new_client_order_id("nq")
             side_txt = "BUY" if side == "long" else "SELL"
@@ -325,6 +353,15 @@ class BinanceBroker:
             avg = float(resp.get("avgPrice", 0) or 0)
             if avg <= 0:
                 avg = filters.last_price
+            if avg <= 0:
+                # 回执没带均价且缓存价为空时, 现取一次盘口, 否则会写出 entry_price=0 的脏仓位
+                try:
+                    tick = (await binance_client.client.book_tickers([symbol])).get(symbol)
+                    avg = (tick[0] + tick[1]) / 2 if tick else 0.0
+                except BinanceError:
+                    avg = 0.0
+            if avg <= 0:
+                return ExecResult(False, message="下单成功但取不到成交价, 已放弃落库")
             # 入场滑点 (bps): 成交均价相对决策价的偏差, 方向校正后正值为不利滑点
             ref = filters.last_price or 0
             direction = 1 if side == "long" else -1
@@ -372,7 +409,7 @@ class BinanceBroker:
             )
             stage["persist_ms"] = (time.perf_counter() - t_persist) * 1000
             t_protect = time.perf_counter()
-            await self._place_protection(symbol, side, sl_price, tp_price)
+            await self._place_protection(symbol, side, sl_price, tp_price, filters)
             stage["protect_ms"] = (time.perf_counter() - t_protect) * 1000
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
@@ -383,26 +420,52 @@ class BinanceBroker:
         except BinanceError as exc:
             return ExecResult(False, message=f"下单失败 {exc.code}: {exc.message}")
 
-    async def _place_protection(self, symbol: str, side: str, sl_price: float, tp_price: float) -> None:
+    async def _place_protection(
+        self, symbol: str, side: str, sl_price: float, tp_price: float, filters: Any = None
+    ) -> None:
         close_side = "SELL" if side == "long" else "BUY"
 
         async def place(kind: str, price: float) -> None:
             if price <= 0:
                 return
-            params = {
+            if filters is not None and getattr(filters, "price_tick", 0):
+                price = round_to_tick(price, filters.price_tick, mode="down")
+                decimals = max(0, -int(math.floor(math.log10(filters.price_tick))))
+                px = f"{price:.{decimals}f}"
+            else:
+                px = f"{price:.8f}".rstrip("0").rstrip(".")
+            # 币安已要求 closePosition 类条件单走 Algo 接口(-4120), 老接口仅作回落
+            algo_params = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": close_side,
                 "type": kind,
-                "stopPrice": f"{price:.12f}".rstrip("0").rstrip("."),
+                "triggerPrice": px,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
-                "newClientOrderId": new_client_order_id("np"),
+                "clientAlgoId": new_client_order_id("np"),
             }
             try:
-                await binance_client.client.place_order(**params)
+                await binance_client.client.place_algo_order(**algo_params)
             except BinanceError as exc:
-                log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc)
+                if exc.code in (-4120, -1121, -1102):
+                    legacy = {
+                        "symbol": symbol,
+                        "side": close_side,
+                        "type": kind,
+                        "stopPrice": px,
+                        "closePosition": "true",
+                        "workingType": "MARK_PRICE",
+                        "priceProtect": "TRUE",
+                        "newClientOrderId": new_client_order_id("np"),
+                    }
+                    try:
+                        await binance_client.client.place_order(**legacy)
+                    except BinanceError as exc2:
+                        log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc2)
+                else:
+                    log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc)
 
         # 止损与止盈是两笔独立的 reduce-only 单, 并行发出:
         # 串行会让开仓关键路径多背一个 RTT, 直接体现在下单 p99 上.
