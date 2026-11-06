@@ -1,0 +1,33 @@
+[Unit]
+Description=NanoQuant (FastAPI + trading engine)
+Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant
+After=network-online.target
+Wants=network-online.target
+# exec sidecar 先起；sidecar 不在时主服务会自动降级，不会被拖死
+After=nanoquant-exec.service
+
+[Service]
+Type=simple
+User=nanoquant
+Group=nanoquant
+WorkingDirectory=/opt/nanoquant/backend
+Environment=NANOQUANT_HOME=/opt/nanoquant
+Environment=NANOQUANT_PORT=8899
+ExecStart=/opt/nanoquant/.venv/bin/python -m nanoquant
+
+# 崩溃自动拉起；停机时先 SIGINT 让 lifespan 排空写队列
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# 最小权限
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/nanoquant/data /opt/nanoquant/logs /run/nanoquant
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -68,6 +68,12 @@ class RiskSettings(BaseModel):
     default_leverage: int = Field(default=20, ge=1, le=100)
     margin_pct: float = Field(default=50.0, gt=0, le=100, description="单仓保证金占权益%")
     max_exposure_pct: float = Field(default=2000.0, gt=0, le=20000, description="总名义额/权益 上限%")
+    max_same_direction: int = Field(
+        default=0, ge=0, le=20, description="同方向最多持仓数, 0=不限制（币种高度相关, 建议小资金设 1）"
+    )
+    vol_target_atr_pct: float = Field(
+        default=0.0, ge=0.0, le=20.0, description="波动率目标(ATR%), 0=关闭；ATR 高则自动缩仓"
+    )
     daily_loss_limit_pct: float = Field(default=25.0, gt=0, le=100)
     max_drawdown_pct: float = Field(default=50.0, gt=0, le=100)
     consecutive_loss_limit: int = Field(default=4, ge=1, le=20)

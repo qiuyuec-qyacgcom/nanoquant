@@ -483,7 +483,9 @@ class TradingEngine:
                 continue
             if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
                 continue
-            gate = risk_mod.symbol_gates(symbol, account, engine_cfg, risk_cfg, prices=prices)
+            gate = risk_mod.symbol_gates(
+                symbol, account, engine_cfg, risk_cfg, prices=prices, side=sig.direction
+            )
             if not gate.ok:
                 self._update_signal_reject(rec["signal_id"], gate.reason)
                 continue
@@ -637,9 +639,13 @@ class TradingEngine:
             if d.tp_pct > 0:
                 tp_pct = min(max(sl_pct * 1.05, d.tp_pct), 8.0)
 
+        # 波动率目标: ATR% 高于目标就缩仓, 反之放大 (关闭时 risk_scale=1)
+        risk_scale = risk_mod.vol_risk_scale(
+            risk_cfg.vol_target_atr_pct, float(sig.features.get("atr_pct") or 0.0)
+        )
         qty, info = risk_mod.plan_position(
             price=ticker.last, filters=filters, account=account,
-            cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage,
+            cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage, risk_scale=risk_scale,
         )
         if qty <= 0:
             self._update_signal_reject(signal_id, f"仓位不足: {info['note']}")

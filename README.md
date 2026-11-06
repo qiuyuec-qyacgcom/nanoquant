@@ -109,6 +109,8 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 
 首次登录：`admin / admin123`（登录后会被要求立即改密）。
 
+> 生产守护（systemd）：主服务与 sidecar 的 unit 文件见 [`deploy/`](deploy/README.md)，含最小权限硬化与 UDS `0600` 权限设置。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -146,6 +148,7 @@ nanoquant/
 │   ├── components/      # EChart / EnvironmentSwitch / Modal / EventFeed ...
 │   └── layouts/         # SiteLayout（前台）/ ShellLayout（后台）
 ├── rust/exec-service/   # 执行内核 sidecar（P2：只签名不下单，UDS + JSON Lines）
+├── deploy/              # systemd unit（主服务 + sidecar）与部署说明
 ├── scripts/             # install / start / stop / status + 压测/对账/校验工具
 ├── backend/tests/       # 契约测试 + smoke / evolution / ai / news 探测 + 本地 Mock 模型
 ├── docs/                # RESEARCH 调研 / TASKS 任务书 / EXEC_PROTOCOL 协议 / MAINNET_DRILL 演练手册
@@ -173,6 +176,7 @@ nanoquant/
             结构确认：多头需 EMA9>EMA21，空头反之（避免逆势抄底）
 ③ 风控      全局：权益≥0.5U、日内亏损≤25%、回撤≤50%、连亏<4笔、无熔断
             单标的：未持仓、持仓数<2、无冷却、总敞口<2000%
+            组合：同向持仓上限（相关性代理）、波动率目标自动缩放仓位
 ④ 仓位      名义额 = min( 权益×10% ÷ 止损%, 权益×50%×杠杆 )
             数量 = 名义额 ÷ 价，按步进向下取整；低于最小可下单量 → 拒绝
 ⑤ AI 复核  只能「同意 / 否决 / 降杠杆 / 收窄止损」，不能放宽任何风控
@@ -221,6 +225,7 @@ nanoquant/
 | 引擎 | 周期 / 同时持仓 / 每轮扫描 / 时段 / 交易环境 | 5s / 2 / 12 / 全天 / demo 模拟盘 |
 | 风控 | 单笔风险 / 默认杠杆 / 保证金占比 / 总敞口 | 10% / 20x / 50% / 2000% |
 | 风控 | 日内亏损 / 回撤 / 连亏上限 / 冷静期 | 25% / 50% / 4 笔 / 10 分钟 |
+| 组合 | 同向持仓上限 / 波动率目标 | 0 不限制 / 0 关闭（建议小资金设 1 / 1.5） |
 | 策略 | 周期 / 阈值 / 量比 / ATR% / 最长持仓 | 5m / 0.30 / 0.80 / 0.05–4 / 180 分钟 |
 | 执行 | 盘口点差闸门 / 时间阶梯止盈 | 8 bps / 0min 0.8%、15min 0.6%、30min 0.45%、60min 0.3%、120min 0.2% |
 | 执行内核 | 模式 / 抽样 / 超时 | off / 100% / 500ms |
@@ -259,7 +264,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 36 + 路由 9（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 39 + 路由 9（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）

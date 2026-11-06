@@ -314,6 +314,43 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# ------------------------------------------------------ 组合风险与波动率目标
+def test_side_cap_reason_counts_same_direction():
+    from nanoquant.engine.risk import side_cap_reason
+
+    positions = [SimpleNamespace(side="long"), SimpleNamespace(side="short")]
+    assert side_cap_reason(positions, "long", 0) == ""  # 0=不限制, 保持旧行为
+    assert side_cap_reason(positions, "long", 2) == ""
+    assert "同方向" in side_cap_reason(positions, "long", 1)
+    assert "同方向" in side_cap_reason(positions, "short", 1)
+    assert side_cap_reason(positions, "", 1) == ""  # 没有方向信息时不做判断
+
+
+def test_vol_risk_scale_clamps_and_disables():
+    from nanoquant.engine.risk import vol_risk_scale
+
+    assert vol_risk_scale(0.0, 1.0) == 1.0  # 关闭
+    assert vol_risk_scale(1.5, 0.0) == 1.0  # ATR 无效
+    assert vol_risk_scale(1.5, 1.5) == 1.0
+    assert vol_risk_scale(1.5, 3.0) == pytest.approx(0.5)  # 高波动缩仓
+    assert vol_risk_scale(1.0, 0.1) == pytest.approx(2.0)  # 放大上限
+    assert vol_risk_scale(1.0, 10.0) == pytest.approx(0.25)  # 缩小下限
+
+
+def test_estimate_qty_applies_risk_scale():
+    from nanoquant.exchange.broker import estimate_qty
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import RiskSettings
+
+    cfg = RiskSettings(risk_per_trade_pct=1.0, margin_pct=50.0, default_leverage=20)
+    filters = SymbolFilters(symbol="TESTUSDT", qty_step=0.001, min_qty=0.001, min_notional=5.0)
+
+    full, _ = estimate_qty(1000.0, 100.0, 20, cfg, 0.01, filters)
+    half, _ = estimate_qty(1000.0, 100.0, 20, cfg, 0.01, filters, risk_scale=0.5)
+    assert full == pytest.approx(10.0)  # 权益1%÷止损1% = 1000 名义额 → 10 个
+    assert half == pytest.approx(5.0)
+
+
 # ------------------------------------------------------------ 回测保真度
 def _flat(n: int, price: float = 100.0, start_ts: int = 0, step_ms: int = 300_000):
     return [bar(o=price, h=price, l=price, c=price, v=1e6, t=start_ts + i * step_ms) for i in range(n)]

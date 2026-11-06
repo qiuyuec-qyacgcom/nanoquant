@@ -632,11 +632,22 @@ def position_from_db(position_id: int) -> PositionRecord | None:
         return s.get(PositionRecord, position_id)
 
 
-def estimate_qty(equity: float, price: float, leverage: float, risk_cfg, sl_pct: float, filters: SymbolFilters) -> tuple[float, str]:
-    """风险预算 -> 名义额 -> 数量, 并对齐步进; 返回 (qty, 说明)."""
+def estimate_qty(
+    equity: float,
+    price: float,
+    leverage: float,
+    risk_cfg,
+    sl_pct: float,
+    filters: SymbolFilters,
+    risk_scale: float = 1.0,
+) -> tuple[float, str]:
+    """风险预算 -> 名义额 -> 数量, 并对齐步进; 返回 (qty, 说明).
+
+    risk_scale 是波动率目标的缩放系数 (1.0=不调整).
+    """
     if equity <= 0 or price <= 0:
         return 0.0, "权益或价格无效"
-    risk_budget = equity * risk_cfg.risk_per_trade_pct / 100.0
+    risk_budget = equity * risk_cfg.risk_per_trade_pct / 100.0 * max(0.0, risk_scale)
     risk_notional = risk_budget / max(sl_pct, 1e-6)
     margin_cap = equity * risk_cfg.margin_pct / 100.0 * leverage
     notional = min(risk_notional, margin_cap)

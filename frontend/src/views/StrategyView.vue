@@ -75,6 +75,16 @@ const BASE_META: Record<string, FieldMeta> = {
   default_leverage: { label: '默认杠杆', unit: 'x' },
   max_leverage: { label: '杠杆上限', unit: 'x', hint: '1–100x，单标的配置只能收紧不能突破' },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
+  max_same_direction: {
+    label: '同向持仓上限',
+    unit: '个',
+    hint: '0=不限制；币种高度相关，小资金建议设 1，避免同涨同跌时吃双份风险',
+  },
+  vol_target_atr_pct: {
+    label: '波动率目标',
+    unit: '%',
+    hint: '如 1.5：ATR% 高于它自动缩仓、低于它放大（0.25–2x）；0=关闭',
+  },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
@@ -234,7 +244,19 @@ const SECTIONS: Record<string, SectionDef[]> = {
     { title: '模拟盘与下单', fields: ['demo_start_balance', 'order_type', 'recv_window_ms', 'close_on_halt'] },
   ],
   risk: [
-    { title: '仓位与杠杆', hint: '先由风险预算反推名义额，再被保证金与敞口截断', fields: ['risk_per_trade_pct', 'margin_pct', 'default_leverage', 'max_leverage', 'max_exposure_pct'] },
+    {
+      title: '仓位与杠杆',
+      hint: '先由风险预算反推名义额，再被保证金、敞口与同向集中度截断',
+      fields: [
+        'risk_per_trade_pct',
+        'margin_pct',
+        'default_leverage',
+        'max_leverage',
+        'max_exposure_pct',
+        'max_same_direction',
+        'vol_target_atr_pct',
+      ],
+    },
     { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
     { title: '止损熔断', hint: '窗口内多次止损 = 策略与行情脱节，先暂停观察', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
     { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },

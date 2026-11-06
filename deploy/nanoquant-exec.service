@@ -1,0 +1,31 @@
+[Unit]
+Description=NanoQuant exec-service (Rust signing sidecar, sign-only)
+Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant/blob/main/docs/EXEC_PROTOCOL.md
+After=network-online.target
+Wants=network-online.target
+Before=nanoquant.service
+
+[Service]
+Type=simple
+User=nanoquant
+Group=nanoquant
+# /run/nanoquant 由 systemd 创建，属主随 User=
+RuntimeDirectory=nanoquant
+RuntimeDirectoryMode=0750
+Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
+# EXEC_SECRET=...；文件不存在也能起（二进制会明确报错），避免 unit 直接失败
+EnvironmentFile=-/etc/nanoquant/exec.env
+ExecStart=/opt/nanoquant/exec-service
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/nanoquant
+# 0077 → socket 文件 0600，只有同用户进程能连
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

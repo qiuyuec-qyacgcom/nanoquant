@@ -778,6 +778,21 @@
     遗留挂单 / 每个标的的最小名义额与所需保证金；致命项直接非零退出。
 - **待办（用户侧）**：按手册执行 A/B/C 并回填记录表；把 `partial_tp_at_r` 等临时参数改回默认。
 
+### 60. 组合风险控制 + 生产部署脚本（本次执行）
+- **状态**：✅ 已完成
+- **背景**：之前只有单笔/总量敞口上限，两个仓位可同时做多高相关币；仓位也不随波动率调整。
+- **过程要点**：
+  - `RiskSettings` 新增两个字段（默认都关闭，保持旧行为）：
+    - `max_same_direction`（默认 0=不限制，建议小资金设 1）：同方向持仓上限，币种高度相关时同向多仓等于变相加杠杆；
+    - `vol_target_atr_pct`（默认 0=关闭）：波动率目标，ATR% 高于目标自动缩仓、低于放大（限制 0.25–2x）。
+  - `risk.py` 抽出纯函数 `side_cap_reason()` / `vol_risk_scale()`；`symbol_gates(..., side=)` 接入同向检查，
+    `estimate_qty(..., risk_scale=)` / `plan_position` 透传缩放，worker 用 `features.atr_pct` 计算。
+  - 参数页「仓位与杠杆」补两项并加提示。
+  - 部署：新增 `deploy/nanoquant.service`、`deploy/nanoquant-exec.service`（sidecar UDS，`RuntimeDirectory` +
+    `UMask=0077` 保证 socket 0600）、`deploy/README.md`；`scripts/start.ps1` 改为探测解释器
+    （`-Python` / `NANOQUANT_VENV` / 仓库 `.venv` / 上级 `.venvtest`），新增 `scripts/stop.ps1`。
+- **验证**：新增 3 条用例（同向计数、缩放钳位、仓位按 scale 减半）；**48 passed**；运行服务返回两个新字段默认值。
+
 ---
 
 ## 二、未开始

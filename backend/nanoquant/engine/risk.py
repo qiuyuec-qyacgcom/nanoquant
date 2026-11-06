@@ -96,6 +96,29 @@ def open_positions(mode: str | None = None) -> list[PositionRecord]:
         )
 
 
+def side_cap_reason(positions: list[PositionRecord], side: str, limit: int) -> str:
+    """同向集中控制: 所有币同涨同跌, 同向多仓本质是加杠杆.
+
+    limit<=0 表示不限制 (默认, 保持旧行为); 建议小资金设为 1.
+    """
+    if limit <= 0 or not side:
+        return ""
+    same = sum(1 for p in positions if (getattr(p, "side", "") or "") == side)
+    if same >= limit:
+        return f"同方向持仓已达上限 {limit} 个 ({side}), 避免相关性叠加"
+    return ""
+
+
+def vol_risk_scale(target_atr_pct: float, atr_pct: float, *, low: float = 0.25, high: float = 2.0) -> float:
+    """波动率目标仓位缩放: ATR% 高则缩小风险预算, 低则放大 (限制在 [low, high]).
+
+    target<=0 或 atr 无效时返回 1.0, 即关闭该功能.
+    """
+    if target_atr_pct <= 0 or atr_pct <= 0:
+        return 1.0
+    return max(low, min(high, target_atr_pct / atr_pct))
+
+
 def total_notional(prices: dict[str, float]) -> float:
     total = 0.0
     for p in open_positions():
@@ -143,12 +166,16 @@ def symbol_gates(
     cfg_risk: RiskSettings,
     *,
     prices: dict[str, float],
+    side: str = "",
 ) -> GateDecision:
     positions = open_positions()
     if any(p.symbol == symbol for p in positions):
         return GateDecision(False, "该标的已有持仓")
     if len(positions) >= cfg_engine.max_positions:
         return GateDecision(False, f"持仓数已达上限 {cfg_engine.max_positions}")
+    cap = side_cap_reason(positions, side, cfg_risk.max_same_direction)
+    if cap:
+        return GateDecision(False, cap)
     cooldowns = state.active_cooldowns(int(time.time()))
     cd = cooldowns.get(symbol)
     if cd:
@@ -176,14 +203,18 @@ def plan_position(
     cfg_risk: RiskSettings,
     sl_pct: float,
     leverage: int,
+    risk_scale: float = 1.0,
 ) -> tuple[float, dict[str, Any]]:
-    qty, note = estimate_qty(account.equity, price, leverage, cfg_risk, sl_pct / 100.0, filters)
+    qty, note = estimate_qty(
+        account.equity, price, leverage, cfg_risk, sl_pct / 100.0, filters, risk_scale=risk_scale
+    )
     notional = qty * price
     info = {
         "qty": qty,
         "notional": round(notional, 6),
         "margin": round(notional / max(1, leverage), 6),
         "leverage": leverage,
+        "risk_scale": round(risk_scale, 3),
         "note": note,
         "effective_min_notional": filters.effective_min_notional(price),
         "min_qty": filters.effective_min_qty(price),
