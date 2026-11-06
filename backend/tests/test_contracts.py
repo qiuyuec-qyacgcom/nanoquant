@@ -171,6 +171,23 @@ def test_backtest_needs_enough_bars():
     assert "error" in result.summary
 
 
+# -------------------------------------------------------------- 部分平仓数量
+def test_partial_close_qty_rounding_and_min():
+    from nanoquant.engine.strategy import partial_close_qty
+
+    # 正常取整
+    assert partial_close_qty(1.0, 0.5, 0.001, 0.001) == pytest.approx(0.5)
+    # 取整后低于最小下单量 → 放弃
+    assert partial_close_qty(0.015, 0.5, 0.001, 0.01) == 0.0
+    # 取整后为 0 → 放弃
+    assert partial_close_qty(0.001, 0.5, 0.001, 0.001) == 0.0
+    # 无步进时按原值
+    assert partial_close_qty(1.0, 0.3, 0.0, 0.001) == pytest.approx(0.3)
+    # 非法输入
+    assert partial_close_qty(0, 0.5, 0.001, 0.001) == 0.0
+    assert partial_close_qty(1.0, 0, 0.001, 0.001) == 0.0
+
+
 # ---------------------------------------------------------------- 告警静默
 def test_quiet_hours_parsing():
     from nanoquant.services.alerts import _in_quiet_hours

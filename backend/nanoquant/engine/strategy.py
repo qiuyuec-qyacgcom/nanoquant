@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +158,24 @@ def partial_tp_r(side: str, entry_price: float, initial_sl: float, mark_price: f
         return 0.0
     direction = 1 if side == "long" else -1
     return (mark_price - entry_price) * direction / risk
+
+
+def partial_close_qty(qty: float, ratio: float, qty_step: float, min_qty: float) -> float:
+    """部分止盈的实际下单量: 按步进取整, 低于最小量则放弃.
+
+    抽成纯函数是为了可测: 部分平仓最容易出错的地方就是"取整后为 0 / 低于最小下单量",
+    此时必须返回 0 让调用方跳过, 而不是发一笔必然被交易所拒绝的单。
+    """
+    if qty <= 0 or ratio <= 0:
+        return 0.0
+    raw = qty * ratio
+    step = qty_step if qty_step > 0 else 0.0
+    if step:
+        raw = math.floor(raw / step + 1e-12) * step
+    raw = round(raw, 12)
+    if raw <= 0 or raw < min_qty - 1e-12:
+        return 0.0
+    return raw
 
 
 def roi_target(table: list[list[float]], minutes: float) -> float | None:

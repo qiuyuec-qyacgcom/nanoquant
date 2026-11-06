@@ -39,8 +39,7 @@ from ..services.settings import (
 from ..evolution import mantra as mantra_store
 from ..evolution import review as evolution_review
 from . import risk as risk_mod
-from ..exchange.precision import floor_to_step
-from .strategy import build_features, detect_exit, partial_tp_r, score_signal
+from .strategy import build_features, detect_exit, partial_close_qty, partial_tp_r, score_signal
 
 log = get_logger("engine")
 
@@ -314,10 +313,13 @@ class TradingEngine:
                 r_mult = partial_tp_r(side, entry, initial_sl, mark)
                 if r_mult >= cfg.partial_tp_at_r:
                     filters = symbol_service.filters_for(pos.symbol)
-                    part_qty = live_qty * cfg.partial_tp_ratio
-                    if filters is not None:
-                        part_qty = floor_to_step(part_qty, filters.qty_step)
-                    if part_qty > 0 and (filters is None or part_qty >= filters.min_qty - 1e-12):
+                    if filters is None:
+                        part_qty = live_qty * cfg.partial_tp_ratio
+                    else:
+                        part_qty = partial_close_qty(
+                            live_qty, cfg.partial_tp_ratio, filters.qty_step, filters.min_qty
+                        )
+                    if part_qty > 0:
                         result = await broker.close_position(position=pos, reason="partial_tp", qty=part_qty)
                         if result.ok:
                             with session_scope() as s:
