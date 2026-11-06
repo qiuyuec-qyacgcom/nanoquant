@@ -28,7 +28,7 @@ const nav = [
   { group: '运维', items: [
     { path: '/admin/strategy', label: '参数配置', ico: '⚙' },
     { path: '/admin/backup', label: '备份还原', ico: '⛁' },
-    { path: '/admin/dead-letters', label: '写失败', ico: '⛔' },
+    { path: '/admin/dead-letters', label: '落库补偿', ico: '⟳' },
     { path: '/admin/system', label: '系统诊断', ico: '⌁' },
   ]},
 ]

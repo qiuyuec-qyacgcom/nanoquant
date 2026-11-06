@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 写失败（死信）面板: 查看异步写库最终失败的记录, 支持单条/批量重放与忽略.
+ * 落库补偿面板: 查看异步落库最终失败的记录, 支持单条/批量重放与忽略.
  * 重放带幂等检查: 同 client_order_id 已落库时直接标记处理, 不会重复记账.
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -110,7 +110,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
   <div class="stack" style="gap: 12px">
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">写失败（死信）</span>
+        <span class="panel-title">落库补偿</span>
         <div class="right">
           <span class="tag" :class="summary.pending ? 'tag-warn' : 'tag-long'">
             {{ summary.pending ? `待处理 ${summary.pending}` : '全部已处理' }}
@@ -126,11 +126,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
       </div>
       <div class="panel-body">
         <div class="hint" style="margin-bottom: 10px">
-          异步写库最终失败的记录会落在这里。重放前会校验 <code>client_order_id</code>：如果同号订单已落库，
-          直接标记为已处理，不会重复记账。忽略仅做标记，不写库。
+          异步落库最终失败的记录会进入这里，等待补偿。重放前会校验 <code>client_order_id</code>：
+          同号订单已落库则直接结案，不会重复记账；忽略仅标记状态，不写库。
         </div>
         <div v-if="!items.length" class="empty" style="padding: 40px">
-          {{ loading ? '加载中…' : '没有待处理的写失败记录' }}
+          {{ loading ? '加载中…' : '没有待补偿的记录' }}
         </div>
         <table v-else class="table">
           <thead>

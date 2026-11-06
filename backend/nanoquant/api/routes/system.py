@@ -122,24 +122,24 @@ async def diagnostics(user: str = Depends(current_user)) -> dict:
     except Exception as exc:  # noqa: BLE001
         checks.append({"name": "写库队列", "ok": False, "detail": str(exc)[:160], "latency_ms": 0})
 
-    # 3. 死信队列 (异步写库最终失败)
+    # 3. 落库补偿 (异步写库最终失败)
     try:
         with session_scope() as s:
             dead_count = s.query(WriteFailure).filter(WriteFailure.resolved.is_(False)).count()
         checks.append(
             {
-                "name": "死信队列",
+                "name": "落库补偿",
                 "ok": dead_count == 0,
                 "detail": (
-                    "无待处理写入失败"
+                    "无待补偿记录"
                     if dead_count == 0
-                    else f"{dead_count} 条写入失败待处理，可在「写失败」接口查看并重放"
+                    else f"{dead_count} 条待补偿记录，可在「落库补偿」页查看并重放"
                 ),
                 "latency_ms": 0,
             }
         )
     except Exception as exc:  # noqa: BLE001
-        checks.append({"name": "死信队列", "ok": False, "detail": str(exc)[:160], "latency_ms": 0})
+        checks.append({"name": "落库补偿", "ok": False, "detail": str(exc)[:160], "latency_ms": 0})
 
     # 4. 交易所接入 (当前交易环境: 模拟盘=测试网 / 实盘=主网)
     try:

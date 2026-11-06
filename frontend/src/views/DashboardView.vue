@@ -253,7 +253,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <span class="panel-title">超短线执行</span>
         <div class="right">
           <router-link v-if="dlq.pending" to="/admin/dead-letters" class="tag tag-warn">
-            死信 {{ dlq.pending }}{{ dlq.stuck ? ` (卡住 ${dlq.stuck})` : '' }}
+            待补偿 {{ dlq.pending }}{{ dlq.stuck ? ` (滞留 ${dlq.stuck})` : '' }}
           </router-link>
           <span class="tag tag-dim">近 {{ scalp.count }} 笔</span>
           <router-link to="/admin/strategy?group=strategy" class="btn btn-xs">调参</router-link>

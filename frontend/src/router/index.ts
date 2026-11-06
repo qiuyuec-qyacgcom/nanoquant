@@ -31,7 +31,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'strategy', name: 'strategy', component: () => import('../views/StrategyView.vue'), meta: { title: '参数配置' } },
       { path: 'evolution', name: 'evolution', component: () => import('../views/EvolutionView.vue'), meta: { title: '自进化心法' } },
       { path: 'backup', name: 'backup', component: () => import('../views/BackupView.vue'), meta: { title: '备份还原' } },
-      { path: 'dead-letters', name: 'dead-letters', component: () => import('../views/DeadLetterView.vue'), meta: { title: '写失败' } },
+      { path: 'dead-letters', name: 'dead-letters', component: () => import('../views/DeadLetterView.vue'), meta: { title: '落库补偿' } },
       { path: 'system', name: 'system', component: () => import('../views/SystemView.vue'), meta: { title: '系统诊断' } },
     ],
   },
