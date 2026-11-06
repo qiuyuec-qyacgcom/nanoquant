@@ -137,6 +137,8 @@ class ExecSidecar:
             raise ExecSidecarError(self.last_error)
         if data.get("algo"):
             self.algo = str(data["algo"])
+        # 最近一次已成功: 清掉历史错误, 否则面板会一直挂着早已恢复的超时
+        self.last_error = ""
         # 在锁内计时, 不含排队等待: 影子比对要的是 sidecar 真实往返, 不是排队时长
         data["elapsed_ms"] = self.last_ms
         return data

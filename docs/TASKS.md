@@ -668,7 +668,7 @@
 - **说明**：Windows 默认定时器粒度约 15.6ms，lag 的 p50 偏高属测量基线，看 max 与 >50ms 计数更有意义。
 
 ### 54. Rust 执行内核 sidecar：协议 + 影子签名（本次执行）
-- **状态**：✅ 骨架完成（**未在本机编译**：无 Rust 工具链、无 MSVC/MinGW 链接器、磁盘剩余 0.7GB；需在 VPS 构建）
+- **状态**：✅ 骨架完成（当时未编译；已于 #56 在 Windows 上编译通过）
 - **决策依据**：用户确认将迁移到交易所同区域 VPS → RTT 从 250ms 降到 ~5–40ms，应用侧 10–40ms 抖动将占主导，Rust 收益从 1–3% 提升到 12–40%，值得做。
 - **交付物**：
   - `rust/exec-service/`：`main.rs`（UDS + 可选 TCP 回环、JSON Lines 分发）、`sign.rs`（HMAC hex / Ed25519 base64，含与 Python 对齐的 3 个向量测试）、`model.rs`。
@@ -686,7 +686,7 @@
 - **下一步**：VPS 上 `cargo test` → 接 `reqwest` 连接池 → 影子模式与 Python 并行比对 → 灰度切流。
 
 ### 55. 影子模式接入真实签名链路（本次执行）
-- **状态**：✅ 已完成（Python 侧 P2 闭环；Rust 侧仍待 VPS 编译）
+- **状态**：✅ 已完成（Python 侧 P2 闭环；Rust 侧编译验证见 #56）
 - **背景**：此前只有 `scripts/verify_sidecar.py` 的离线比对——真实下单链路上算出来的签名，从来没有和 sidecar 对过。
 - **过程要点**：
   - `exchange/exec_client.py` 改为**长连接复用** + 串行锁；任何超时/断流都丢弃连接（避免读到上一条的迟到响应）；新增 `requests/errors/timeouts/connects` 计数与**锁内**往返计时。
@@ -709,15 +709,44 @@
   - `rust/exec-service/src/sign.rs::normalize_pem` 旧状态机进入 `BEGIN` 后永远退不出（PEM 被清空 → 静默回落 HMAC → 签名必错），改为按 `-----...-----` 标记片段删除。**尚未在本机编译验证**（无 Rust 工具链）。
 - **切流判据**：`counts.mismatched == 0` 且自检 88 字符 base64 一致，才允许把 `exec_mode` 调到 `enforce`。
 
+### 56. Rust sidecar 实机编译与真实二进制验证（本次执行）
+- **状态**：✅ 已完成（Windows 回环 TCP；Linux UDS 与 systemd 仍需 VPS）
+- **背景**：#54/#55 只有源码与 Python mock，`cargo test` 从未跑过，等于"纸面 P2"。
+- **工具链**（装在 F 盘，不动 C 盘）：`rustup` 1.99.1（`x86_64-pc-windows-gnu`）+ MinGW-w64 gcc 16.2.0（winlibs）。
+- **首次编译暴露 3 个真实缺陷（全部修复）**：
+  1. `use tokio::net::UnixListener` 无条件导入 → Windows 直接 `E0432`；改为 `#[cfg(unix)]`，并把 TCP 监听提到入口（Windows 只给 `EXEC_TCP` 时不再 panic，缺少时返回明确错误）。
+  2. `stream.split()` 找不到方法（`E0599`，`AsyncReadExt` 在当前 tokio 下不提供）；改用 free function `tokio::io::split()`。
+  3. `handle` 的 future 缺 `Send` 约束，`tokio::spawn` 会拒绝；补 `S: Send`。
+- **验证结果**（release 构建，0.91MB，常驻 RSS 4MB）：
+  | 场景 | 结果 |
+  |---|---|
+  | `cargo test` | **3 passed**（Ed25519 向量 / HMAC 向量 / 单行 PEM 归一化） |
+  | 协议 + 签名比对（临时密钥） | Ed25519 88 字符、HMAC 64 字符均与 Python 逐字节一致；空 query 被拒 |
+  | 真实凭证 shadow | `matched` 13–16 / `mismatched` 0，p50 **0.50ms** / p99 **1.18ms** |
+  | 面板自检 | `ok=true`，两侧 88 字符，`compare_ms=0.12` |
+  | **错误密钥**（shadow） | `mismatched=4`，verdict「签名不一致：禁止切流」，引擎不受影响 |
+  | 杀掉 sidecar | `errors=2`、静默期剩余 2918ms、max 514ms（= 1 次 500ms 超时），引擎照常运行 |
+  | 重启 sidecar | 自动重连，`matched` 10→14 |
+  | enforce 稳态 | `matched=10 / mismatched=0`，p50 **0.176ms** / p99 **0.399ms**，下单链路正常 |
+  | 回归 | 契约测试 **30 passed**、`compileall` 通过 |
+- **顺带修掉**：
+  - sidecar 请求成功后清空 `last_error`，否则面板会一直挂着早已恢复的「响应超时」。
+  - `scripts/verify_sidecar.py` 自起 mock 模式会卡死：客户端 #55 起改为长连接，脚本却先 `server.wait_closed()`，
+    处理协程还没退出 → 永远等下去。改为先 `client.close()` 再限时关闭 server，并支持 `--secret`/`EXEC_SECRET`
+    对真实 sidecar 逐字节比对（之前外部 target 只校验协议）。
+- **换密钥流程（实测有效）**：换 Secret 必须先 `POST /system/exec-sidecar/reset`——切换窗口内的在途请求会被判为不一致（本次故意用错密钥验证过），清零后立刻恢复 `mismatched=0`。
+- **未覆盖**：UDS（Windows 无此能力）、systemd 守护、`enforce` 24h 灰度。
+
 ---
 
 ## 二、未开始
 
-### 1. Rust sidecar 实机编译与 P3 接管（需 VPS）
-- **状态**：⬜ 未开始（P2 协议、影子比对与观测已完成，见 #54 / #55）
+### 1. VPS 上的 UDS 部署与 P3 接管
+- **状态**：⬜ 未开始（二进制已在 Windows 编译验证，见 #56）
 - **待办**：
-  - VPS：`cargo test`（3 个签名向量 + 单行 PEM 用例）→ `cargo build --release`。
-  - 对真实 sidecar 跑 `python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock`。
+  - VPS：`cargo test` + `cargo build --release`（Linux 产物）。
+  - 起进程：`EXEC_SOCKET=/run/nanoquant/exec.sock EXEC_SECRET=... ./exec-service`，目录属主与 `0600` 权限。
+  - `EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock`（已支持 `--secret`/`EXEC_SECRET` 比对签名）。
   - 面板「自检」通过后切 `enforce` 灰度 24h（`mismatched` 必须恒为 0）。
   - P3：`reqwest` 连接池 + 订单状态机（Planned → Sent → Acked → Filled）+ 保护单并行 + 单写线程落库。
 

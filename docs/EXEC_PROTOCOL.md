@@ -76,7 +76,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 | 阶段 | 内容 | 退出标准 |
 |---|---|---|
-| P2 | 协议 + 签名（影子） | ✅ 已完成：真实 Ed25519 签名逐字节一致（88 字符 base64），sidecar 崩溃不影响主流程 |
+| P2 | 协议 + 签名（影子） | ✅ 已完成：Rust 二进制已编译（`cargo test` 3 passed），真实 Ed25519 签名逐字节一致（88 字符 base64），`shadow` p99 1.18ms / `enforce` p99 0.40ms，sidecar 崩溃 3s 内降级且不影响主流程 |
 | P3（下一步） | 接管 `place_order` / 保护单，单写线程落库 | demo 全量跑 24h 无差异 |
 | P4 | 多标的并发 + 连接预热 | p99 达标、无重复单 |
 

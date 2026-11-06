@@ -3,10 +3,13 @@
 //! 阶段目标：**只签名、不发单**。Python 侧把同一批 intent 同时送给 Rust，
 //! 逐字节比对 `query` 与 `signature`，一致后再进入真实下单。
 //!
-//! 运行：
+//! 运行（Linux / macOS，UDS）：
 //!     EXEC_SECRET="<base64 PKCS#8 或 HMAC secret>" \
 //!     EXEC_SOCKET=/run/nanoquant/exec.sock \
 //!     ./exec-service
+//!
+//! 运行（Windows 开发机 / 容器联调，回环 TCP；也可与 UDS 并存）：
+//!     EXEC_SECRET=... EXEC_TCP=127.0.0.1:9101 ./exec-service
 //!
 //! 协议见 docs/EXEC_PROTOCOL.md。
 
@@ -14,32 +17,40 @@ mod model;
 mod sign;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use model::{Request, Response};
 use sign::Signer;
 
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Config {
     socket: PathBuf,
     secret: String,
+    tcp: Option<String>,
 }
 
 impl Config {
     fn from_env() -> Self {
         Self {
-            socket: std::env::var("EXEC_SOCKET").unwrap_or_else(|_| "/tmp/nanoquant-exec.sock".into()).into(),
+            socket: std::env::var("EXEC_SOCKET")
+                .unwrap_or_else(|_| "/tmp/nanoquant-exec.sock".into())
+                .into(),
             secret: std::env::var("EXEC_SECRET").expect("EXEC_SECRET 未设置"),
+            tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
         }
     }
 }
 
-async fn handle<S>(stream: S, signer: std::sync::Arc<Signer>)
+async fn handle<S>(stream: S, signer: Arc<Signer>)
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let (read_half, mut write_half) = stream.split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -85,53 +96,73 @@ fn dispatch(req: Request, signer: &Signer) -> Response {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cfg = Config::from_env();
-    let signer = std::sync::Arc::new(Signer::detect(&cfg.secret));
+    let signer = Arc::new(Signer::detect(&cfg.secret));
 
-    if cfg.socket.exists() {
-        let _ = std::fs::remove_file(&cfg.socket);
-    }
-    if let Some(dir) = cfg.socket.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-
-    let listener = UnixListener::bind(&cfg.socket)?;
-    eprintln!("exec-service listening on {:?} (algo={})", cfg.socket, signer.algo());
-
-    // Windows 开发机没有 asyncio 的 unix socket, 用回环 TCP 验证同一套协议
-    if let Ok(addr) = std::env::var("EXEC_TCP") {
+    // 回环 TCP：Windows 无 UDS，容器/联调也用这条；与 UDS 可并存
+    if let Some(addr) = cfg.tcp.as_deref() {
+        let listener = TcpListener::bind(addr).await?;
+        eprintln!("exec-service tcp listening on {addr} (algo={})", signer.algo());
         let signer_tcp = signer.clone();
         tokio::spawn(async move {
-            match TcpListener::bind(&addr).await {
-                Ok(tcp) => {
-                    eprintln!("exec-service also listening on tcp {addr}");
-                    loop {
-                        if let Ok((stream, _)) = tcp.accept().await {
-                            let s = signer_tcp.clone();
-                            tokio::spawn(async move { handle(stream, s).await });
-                        }
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let s = signer_tcp.clone();
+                        tokio::spawn(async move { handle(stream, s).await });
                     }
+                    Err(exc) => eprintln!("tcp accept failed: {exc}"),
                 }
-                Err(exc) => eprintln!("tcp bind {addr} failed: {exc}"),
             }
         });
     }
 
-    tokio::spawn({
-        let socket = cfg.socket.clone();
-        async move {
-            let _ = tokio::signal::ctrl_c().await;
-            let _ = std::fs::remove_file(socket);
-            std::process::exit(0);
+    #[cfg(unix)]
+    {
+        if cfg.socket.exists() {
+            let _ = std::fs::remove_file(&cfg.socket);
         }
-    });
+        if let Some(dir) = cfg.socket.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let signer = signer.clone();
-                tokio::spawn(async move { handle(stream, signer).await });
+        let listener = UnixListener::bind(&cfg.socket)?;
+        eprintln!(
+            "exec-service uds listening on {:?} (algo={})",
+            cfg.socket,
+            signer.algo()
+        );
+
+        tokio::spawn({
+            let socket = cfg.socket.clone();
+            async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = std::fs::remove_file(socket);
+                std::process::exit(0);
             }
-            Err(exc) => eprintln!("accept failed: {exc}"),
+        });
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let s = signer.clone();
+                    tokio::spawn(async move { handle(stream, s).await });
+                }
+                Err(exc) => eprintln!("uds accept failed: {exc}"),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if cfg.tcp.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows 无 UDS 支持：请设置 EXEC_TCP=127.0.0.1:9101",
+            ));
+        }
+        // TCP 监听已在后台任务里跑，这里只保持进程存活
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
 }

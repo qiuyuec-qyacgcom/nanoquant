@@ -16,6 +16,9 @@ node_modules/
 frontend/dist/
 node_modules_broken_*/
 
+# Rust
+rust/**/target/
+
 # 系统
 .DS_Store
 Thumbs.db

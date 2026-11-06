@@ -207,8 +207,10 @@ nanoquant/
 配置：参数页「系统 → 执行内核（sidecar）」——`exec_mode` / `exec_socket` / `exec_sample_pct` / `exec_timeout_ms`。
 协议细节与时间线见 [`docs/EXEC_PROTOCOL.md`](docs/EXEC_PROTOCOL.md)，当前进度见 [`docs/TASKS.md`](docs/TASKS.md)。
 
-> P2 已完成：真实测试网 Ed25519 签名逐字节一致（两侧均 88 字符 base64），本地回环比对 p50 0.48ms / p99 1.79ms；
-> P3（接管下单）尚未开始。
+> P2 已完成并**已编译验证**：Rust 二进制（release 0.91MB）在真实测试网 Ed25519 凭证下与 Python 逐字节一致，
+> `shadow` p50 0.50ms / p99 1.18ms，`enforce` p50 0.18ms / p99 0.40ms；错误密钥会被判为不一致、进程被杀 3s 内降级。
+> 尚未覆盖：Linux UDS 部署、systemd 守护、`enforce` 24h 灰度；P3（接管下单）未开始。构建与验证命令见
+> [`rust/README.md`](rust/README.md)。
 
 ---
 

@@ -186,6 +186,7 @@ class ExecShadow:
         echoed = resp.get("query")
         if remote == signature and (echoed is None or echoed == query):
             self.counts["matched"] += 1
+            self.last_error = ""
             return True
 
         self.counts["mismatched"] += 1
