@@ -314,6 +314,51 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# ------------------------------------------------------------ 心法效果对照
+def _trade(pnl: float, *, ai_used=True, ids=None, features=None):
+    feat = {} if features is None else dict(features)
+    if ai_used is not None:
+        feat["ai_used"] = ai_used
+    if ids is not None:
+        feat["injected_mantra_ids"] = ids
+    return {"pnl": pnl, "features": feat}
+
+
+def test_effectiveness_splits_by_injection_snapshot():
+    from nanoquant.evolution.effectiveness import compare_groups
+
+    rows = [
+        _trade(2.0, ids=[1, 2]),
+        _trade(-1.0, ids=[1]),
+        _trade(1.0, ids=[]),
+        _trade(-2.0),  # AI 参与但没注入
+        _trade(5.0, ai_used=False),
+        _trade(1.0, ai_used=None),  # 旧数据: legacy
+        {"pnl": 0.5, "features": None},
+    ]
+    out = compare_groups(rows)
+    assert out["injected"]["trades"] == 2
+    assert out["control"]["trades"] == 2
+    assert out["ai_off"]["trades"] == 1
+    assert out["legacy"]["trades"] == 2
+    assert out["per_mantra"][0]["id"] == 1 and out["per_mantra"][0]["trades"] == 2
+    assert out["delta_win_rate_pct"] == 0.0  # 两组各 50%
+    assert out["sample_ok"] is False
+    assert "随机 A/B" in out["note"]
+
+
+def test_effectiveness_needs_min_sample_and_reports_delta():
+    from nanoquant.evolution.effectiveness import MIN_SAMPLE, compare_groups
+
+    rows = [_trade(1.0, ids=[7]) for _ in range(MIN_SAMPLE)]
+    rows += [_trade(-1.0, ids=[]) for _ in range(MIN_SAMPLE)]
+    out = compare_groups(rows)
+    assert out["sample_ok"] is True
+    assert out["delta_win_rate_pct"] == 100.0
+    assert out["delta_avg_pnl"] == 2.0
+    assert "更高" in out["verdict"]
+
+
 # ------------------------------------------------------ 组合风险与波动率目标
 def test_side_cap_reason_counts_same_direction():
     from nanoquant.engine.risk import side_cap_reason

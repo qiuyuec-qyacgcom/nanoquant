@@ -91,3 +91,15 @@ def stats(user: str = Depends(current_user)) -> dict:
         "mantras": mantra_store.stats(),
         "trades": evolution_review.trade_stats(),
     }
+
+
+@router.get("/evolution/effectiveness")
+def effectiveness(
+    limit: int = Query(default=500, ge=1, le=2000),
+    mode: str = Query(default="", pattern="^(demo|live|)$"),
+    user: str = Depends(current_user),
+) -> dict:
+    """采用心法 vs 未采用的观察性对照（详见 evolution/effectiveness.py 的口径说明）."""
+    from ...evolution.effectiveness import evaluate
+
+    return evaluate(limit=limit, mode=mode)

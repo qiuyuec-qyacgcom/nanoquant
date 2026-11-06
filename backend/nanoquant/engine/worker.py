@@ -580,6 +580,8 @@ class TradingEngine:
         leverage = risk_mod.choose_leverage(sig.symbol, engine_cfg, risk_cfg, filters)
         sl_pct, tp_pct = sig.sl_pct, sig.tp_pct
         ai_meta: dict[str, Any] = {}
+        ai_used = False
+        injected_ids: list[int] = []
 
         from ..ai.client import providers_available
 
@@ -596,6 +598,8 @@ class TradingEngine:
 
         if ai_cfg.enabled and ai_ready:
             ctx = self._build_ai_context(sig, ticker, account, engine_cfg, risk_cfg, filters)
+            injected_ids = [int(x) for x in ctx.get("injected_mantra_ids", [])]
+            ai_used = True
             try:
                 outcome = await asyncio.wait_for(decide(ctx), timeout=ai_cfg.timeout_sec + 15)
             except asyncio.TimeoutError:
@@ -685,15 +689,20 @@ class TradingEngine:
                 "symbol": sig.symbol, "side": direction, "price": res.price, "qty": res.qty,
                 "leverage": leverage, "sl_pct": sl_pct, "tp_pct": tp_pct, "mode": broker.mode,
                 "ai": ai_meta, "plan": info,
+                # 决策时快照: 用于「采用心法 vs 未采用」的观察性对照，复盘时还可回写命中率
+                "ai_used": ai_used, "injected_mantra_ids": injected_ids,
             },
         )
 
     def _build_ai_context(self, sig, ticker, account, engine_cfg, risk_cfg, filters) -> dict[str, Any]:
         ai_cfg = get_ai()
         mantras: list[dict[str, Any]] = []
+        injected_ids: list[int] = []
         if ai_cfg.inject_mantras:
             lessons = mantra_store.rank_lessons()
             mantras = [{"title": m["title"], "rule": m["rule"], "health": m["health"]} for m in lessons]
+            # 只记 id，不把 id 塞进 prompt（快照用于事后「采用/未采用」对照）
+            injected_ids = [int(m["id"]) for m in lessons if m.get("id")]
         news_items = news_service.digest(6) if ai_cfg.inject_news else []
         positions = risk_mod.open_positions()
         today_pnl = 0.0
@@ -732,6 +741,7 @@ class TradingEngine:
             },
             "news": news_items,
             "mantras": mantras,
+            "injected_mantra_ids": injected_ids,
         }
 
     async def _sample_equity(self, account) -> None:

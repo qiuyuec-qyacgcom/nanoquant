@@ -50,6 +50,58 @@ jobs:
       - name: Cargo test
         run: cargo test --release
 
+  e2e:
+    name: e2e (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          cd frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        run: cd frontend && npm run build
+
+      - name: Start backend
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/logs" "$GITHUB_WORKSPACE/data"
+          cd backend
+          export NANOQUANT_HOME="$GITHUB_WORKSPACE"
+          export NANOQUANT_DATA_DIR="$GITHUB_WORKSPACE/data"
+          export NANOQUANT_LOG_DIR="$GITHUB_WORKSPACE/logs"
+          export NANOQUANT_DB="$GITHUB_WORKSPACE/data/e2e.db"
+          export NANOQUANT_FRONTEND="$GITHUB_WORKSPACE/frontend/dist"
+          nohup python -m nanoquant > "$GITHUB_WORKSPACE/logs/stdout.log" 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8899/api/v1/health > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat "$GITHUB_WORKSPACE/logs/stdout.log"; exit 1
+
+      - name: Playwright smoke
+        run: cd frontend && npx playwright test
+
+      - name: Logs on failure
+        if: failure()
+        run: tail -100 "$GITHUB_WORKSPACE/logs/stdout.log"
+
   frontend:
     name: frontend (build)
     runs-on: ubuntu-latest

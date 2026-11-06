@@ -12,6 +12,7 @@ const stats = ref<any>(null)
 const injection = ref<any>(null)
 const runs = ref<any[]>([])
 const trades = ref<Trade[]>([])
+const effect = ref<any>(null)
 const category = ref('')
 const busy = ref(false)
 const showForm = ref(false)
@@ -20,13 +21,15 @@ const reviewResult = ref<any>(null)
 const form = reactive({ title: '', rule: '', category: 'entry', confidence: 0.55 })
 
 const filtered = computed(() => (category.value ? mantras.value.filter((m) => m.category === category.value) : mantras.value))
+const perMantra = computed(() => effect.value?.per_mantra || [])
 
 async function load() {
-  const [m, inj, r, t] = await Promise.allSettled([
+  const [m, inj, r, t, e] = await Promise.allSettled([
     http.get('/evolution/mantras?limit=300'),
     http.get('/evolution/injection'),
     http.get('/evolution/runs?limit=20'),
     http.get('/engine/trades?limit=12'),
+    http.get('/evolution/effectiveness?limit=500'),
   ])
   if (m.status === 'fulfilled') {
     mantras.value = m.value.items
@@ -35,6 +38,7 @@ async function load() {
   if (inj.status === 'fulfilled') injection.value = inj.value
   if (r.status === 'fulfilled') runs.value = r.value.items
   if (t.status === 'fulfilled') trades.value = t.value.items
+  if (e.status === 'fulfilled') effect.value = e.value
 }
 
 function openCreate() {
@@ -146,7 +150,10 @@ onMounted(load)
         <div class="panel-body">
           <pre v-if="injection?.text" class="code">{{ injection.text }}</pre>
           <div v-else class="empty">暂无可注入心法 · 完成交易复盘后会自动沉淀</div>
-          <div class="hint" style="margin-top: 8px">这里是真正进入模型上下文的文本，避免「面板显示 A、实际注入 B」。</div>
+          <div class="hint" style="margin-top: 8px">
+            这里是同批心法的预览；真实决策上下文是 title/rule/health 的 JSON 快照。
+            决策时注入的心法 ID 会随成交落库，供下方效果对照与命中率回写使用。
+          </div>
         </div>
       </div>
 
@@ -173,6 +180,63 @@ onMounted(load)
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">心法效果对照（观察性）</span>
+        <div class="right">
+          <span class="tag" :class="effect?.sample_ok ? 'tag-long' : 'tag-warn'">{{ effect?.verdict || '读取中…' }}</span>
+          <button class="btn btn-xs" @click="load">刷新</button>
+        </div>
+      </div>
+      <div class="panel-body stack" style="gap: 10px">
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="kpi-label">采用组（AI + 心法）</div>
+            <div class="kpi-value">{{ effect?.injected?.trades ?? 0 }} <span class="muted" style="font-size: 12px">笔</span></div>
+            <div class="kpi-foot">胜率 {{ effect?.injected?.win_rate ?? 0 }}% · 均盈亏 {{ (effect?.injected?.avg_pnl ?? 0).toFixed(4) }}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">对照组（AI 无注入）</div>
+            <div class="kpi-value">{{ effect?.control?.trades ?? 0 }} <span class="muted" style="font-size: 12px">笔</span></div>
+            <div class="kpi-foot">胜率 {{ effect?.control?.win_rate ?? 0 }}% · 均盈亏 {{ (effect?.control?.avg_pnl ?? 0).toFixed(4) }}</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">胜率差（采用 − 对照）</div>
+            <div class="kpi-value mono" :class="(effect?.delta_win_rate_pct ?? 0) >= 0 ? 'up' : 'down'">
+              {{ (effect?.delta_win_rate_pct ?? 0) > 0 ? '+' : '' }}{{ effect?.delta_win_rate_pct ?? 0 }}%
+            </div>
+            <div class="kpi-foot">需两组各 ≥ {{ effect?.min_sample ?? 10 }} 笔才给结论</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">单笔均值差</div>
+            <div class="kpi-value mono" :class="(effect?.delta_avg_pnl ?? 0) >= 0 ? 'up' : 'down'">
+              {{ (effect?.delta_avg_pnl ?? 0).toFixed(4) }}
+            </div>
+            <div class="kpi-foot">未走 AI {{ effect?.ai_off?.trades ?? 0 }} 笔 · 旧数据 {{ effect?.legacy?.trades ?? 0 }} 笔</div>
+          </div>
+        </div>
+
+        <div class="muted" style="font-size: 11px; line-height: 1.7">{{ effect?.note || '' }}</div>
+
+        <table v-if="perMantra.length" class="table">
+          <thead>
+            <tr><th>心法 ID</th><th>命中笔数</th><th>胜率</th><th>累计盈亏</th><th>均盈亏</th><th>盈亏比</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in perMantra" :key="row.id">
+              <td class="mono">#{{ row.id }}</td>
+              <td class="mono">{{ row.trades }}</td>
+              <td class="mono">{{ row.win_rate }}%</td>
+              <td class="mono" :class="row.pnl >= 0 ? 'up' : 'down'">{{ row.pnl.toFixed(4) }}</td>
+              <td class="mono">{{ row.avg_pnl.toFixed(4) }}</td>
+              <td class="mono muted">{{ row.profit_factor }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty" style="padding: 18px">还没有带注入快照的成交；新成交完成后这里会按心法逐条统计。</div>
       </div>
     </div>
 

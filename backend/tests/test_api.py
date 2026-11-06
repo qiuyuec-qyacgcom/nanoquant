@@ -173,6 +173,16 @@ def test_backtest_rejects_bad_cost_params(client):
     assert res.status_code == 422
 
 
+def test_evolution_effectiveness_shape(client):
+    headers = _token(client)
+    res = client.get(f"{API}/evolution/effectiveness?limit=50", headers=headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert {"injected", "control", "ai_off", "legacy", "delta_win_rate_pct", "sample_ok", "verdict"} <= set(body)
+    assert body["window"]["limit"] == 50
+    assert body["injected"]["trades"] == 0  # 临时库无成交
+
+
 def test_metrics_is_public_text_without_secrets(client):
     res = client.get(f"{API}/metrics")
     assert res.status_code == 200

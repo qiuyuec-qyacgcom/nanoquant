@@ -31,7 +31,7 @@
 | 💸 **1 USDT 起跑** | 按交易所步进计算真实最小名义额，取整不足即明确拒绝，而不是发出必然失败的订单 |
 | 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限截断；杠杆只能逐层封顶，不会越权 |
 | 🤖 **AI 辅助开平仓** | OpenAI 兼容协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽** |
-| 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；心法按健康度排序回注后续决策，可被优化替代 |
+| 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；按健康度回注后续决策，并用「采用 vs 未采用」的成交对照量化效果（观察性，非随机 A/B） |
 | 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽 |
 | 📰 **资讯与情绪** | 10 个源（含币安广场 / 公告），情绪指数与币种共现，可选注入 AI 上下文，源体检逐项给状态码 |
 | 🌐 **前台 / 后台双端** | 前台公开站点（首页 / 观点 / 关于，响应式）+ 后台管理终端（需登录） |
@@ -64,7 +64,7 @@
 | 后台 | `/admin/news` | 资讯情绪 + 源检测 |
 | 后台 | `/admin/ai` | 模型接入、诊断、决策演练 |
 | 后台 | `/admin/strategy` | 交易环境（模拟盘 / 实盘）+ 引擎/风控/策略/数据源/执行内核等分区参数 |
-| 后台 | `/admin/evolution` | 心法库、注入预览、复盘记录 |
+| 后台 | `/admin/evolution` | 心法库、注入预览、复盘记录、心法效果对照 |
 | 后台 | `/admin/backup` | 备份 / 还原 / 下载 |
 | 后台 | `/admin/dead-letters` | 落库死信：查看失败载荷、重放、忽略 |
 | 后台 | `/admin/system` | 系统诊断、执行内核状态、告警记录、归档、运行事件与日志 |
@@ -248,7 +248,7 @@ nanoquant/
 | 交易 | `GET /engine/status`、`POST /engine/control`、`POST /engine/cycle-now`、`GET /engine/admission`、`/engine/positions`、`POST /engine/positions/{id}/close`、`/engine/orders`、`/engine/protection`、`/engine/execution`、`/engine/quotes`、`/engine/signals`、`/engine/trades`、`/engine/equity`、`/engine/stats`、`GET /chart/klines` |
 | 回测 | `POST /backtest/run`、`POST /backtest/grid` |
 | AI | `GET/POST /ai/providers`、`PATCH/DELETE /ai/providers/{id}`、`POST /ai/providers/fetch-models`、`POST /ai/providers/{id}/test`、`GET /ai/providers/{id}/diagnose`、`GET /ai/providers/{id}/models`、`POST /ai/analyze`、`POST /ai/decision-preview`、`GET /ai/logs`、`GET /ai/usage` |
-| 自进化 | `GET/POST /evolution/mantras`、`PATCH/DELETE /evolution/mantras/{id}`、`GET /evolution/injection`、`GET /evolution/runs`、`POST /evolution/review/{trade_id}`、`POST /evolution/global-review`、`GET /evolution/stats` |
+| 自进化 | `GET/POST /evolution/mantras`、`PATCH/DELETE /evolution/mantras/{id}`、`GET /evolution/injection`、`GET /evolution/runs`、`POST /evolution/review/{trade_id}`、`POST /evolution/global-review`、`GET /evolution/stats`、`GET /evolution/effectiveness` |
 | 资讯 | `GET /news`、`POST /news/refresh`、`GET /news/overview`、`GET /news/diagnostics`、`POST /news/ai-summary` |
 | 备份 | `GET /backup/options`、`POST /backup/create`、`GET /backup/jobs`、`POST /backup/{id}/restore`、`DELETE /backup/{id}`、`GET /backup/{id}/download` |
 | 配置 | `GET /settings`、`GET/PUT /settings/{group}`、`POST /settings/{group}/reset`、`GET/POST/DELETE /settings/credentials/exchange` |
@@ -266,7 +266,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 39 + 路由 12（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 41 + 路由 13（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -276,7 +276,7 @@ python tests/news_probe.py        # 资讯源体检
 
 契约测试覆盖：部分止盈 R 计算、阶梯止盈档位、出场优先级、配置校验、分位耗时、回测与参数网格、
 资金费结算与多付空收、部分止盈记账与保本止损、点差成本、walk-forward 结构、
-单行 PEM 归一化、Ed25519/HMAC 签名、告警静默、写库重试分类、sidecar 协议与影子判定。
+单行 PEM 归一化、Ed25519/HMAC 签名、告警静默、写库重试分类、sidecar 协议与影子判定、心法效果分组统计。
 路由测试覆盖鉴权、配置校验与只读观测接口，运行在临时目录（`tests/conftest.py` 强制隔离）。
 
 签名链路与性能工具（需在仓库根目录执行）：
@@ -293,8 +293,17 @@ python scripts/verify_partial_tp.py                                     # 部分
 python scripts/mainnet_preflight.py --yes                               # 主网演练前只读预检
 ```
 
+前端 e2e 冒烟（需先启动服务；Windows 用系统 Edge 免下载浏览器）：
+
+```powershell
+cd frontend
+$env:E2E_CHANNEL = 'msedge'
+npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash 模式
+```
+
 > CI：`.github/workflows/ci.yml` 在 push / PR 时跑 `compileall + pytest tests`（后端）、
-> `npm ci + typecheck + build`（前端）与 `cargo test --release`（Rust sidecar）。
+> `npm ci + typecheck + build`（前端）、`cargo test --release`（Rust）与
+> 临时库起服务的 Playwright 冒烟（chromium）。
 > 依赖版本由 `backend/requirements.txt` 锁定，源头是同目录的 `requirements.in`。
 
 ---
@@ -322,7 +331,8 @@ python scripts/mainnet_preflight.py --yes                               # 主网
 - [x] WebSocket K 线推送（服务端复用币安流，不占 REST 权重）
 - [x] 执行内核 P2：UDS 协议 + 影子签名比对 + `enforce` 闸门 + 面板自检（已编译验证）
 - [x] 写库单队列 + 死信补偿 + 事件循环抖动探针
-- [x] 路由层测试 + 依赖锁定 + CI 覆盖 Rust
+- [x] 路由层测试 + 依赖锁定 + CI 覆盖 Rust / 前端 e2e
+- [x] 心法注入快照与「采用 vs 未采用」效果对照（观察性统计）
 
 下一步：
 

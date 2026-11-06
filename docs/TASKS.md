@@ -807,6 +807,25 @@
     → `/api/v1/health` 200，证明 F 盘共享 venv 下的一键启动已恢复。
 - **验证**：新增 3 条用例（指标文本与脱敏、开关 404、限频 429 + 豁免）；**51 passed**。
 
+### 62. 心法效果量化评估 + 前端 e2e 冒烟（本次执行）
+- **状态**：✅ 已完成（CI 的 e2e job 待首次 runner 运行验证）
+- **背景**：心法注入只进 prompt 文本（且不带 id），成交表里没有任何"决策时用了哪些心法"的快照，
+  因此**无法分组比较**；`Mantra.hits/wins/losses` 有字段、`touch()` 有实现，但全仓无调用点。
+- **过程要点**：
+  - `worker._build_ai_context` 记录注入心法 id；`broker.open_position` 的 `features` 增加
+    `ai_used` 与 `injected_mantra_ids`（平仓时随 `features` 自动复制到 `TradeRecord`）。
+  - `review_trade()` 首次复盘时调 `mantra.touch(ids, won)` 回写命中/胜负，前端已有的「命中/胜负」列从此有数据。
+  - 新增 `evolution/effectiveness.py` + `GET /evolution/effectiveness`：按「是否走 AI × 是否注入」分为
+    injected / control / ai_off / legacy 四组，输出胜率、累计与单笔盈亏、盈亏因子、两组差值、
+    样本门槛（各 ≥10 笔）与逐心法排名；明确标注**这是观察性对照，不是随机 A/B**。
+  - `EvolutionView.vue` 新增「心法效果对照」面板（4 张 KPI + 逐心法表 + 口径说明）；
+    顺带修正注入预览里「这里是真正进入模型上下文的文本」的错误文案（实际是 title/rule/health 的 JSON 快照）。
+  - 前端 e2e：新增 `@playwright/test`、`playwright.config.ts`、`e2e/smoke.spec.ts`（3 条：
+    公开首页 / 登录进总览 / 4 个后台关键面板），`npm run e2e`；CI 新增 `e2e` job（临时库起后端 + chromium）。
+    路由是 **hash 模式**，首版 e2e 用 `/login` 全部找不到输入框，已按 `/#/login` 修正。
+- **验证**：新增 3 条纯函数用例 + 1 条 API 用例 → **54 passed**；
+  本机用系统 Edge 实测 `npm run e2e` → **3 passed (5.7s)**。
+
 ---
 
 ## 二、未开始

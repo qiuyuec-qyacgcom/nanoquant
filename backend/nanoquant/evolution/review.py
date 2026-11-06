@@ -120,7 +120,15 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
             return {"ok": False, "error": "交易不存在"}
         if t.reviewed and not force:
             return {"ok": True, "skipped": True, "reason": "已复盘"}
+        was_reviewed = bool(t.reviewed)
+        pnl = float(t.pnl or 0.0)
+        injected = list((t.features or {}).get("injected_mantra_ids") or [])
         s.expunge(t)
+
+    # 把成交胜负回写到决策时注入过的心法（hits/wins/losses 之前一直是死字段）
+    if injected and not was_reviewed:
+        ids = [int(x) for x in injected if str(x).lstrip("-").isdigit()]
+        mantra_store.touch(ids, pnl > 0)
 
     ai_cfg = get_ai()
     existing = [{"title": m["title"], "rule": m["rule"]} for m in mantra_store.rank_lessons(6)]
