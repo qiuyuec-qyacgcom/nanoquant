@@ -188,6 +188,39 @@ def test_partial_close_qty_rounding_and_min():
     assert partial_close_qty(1.0, 0, 0.001, 0.001) == 0.0
 
 
+# ---------------------------------------------------------------- 密钥归一化
+def test_normalize_pem_and_public_key_detection():
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    from nanoquant.exchange.client import looks_like_public_key, normalize_pem
+
+    pem = Ed25519PrivateKey.generate().public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+    flat = normalize_pem(pem)
+    assert "\n" not in flat and "-----" not in flat
+    assert flat == base64.b64encode(base64.b64decode(flat)).decode()
+    assert looks_like_public_key(pem) is True
+    assert looks_like_public_key("a" * 64) is False
+
+
+def test_sign_query_accepts_pem_private_key():
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
+
+    from nanoquant.exchange.client import sign_query
+
+    priv = Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
+    query = "x=9&timestamp=1700000000000"
+    priv.public_key().verify(base64.b64decode(sign_query(query, pem)), query.encode())
+
+
 # ---------------------------------------------------------------- 交易所签名
 def test_sign_query_supports_ed25519_and_hmac():
     import base64

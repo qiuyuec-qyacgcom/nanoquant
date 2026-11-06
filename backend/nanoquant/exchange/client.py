@@ -39,6 +39,25 @@ log = get_logger("binance")
 _ED25519_CACHE: dict[str, Any] = {}
 
 
+def normalize_pem(value: str) -> str:
+    """把粘贴进来的 PEM / 带换行的密钥压成单行.
+
+    用户经常直接从 openssl 输出或币安页面复制, 带 `-----BEGIN ...-----` 头尾和换行;
+    请求头里塞原始 PEM 会直接触发 -2014。这里统一去掉头尾与空白。
+    """
+    text = (value or "").strip()
+    if "-----BEGIN" not in text:
+        return "".join(text.split())
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("-----")]
+    return "".join(lines)
+
+
+def looks_like_public_key(value: str) -> bool:
+    """Ed25519 公钥(SPKI)的 base64 以 MCow 开头, 长度约 60."""
+    key = normalize_pem(value)
+    return key.startswith("MCow") and len(key) >= 56
+
+
 def _ed25519_key(secret: str) -> Any | None:
     """尝试把 secret 解析成 Ed25519 私钥; 不是就给 None.
 
@@ -51,7 +70,7 @@ def _ed25519_key(secret: str) -> Any | None:
     if cached is not None:
         return cached
     try:
-        raw = base64.b64decode(secret, validate=True)
+        raw = base64.b64decode(normalize_pem(secret), validate=True)
         key = load_der_private_key(raw, password=None)
     except Exception:  # noqa: BLE001
         return None
@@ -264,6 +283,7 @@ class BinanceClient:
         headers: dict[str, str] = {}
         if signed:
             key, secret = self._credentials(required=True)
+            key = normalize_pem(key)
             payload["timestamp"] = int((time.time() + self._time_offset) * 1000)
             payload["recvWindow"] = int(cfg.request_timeout_sec * 1000) if cfg.request_timeout_sec < 6 else 5000
             query = urlencode(payload, doseq=True)
@@ -320,9 +340,14 @@ class BinanceClient:
                 body = {"code": -1, "msg": r.text[:200]}
             code = int(body.get("code", -1))
             msg = str(body.get("msg", ""))[:300]
-            if code == -2014 and signed and _ed25519_key(self._secret) is not None:
-                # 实测: 测试网对 Ed25519 直接按"格式非法"拒绝, 主网才支持
-                msg = f"{msg}（当前 Key 为 Ed25519 类型，币安测试网不支持，请改用 HMAC 密钥）"
+            if code == -2014 and signed:
+                if looks_like_public_key(self._key):
+                    msg = (
+                        f"{msg}（当前 API Key 是一段公钥；币安要求填的是创建密钥后"
+                        "返回的 API Key，公钥只用于在网页上注册）"
+                    )
+                elif _ed25519_key(self._secret) is not None:
+                    msg = f"{msg}（Ed25519 私钥格式未被接受，请确认粘贴的是完整的 Secret）"
             if code == -1003:
                 # 先尝试换线路 (不同出口 IP 不会被同一条封禁连累), 换不了才本地熔断
                 if _retry and method.upper() == "GET" and self._rotate_base():
