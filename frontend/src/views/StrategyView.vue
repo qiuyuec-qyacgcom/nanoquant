@@ -636,7 +636,7 @@ onMounted(async () => {
                       清空
                     </button>
                     <span class="hint">
-                      {{ env === 'demo' ? '币安测试网密钥（仅支持 HMAC）' : '币安主网密钥（HMAC / Ed25519 均可）' }}
+                      {{ env === 'demo' ? '币安测试网密钥 · HMAC / Ed25519' : '币安主网密钥 · HMAC / Ed25519' }}
                     </span>
                   </div>
                 </div>
@@ -648,6 +648,11 @@ onMounted(async () => {
               <div class="hint">
                 只需要合约交易权限，建议绑定 IP 并关闭提币。模拟盘使用币安测试网（testnet.binancefuture.com），
                 实盘使用主网（fapi.binance.com）。
+              </div>
+              <div class="hint">
+                密钥类型两种都支持：<b>HMAC</b>（Key/Secret 均为币安生成）与 <b>Ed25519</b>。
+                Ed25519 的 API Key 填<b>币安创建密钥后返回的那串 Key</b>（不是公钥），
+                API Secret 填<b>本地私钥</b>（PEM 或 base64 均可，直接粘贴即可）。
               </div>
             </div>
 

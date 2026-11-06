@@ -523,7 +523,7 @@
   - `exchange/client.py` 新增 `sign_query()`：用「能否按 base64 DER 解析出 Ed25519 私钥」判定类型——是则 `base64(ed25519_sign(query))`，否则保持 `hex(hmac_sha256)`；私钥解析结果按 secret 缓存，热路径无额外开销。
   - `-2014` 且识别为 Ed25519 时，错误信息追加「当前 Key 为 Ed25519 类型，币安测试网不支持，请改用 HMAC 密钥」。
   - 修复诊断项「交易所接入」的 `'BinanceClient' object has no attribute 'client'`（`binance_client.client.ping()` → `binance_client.ping()`），该项从长期误报恢复为真实结果。
-  - 参数页密钥区补充提示：测试网仅支持 HMAC、主网两者皆可。
+  - 参数页密钥区补充提示：两种密钥类型都支持，并说明 Ed25519 的 Key/Secret 分别该填什么。
 - **实测判据**（同一台机器、同一时间窗）：
   | 密钥类型 | 是否注册 | 测试网返回 |
   |---|---|---|
