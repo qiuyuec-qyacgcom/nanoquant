@@ -418,6 +418,9 @@ class BinanceBroker:
         except NoCredentials as exc:
             return ExecResult(False, message=str(exc))
         except BinanceError as exc:
+            if exc.code == -2019:
+                need = qty * (filters.last_price or 0) / max(1.0, leverage)
+                return ExecResult(False, message=margin_insufficient_hint(need, leverage))
             return ExecResult(False, message=f"下单失败 {exc.code}: {exc.message}")
 
     async def _place_protection(
@@ -632,6 +635,18 @@ def position_from_db(position_id: int) -> PositionRecord | None:
         return s.get(PositionRecord, position_id)
 
 
+#: 交易所按 availableBalance 校验初始保证金；留 10% 给手续费/资金费/保护单划转
+MARGIN_SAFETY = 0.90
+
+
+def margin_insufficient_hint(required_margin: float, leverage: float = 1.0) -> str:
+    """-2019 的可读解释：不要再让用户只看到一句 Margin is insufficient."""
+    return (
+        f"下单失败 -2019: 可用保证金不足（本单约需 {required_margin:.2f} USDT 初始保证金 @ {leverage:g}x）。"
+        "已有仓位/挂单占用了保证金；可先平掉部分仓位，或降低「单仓保证金/单笔风险」、提高杠杆。"
+    )
+
+
 def estimate_qty(
     equity: float,
     price: float,
@@ -640,10 +655,14 @@ def estimate_qty(
     sl_pct: float,
     filters: SymbolFilters,
     risk_scale: float = 1.0,
+    available: float | None = None,
 ) -> tuple[float, str]:
     """风险预算 -> 名义额 -> 数量, 并对齐步进; 返回 (qty, 说明).
 
-    risk_scale 是波动率目标的缩放系数 (1.0=不调整).
+    - `risk_scale`: 波动率目标缩放系数 (1.0=不调整)
+    - `available`: 账户可用余额。交易所按 **availableBalance** 校验初始保证金，
+      而不是按总权益。老实现只用 equity 算，已有仓位占满保证金时会算出买不起的数量，
+      最终被交易所以 -2019 Margin is insufficient 拒绝。
     """
     if equity <= 0 or price <= 0:
         return 0.0, "权益或价格无效"
@@ -651,10 +670,25 @@ def estimate_qty(
     risk_notional = risk_budget / max(sl_pct, 1e-6)
     margin_cap = equity * risk_cfg.margin_pct / 100.0 * leverage
     notional = min(risk_notional, margin_cap)
+
+    affordable = 0.0
+    if available is not None:
+        # 本单初始保证金 = notional / leverage, 必须 <= 可用余额(留安全垫)
+        affordable = max(0.0, float(available)) * MARGIN_SAFETY * leverage
+        notional = min(notional, affordable)
+
     qty = floor_to_step(notional / price, filters.qty_step)
     min_qty = filters.effective_min_qty(price)
     if qty <= 0 or qty < min_qty - 1e-12:
         need = filters.effective_min_notional(price)
+        if available is not None and affordable < need:
+            return (
+                0.0,
+                f"可用保证金不足: 可用 {float(available):.2f} USDT, "
+                f"按 {leverage:g}x 最多可开 {affordable:.2f} USDT 名义额, "
+                f"但该标的最小名义额约 {need:.2f} USDT; "
+                f"请平掉已有仓位、提高杠杆或降低单仓保证金占比",
+            )
         return (
             0.0,
             f"可分配名义额 {notional:.4f} USDT 不足该标的最小可下单量 "

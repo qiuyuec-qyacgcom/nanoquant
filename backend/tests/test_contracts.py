@@ -315,6 +315,51 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# ------------------------------------------------------ 可用保证金与 -2019
+def test_estimate_qty_caps_by_available_margin():
+    """复现 -2019: 按总权益算得起的仓位，可用余额其实付不起初始保证金."""
+    from nanoquant.exchange.broker import MARGIN_SAFETY, estimate_qty
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import RiskSettings
+
+    cfg = RiskSettings(risk_per_trade_pct=10.0, margin_pct=50.0, default_leverage=1)
+    filters = SymbolFilters(symbol="ICNTUSDT", qty_step=1.0, min_qty=1.0, min_notional=5.0)
+    # equity 5000 / leverage 1 → margin_cap = 2500 名义额，需 2500 保证金
+    no_cap, _ = estimate_qty(5000.0, 0.3, 1, cfg, 0.009, filters)
+    assert no_cap == pytest.approx(8333.0, abs=1.0)
+
+    # 可用余额只有 2000 → 名义额被压到 2000*0.9 = 1800
+    capped, note = estimate_qty(5000.0, 0.3, 1, cfg, 0.009, filters, available=2000.0)
+    assert capped == pytest.approx(2000.0 * MARGIN_SAFETY / 0.3, abs=1.0)
+    assert note == "ok"
+
+    # 连最小名义额都付不起 → 明确拒绝，不再把订单丢给交易所吃 -2019
+    qty, note = estimate_qty(5000.0, 0.3, 1, cfg, 0.009, filters, available=1.0)
+    assert qty == 0.0
+    assert "可用保证金不足" in note
+
+
+def test_estimate_qty_high_leverage_still_respects_available():
+    from nanoquant.exchange.broker import estimate_qty
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import RiskSettings
+
+    cfg = RiskSettings(risk_per_trade_pct=10.0, margin_pct=50.0, default_leverage=20)
+    filters = SymbolFilters(symbol="ICNTUSDT", qty_step=0.001, min_qty=0.001, min_notional=5.0)
+    qty, note = estimate_qty(5000.0, 100.0, 20, cfg, 0.01, filters, available=100.0)
+    assert note == "ok"
+    # 所需初始保证金 = qty*price/20 <= 100*0.9
+    assert qty * 100.0 / 20 <= 100.0 * 0.9 + 1e-6
+
+
+def test_margin_insufficient_hint_is_actionable():
+    from nanoquant.exchange.broker import margin_insufficient_hint
+
+    text = margin_insufficient_hint(2493.0, 1)
+    assert "-2019" in text and "2493.00" in text
+    assert "平掉" in text and "杠杆" in text
+
+
 # ------------------------------------------------------------ 持仓浮盈亏
 def _position(**kwargs):
     base = dict(

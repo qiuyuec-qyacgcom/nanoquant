@@ -718,7 +718,9 @@ class TradingEngine:
             features={**sig.features, "ai": ai_meta, "plan": info},
         )
         if not res.ok:
-            self._update_signal_reject(signal_id, f"下单失败: {res.message}"[:200])
+            # broker 的错误文案已带「下单失败 N:」，不要拼成「下单失败: 下单失败 N:」
+            detail = res.message if res.message.startswith("下单失败") else f"下单失败: {res.message}"
+            self._update_signal_reject(signal_id, detail[:200])
             events.record("error", "trade", f"{sig.symbol} 开仓失败: {res.message}"[:250])
             return
         with session_scope() as s:

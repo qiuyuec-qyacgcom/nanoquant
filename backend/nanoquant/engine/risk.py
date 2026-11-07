@@ -206,7 +206,8 @@ def plan_position(
     risk_scale: float = 1.0,
 ) -> tuple[float, dict[str, Any]]:
     qty, note = estimate_qty(
-        account.equity, price, leverage, cfg_risk, sl_pct / 100.0, filters, risk_scale=risk_scale
+        account.equity, price, leverage, cfg_risk, sl_pct / 100.0, filters,
+        risk_scale=risk_scale, available=account.available,
     )
     notional = qty * price
     info = {
@@ -214,6 +215,7 @@ def plan_position(
         "notional": round(notional, 6),
         "margin": round(notional / max(1, leverage), 6),
         "leverage": leverage,
+        "available": round(account.available, 6),
         "risk_scale": round(risk_scale, 3),
         "note": note,
         "effective_min_notional": filters.effective_min_notional(price),

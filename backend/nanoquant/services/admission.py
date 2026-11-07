@@ -198,7 +198,11 @@ async def evaluate() -> dict[str, Any]:
             )
             continue
         leverage = min(risk_cfg.default_leverage, filters.max_leverage, risk_cfg.max_leverage, 100)
-        qty, note = estimate_qty(equity, ticker.last, leverage, risk_cfg, 0.005, filters)
+        qty, note = estimate_qty(
+            equity, ticker.last, leverage, risk_cfg, 0.005, filters,
+            # 账户接口不可用时不要把"可用 0"误判成余额不足
+            available=available if account else None,
+        )
         min_notional = filters.effective_min_notional(ticker.last)
         symbols.append(
             {
