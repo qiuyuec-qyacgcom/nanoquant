@@ -21,6 +21,7 @@ interface SignalRow {
   ai_reason: string
   decision: string
   reject_reason: string
+  repeats: number
 }
 
 const items = ref<SignalRow[]>([])
@@ -107,8 +108,8 @@ onMounted(load)
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-label">扫描信号</div>
-        <div class="kpi-value">{{ summary?.total ?? '--' }}</div>
-        <div class="kpi-foot">全部裁决</div>
+        <div class="kpi-value">{{ summary?.scans ?? summary?.total ?? '--' }}</div>
+        <div class="kpi-foot">合并后 {{ summary?.total ?? 0 }} 行 · 相同 flat 60s 合并</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">已开仓</div>
@@ -167,7 +168,10 @@ onMounted(load)
             </thead>
             <tbody>
               <tr v-for="row in items" :key="row.id">
-                <td class="mono muted">{{ timeStr(row.ts) }}</td>
+                <td class="mono muted">
+                  {{ timeStr(row.ts) }}
+                  <span v-if="(row.repeats ?? 1) > 1" class="tag tag-dim" title="同状态重复扫描已合并">×{{ row.repeats }}</span>
+                </td>
                 <td class="mono">{{ row.symbol }}</td>
                 <td :class="row.direction === 'long' ? 'up' : row.direction === 'short' ? 'down' : 'flat'">
                   {{ DIRECTION_LABELS[row.direction] || row.direction }}

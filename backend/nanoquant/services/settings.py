@@ -29,6 +29,8 @@ class SettingsValidationError(ValueError):
 # 交易环境: demo=币安模拟盘(测试网真实下单) / live=币安实盘
 MODE_DEMO = "demo"
 MODE_LIVE = "live"
+#: 引擎轮询下限: 策略是 5m K 线, 低于 15s 只是徒增 REST 权重与信号行, 没有信息增量
+MIN_CYCLE_INTERVAL_SEC = 15
 _LEGACY_MODES = {"paper": MODE_DEMO, "sim": MODE_DEMO, "demo": MODE_DEMO, "live": MODE_LIVE}
 
 
@@ -40,7 +42,7 @@ def normalize_mode(mode: str | None, default: str = MODE_DEMO) -> str:
 class EngineSettings(BaseModel):
     enabled: bool = False
     mode: Literal["demo", "live"] = MODE_DEMO
-    cycle_interval_sec: int = Field(default=5, ge=1, le=120)
+    cycle_interval_sec: int = Field(default=MIN_CYCLE_INTERVAL_SEC, ge=MIN_CYCLE_INTERVAL_SEC, le=120)
     max_positions: int = Field(default=2, ge=1, le=20)
     max_symbols_per_cycle: int = Field(default=12, ge=1, le=60)
     trading_windows: list[str] = Field(default_factory=lambda: ["00:00-24:00"])
@@ -364,6 +366,12 @@ def _migrate_legacy_group(name: str, data: dict[str, Any]) -> dict[str, Any]:
     if name == "engine":
         if out.get("mode") == "paper":
             out["mode"] = MODE_DEMO
+        # 老库可能存了 1~14s 的轮询间隔: 先钳到下限, 否则整组配置会校验失败并回退全部默认值
+        try:
+            interval = int(out.get("cycle_interval_sec", MIN_CYCLE_INTERVAL_SEC))
+        except (TypeError, ValueError):
+            interval = MIN_CYCLE_INTERVAL_SEC
+        out["cycle_interval_sec"] = max(MIN_CYCLE_INTERVAL_SEC, min(120, interval))
         if "paper_start_balance" in out:
             out.setdefault("demo_start_balance", out.pop("paper_start_balance"))
         out.pop("demo_start_balance", None)
@@ -394,7 +402,20 @@ def _load_raw(name: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             log.warning("配置 %s JSON 损坏, 回退默认值", name)
             return {}
-        return _migrate_legacy_group(name, data) if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        migrated = _migrate_legacy_group(name, data)
+        # 一次性写回被钳制的轮询间隔，避免每次读都做迁移、也避免面板显示旧值
+        if name == "engine" and data.get("cycle_interval_sec") != migrated.get("cycle_interval_sec"):
+            row.value = json.dumps(
+                {**data, "cycle_interval_sec": migrated["cycle_interval_sec"]}, ensure_ascii=False
+            )
+            s.flush()
+            log.info(
+                "引擎轮询间隔 %ss → %ss (下限 %ss)",
+                data.get("cycle_interval_sec"), migrated["cycle_interval_sec"], MIN_CYCLE_INTERVAL_SEC,
+            )
+        return migrated
 
 
 def get_group(name: str, use_cache: bool = True) -> dict[str, Any]:

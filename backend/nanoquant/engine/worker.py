@@ -44,6 +44,8 @@ from .strategy import build_features, detect_exit, partial_close_qty, partial_tp
 log = get_logger("engine")
 
 MAX_TASKS = 2
+#: 同一标的、同一方向/拒绝原因的 flat 信号在这个窗口内合并成一行 (repeats 计数)
+SIGNAL_DEDUP_SEC = 60
 
 
 class TradingEngine:
@@ -51,6 +53,7 @@ class TradingEngine:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._entry_tasks: dict[str, asyncio.Task] = {}
+        self._signal_dedup: dict[tuple, int] = {}
         self._sem = asyncio.Semaphore(MAX_TASKS)
         self._last_equity = 0.0
         self._last_account: dict[str, Any] = {}
@@ -498,26 +501,55 @@ class TradingEngine:
     def _record_signal(self, sig, ticker, source: str) -> dict[str, Any]:
         # 先取环境再开事务: 避免在写事务里再嵌套一次配置读取
         mode = normalize_mode(get_engine().mode)
+        now = int(time.time())
+        features = {**sig.features, "price": ticker.last, "source": source}
+        reason = sig.blocked or ""
+        decision = "pending" if sig.direction != "flat" else "flat"
+        key = (mode, sig.symbol, sig.direction, decision, reason)
+
         with session_scope() as s:
+            # flat 信号每轮都写会把信号表撑到 2 万行/天；同状态的在 60s 内合并为一行,
+            # 用 repeats 保留真实扫描次数，审计页的密度图按 repeats 加权。
+            if sig.direction == "flat":
+                cached_id = self._signal_dedup.get(key)
+                if cached_id:
+                    row = s.get(Signal, cached_id)
+                    first_ts = int((row.features or {}).get("first_ts", row.ts)) if row else 0
+                    if row is not None and now - first_ts < SIGNAL_DEDUP_SEC:
+                        row.repeats = int(row.repeats or 1) + 1
+                        row.ts = now
+                        row.score = sig.score
+                        row.features = {**features, "first_ts": first_ts, "repeat": row.repeats}
+                        s.flush()
+                        return self._signal_view(row, sig, reason)
+
             row = Signal(
-                ts=int(time.time()),
+                ts=now,
                 symbol=sig.symbol,
                 direction=sig.direction,
                 score=sig.score,
-                features={**sig.features, "price": ticker.last, "source": source},
-                decision="pending" if sig.direction != "flat" else "flat",
-                reject_reason=sig.blocked,
+                features={**features, "first_ts": now, "repeat": 1},
+                decision=decision,
+                reject_reason=reason,
                 mode=mode,
+                repeats=1,
             )
             s.add(row)
             s.flush()
-            signal_id = row.id
+            if sig.direction == "flat":
+                self._signal_dedup[key] = row.id
+                if len(self._signal_dedup) > 256:
+                    self._signal_dedup.clear()
+            return self._signal_view(row, sig, reason)
+
+    @staticmethod
+    def _signal_view(row: Signal, sig, reason: str) -> dict[str, Any]:
         return {
-            "signal_id": signal_id,
+            "signal_id": row.id,
             "symbol": sig.symbol,
             "direction": sig.direction,
             "score": sig.score,
-            "blocked": sig.blocked,
+            "blocked": reason,
         }
 
     def _update_signal_reject(self, signal_id: int, reason: str) -> None:

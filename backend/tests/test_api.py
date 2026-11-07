@@ -77,6 +77,15 @@ def test_settings_read_and_validate(client):
     assert unknown.status_code == 404
 
 
+def test_cycle_interval_below_floor_is_rejected(client):
+    headers = _token(client)
+    bad = client.put(f"{API}/settings/engine", headers=headers, json={"patch": {"cycle_interval_sec": 5}})
+    assert bad.status_code == 400
+    ok = client.put(f"{API}/settings/engine", headers=headers, json={"patch": {"cycle_interval_sec": 30}})
+    assert ok.status_code == 200 and ok.json()["data"]["cycle_interval_sec"] == 30
+    client.put(f"{API}/settings/engine", headers=headers, json={"patch": {"cycle_interval_sec": 15}})
+
+
 def test_engine_mode_cannot_be_switched_via_settings(client):
     headers = _token(client)
     res = client.put(f"{API}/settings/engine", headers=headers, json={"patch": {"mode": "live"}})
@@ -171,6 +180,15 @@ def test_backtest_rejects_bad_cost_params(client):
         json={"symbol": "BTCUSDT", "interval": "5m", "limit": 200, "funding_bps_8h": 999},
     )
     assert res.status_code == 422
+
+
+def test_signals_summary_exposes_scans_and_repeats(client):
+    headers = _token(client)
+    res = client.get(f"{API}/engine/signals?limit=5", headers=headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert "scans" in body["summary"]
+    assert all("repeats" in row for row in body["items"])
 
 
 def test_evolution_effectiveness_shape(client):

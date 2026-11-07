@@ -826,6 +826,23 @@
 - **验证**：新增 3 条纯函数用例 + 1 条 API 用例 → **54 passed**；
   本机用系统 Edge 实测 `npm run e2e` → **3 passed (5.7s)**。
 
+### 63. 轮询成本优化：资金费率缓存 / 信号合并 / 15s 下限（本次执行）
+- **状态**：✅ 已完成
+- **背景**：实测 2 标的 × 5s 轮询 ≈ 20 条信号/分钟（约 2.9 万条/天）；`premiumIndex`
+  每轮拉全市场（权重 10）却无缓存，约 120 weight/min 属纯浪费。
+- **过程要点**：
+  - `exchange/client.py`：`funding_rates()` 缓存全市场资金费率 60s、`open_interest()` 逐标的缓存 60s，
+    切换交易环境时随其它缓存一起清空；预计省下 100+ weight/min。
+  - **信号合并**：`Signal` 新增 `repeats` 列（老库自动 ALTER）；同一标的/方向/拒绝原因的 flat 信号
+    在 60s 窗口内合并成一行并累加 `repeats`，非 flat 信号仍每行独立（决策更新需要独立 id）。
+    `/engine/signals` 用 `sum(repeats)` 还原真实扫描次数（`summary.scans`、按小时密度、Top 拒绝原因均按权重），
+    信号审计页显示 `×N` 合并标记。实测 100s 内只写 **4 行、代表 14 次扫描**（旧逻辑约 33 行），写入量降约 88%。
+  - **轮询下限 15s**：`EngineSettings.cycle_interval_sec` 由 `default=5, ge=1` 改为
+    `default=15, ge=15`；`_migrate_legacy_group` 会把老库里的 1–14s 钳到 15 并**一次性写回**，
+    避免整组配置校验失败后被回退成全默认值；参数页提示与输入框 `min=15`。
+- **验证**：新增 5 条用例（下限校验与老库迁移、两类 REST 缓存、flat 合并与非 flat 不合并、
+  API 400 与信号汇总字段）→ **59 passed**；本机 e2e 3 passed。
+
 ---
 
 ## 二、未开始

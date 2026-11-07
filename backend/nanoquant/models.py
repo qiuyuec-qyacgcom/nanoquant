@@ -133,6 +133,8 @@ class Signal(Base):
     reject_reason: Mapped[str] = mapped_column(String(255), default="")
     #: 产生该信号时的交易环境: 模拟盘/实盘的信号不能混在同一条审计流里
     mode: Mapped[str] = mapped_column(String(8), default="demo", index=True)
+    #: 同标的同方向的 flat 信号在 60s 窗口内合并计数，避免每轮扫描都写一行
+    repeats: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class OrderRecord(Base):

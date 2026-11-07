@@ -44,6 +44,11 @@ log = get_logger("binance")
 #: Ed25519 私钥解析结果缓存: base64(secret) -> key 对象
 _KEY_CACHE: dict[str, Any] = {}
 
+#: 资金费率每 8h 才结算、持仓量分钟级变化，引擎 5s 一轮没必要每轮打 REST
+#: (premiumIndex 单次权重 10，是全国表；缓存 60s 可省约 100+ weight/min)
+FUNDING_TTL_SEC = 60.0
+OI_TTL_SEC = 60.0
+
 
 def normalize_pem(value: str) -> str:
     """把粘贴进来的 PEM / 带换行的密钥压成单行.
@@ -175,6 +180,9 @@ class BinanceClient:
         self._klines: dict[tuple[str, str, int], tuple[float, list[Candle]]] = {}
         self._books: dict[str, tuple[float, float]] = {}
         self._books_ts = 0.0
+        self._funding: dict[str, float] = {}
+        self._funding_ts = 0.0
+        self._oi: dict[str, tuple[float, float]] = {}
         self._lock = asyncio.Lock()
 
     # -------------------------------------------------------------- lifecycle
@@ -196,6 +204,9 @@ class BinanceClient:
             self._klines = {}
             self._books = {}
             self._books_ts = 0.0
+            self._funding = {}
+            self._funding_ts = 0.0
+            self._oi = {}
         return env
 
     async def _client(self) -> httpx.AsyncClient:
@@ -536,21 +547,42 @@ class BinanceClient:
         return candles
 
     async def funding_rates(self, symbols: list[str]) -> dict[str, float]:
-        rows = await self._request("GET", "/fapi/v1/premiumIndex", signed=False, weight=10)
+        """全市场 premiumIndex 缓存 60s（8h 才结算，5s 轮询纯属浪费权重）."""
+        self._ensure_env()
+        now = time.time()
+        if not self._funding or now - self._funding_ts >= FUNDING_TTL_SEC:
+            rows = await self._request("GET", "/fapi/v1/premiumIndex", signed=False, weight=10)
+            parsed: dict[str, float] = {}
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict) or "symbol" not in row:
+                    continue
+                try:
+                    parsed[str(row["symbol"])] = float(row.get("lastFundingRate") or 0)
+                except (TypeError, ValueError):
+                    continue
+            if parsed:
+                self._funding = parsed
+                self._funding_ts = now
         wanted = set(symbols)
-        return {
-            str(row["symbol"]): float(row["lastFundingRate"])
-            for row in rows if isinstance(row, dict) and row.get("symbol") in wanted
-        } if isinstance(rows, list) else {}
+        return {s: v for s, v in self._funding.items() if s in wanted}
 
     async def open_interest(self, symbols: list[str]) -> dict[str, float]:
+        """逐标的 60s 缓存，避免每轮为每个标的打一次 REST."""
+        self._ensure_env()
+        now = time.time()
         out: dict[str, float] = {}
         for symbol in symbols[:10]:
+            hit = self._oi.get(symbol)
+            if hit and now - hit[0] < OI_TTL_SEC:
+                out[symbol] = hit[1]
+                continue
             try:
                 row = await self._request(
                     "GET", "/fapi/v1/openInterest", {"symbol": symbol}, signed=False, weight=1
                 )
-                out[symbol] = float(row.get("openInterest", 0))
+                value = float(row.get("openInterest", 0))
+                self._oi[symbol] = (now, value)
+                out[symbol] = value
             except Exception:  # noqa: BLE001
                 continue
         return out

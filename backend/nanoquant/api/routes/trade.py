@@ -389,31 +389,36 @@ def signals(
         if direction:
             base = base.filter(Signal.direction == direction)
 
+        from sqlalchemy import func
+
         summary = {
             "total": base.count(),
             "opened": base.filter(Signal.decision == "opened").count(),
             "rejected": base.filter(Signal.decision == "rejected").count(),
             "flat": base.filter(Signal.decision == "flat").count(),
             "pending": base.filter(Signal.decision == "pending").count(),
+            # flat 信号会合并重复扫描，scans 才是真实扫描次数
+            "scans": int(base.with_entities(func.coalesce(func.sum(Signal.repeats), 0)).scalar() or 0),
         }
         reason_rows = (
             base.filter(Signal.decision == "rejected", Signal.reject_reason != "")
-            .with_entities(Signal.reject_reason)
+            .with_entities(Signal.reject_reason, Signal.repeats)
             .all()
         )
+        weighted: Counter[str] = Counter()
+        for reason, repeats in reason_rows:
+            weighted[reason] += max(1, int(repeats or 1))
         summary["top_reasons"] = [
-            {"reason": reason, "count": count} for reason, count in Counter(r[0] for r in reason_rows).most_common(8)
+            {"reason": reason, "count": count} for reason, count in weighted.most_common(8)
         ]
 
-        # 信号密度按小时分布 (近 7 天): 用来判断信号是变少了还是变多了
-        from sqlalchemy import func
-
+        # 信号密度按小时分布 (近 7 天): 合并行按 repeats 加权，仍是"真实扫描次数"
         since = int(time.time()) - 7 * 86400
         hour_rows = (
             base.filter(Signal.ts >= since)
             .with_entities(
                 func.strftime("%H", func.datetime(Signal.ts, "unixepoch")).label("hour"),
-                func.count(Signal.id),
+                func.coalesce(func.sum(Signal.repeats), 0),
             )
             .group_by("hour")
             .all()
@@ -438,6 +443,7 @@ def signals(
                 "ai_reason": s_.ai_reason,
                 "decision": s_.decision,
                 "reject_reason": s_.reject_reason,
+                "repeats": int(s_.repeats or 1),
             }
             for s_ in rows
         ]

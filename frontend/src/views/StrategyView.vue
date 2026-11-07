@@ -23,6 +23,7 @@ interface FieldMeta {
   unit?: string
   widget?: Widget
   options?: [string, string][]
+  min?: number
 }
 
 interface SectionDef {
@@ -52,7 +53,12 @@ const groups = [
 
 const BASE_META: Record<string, FieldMeta> = {
   enabled: { label: '启用', hint: '关闭后该模块不参与运行' },
-  cycle_interval_sec: { label: '轮询间隔', unit: '秒', hint: '越小越灵敏，但会消耗更多 API 权重' },
+  cycle_interval_sec: {
+    label: '轮询间隔',
+    unit: '秒',
+    hint: '最小 15 秒；策略跑 5m K 线，更快只会增加 REST 权重与信号表写入，不会更灵敏',
+    min: 15,
+  },
   max_symbols_per_cycle: { label: '每轮扫描标的', unit: '个', hint: '按信号分从标的池取前 N 个' },
   max_positions: { label: '最大同时持仓', unit: '个' },
   trading_windows: { label: '交易时段', widget: 'tags', hint: 'HH:MM-HH:MM，可多个；00:00-24:00 表示全天' },
@@ -396,7 +402,7 @@ function widgetOf(value: any, meta: FieldMeta): Widget {
 
 function rowOf(group: string, key: string, value: any): Row {
   const meta = metaOf(group, key)
-  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options }
+  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min }
 }
 
 const currentSections = computed(() => {
@@ -770,7 +776,7 @@ onMounted(async () => {
                   </select>
 
                   <div v-else-if="f.widget === 'number'" class="num-wrap">
-                    <input v-model.number="draft[f.key]" type="number" step="any" class="input mono" />
+                    <input v-model.number="draft[f.key]" type="number" step="any" :min="f.min" class="input mono" />
                     <span v-if="f.unit" class="num-unit">{{ f.unit }}</span>
                   </div>
 

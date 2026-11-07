@@ -9,10 +9,11 @@
 - 回测引擎能跑通且不产生负数仓位;
 - 执行 sidecar 协议/长连接复用与影子比对的判定.
 
-这些用例**不联网、不碰数据库**, 适合放进 CI。
+这些用例**不联网、不碰真实数据库**（涉及库的一律走 conftest 的临时目录）, 适合放进 CI。
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -312,6 +313,101 @@ def test_grid_runs_and_ranks():
     returns = [row["summary"]["total_return_pct"] for row in result["items"]]
     assert returns == sorted(returns, reverse=True)
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
+
+
+# ------------------------------------------------------ 轮询成本与信号去重
+def test_cycle_interval_has_15s_floor_and_migrates_legacy_value():
+    from pydantic import ValidationError
+
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.models import Setting
+    from nanoquant.services.settings import MIN_CYCLE_INTERVAL_SEC, EngineSettings, get_group, invalidate
+
+    assert MIN_CYCLE_INTERVAL_SEC == 15
+    assert EngineSettings().cycle_interval_sec == 15
+    with pytest.raises(ValidationError):
+        EngineSettings(cycle_interval_sec=5)
+
+    init_db()
+    with session_scope() as s:
+        row = s.get(Setting, "engine") or Setting(key="engine", value="{}")
+        raw = {"cycle_interval_sec": 5, "max_positions": 3}
+        row.value = json.dumps(raw)
+        s.add(row)
+    invalidate("engine")
+    assert get_group("engine", use_cache=False)["cycle_interval_sec"] == 15
+    assert get_group("engine", use_cache=False)["max_positions"] == 3  # 不能整组回退默认值
+    with session_scope() as s:
+        assert json.loads(s.get(Setting, "engine").value)["cycle_interval_sec"] == 15
+
+
+def test_funding_and_open_interest_are_cached():
+    import asyncio
+
+    from nanoquant.exchange.client import BinanceClient
+
+    calls: list[str] = []
+
+    async def fake_request(method, path, params=None, **kwargs):  # noqa: ARG001
+        calls.append(path)
+        if path.endswith("premiumIndex"):
+            return [
+                {"symbol": "BTCUSDT", "lastFundingRate": "0.0001"},
+                {"symbol": "ETHUSDT", "lastFundingRate": "0.0002"},
+            ]
+        return {"openInterest": "123.5"}
+
+    c = BinanceClient()
+    c._request = fake_request  # type: ignore[method-assign]
+
+    async def run():
+        for _ in range(3):
+            assert (await c.funding_rates(["BTCUSDT"]))["BTCUSDT"] == pytest.approx(0.0001)
+            assert (await c.open_interest(["BTCUSDT"]))["BTCUSDT"] == pytest.approx(123.5)
+        assert calls.count("/fapi/v1/premiumIndex") == 1
+        assert calls.count("/fapi/v1/openInterest") == 1
+        # TTL 过期后重新拉一次
+        c._funding_ts -= 120
+        c._oi.clear()
+        await c.funding_rates(["BTCUSDT"])
+        await c.open_interest(["BTCUSDT"])
+        assert calls.count("/fapi/v1/premiumIndex") == 2
+        assert calls.count("/fapi/v1/openInterest") == 2
+
+    asyncio.run(run())
+
+
+def test_flat_signals_are_deduped_with_repeat_count():
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.engine.worker import TradingEngine
+    from nanoquant.models import Signal
+
+    init_db()
+    engine = TradingEngine()
+    ticker = SimpleNamespace(last=100.0)
+
+    def sig(direction="flat", blocked="波动率过低"):
+        return SimpleNamespace(
+            symbol="TESTUSDT", direction=direction, score=0.12,
+            features={"atr_pct": 0.5}, blocked=blocked,
+        )
+
+    first = engine._record_signal(sig(), ticker, "scan")["signal_id"]
+    second = engine._record_signal(sig(), ticker, "scan")["signal_id"]
+    assert first == second
+    with session_scope() as s:
+        assert s.get(Signal, first).repeats == 2
+
+    # 拒绝原因变化 → 新行；非 flat 信号永远单独成行，避免影响后续裁决更新
+    other = engine._record_signal(sig(blocked="量比不足"), ticker, "scan")["signal_id"]
+    long1 = engine._record_signal(sig(direction="long", blocked=""), ticker, "scan")["signal_id"]
+    long2 = engine._record_signal(sig(direction="long", blocked=""), ticker, "scan")["signal_id"]
+    assert other != first
+    assert long1 != long2 and long1 not in {first, other}
+
+    with session_scope() as s:
+        for row in s.query(Signal).filter(Signal.symbol == "TESTUSDT").all():
+            s.delete(row)
 
 
 # ------------------------------------------------------------ 心法效果对照
