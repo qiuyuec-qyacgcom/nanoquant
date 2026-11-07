@@ -843,6 +843,26 @@
 - **验证**：新增 5 条用例（下限校验与老库迁移、两类 REST 缓存、flat 合并与非 flat 不合并、
   API 400 与信号汇总字段）→ **59 passed**；本机 e2e 3 passed。
 
+### 64. 修复「当前持仓不显示盈亏」（本次执行）
+- **状态**：✅ 已完成
+- **现象**：持仓行浮盈亏恒为 `0.00000 (0.0%)`，而交易所账户里浮亏已到 -88U。
+- **根因**（实测对照）：交易所 `positionRisk` 的 `markPrice=0.00497112`、`unRealizedProfit=-88.80`，
+  但本地 `mark_price` 被写成 24h ticker 的 `lastPrice=0.0049563`（测试网该值长时间不动）。
+  合约盈亏按 **markPrice** 结算，用最新成交价估算就会得到 0；且 `_manage_positions` 每轮
+  都会把 `_reconcile_live` 刚同步来的权威 markPrice 覆盖掉。
+  另一个暴露的问题：账户接口偶发 `[-1] 服务异常` 时 `status()` 直接把整个账户面板刷成 0。
+- **修复**：
+  - `positions` 新增 `venue_unrealized / venue_ts`（老库自动 ALTER）；`_reconcile_live` 写入交易所
+    权威盈亏与 markPrice；`_manage_positions` 不再用 lastPrice 覆盖，且出场判定也对齐 markPrice。
+  - `position_view.derived()` 优先用 90s 内的交易所快照，超时才回退本地估算，并返回
+    `unrealized_source`；面板显示「估算」标签、口径说明与「每轮同步」提示。
+  - `status()` 账户接口失败时沿用上一轮成功读数并标记 `stale`，KPI 显示「缓存值」而不是 0。
+  - 顺带修掉 `record_external_position()` 里模块级函数误用 `self.mode` 的 NameError（外部仓位根本写不进库），
+    并补齐 `venue_*` 字段；修正空持仓 `colspan`。
+- **验证**：新增 2 条用例（快照优先/超时回退、外部仓位写入）→ **61 passed**；
+  真实服务重启后：账户浮盈亏 -90.36U、持仓行 -89.52U（同一轮同步的快照），浏览器实测
+  持仓行显示 `-91.79427 (-3.7%)`、KPI 显示 `-85.3831`（两者为不同时刻读数，已在列头注明）。
+
 ---
 
 ## 二、未开始

@@ -669,12 +669,26 @@ def estimate_qty(
 
 
 def record_external_position(
-    symbol: str, side: str, qty: float, entry: float, mark: float, leverage: float, mode: str | None = None
+    symbol: str,
+    side: str,
+    qty: float,
+    entry: float,
+    mark: float,
+    leverage: float,
+    mode: str | None = None,
+    unrealized: float = 0.0,
 ) -> None:
+    """记录交易所已有仓位 (外部下单/崩溃恢复).
+
+    以前这里用了 `self.mode`（模块级函数里没有 self，会 NameError），
+    导致恢复出来的仓位根本写不进库。
+    """
+    resolved = normalize_mode(mode)
+    now = int(time.time())
     with session_scope() as s:
         exists = (
             s.query(PositionRecord)
-            .filter(PositionRecord.symbol == symbol, PositionRecord.status == "open")
+            .filter(PositionRecord.symbol == symbol, PositionRecord.mode == resolved, PositionRecord.status == "open")
             .first()
         )
         if exists:
@@ -682,6 +696,8 @@ def record_external_position(
             exists.mark_price = mark
             exists.entry_price = entry or exists.entry_price
             exists.leverage = leverage
+            exists.venue_unrealized = float(unrealized or 0.0)
+            exists.venue_ts = now
             return
         s.add(
             PositionRecord(
@@ -692,9 +708,11 @@ def record_external_position(
                 mark_price=mark,
                 leverage=leverage,
                 margin=qty * entry / max(1.0, leverage),
-                opened_at=int(time.time()),
-                mode=self.mode,
+                opened_at=now,
+                mode=resolved,
                 status="open",
+                venue_unrealized=float(unrealized or 0.0),
+                venue_ts=now,
                 ai_reason="交易所已有仓位(外部/恢复)",
             )
         )

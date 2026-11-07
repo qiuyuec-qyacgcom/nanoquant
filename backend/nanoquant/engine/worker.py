@@ -247,17 +247,24 @@ class TradingEngine:
                 .all()
             )
             local_map = {p.symbol: p for p in local}
+        now = int(time.time())
         for symbol, vp in venue_map.items():
             if symbol not in local_map:
-                record_external_position(symbol, vp.side, vp.qty, vp.entry_price, vp.mark_price, vp.leverage, mode)
+                record_external_position(
+                    symbol, vp.side, vp.qty, vp.entry_price, vp.mark_price, vp.leverage, mode,
+                    unrealized=vp.unrealized,
+                )
                 events.record("warn", "engine", f"发现交易所外部仓位 {symbol} {vp.side} {vp.qty}", {"symbol": symbol})
             else:
                 with session_scope() as s:
                     row = s.get(PositionRecord, local_map[symbol].id)
                     if row:
                         row.qty = vp.qty
-                        row.mark_price = vp.mark_price
+                        # markPrice 而非 24h lastPrice：合约盈亏与保护单都按 markPrice 结算
+                        row.mark_price = vp.mark_price or row.mark_price
                         row.entry_price = row.entry_price or vp.entry_price
+                        row.venue_unrealized = float(vp.unrealized or 0.0)
+                        row.venue_ts = now
         for symbol, lp in local_map.items():
             if symbol not in venue_map:
                 with session_scope() as s:
@@ -299,7 +306,12 @@ class TradingEngine:
                 row = s.get(PositionRecord, pos.id)
                 if row is None or row.status != "open":
                     continue
-                row.mark_price = mark
+                venue_ts = int(row.venue_ts or 0)
+                if venue_ts and now - venue_ts < position_view.VENUE_FRESH_SEC and row.mark_price:
+                    # 交易所刚同步过 markPrice: 出场判定也应对齐它，别用 24h 最新成交价覆盖
+                    mark = float(row.mark_price)
+                else:
+                    row.mark_price = mark
                 if row.side == "long":
                     row.peak_price = max(row.peak_price or row.entry_price, mark)
                 else:
@@ -865,7 +877,17 @@ class TradingEngine:
             account = await broker.account()
             account_d = account.as_dict()
         except Exception as exc:  # noqa: BLE001
-            account_d = {"error": str(exc)[:200], "equity": 0, "wallet": 0, "available": 0, "unrealized": 0, "margin_used": 0}
+            # 交易所临时报错（限频/网络抖动）不能把整个账户面板刷成 0:
+            # 保留上一轮成功读到的权益与浮盈亏，并标记 stale 让前端提示
+            account_d = {
+                **(
+                    dict(self._last_account)
+                    if self._last_account
+                    else {"equity": 0, "wallet": 0, "available": 0, "unrealized": 0, "margin_used": 0}
+                ),
+                "error": str(exc)[:200],
+                "stale": True,
+            }
         with session_scope() as s:
             # 只展示当前交易环境的仓位, 模拟盘与实盘互不串台
             positions = (

@@ -315,6 +315,57 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# ------------------------------------------------------------ 持仓浮盈亏
+def _position(**kwargs):
+    base = dict(
+        symbol="TESTUSDT", side="short", entry_price=100.0, mark_price=100.0,
+        qty=10.0, margin=100.0, leverage=10.0, partial_taken_at=0,
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+def test_derived_prefers_fresh_exchange_unrealized():
+    """lastPrice 冻结但交易所 markPrice 已变: 必须显示交易所的浮盈亏, 不能显示 0."""
+    import time
+
+    from nanoquant.services.position_view import derived
+
+    now = int(time.time())
+    stale_price = _position(mark_price=100.0)  # 24h lastPrice 没动
+    assert derived(stale_price)["unrealized"] == 0.0
+
+    with_venue = _position(mark_price=100.0, venue_unrealized=-88.79837226, venue_ts=now)
+    out = derived(with_venue)
+    assert out["unrealized"] == pytest.approx(-88.79837226)
+    assert out["unrealized_source"] == "exchange"
+    assert out["roi_pct"] == pytest.approx(-88.798, abs=0.01)
+
+    # 超过 90s 的快照不能继续用，回退到按标记价估算
+    old = _position(mark_price=101.0, venue_unrealized=999.0, venue_ts=now - 120)
+    fallback = derived(old)
+    assert fallback["unrealized"] == pytest.approx(-10.0)  # (101-100)*10*(-1)
+    assert fallback["unrealized_source"] == "estimated"
+
+
+def test_record_external_position_writes_mode_and_venue_pnl():
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.exchange.broker import record_external_position
+    from nanoquant.models import PositionRecord
+    from nanoquant.services.position_view import derived
+
+    init_db()
+    with session_scope() as s:
+        s.query(PositionRecord).filter(PositionRecord.symbol == "EXTUSDT").delete()
+    record_external_position("EXTUSDT", "long", 2.0, 100.0, 101.0, 10.0, "demo", unrealized=2.0)
+    with session_scope() as s:
+        row = s.query(PositionRecord).filter(PositionRecord.symbol == "EXTUSDT").one()
+        assert row.mode == "demo" and row.status == "open"
+        assert row.venue_unrealized == 2.0 and row.venue_ts > 0
+        assert derived(row)["unrealized"] == pytest.approx(2.0)
+        s.delete(row)
+
+
 # ------------------------------------------------------ 轮询成本与信号去重
 def test_cycle_interval_has_15s_floor_and_migrates_legacy_value():
     from pydantic import ValidationError

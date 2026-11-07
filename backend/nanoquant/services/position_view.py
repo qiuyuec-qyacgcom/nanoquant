@@ -4,19 +4,32 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 MMR = 0.005  # 维持保证金率近似值, 仅用于估算强平价
+#: 交易所仓位快照的有效期；超时则回退到按本地标记价估算
+VENUE_FRESH_SEC = 90
 
 
 def derived(position: Any) -> dict[str, Any]:
+    """持仓派生字段.
+
+    未实现盈亏优先用交易所 `positionRisk.unRealizedProfit`：
+    合约的盈亏按 **markPrice** 结算，而 24h ticker 的 lastPrice 是最新成交价，
+    两者可能相差 0.3%+（测试网还出现过 lastPrice 长时间不动）。
+    只按 lastPrice 估算会出现「账户浮亏 -88U、持仓行却显示 0」的矛盾。
+    """
     direction = 1 if position.side == "long" else -1
     entry = float(position.entry_price or 0)
     mark = float(position.mark_price or entry)
     qty = float(position.qty or 0)
     margin = float(position.margin or 0)
 
-    unrealized = (mark - entry) * qty * direction
+    computed = (mark - entry) * qty * direction
+    venue_ts = int(getattr(position, "venue_ts", 0) or 0)
+    fresh = venue_ts > 0 and time.time() - venue_ts < VENUE_FRESH_SEC
+    unrealized = float(getattr(position, "venue_unrealized", 0) or 0) if fresh else computed
     notional = qty * mark
     roi = (unrealized / margin * 100) if margin else 0.0
 
@@ -31,6 +44,8 @@ def derived(position: Any) -> dict[str, Any]:
     partial_at = int(getattr(position, "partial_taken_at", 0) or 0)
     return {
         "unrealized": round(unrealized, 8),
+        "unrealized_source": "exchange" if fresh else "estimated",
+        "venue_ts": venue_ts,
         "notional": round(notional, 6),
         "roi_pct": round(roi, 3),
         "liquidation_price": round(liq, 8),

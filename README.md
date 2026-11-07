@@ -266,7 +266,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 44 + 路由 15（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 46 + 路由 15（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -321,6 +321,8 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
   `GET /metrics` 提供 Prometheus 文本（引擎状态、写队列、死信、sidecar 比对计数），不含任何账户或密钥数据。
 - **轮询成本**：资金费率/持仓量按 60s 缓存；相同状态的 flat 信号 60s 内合并为一行并以 `repeats` 计数，
   审计页与密度图按 `repeats` 还原真实扫描次数；引擎轮询下限 15s（5m 策略无需更快）。
+- **盈亏口径**：持仓浮盈亏优先取交易所 `positionRisk` 的 `unRealizedProfit`（按 markPrice 结算，
+  与保护单一致），快照超时才按本地价估算并显示「估算」标签；账户接口抖动时沿用上次读数而不是刷成 0。
 
 ---
 

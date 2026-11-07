@@ -113,6 +113,8 @@ _EXEC_COLUMNS = {
         "entry_slippage_bps": "FLOAT DEFAULT 0.0",
         "initial_sl_price": "FLOAT DEFAULT 0.0",
         "partial_taken_at": "INTEGER DEFAULT 0",
+        "venue_unrealized": "FLOAT DEFAULT 0.0",
+        "venue_ts": "INTEGER DEFAULT 0",
     },
     "trades": {"slippage_bps": "FLOAT DEFAULT 0.0"},
     "signals": {"mode": "VARCHAR(8) DEFAULT 'demo'", "repeats": "INTEGER DEFAULT 1"},

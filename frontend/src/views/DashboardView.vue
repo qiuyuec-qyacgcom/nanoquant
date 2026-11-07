@@ -194,9 +194,14 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <div class="kpi-foot">钱包 {{ fmt(account.wallet, 4) }} · 可用 {{ fmt(account.available, 4) }}</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">浮动盈亏</div>
+        <div class="kpi-label">
+          浮动盈亏
+          <span v-if="account.stale" class="tag tag-warn" :title="account.error">缓存值</span>
+        </div>
         <div class="kpi-value" :class="numClass(account.unrealized)">{{ usdt(account.unrealized, 4) }}</div>
-        <div class="kpi-foot">占用保证金 {{ fmt(account.margin_used, 4) }} USDT</div>
+        <div class="kpi-foot">
+          {{ account.stale ? '账户接口暂不可用 · 沿用上次读数' : '占用保证金 ' + fmt(account.margin_used, 4) + ' USDT' }}
+        </div>
       </div>
       <div class="kpi">
         <div class="kpi-label">累计已实现</div>
@@ -367,7 +372,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <b>持仓</b>：一笔尚未平掉的合约头寸，由「开仓」产生、由「平仓」结束。
           <b>数量</b>是币的数量（不是 USDT）；<b>名义额</b>=数量×标记价，是这笔仓位的真实市场敞口；
           <b>保证金</b>=名义额÷杠杆，是账户被占用的资金；
-          <b>浮盈亏</b>=(标记价−开仓价)×数量×方向，未落袋，会随价格实时变化；
+          <b>浮盈亏</b>优先取交易所 positionRisk 的未实现盈亏（按 markPrice 结算，与保护单口径一致）；
+          同步超过 90 秒才回退到按最新成交价估算；
           <b>ROI</b>=浮盈亏÷保证金，即保证金收益率（杠杆会放大该比例）；
           <b>强平价</b>为按逐仓近似公式估算，仅供参考，实际以交易所为准。
         </div>
@@ -381,12 +387,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
               <th title="币的数量, 由名义额 ÷ 价格并按交易所步进取整得到">数量</th>
               <th title="数量 × 标记价, 即真实市场敞口">名义额</th>
               <th>开仓价</th>
-              <th>标记价</th>
+              <th title="交易所 markPrice, 盈亏与保护单均按此价结算">标记价</th>
               <th title="开仓时确定的杠杆; 保证金 = 名义额 ÷ 杠杆">杠杆</th>
               <th title="数量 × 开仓价 ÷ 杠杆, 该仓位占用的保证金">保证金</th>
               <th title="硬止损 / 止盈目标价; 触发由引擎每轮比对或交易所保护单执行">止损 / 止盈</th>
               <th title="按逐仓公式估算的强平价, 仅供参考">强平(估)</th>
-              <th title="未实现盈亏, 以及占保证金的收益率">浮盈亏 (ROI)</th>
+              <th title="优先取交易所 positionRisk 的未实现盈亏（每轮同步），可能比账户实时值晚几秒；括号内为占保证金的收益率">浮盈亏 (ROI)</th>
               <th title="从开仓到现在的时长; 超过 max_hold_minutes 会超时离场">持仓时长</th>
               <th title="开仓时 AI 的置信度, 悬浮可看理由">AI</th>
               <th></th>
@@ -415,6 +421,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
               <td class="mono" :class="numClass(p.unrealized)">
                 {{ usdt(p.unrealized, 5) }}
                 <span class="muted" style="font-size: 10px">({{ (p.roi_pct ?? 0).toFixed(1) }}%)</span>
+                <span
+                  v-if="p.unrealized_source === 'estimated'"
+                  class="tag tag-warn"
+                  style="margin-left: 4px"
+                  title="交易所仓位快照超过 90 秒未更新，此处按本地标记价估算"
+                >估算</span>
               </td>
               <td class="mono muted">{{ duration((Date.now() / 1000) - p.opened_at) }}</td>
               <td>
@@ -426,7 +438,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
               <td class="right"><button class="btn btn-xs btn-danger" @click="closePosition(p.id)">平仓</button></td>
             </tr>
             <tr v-if="!positions.length">
-              <td colspan="11" class="empty">暂无持仓 · 引擎会在信号与风控同时满足时自动开仓</td>
+              <td colspan="14" class="empty">暂无持仓 · 引擎会在信号与风控同时满足时自动开仓</td>
             </tr>
           </tbody>
         </table>

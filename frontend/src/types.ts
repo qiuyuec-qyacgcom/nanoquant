@@ -29,6 +29,8 @@ export interface Position {
   exit_reason?: string
   realized_pnl?: number
   unrealized?: number
+  unrealized_source?: 'exchange' | 'estimated'
+  venue_ts?: number
   notional?: number
   roi_pct?: number
   liquidation_price?: number
