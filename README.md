@@ -18,30 +18,38 @@
 串成一条**可解释、可审计**的执行链。默认模拟盘模式，所有参数热更新，支持选择性备份与还原。
 
 [特性](#-特性) · [界面](#-界面) · [快速开始](#-快速开始) · [架构](#-架构) · [交易逻辑](#-交易逻辑) ·
-[执行内核](#-执行内核-sidecar) · [参数](#-默认参数) · [API](#-api-概览) · [运维](#-运维与可观测) · [FAQ](#-faq)
+[执行内核](#-执行内核-sidecar) · [参数](#-默认参数) · [API](#-api-概览) · [测试](#-测试) ·
+[运维](#-运维与可观测) · [路线图](#-路线图) · [FAQ](#-faq)
 
 </div>
 
 ---
+
+> **近期更新（2026-11）**：主网演练手册与只读预检、systemd 部署、组合风险与波动率目标仓位、
+> 心法效果对照与命中率回写、API 限频与 `/metrics`、轮询成本优化、持仓权威浮盈亏、
+> 可用保证金截断（修复 `-2019`）。逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#65。
 
 ## ✨ 特性
 
 | 能力 | 说明 |
 |---|---|
 | 💸 **1 USDT 起跑** | 按交易所步进计算真实最小名义额，取整不足即明确拒绝，而不是发出必然失败的订单 |
-| 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限截断；杠杆只能逐层封顶，不会越权 |
-| 🤖 **AI 辅助开平仓** | OpenAI 兼容协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽** |
-| 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；按健康度回注后续决策，并用「采用 vs 未采用」的成交对照量化效果（观察性，非随机 A/B） |
-| 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽 |
+| 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限与**可用余额**双重截断（留 10% 安全垫，避免 `-2019`）；杠杆只能逐层封顶 |
+| 🤖 **AI 辅助开平仓** | OpenAI 兼容协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算 |
+| 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；按健康度回注后续决策，决策时注入的 ID 随成交落库，用「采用 vs 未采用」对照量化效果（观察性，非随机 A/B），胜负回写命中率 |
+| 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽；相同状态的 flat 信号 60s 合并为一行并用 `repeats` 还原真实扫描次数 |
 | 📰 **资讯与情绪** | 10 个源（含币安广场 / 公告），情绪指数与币种共现，可选注入 AI 上下文，源体检逐项给状态码 |
 | 🌐 **前台 / 后台双端** | 前台公开站点（首页 / 观点 / 关于，响应式）+ 后台管理终端（需登录） |
 | 📈 **前台 K 线（跟随标的池）** | 前台只展示后台已添加的合约，严格按添加顺序排列；空池显示「未添加标的」，增删 10 秒内自动同步 |
 | 🎯 **astra 规则标的池** | 添加前用币安在线合约表校验（USDT 永续 / 交易中），分层派生杠杆与止损，去重 + 容量上限，删除需确认短语且持仓禁删 |
 | 🧩 **执行内核 sidecar** | Rust 只签名不下单：`shadow` 旁路逐字节比对（零阻塞）、`enforce` 不一致直接拒单；掉线自动降级 + 5s 静默（详见[执行内核](#-执行内核-sidecar)） |
 | 🧪 **回测与样本外验证** | 与实盘共用策略函数：计入手续费/滑点/点差/资金费，部分止盈同口径；参数网格 + walk-forward（前段选参、后段冻结）给出过拟合差距 |
+| ⚖️ **组合风险控制** | 同向持仓上限（相关性代理，避免两仓同涨同跌）、波动率目标自动缩放仓位；下单按 `availableBalance` 截断，防止已有仓位占满保证金 |
+| 📊 **权威盈亏口径** | 持仓浮盈亏直接取交易所 `positionRisk.unRealizedProfit`（按 markPrice 结算，与保护单一致）；账户接口抖动时沿用上次读数而不是刷成 0 |
 | 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、抖动探针、可选 IP 限频与 `/metrics` |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
-| 🧰 **一键部署** | `install.sh` / `install.ps1` / Docker Compose，三种方式等价 |
+| 🧰 **一键部署** | `install.sh` / `install.ps1` / `start.ps1` / `stop.ps1` / Docker Compose；另有 systemd unit（主服务 + sidecar，最小权限硬化） |
+| 🩺 **主网演练手册** | [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md) 给出三段演练判据与回滚；`scripts/mainnet_preflight.py --yes` 用实盘凭证做只读预检（不碰下单） |
 
 ---
 
@@ -55,16 +63,16 @@
 | 前台 | `/charts` | 行情终端：池内标的 K 线（按添加顺序）、周期切换、24H 概览 |
 | 前台 | `/insights` | 资讯流、情绪指数、脱敏心法 |
 | 前台 | `/about` | 开仓链路、技术栈、风险声明 |
-| 后台 | `/admin/dashboard` | 权益曲线、账户、持仓、信号审计、事件流、引擎控制 |
-| 后台 | `/admin/onboarding` | 开仓检查：7 项前置条件 + 每标的下单量 |
-| 后台 | `/admin/signals` | 信号审计（评分 / AI / 裁决 / 拒绝原因分布） |
+| 后台 | `/admin/dashboard` | 权益曲线、账户、持仓（交易所权威浮盈亏 / ROI / 「缓存值」标记）、事件流、引擎控制、超短线执行 |
+| 后台 | `/admin/onboarding` | 开仓检查：7 项前置条件 + 每标的最小名义额与所需保证金（按可用余额判定） |
+| 后台 | `/admin/signals` | 信号审计：评分 / AI / 裁决 / 拒绝原因 Top / 24h 密度图；`×N` 标记合并的重复扫描，`summary.scans` 还原真实次数 |
 | 后台 | `/admin/symbols` | 标的池（币安合约表校验、分层/精度/最小下单、删除确认短语） |
 | 后台 | `/admin/chart` | K 线工作站：与前台同源组件，MA/EMA/BOLL + VOL/MACD/RSI，币安推送 + 收盘倒计时 |
 | 后台 | `/admin/backtest` | 回测：净值曲线、分段统计、成交明细（含资金费/部分止盈）、参数网格、样本外验证 |
 | 后台 | `/admin/news` | 资讯情绪 + 源检测 |
 | 后台 | `/admin/ai` | 模型接入、诊断、决策演练 |
-| 后台 | `/admin/strategy` | 交易环境（模拟盘 / 实盘）+ 引擎/风控/策略/数据源/执行内核等分区参数 |
-| 后台 | `/admin/evolution` | 心法库、注入预览、复盘记录、心法效果对照 |
+| 后台 | `/admin/strategy` | 交易环境（模拟盘 / 实盘）+ 引擎/风控/策略/数据源/执行内核/**安全与观测**等分区参数 |
+| 后台 | `/admin/evolution` | 心法库、注入预览、复盘记录、心法效果对照（4 张 KPI + 逐心法命中/胜率表） |
 | 后台 | `/admin/backup` | 备份 / 还原 / 下载 |
 | 后台 | `/admin/dead-letters` | 落库死信：查看失败载荷、重放、忽略 |
 | 后台 | `/admin/system` | 系统诊断、执行内核状态、告警记录、归档、运行事件与日志 |
@@ -87,7 +95,15 @@ bash scripts/stop.sh        # 停止
 # Windows PowerShell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 powershell -File scripts\start.ps1
+powershell -File scripts\stop.ps1        # 按命令行匹配停止，不误杀其它 Python 进程
+
+# venv 不在仓库内时（如迁移后共用上级目录的解释器）
+$env:NANOQUANT_VENV = 'F:\cb\.venvtest'
+powershell -File scripts\start.ps1       # 也支持 -Python / -Port / -Debug
 ```
+
+`start.ps1` 按 `-Python` → `NANOQUANT_VENV` → 仓库 `.venv` → 上级 `.venvtest` 顺序探测解释器，
+迁移目录后不会因找不到虚拟环境而启动失败。
 
 ### 方式二：Docker
 
@@ -100,7 +116,7 @@ docker compose up -d
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r backend/requirements.txt
+pip install -r backend/requirements.txt             # 锁定版本；源头是 backend/requirements.in
 cd frontend && npm install && npm run build && cd ..
 
 cd backend
@@ -110,6 +126,8 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 首次登录：`admin / admin123`（登录后会被要求立即改密）。
 
 > 生产守护（systemd）：主服务与 sidecar 的 unit 文件见 [`deploy/`](deploy/README.md)，含最小权限硬化与 UDS `0600` 权限设置。
+> 上主网前请先读 [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md)（三段演练、判据、回滚），并跑一次
+> `python scripts/mainnet_preflight.py --yes` 只读预检。
 
 ### 环境变量
 
@@ -121,7 +139,11 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 | `NANOQUANT_LOG_DIR` | `$HOME/logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 主密钥；**丢失后已加密的 API 密钥无法解密** |
 | `NANOQUANT_FRONTEND` | `$HOME/frontend/dist` | 前端产物目录 |
-| `EXEC_SOCKET` | 空 | 执行内核 sidecar 地址，如 `unix:/run/nanoquant/exec.sock` |
+| `NANOQUANT_VENV` | 空 | Windows 启动脚本的虚拟环境目录（迁移场景） |
+| `EXEC_SOCKET` | 空 → `/run/nanoquant/exec.sock` | sidecar 地址，如 `unix:/run/nanoquant/exec.sock` / `tcp:127.0.0.1:9101`；参数页 `exec_socket` 优先 |
+| `EXEC_SECRET` | 无 | sidecar 使用的签名 Secret（生产放 `EnvironmentFile`，权限 `0600`） |
+| `EXEC_TCP` | 空 | Windows / 容器联调用的回环 TCP 地址，如 `127.0.0.1:9101` |
+| `E2E_BASE_URL` / `E2E_CHANNEL` | `http://127.0.0.1:8899` / 空 | Playwright 冒烟目标与浏览器通道（如 `msedge`） |
 | `NANOQUANT_DEBUG` / `NANOQUANT_SALT` | `false` / 内置值 | 调试开关 / 口令盐 |
 
 > 端口与路径只在这里读一次；其余业务参数全部存在库里，后台改完即生效（≤1.5s 缓存）。
@@ -136,10 +158,11 @@ nanoquant/
 │   ├── engine/          # 交易引擎：主循环、信号、风控、出场规则、指标
 │   ├── exchange/        # 币安行情 + 签名客户端（exec_client：sidecar 长连接）、执行层、精度与限频
 │   ├── ai/              # 多模型调用、JSON 契约决策、议会聚合、诊断
-│   ├── evolution/       # 复盘、心法库、防污染审计
+│   ├── evolution/       # 复盘、心法库、防污染审计、effectiveness（采用/未采用对照）
 │   ├── news/            # 资讯源适配、情绪打分、聚合与源体检
-│   ├── backtest/        # 回测引擎 + 参数网格（与实盘共用策略函数）
-│   ├── services/        # 配置热更新、运行态、事件总线、标的池、备份、写库队列、exec_shadow、诊断
+│   ├── backtest/        # 回测引擎 + 参数网格 + walkforward（与实盘共用策略函数）
+│   ├── services/        # 配置热更新、运行态、事件总线、标的池、备份、写库队列、api_guard、
+│   │                    # exec_shadow、position_view（权威盈亏口径）、诊断
 │   ├── api/routes/      # auth / system / symbols / trade / backtest / ai / evolution / news / backup / public / ws
 │   └── main.py          # FastAPI 装配 + SPA 托管
 ├── frontend/src/
@@ -147,11 +170,14 @@ nanoquant/
 │   ├── views/           # 后台页面
 │   ├── components/      # EChart / EnvironmentSwitch / Modal / EventFeed ...
 │   └── layouts/         # SiteLayout（前台）/ ShellLayout（后台）
+├── frontend/e2e/        # Playwright 冒烟（首页 / 登录 / 4 个后台关键面板）
 ├── rust/exec-service/   # 执行内核 sidecar（P2：只签名不下单，UDS + JSON Lines）
 ├── deploy/              # systemd unit（主服务 + sidecar）与部署说明
-├── scripts/             # install / start / stop / status + 压测/对账/校验工具
-├── backend/tests/       # 契约测试 + smoke / evolution / ai / news 探测 + 本地 Mock 模型
+├── scripts/             # install / start / stop / status + 压测/对账/校验/主网预检工具
+├── backend/tests/       # 契约 + 路由测试（临时目录隔离）/ smoke / evolution / ai / news 探测
+├── backend/requirements.in / requirements.txt   # 直接依赖 → 锁定版本
 ├── docs/                # RESEARCH 调研 / TASKS 任务书 / EXEC_PROTOCOL 协议 / MAINNET_DRILL 演练手册
+├── .github/workflows/   # CI：pytest / typecheck+build / cargo test / Playwright e2e
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -170,6 +196,7 @@ nanoquant/
 
 ```
 ① 取价      引擎内部直接调币安公共接口（5–30m K 线 + 资金费率 + 持仓量），无本地行情模块
+            K 线 20s 缓存、资金费率/持仓量 60s 缓存，ticker/前台 K 线走 WS 不占 REST 权重
 ② 信号      五因子加权得分 ∈ [-1,1]
             趋势0.32 / 动量0.26 / 量能0.18 / 资金费率0.12 / 持仓量0.12
             准入：ATR%∈[0.05,4]、量比≥0.80、24h成交额≥300万
@@ -177,8 +204,9 @@ nanoquant/
 ③ 风控      全局：权益≥0.5U、日内亏损≤25%、回撤≤50%、连亏<4笔、无熔断
             单标的：未持仓、持仓数<2、无冷却、总敞口<2000%
             组合：同向持仓上限（相关性代理）、波动率目标自动缩放仓位
-④ 仓位      名义额 = min( 权益×10% ÷ 止损%, 权益×50%×杠杆 )
-            数量 = 名义额 ÷ 价，按步进向下取整；低于最小可下单量 → 拒绝
+④ 仓位      风险预算 = 权益×10% × 波动率缩放系数(0.25–2x)
+            名义额 = min( 风险预算 ÷ 止损%, 权益×50%×杠杆, 可用余额×0.9×杠杆 )
+            数量 = 名义额 ÷ 价，按步进向下取整；低于最小可下单量 / 可用保证金不足 → 明确拒绝
 ⑤ AI 复核  只能「同意 / 否决 / 降杠杆 / 收窄止损」，不能放宽任何风控
             解析失败、超时、调用失败 → fail-closed 跳过
 ⑥ 下单      市价 + 止损/止盈保护单（模拟盘走币安测试网，实盘走主网；与数量解耦）
@@ -226,11 +254,16 @@ nanoquant/
 | 风控 | 单笔风险 / 默认杠杆 / 保证金占比 / 总敞口 | 10% / 20x / 50% / 2000% |
 | 风控 | 日内亏损 / 回撤 / 连亏上限 / 冷静期 | 25% / 50% / 4 笔 / 10 分钟 |
 | 组合 | 同向持仓上限 / 波动率目标 | 0 不限制 / 0 关闭（建议小资金设 1 / 1.5） |
+| 资金 | 可用保证金安全垫 | 0.9（下单按 `availableBalance` 截断，防 `-2019`） |
 | 策略 | 周期 / 阈值 / 量比 / ATR% / 最长持仓 | 5m / 0.30 / 0.80 / 0.05–4 / 180 分钟 |
 | 执行 | 盘口点差闸门 / 时间阶梯止盈 | 8 bps / 0min 0.8%、15min 0.6%、30min 0.45%、60min 0.3%、120min 0.2% |
 | 执行内核 | 模式 / 抽样 / 超时 | off / 100% / 500ms |
 | 安全 | API 限频 / Prometheus 指标 | 0 关闭（按 IP 计次） / 开启 |
+| 轮询 | 资金费率缓存 / 持仓量缓存 / flat 信号合并窗口 | 60s / 60s / 60s（`repeats` 计数） |
+| 心法 | 效果对照最小样本 | 每组 ≥ 10 笔才给结论（观察性统计） |
 | AI | 模式 / 最低置信 / 调用上限 / 月预算 | single / 0.45 / 30 次每小时 / $3 |
+
+> 以上均为**出厂默认值**，可在「参数配置」热更新；例如当前运行环境的 AI 配额、杠杆与风险参数可能已被调整。
 
 > 1 USDT 买不了 BTC：BTCUSDT 最小名义额以币安合约表为准（当前约 50–100 USDT）。小资金请选 DOGE / SOL / ETH 等小面值标的，
 > 或提高保证金比例 / 杠杆。面板会在「开仓检查」和信号审计里给出这一原因。
@@ -246,13 +279,13 @@ nanoquant/
 | 认证 | `POST /auth/login`、`GET /auth/me`、`POST /auth/password` |
 | 标的池 | `GET /symbols`、`GET /symbols/available`、`POST /symbols`、`POST /symbols/bulk`、`PATCH /symbols/{symbol}`、`DELETE /symbols/{symbol}?confirmation=REMOVE%20<SYMBOL>` |
 | 交易 | `GET /engine/status`、`POST /engine/control`、`POST /engine/cycle-now`、`GET /engine/admission`、`/engine/positions`、`POST /engine/positions/{id}/close`、`/engine/orders`、`/engine/protection`、`/engine/execution`、`/engine/quotes`、`/engine/signals`、`/engine/trades`、`/engine/equity`、`/engine/stats`、`GET /chart/klines` |
-| 回测 | `POST /backtest/run`、`POST /backtest/grid` |
+| 回测 | `POST /backtest/run`、`POST /backtest/grid`、`POST /backtest/walkforward`（样本外验证） |
 | AI | `GET/POST /ai/providers`、`PATCH/DELETE /ai/providers/{id}`、`POST /ai/providers/fetch-models`、`POST /ai/providers/{id}/test`、`GET /ai/providers/{id}/diagnose`、`GET /ai/providers/{id}/models`、`POST /ai/analyze`、`POST /ai/decision-preview`、`GET /ai/logs`、`GET /ai/usage` |
 | 自进化 | `GET/POST /evolution/mantras`、`PATCH/DELETE /evolution/mantras/{id}`、`GET /evolution/injection`、`GET /evolution/runs`、`POST /evolution/review/{trade_id}`、`POST /evolution/global-review`、`GET /evolution/stats`、`GET /evolution/effectiveness` |
 | 资讯 | `GET /news`、`POST /news/refresh`、`GET /news/overview`、`GET /news/diagnostics`、`POST /news/ai-summary` |
 | 备份 | `GET /backup/options`、`POST /backup/create`、`GET /backup/jobs`、`POST /backup/{id}/restore`、`DELETE /backup/{id}`、`GET /backup/{id}/download` |
 | 配置 | `GET /settings`、`GET/PUT /settings/{group}`、`POST /settings/{group}/reset`、`GET/POST/DELETE /settings/credentials/exchange` |
-| 系统 | `GET /health`、`GET /system/info`、`GET /system/diagnostics`、`GET /system/events`、`GET /system/logs`、`GET /system/runtime`、`GET /system/write-health`、`GET /system/archives`、`GET /system/dead-letters`、`POST /system/dead-letters/{id}/replay`、`GET /system/alerts/logs`、`POST /system/alerts/test` |
+| 系统 | `GET /health`、`GET /system/info`、`GET /system/diagnostics`、`GET /system/events`、`GET /system/logs`、`GET /system/runtime`、`GET /system/write-health`、`GET /system/system-settings`、`GET /system/archives`、`GET /system/archives/{name}`、`GET /system/dead-letters`、`POST /system/dead-letters/{id}/replay`、`POST /system/dead-letters/{id}/ignore`、`POST /system/dead-letters/replay-all`、`GET /system/alerts/logs`、`POST /system/alerts/test` |
 | 执行内核 | `GET /system/exec-sidecar`、`POST /system/exec-sidecar/self-test`、`POST /system/exec-sidecar/reset` |
 | 指标 | `GET /metrics`（Prometheus 文本，只读免鉴权；仅队列/死信/比对计数与状态位） |
 | 公开 | `GET /public/config`、`/public/overview`、`/public/pool`（按添加顺序）、`/public/quotes`、`/public/klines`、`/public/klines/batch`（仅池内合约）、`/public/news`、`/public/mantras`、`/public/performance` |
@@ -276,14 +309,17 @@ python tests/news_probe.py        # 资讯源体检
 
 契约测试覆盖：部分止盈 R 计算、阶梯止盈档位、出场优先级、配置校验、分位耗时、回测与参数网格、
 资金费结算与多付空收、部分止盈记账与保本止损、点差成本、walk-forward 结构、
-单行 PEM 归一化、Ed25519/HMAC 签名、告警静默、写库重试分类、sidecar 协议与影子判定、心法效果分组统计、轮询缓存与信号合并。
-路由测试覆盖鉴权、配置校验与只读观测接口，运行在临时目录（`tests/conftest.py` 强制隔离）。
+单行 PEM 归一化、Ed25519/HMAC 签名、告警静默、写库重试分类、sidecar 协议与影子判定、
+心法效果分组统计、组合风险与波动率缩放、15s 轮询下限与老库迁移、轮询缓存与信号合并、
+可用保证金截断与 `-2019` 文案、持仓浮盈亏快照优先与外部仓位写入。
+路由测试覆盖鉴权、配置校验、回测/信号汇总与只读观测接口，运行在临时目录（`tests/conftest.py` 强制隔离）。
 
 签名链路与性能工具（需在仓库根目录执行）：
 
 ```bash
 python scripts/verify_sidecar.py                                        # 自起 mock，协议 + 签名比对
-python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock # 对真实 sidecar 复核
+EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock  # 真实 sidecar 逐字节复核
+python scripts/verify_sidecar.py --target tcp:127.0.0.1:9101            # Windows 回环 TCP（不传 Secret 只验协议）
 python scripts/mock_exec_sidecar.py --port 9101 --secret "$SECRET"      # 本地 mock sidecar（联调）
 python scripts/bench_exec.py --orders 200 --delay-ms 60                 # 分阶段耗时压测
 python scripts/p99_real.py --orders 15 --per-minute 5                   # 真实网络 p99 采样
@@ -325,6 +361,12 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
   与保护单一致），快照超时才按本地价估算并显示「估算」标签；账户接口抖动时沿用上次读数而不是刷成 0。
 - **保证金校验**：下单数量按 `availableBalance`（而非总权益）截断并留 10% 安全垫，避免已有仓位
   占用保证金后仍算出买不起的数量、被交易所以 `-2019 Margin is insufficient` 拒绝。
+- **组合风险**：同向持仓上限（默认关闭，建议小资金设 1）、ATR 波动率目标缩放（0.25–2x），
+  在「参数配置 → 风控 → 仓位与杠杆」调整。
+- **心法效果**：自进化页的「心法效果对照」给出采用组/对照组的笔数、胜率、单笔盈亏差与逐心法命中率；
+  样本不足（任一组 < 10 笔）时只显示数据不下结论，且明确标注为观察性对照而非随机 A/B。
+- **部署守护**：`deploy/nanoquant.service` 与 `deploy/nanoquant-exec.service` 提供 systemd 开机自启、
+  崩溃拉起、最小权限硬化；`deploy/README.md` 内含 Prometheus 抓取配置与建议告警规则。
 
 ---
 
@@ -338,8 +380,13 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - [x] 执行内核 P2：UDS 协议 + 影子签名比对 + `enforce` 闸门 + 面板自检（已编译验证）
 - [x] 写库单队列 + 死信补偿 + 事件循环抖动探针
 - [x] 路由层测试 + 依赖锁定 + CI 覆盖 Rust / 前端 e2e
-- [x] 心法注入快照与「采用 vs 未采用」效果对照（观察性统计）
+- [x] 心法注入快照与「采用 vs 未采用」效果对照（观察性统计）+ 命中率回写
+- [x] 主网演练手册与只读预检工具；systemd 部署 unit 与 Windows 启停脚本
+- [x] 组合风险控制：同向持仓上限 + 波动率目标仓位
+- [x] API 限频 + Prometheus `/metrics` 指标
 - [x] 轮询成本优化：资金费率缓存 / flat 信号合并 / 15s 下限
+- [x] 持仓浮盈亏改用交易所权威口径 + 账户读数缓存兜底
+- [x] 下单按可用保证金截断，修复 `-2019 Margin is insufficient`
 
 下一步：
 
@@ -375,9 +422,20 @@ A：说明已有仓位/挂单占用了可用保证金，而这一单按总权益
 「可用保证金不足」的拒绝原因；若仍遇到（例如下单瞬间余额被别的仓位占用），可平掉部分仓位、
 降低「单仓保证金 / 单笔风险」或适当提高杠杆。
 
+**Q：持仓行的浮盈亏和「浮动盈亏」KPI 为什么不完全一致？**
+A：两者口径相同但**取样时刻不同**：KPI 是本次页面请求时实时读交易所账户的 `totalUnrealizedProfit`，
+持仓行用的是引擎上一轮（默认 15s）同步的 `positionRisk` 快照。价格在动就会出现几 USDT 的差异；
+若快照超过 90 秒未更新，持仓行会回退本地估算并显示「估算」标签。
+
+**Q：信号审计里的信号行数怎么变少了？**
+A：同一标的、方向、拒绝原因都相同的 flat 信号会在 60 秒内合并成一行，用 `×N` 标记并累计 `repeats`。
+KPI「扫描信号」显示的是按 `repeats` 还原的**真实扫描次数**，按小时密度图与拒绝原因 Top 分布同样按权重统计，
+所以统计口径没有变，只是不再每轮都写一行（写入量降约 88%）。
+
 **Q：心法会越来越不可控吗？**
 A：不会。心法入库前经防污染审计（拦截提高杠杆、取消止损等危险结论），并带健康度与版本；
-全局复盘会淘汰低分心法，新心法以"替代"关系覆盖旧结论。
+全局复盘会淘汰低分心法，新心法以"替代"关系覆盖旧结论。自进化页另有「采用 vs 未采用」对照，
+但那是观察性统计（非随机 A/B），只作早期预警，不能当因果结论。
 
 **Q：怎么确认 Rust sidecar 算出的签名和我这里一致？**
 A：起 sidecar 后在「系统诊断 → 执行内核」点「自检」：它用固定 query 与当前环境 Secret 各签一次，
