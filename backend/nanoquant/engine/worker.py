@@ -897,10 +897,12 @@ class TradingEngine:
         cfg = get_engine()
         mode = normalize_mode(cfg.mode)
         broker = get_broker(mode)
-        try:
-            account = await broker.account()
-            account_d = account.as_dict()
-        except Exception as exc:  # noqa: BLE001
+        now = int(time.time())
+        # 账户与仓位并行拉取：两者在同一时刻取样，持仓行与顶部 KPI 才不会差几秒
+        account_res, venue_res = await asyncio.gather(
+            broker.account(), broker.positions(), return_exceptions=True
+        )
+        if isinstance(account_res, Exception):
             # 交易所临时报错（限频/网络抖动）不能把整个账户面板刷成 0:
             # 保留上一轮成功读到的权益与浮盈亏，并标记 stale 让前端提示
             account_d = {
@@ -909,9 +911,14 @@ class TradingEngine:
                     if self._last_account
                     else {"equity": 0, "wallet": 0, "available": 0, "unrealized": 0, "margin_used": 0}
                 ),
-                "error": str(exc)[:200],
+                "error": str(account_res)[:200],
                 "stale": True,
             }
+        else:
+            account_d = account_res.as_dict()
+        venue_map: dict[str, Any] = {}
+        if not isinstance(venue_res, Exception):
+            venue_map = {vp.symbol: vp for vp in venue_res}
         with session_scope() as s:
             # 只展示当前交易环境的仓位, 模拟盘与实盘互不串台
             positions = (
@@ -919,8 +926,9 @@ class TradingEngine:
                 .filter(PositionRecord.status == "open", PositionRecord.mode == mode)
                 .all()
             )
-            pos_d = [
-                {
+            pos_d = []
+            for p in positions:
+                view = {
                     "id": p.id,
                     "symbol": p.symbol,
                     "side": p.side,
@@ -939,8 +947,18 @@ class TradingEngine:
                     "mode": p.mode,
                     "status": p.status,
                 }
-                for p in positions
-            ]
+                vp = venue_map.get(p.symbol)
+                if vp is not None:
+                    # 与 account.totalUnrealizedProfit 同一次请求取样，避免两个面板不同步
+                    view = position_view.merge_venue(
+                        view,
+                        qty=float(p.qty or 0),
+                        margin=float(p.margin or 0),
+                        mark_price=vp.mark_price,
+                        unrealized=vp.unrealized,
+                        ts=now,
+                    )
+                pos_d.append(view)
             trades = (
                 s.query(TradeRecord)
                 .filter(TradeRecord.mode == mode)

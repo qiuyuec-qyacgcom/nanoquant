@@ -1001,6 +1001,23 @@
 - **验证**：新增 2 条用例（23 个正例 + 7 个反例 + extreme 判定 + 库结构、API 端点与
   `?model=` 选项）→ **81 passed**；`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
 
+### 71. 总览持仓浮盈亏与顶部 KPI 同步（本次执行）
+- **状态**：✅ 已完成
+- **现象**：顶部「浮动盈亏」实时读交易所 `account.totalUnrealizedProfit`，
+  而「当前持仓」每一行用的是引擎上一轮（默认 15s）写进 DB 的 `venue_unrealized`，
+  价格波动时两个面板会差几 USDT，用户以为某一侧算错了。
+- **修复**：
+  - `engine.status()` 改为 `asyncio.gather(broker.account(), broker.positions())` 并行取数，
+    用**同一次请求**的 `positionRisk` 覆盖持仓行的 `unrealized / mark_price / notional / roi_pct`，
+    两个面板从此同源同刻；单次 status 多一次签名请求（weight 5，8s 轮询约 37.5 weight/min）。
+  - `position_view.merge_venue()` 纯函数承载合并逻辑（mark 无效时原样返回，避免把 0 价写进面板）。
+  - 实时仓位读取失败时保留 DB 快照并标 `unrealized_source=estimated`，前端继续显示「估算」标签。
+  - 前端列头/标签文案同步改为「同一次请求实时读取」「本次未能读到该仓位」。
+- **实测**（真实服务 8899）：`account.unrealized=-24.5273946`、`DOGEUSDT` 持仓行
+  `unrealized=-24.5273946`、`unrealized_source=exchange`，**差值 0.0**。
+- **验证**：新增 1 条用例（两笔仓位合并后与账户总额一致、无效 mark 原样返回）→ **82 passed**；
+  `vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
+
 ---
 
 ## 二、未开始

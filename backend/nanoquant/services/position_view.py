@@ -54,3 +54,25 @@ def derived(position: Any) -> dict[str, Any]:
         "partial_taken_at": partial_at,
         "partial_tp": partial_at > 0,
     }
+
+
+def merge_venue(row: dict[str, Any], *, qty: float, margin: float, mark_price: float,
+                unrealized: float, ts: int) -> dict[str, Any]:
+    """用本次请求实时读到的 positionRisk 覆盖持仓行.
+
+    总览顶部的「浮动盈亏」来自 `account.totalUnrealizedProfit`，而持仓行以前用
+    引擎上一轮（默认 15s）写入 DB 的快照，价格波动时两者会差几 USDT。
+    这里把同一次 `status()` 里刚拉到的 venue 值合并进来，保证两个面板**同源同刻**。
+    """
+    mark = float(mark_price or 0)
+    if mark <= 0:
+        return row
+    value = float(unrealized or 0)
+    out = dict(row)
+    out["mark_price"] = round(mark, 8)
+    out["unrealized"] = round(value, 8)
+    out["unrealized_source"] = "exchange"
+    out["venue_ts"] = int(ts)
+    out["notional"] = round(float(qty or 0) * mark, 6)
+    out["roi_pct"] = round(value / float(margin) * 100, 3) if margin else 0.0
+    return out

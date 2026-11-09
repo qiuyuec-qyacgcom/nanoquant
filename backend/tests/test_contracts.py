@@ -714,6 +714,32 @@ def test_derived_prefers_fresh_exchange_unrealized():
     assert fallback["unrealized_source"] == "estimated"
 
 
+def test_merge_venue_syncs_position_rows_with_account_total():
+    """总览：持仓行必须与顶部 account.unrealized 同源同刻，不能各自用不同时刻的快照."""
+    import time
+
+    from nanoquant.services.position_view import derived, merge_venue
+
+    now = int(time.time())
+    rows = []
+    # 两笔仓位：DB 里是 15s 前的旧快照，venue 是本次请求的实时值
+    for mark, stale, live in ((101.0, -8.0, -10.0), (99.0, 5.0, 7.0)):
+        pos = _position(mark_price=100.0, venue_unrealized=stale, venue_ts=now - 15)
+        rows.append({"mark_price": 100.0, **derived(pos)})
+        rows[-1] = merge_venue(
+            rows[-1], qty=10.0, margin=100.0, mark_price=mark,
+            unrealized=live, ts=now,
+        )
+    assert [r["unrealized"] for r in rows] == [-10.0, 7.0]
+    assert abs(sum(r["unrealized"] for r in rows) - (-3.0)) < 1e-9  # 账户 totalUnrealizedProfit
+    assert all(r["unrealized_source"] == "exchange" and r["venue_ts"] == now for r in rows)
+    assert rows[0]["mark_price"] == 101.0 and rows[0]["roi_pct"] == -10.0
+
+    # venue 价格无效时保持原样（等价于本次没读到，前端显示「估算」）
+    keep = {"mark_price": 100.0, **derived(_position(venue_unrealized=1.0, venue_ts=now))}
+    assert merge_venue(keep, qty=10, margin=100, mark_price=0, unrealized=2.0, ts=now) is keep
+
+
 def test_record_external_position_writes_mode_and_venue_pnl():
     from nanoquant.db import init_db, session_scope
     from nanoquant.exchange.broker import record_external_position

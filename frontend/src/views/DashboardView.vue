@@ -392,7 +392,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
               <th title="数量 × 开仓价 ÷ 杠杆, 该仓位占用的保证金">保证金</th>
               <th title="硬止损 / 止盈目标价; 触发由引擎每轮比对或交易所保护单执行">止损 / 止盈</th>
               <th title="按逐仓公式估算的强平价, 仅供参考">强平(估)</th>
-              <th title="优先取交易所 positionRisk 的未实现盈亏（每轮同步），可能比账户实时值晚几秒；括号内为占保证金的收益率">浮盈亏 (ROI)</th>
+              <th title="与顶部「浮动盈亏」同一次请求实时读取 positionRisk，两者应一致；括号内为占保证金的收益率">浮盈亏 (ROI)</th>
               <th title="从开仓到现在的时长; 超过 max_hold_minutes 会超时离场">持仓时长</th>
               <th title="开仓时 AI 的置信度, 悬浮可看理由">AI</th>
               <th></th>
@@ -425,7 +425,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
                   v-if="p.unrealized_source === 'estimated'"
                   class="tag tag-warn"
                   style="margin-left: 4px"
-                  title="交易所仓位快照超过 90 秒未更新，此处按本地标记价估算"
+                  title="本次请求未能从交易所读到该仓位，按本地标记价估算"
                 >估算</span>
               </td>
               <td class="mono muted">{{ duration((Date.now() / 1000) - p.opened_at) }}</td>
