@@ -88,7 +88,8 @@ class AiProvider(Base):
     api_key_enc: Mapped[str] = mapped_column(Text, default="")
     model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
-    max_tokens: Mapped[int] = mapped_column(Integer, default=900)
+    #: 推理型模型会先把预算花在 thinking 上，900/1200 常被截断导致 JSON 不完整
+    max_tokens: Mapped[int] = mapped_column(Integer, default=3000)
     timeout_sec: Mapped[int] = mapped_column(Integer, default=45)
     json_mode: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -114,6 +115,8 @@ class AiCallLog(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str] = mapped_column(String(500), default="")
+    #: 模型原始输出（v2 为紧凑英文 JSON），审计可追溯转译前的原文
+    raw_text: Mapped[str] = mapped_column(Text, default="")
 
 
 class Signal(Base):

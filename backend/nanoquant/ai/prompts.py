@@ -31,11 +31,41 @@ COUNCIL_PERSONA_SUFFIX = """
 你现在只代表「{persona}」这一个视角, 关注点: {focus}.
 仍然输出同样的 JSON 结构; 如果你认为证据不足, action 直接给 hold 并说明缺什么数据."""
 
+#: 决策真正用得到的特征白名单；原始 OHLC / 重复派生素不进 prompt
+FEATURE_KEYS = (
+    "rsi", "atr_pct", "vol_ratio", "ema_gap_pct", "range_pct",
+    "ret_1", "ret_5", "ret_15", "macd_hist", "funding",
+    "open_interest", "oi_change_pct", "change_24h", "quote_volume",
+)
+
+
+def clean_features(features: dict[str, Any] | None) -> dict[str, Any]:
+    """去掉 `_bars` 等冗余，只保留白名单数值（v1 / v2 共用）.
+
+    worker 把最近 14 根 K 线放在 features["_bars"]，同时又作为 ctx["klines"] 传入；
+    旧实现两边都序列化，等于把同一份 OHLC 发了两遍（约 875 字符 / 330 tokens）。
+    """
+    src = features or {}
+    out: dict[str, Any] = {}
+    for key in FEATURE_KEYS:
+        value = src.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = round(float(value), 6)
+    return out
+
 
 def format_snapshot(ctx: dict[str, Any]) -> str:
     """压缩行情与账户上下文, 控制 token 消耗."""
     klines = ctx.get("klines") or []
     bars = [[round(k.get("o", 0), 8), round(k.get("h", 0), 8), round(k.get("l", 0), 8), round(k.get("c", 0), 8)] for k in klines[-14:]]
+    news = [
+        {"title": str(n.get("title") or "")[:40], "sentiment": n.get("sentiment"), "symbols": n.get("symbols")}
+        for n in (ctx.get("news") or [])[:3] if isinstance(n, dict)
+    ]
+    mantras = [
+        {"title": str(m.get("title") or "")[:20], "health": m.get("health")}
+        for m in (ctx.get("mantras") or [])[:4] if isinstance(m, dict)
+    ]
     payload = {
         "symbol": ctx.get("symbol"),
         "price": ctx.get("price"),
@@ -44,7 +74,7 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
             "direction_hint": ctx.get("side_hint"),
             "reasons": ctx.get("quant_reasons") or [],
         },
-        "features": ctx.get("features") or {},
+        "features": clean_features(ctx.get("features")),
         "recent_bars_ohlc": bars,
         "market": {
             "funding_rate": ctx.get("funding"),
@@ -53,8 +83,8 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
         },
         "account": ctx.get("account") or {},
         "constraints": ctx.get("constraints") or {},
-        "news": ctx.get("news") or [],
-        "mantras": ctx.get("mantras") or [],
+        "news": news,
+        "mantras": mantras,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 

@@ -15,7 +15,7 @@ from ..logging_setup import get_logger
 from ..services.settings import get_ai
 from ..services import events
 from .client import ai_client
-from .prompts import decision_messages
+from .compact import build_decision_messages, is_compact_payload, localize
 
 log = get_logger("ai.decision")
 
@@ -72,10 +72,13 @@ class DecisionOutcome:
     cost_usd: float = 0.0
     agreement: float = 0.0
     raw_text: str = ""
+    schema_version: int = 1
     votes: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
+            "raw_text": self.raw_text[:2000],
             "ok": self.ok,
             "action": self.decision.action,
             "confidence": self.decision.confidence,
@@ -123,8 +126,11 @@ def extract_json(text: str) -> dict[str, Any]:
     raise ValueError("无法从模型输出中解析出 JSON 对象")
 
 
-def parse_decision(text: str) -> AiDecision:
+def parse_decision(text: str, ctx: dict[str, Any] | None = None) -> AiDecision:
+    """v1 中文详细 JSON / v2 英文紧凑 JSON 自动探测，统一产出中文 AiDecision."""
     data = extract_json(text)
+    if is_compact_payload(data):
+        data = localize(data, ctx)
     try:
         return AiDecision(**data).normalized()
     except ValidationError as exc:
@@ -178,7 +184,7 @@ async def decide(ctx: dict[str, Any], *, purpose: str = "decision") -> DecisionO
         for persona in cfg.personas:
             if not persona.enabled or persona.weight <= 0:
                 continue
-            messages = decision_messages(ctx, persona=persona.name, focus=persona.focus)
+            messages = build_decision_messages(ctx, version=cfg.decision_schema_version, persona=persona.name, focus=persona.focus)
             result = await ai_client.chat_with_fallback(
                 messages,
                 purpose=f"{purpose}:{persona.name}",
@@ -192,7 +198,7 @@ async def decide(ctx: dict[str, Any], *, purpose: str = "decision") -> DecisionO
                 provider = result.provider or provider
                 model = result.model or model
                 try:
-                    vote = parse_decision(result.text)
+                    vote = parse_decision(result.text, ctx)
                     votes.append((persona.weight, vote))
                     meta.append({"persona": persona.name, "weight": persona.weight, "action": vote.action, "confidence": vote.confidence})
                 except ValueError as exc:
@@ -203,16 +209,17 @@ async def decide(ctx: dict[str, Any], *, purpose: str = "decision") -> DecisionO
             return DecisionOutcome(
                 decision=AiDecision(action="hold", reason="议会全部席位调用失败"),
                 error="全部席位失败", latency_ms=total_latency, votes=meta,
+                schema_version=cfg.decision_schema_version,
             )
         merged, agreement = _aggregate(votes)
         return DecisionOutcome(
             decision=merged, ok=True, provider=provider, model=model,
             latency_ms=total_latency, cost_usd=round(total_cost, 6),
-            agreement=agreement, votes=meta,
+            agreement=agreement, votes=meta, schema_version=cfg.decision_schema_version,
         )
 
     result = await ai_client.chat_with_fallback(
-        decision_messages(ctx),
+        build_decision_messages(ctx, version=cfg.decision_schema_version),
         purpose=purpose,
         provider_id=cfg.provider_id,
         fallback_ids=cfg.fallback_provider_ids,
@@ -224,21 +231,24 @@ async def decide(ctx: dict[str, Any], *, purpose: str = "decision") -> DecisionO
             decision=AiDecision(action="hold", reason="AI 调用失败, 按 fail-closed 处理"),
             error=result.error, latency_ms=result.latency_ms, provider=result.provider,
             model=result.model, votes=[{"error": result.error}],
+            schema_version=cfg.decision_schema_version,
         )
     try:
-        decision = parse_decision(result.text)
+        decision = parse_decision(result.text, ctx)
     except ValueError as exc:
-        events.record("warn", "ai", f"AI 输出不可解析: {exc}", {"raw": result.text[:400], "purpose": purpose})
+        events.record("warn", "ai", f"AI 输出不可解析: {exc}", {"raw": result.text[:400], "purpose": purpose, "schema": cfg.decision_schema_version})
         return DecisionOutcome(
             decision=AiDecision(action="hold", reason="AI 输出不符合 JSON 契约, 按 fail-closed 处理"),
             error=str(exc), provider=result.provider, model=result.model,
             latency_ms=result.latency_ms, cost_usd=result.cost_usd,
             raw_text=result.text[:2000], votes=[{"error": str(exc)}],
+            schema_version=cfg.decision_schema_version,
         )
     return DecisionOutcome(
         decision=decision, ok=True, provider=result.provider, model=result.model,
         latency_ms=result.latency_ms, cost_usd=result.cost_usd,
         agreement=1.0, raw_text=result.text[:2000], votes=[{"persona": "single", "action": decision.action, "confidence": decision.confidence}],
+        schema_version=cfg.decision_schema_version,
     )
 
 

@@ -119,6 +119,7 @@ _EXEC_COLUMNS = {
     "trades": {"slippage_bps": "FLOAT DEFAULT 0.0"},
     "signals": {"mode": "VARCHAR(8) DEFAULT 'demo'", "repeats": "INTEGER DEFAULT 1"},
     "write_failures": {"auto_attempts": "INTEGER DEFAULT 0"},
+    "ai_call_logs": {"raw_text": "TEXT DEFAULT ''"},
 }
 
 

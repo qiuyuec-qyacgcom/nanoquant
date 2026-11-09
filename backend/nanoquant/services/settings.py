@@ -179,7 +179,8 @@ class AiSettings(BaseModel):
             AiPersona(name="风险审计官", weight=0.30, focus="回撤、爆仓距离与流动性风险"),
         ]
     )
-    decision_schema_version: int = 1
+    #: 决策协议: 1=中文详细 JSON（兼容旧模型）, 2=英文紧凑 JSON + 后台转中文（省 ~50% 输入 / ~70% 输出）
+    decision_schema_version: Literal[1, 2] = 2
 
 
 class DataSettings(BaseModel):

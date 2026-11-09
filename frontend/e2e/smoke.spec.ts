@@ -33,6 +33,7 @@ test('后台核心页面均有关键面板', async ({ page }) => {
     ['/#/admin/symbols', '当前标的池'],
     ['/#/admin/backtest', '回测（纯量化粗筛）'],
     ['/#/admin/evolution', '心法效果对照'],
+    ['/#/admin/ai', '决策演练'],
   ]
   for (const [path, text] of pages) {
     await page.goto(path)

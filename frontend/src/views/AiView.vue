@@ -40,7 +40,25 @@ const aiCfg = reactive<any>({
   inject_news: true,
   inject_mantras: true,
   personas: [] as any[],
+  decision_schema_version: 2,
 })
+
+/** 决策演练：用真实行情跑一次 AI，不下单；对照原始输出与后台中文转译 */
+const previewSymbol = ref('BTCUSDT')
+const previewResult = ref<any>(null)
+const previewBusy = ref(false)
+
+async function runPreview() {
+  previewBusy.value = true
+  previewResult.value = null
+  try {
+    previewResult.value = await http.post('/ai/decision-preview', { symbol: previewSymbol.value.trim().toUpperCase() })
+  } catch (err: any) {
+    previewResult.value = { ok: false, error: err?.message || '演练失败' }
+  } finally {
+    previewBusy.value = false
+  }
+}
 
 const form = reactive<any>({
   name: '',
@@ -49,7 +67,7 @@ const form = reactive<any>({
   api_key: '',
   model: 'deepseek-chat',
   temperature: 0.2,
-  max_tokens: 900,
+  max_tokens: 3000,
   timeout_sec: 45,
   json_mode: true,
   enabled: true,
@@ -123,7 +141,7 @@ function openCreate() {
   editing.value = null
   Object.assign(form, {
     name: '', protocol: 'openai_chat', base_url: 'https://api.deepseek.com/v1', api_key: '',
-    model: 'deepseek-chat', temperature: 0.2, max_tokens: 900, timeout_sec: 45,
+    model: 'deepseek-chat', temperature: 0.2, max_tokens: 3000, timeout_sec: 45,
     json_mode: true, enabled: true, priority: 100, role: 'primary',
   })
   probe.value = null
@@ -341,6 +359,17 @@ onMounted(loadAll)
             <span class="label">AI 可设最大杠杆</span>
             <input v-model.number="aiCfg.max_position_leverage" type="number" min="1" max="100" class="input mono" />
           </div>
+          <div class="field">
+            <span class="label">决策协议</span>
+            <select v-model.number="aiCfg.decision_schema_version" class="select">
+              <option :value="2">v2 紧凑英文 · 后台转中文（省 token）</option>
+              <option :value="1">v1 中文详细 JSON（兼容旧模型）</option>
+            </select>
+          </div>
+        </div>
+        <div class="hint">
+          v2 用英文短键进、动作码/枚举码出，后台按码表转译中文再落库；输入约省 50%、输出约省 70%。
+          解析时按返回内容自动探测，自定义模型仍能回 v1 格式。
         </div>
 
         <div class="row row-wrap" style="gap: 18px">
@@ -377,6 +406,62 @@ onMounted(loadAll)
           </div>
           <div class="hint">权重决定票数占比; 多数席位一致才会给出开仓建议, 分歧时按 hold 处理。</div>
         </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">决策演练 · 原文 / 中文对照</span>
+        <div class="right" style="gap: 8px">
+          <input
+            v-model="previewSymbol"
+            class="input mono"
+            style="width: 130px; padding: 4px 8px"
+            placeholder="标的，如 BTCUSDT"
+            @keyup.enter="runPreview"
+          />
+          <button class="btn btn-sm" :disabled="previewBusy" @click="runPreview">
+            {{ previewBusy ? '运行中…' : '运行演练' }}
+          </button>
+        </div>
+      </div>
+      <div class="panel-body stack" style="gap: 10px">
+        <div v-if="!previewResult" class="empty" style="padding: 20px">
+          用真实行情跑一次 AI 决策，不触发下单；可核对协议版本、token 估算，以及原始输出与后台中文译文。
+        </div>
+        <template v-else>
+          <div class="row" style="gap: 8px; flex-wrap: wrap">
+            <span class="tag" :class="previewResult.ok ? 'tag-long' : 'tag-short'">
+              {{ previewResult.ok ? '解析成功' : '失败' }}
+            </span>
+            <span class="tag tag-dim">协议 v{{ previewResult.schema_version ?? '—' }}</span>
+            <span class="muted" style="font-size: 11px">
+              输入 ≈ {{ previewResult.prompt_tokens_est ?? '—' }} tokens ·
+              {{ previewResult.action || '—' }} · conf {{ previewResult.confidence ?? '—' }} ·
+              {{ previewResult.latency_ms ?? '—' }}ms
+            </span>
+          </div>
+          <div class="grid g2">
+            <div class="stack" style="gap: 6px">
+              <span class="label">模型原始输出（v2 为紧凑英文 JSON）</span>
+              <pre class="code mono" style="margin: 0; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all">{{ previewResult.raw_text || previewResult.error || '—' }}</pre>
+            </div>
+            <div class="stack" style="gap: 6px">
+              <span class="label">后台转译后（面板 / 审计看到的中文）</span>
+              <pre class="code" style="margin: 0; max-height: 200px; overflow: auto; white-space: pre-wrap">{{ previewResult.reason || '—' }}</pre>
+              <div v-if="previewResult.risk_flags?.length" class="muted" style="font-size: 11px">
+                风险：{{ previewResult.risk_flags.join('；') }}
+              </div>
+              <div v-if="previewResult.invalidation" class="muted" style="font-size: 11px">
+                证伪：{{ previewResult.invalidation }}
+              </div>
+            </div>
+          </div>
+          <details v-if="previewResult.prompt_preview">
+            <summary class="muted" style="font-size: 11px; cursor: pointer">查看送入模型的上下文（截断 1200 字）</summary>
+            <pre class="code mono" style="max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-all">{{ previewResult.prompt_preview }}</pre>
+          </details>
+        </template>
       </div>
     </div>
 
@@ -529,7 +614,11 @@ onMounted(loadAll)
             <input v-model="form.api_key" class="input mono" type="password" placeholder="sk-..." />
           </div>
           <div class="field"><span class="label">温度</span><input v-model.number="form.temperature" type="number" step="0.1" min="0" max="2" class="input mono" /></div>
-          <div class="field"><span class="label">最大输出 tokens</span><input v-model.number="form.max_tokens" type="number" min="64" max="8000" class="input mono" /></div>
+          <div class="field">
+            <span class="label">最大输出 tokens</span>
+            <input v-model.number="form.max_tokens" type="number" min="64" max="8000" class="input mono" />
+            <span class="hint">推理型模型会先消耗 thinking token，建议 ≥ 3000；过小会因 finish_reason=length 截断 JSON。</span>
+          </div>
           <div class="field"><span class="label">超时 (秒)</span><input v-model.number="form.timeout_sec" type="number" min="5" max="300" class="input mono" /></div>
           <div class="field"><span class="label">优先级 (越小越先)</span><input v-model.number="form.priority" type="number" min="1" max="999" class="input mono" /></div>
         </div>

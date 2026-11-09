@@ -241,7 +241,9 @@ async def decision_preview(payload: AnalyzeIn, user: str = Depends(current_user)
     symbol = payload.symbol.upper()
     strat = get_strategy()
     try:
-        candles = await binance_client.klines(symbol, payload.interval or strat.timeframe, 120)
+        # AnalyzeIn 默认 interval=1m（AI 分析用），但策略是 5m；演练必须跟实盘同周期
+        interval = payload.interval if payload.interval in {"5m", "15m", "30m", "1h"} else strat.timeframe
+        candles = await binance_client.klines(symbol, interval, 120)
         tickers = await binance_client.tickers([symbol])
     except (BinanceError, NoCredentials) as exc:
         raise HTTPException(status_code=503, detail=f"币安行情不可用: {exc}") from exc
@@ -276,7 +278,18 @@ async def decision_preview(payload: AnalyzeIn, user: str = Depends(current_user)
         "mantras": [{"title": m["title"], "rule": m["rule"]} for m in mantra_store.rank_lessons()],
     }
     outcome = await decide(ctx, purpose="preview")
-    return {"symbol": symbol, "context_score": round(ctx["score"], 4), **outcome.as_dict()}
+    from ...ai.client import estimate_tokens
+    from ...ai.compact import build_decision_messages
+
+    msgs = build_decision_messages(ctx, version=ai_cfg.decision_schema_version)
+    prompt_tokens_est = estimate_tokens("".join(m["content"] for m in msgs))
+    return {
+        "symbol": symbol,
+        "context_score": round(ctx["score"], 4),
+        "prompt_tokens_est": prompt_tokens_est,
+        "prompt_preview": msgs[1]["content"][:1200],
+        **outcome.as_dict(),
+    }
 
 
 @router.get("/ai/logs")
@@ -299,6 +312,7 @@ def ai_logs(limit: int = Query(default=60, ge=1, le=500), purpose: str = "", use
                 "completion_tokens": r.completion_tokens,
                 "cost_usd": r.cost_usd,
                 "error": r.error,
+                "raw_text": r.raw_text or "",
             }
             for r in rows
         ]

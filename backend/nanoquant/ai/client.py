@@ -68,6 +68,8 @@ class ChatResult:
     completion_tokens: int = 0
     cost_usd: float = 0.0
     error: str = ""
+    raw_text: str = ""
+    finish_reason: str = ""
     attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -212,19 +214,40 @@ class AiClient:
                     continue
                 data = r.json()
                 text, usage = _extract_text(data, provider.protocol)
+                choices = data.get("choices") or []
+                first = choices[0] if choices else {}
+                finish = str(first.get("finish_reason") or "")
                 pt = int(usage.get("prompt_tokens") or 0) or estimate_tokens(" ".join(m["content"] for m in messages))
                 ct = int(usage.get("completion_tokens") or 0) or estimate_tokens(text)
                 cost = estimate_cost(provider.model, pt, ct)
                 self._bump_calls()
+
+                # 明确区分「截断」/「只有思考过程」与「模型真不会输出 JSON」，
+                # 以前这几种都会落到笼统的「无法解析出 JSON 对象」。
+                problem = output_problem(text, finish, mt)
+                if problem:
+                    self._log(
+                        provider=provider, purpose=purpose, ok=False, latency=latency,
+                        pt=pt, ct=ct, cost=cost, error=problem, raw_text=(text or "")[:2000],
+                    )
+                    attempts.append({"status": 200, "latency_ms": latency, "note": problem})
+                    return ChatResult(
+                        ok=False, error=problem, provider=provider.name, provider_id=provider.id,
+                        model=provider.model, latency_ms=latency, prompt_tokens=pt,
+                        completion_tokens=ct, cost_usd=cost, attempts=attempts,
+                        raw_text=(text or "")[:2000], finish_reason=finish,
+                    )
+
                 self._log(
                     provider=provider, purpose=purpose, ok=True, latency=latency,
-                    pt=pt, ct=ct, cost=cost, error="",
+                    pt=pt, ct=ct, cost=cost, error="", raw_text=text[:2000],
                 )
                 attempts.append({"status": 200, "latency_ms": latency})
                 return ChatResult(
                     ok=True, text=text, provider=provider.name, provider_id=provider.id,
                     model=provider.model, latency_ms=latency, prompt_tokens=pt,
                     completion_tokens=ct, cost_usd=cost, attempts=attempts,
+                    raw_text=text[:2000], finish_reason=finish,
                 )
             except Exception as exc:  # noqa: BLE001
                 latency = int((time.perf_counter() - started) * 1000)
@@ -268,7 +291,7 @@ class AiClient:
 
     def _log(
         self, *, provider: AiProvider, purpose: str, ok: bool, latency: int,
-        pt: int, ct: int, cost: float, error: str,
+        pt: int, ct: int, cost: float, error: str, raw_text: str = "",
     ) -> None:
         try:
             with session_scope() as s:
@@ -276,7 +299,7 @@ class AiClient:
                     AiCallLog(
                         provider=provider.name, model=provider.model, purpose=purpose,
                         ok=ok, latency_ms=latency, prompt_tokens=pt, completion_tokens=ct,
-                        cost_usd=cost, error=error[:480],
+                        cost_usd=cost, error=error[:480], raw_text=raw_text[:2000],
                     )
                 )
         except Exception as exc:  # pragma: no cover
@@ -330,14 +353,28 @@ def _extract_text(data: dict[str, Any], protocol: str) -> tuple[str, dict[str, A
     text = ""
     if choices:
         msg = choices[0].get("message") or {}
+        # 只取决策正文；thinking/reasoning 是散文，以前把它当 JSON 解析必然失败
         text = msg.get("content") or ""
-        if not text and msg.get("reasoning_content"):
-            text = msg.get("reasoning_content") or ""
     usage = data.get("usage") or {}
     return text, {
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "completion_tokens": usage.get("completion_tokens", 0),
     }
+
+
+def output_problem(text: str, finish: str, max_tokens: int) -> str:
+    """把「JSON 解析不出来」的锅提前归因到截断 / 只有思考过程。
+
+    返回空串表示输出可用；否则是可直接展示给用户的中文原因。
+    """
+    if finish == "length":
+        return (
+            f"输出被 max_tokens={max_tokens} 截断 (finish_reason=length)；"
+            "请把供应商 max_tokens 提到 3000+，或改用非推理模型/关闭思考"
+        )
+    if not (text or "").strip():
+        return "模型只返回 thinking/reasoning，未给出决策正文；请关闭思考或换非推理模型"
+    return ""
 
 
 async def _sleep_backoff(attempt: int) -> None:

@@ -315,6 +315,114 @@ def test_grid_runs_and_ranks():
     assert set(result["items"][0]["params"]) == {"entry_threshold", "sl_atr_mult"}
 
 
+# -------------------------------------------------- 紧凑决策协议 v2 / 中文转译
+def _ai_ctx():
+    bars = [{"o": 0.1, "h": 0.11, "l": 0.09, "c": 0.105} for _ in range(14)]
+    features = {
+        "close": 0.105, "ema_fast": 0.104, "ema_slow": 0.103,
+        "rsi": 81.8, "atr": 0.001, "atr_pct": 0.95, "vol_ratio": 1.93,
+        "ema_gap_pct": 0.988, "ret_5": 1.93, "ret_15": 5.09,
+        "quote_volume": 4.2e7, "funding": 0.00005, "_bars": bars,
+    }
+    return {
+        "symbol": "ARBUSDT", "price": 0.105, "score": 0.697, "side_hint": "long",
+        "quant_reasons": ["趋势 +0.988%", "量比 1.93"],
+        "features": features, "klines": bars,
+        "funding": 0.00005, "change_24h": 12.3, "quote_volume": 4.2e7,
+        "account": {"equity": 5000, "available": 2400, "open_positions": 1, "today_pnl_pct": 0.3},
+        "constraints": {"max_leverage": 35, "min_confidence": 0.45, "fee_rate_taker": 0.0005},
+        "news": [{"title": "BTC 现货 ETF 净流入 1.05 亿美元", "sentiment": 0.42, "symbols": ["BTC"]} for _ in range(6)],
+        "mantras": [{"title": "超买不追多", "rule": "RSI 高于 80 时禁止顺势追多" * 6, "health": 0.82} for _ in range(8)],
+    }
+
+
+def test_p0_snapshot_drops_duplicate_bars_and_long_text():
+    import re
+
+    from nanoquant.ai.prompts import clean_features, format_snapshot
+
+    ctx = _ai_ctx()
+    cleaned = clean_features(ctx["features"])
+    assert "_bars" not in cleaned and "close" not in cleaned
+    assert cleaned["rsi"] == 81.8
+
+    v1 = format_snapshot(ctx)
+    assert '"_bars"' not in v1
+    assert v1.count('"recent_bars_ohlc"') == 1
+    # 心法 rule 长文本 / 新闻长标题都被裁掉，条数也压缩
+    assert "禁止顺势追多" not in v1
+    assert v1.count('"sentiment"') == 3  # 新闻 6 条 → 3 条
+    assert v1.count('"health"') == 4     # 心法 8 条 → 4 条
+    assert len(v1) < 1200
+    assert not re.search(r"[\u4e00-\u9fff]", json.dumps(cleaned))
+
+
+def test_v2_snapshot_is_much_smaller_than_v1():
+    import re
+
+    from nanoquant.ai.compact import format_snapshot_v2
+    from nanoquant.ai.prompts import format_snapshot
+
+    ctx = _ai_ctx()
+    v1, v2 = format_snapshot(ctx), format_snapshot_v2(ctx)
+    assert len(v2) < len(v1) * 0.6
+    assert '"_bars"' not in v2 and '"features"' not in v2
+    assert '"k"' in v2 and '"s":"ARBUSDT"' in v2
+    assert not re.search(r"[\u4e00-\u9fff]", v2)  # 输入全 ASCII
+
+
+def test_v2_output_is_translated_to_chinese():
+    from nanoquant.ai.compact import is_compact_payload, validate_codes
+    from nanoquant.ai.decision import parse_decision
+
+    assert validate_codes() == []
+    v2 = json.dumps({
+        "a": "H", "c": 0.62, "l": 3, "s": 1.6, "t": 2.0,
+        "r": [12, 9], "k": [21, 11], "x": 1,
+        "n": {"rsi": 81.8, "atr": 0.95}, "f": "wait for pullback",
+    })
+    assert is_compact_payload(json.loads(v2))
+    d = parse_decision(v2, _ai_ctx())
+    assert d.action == "hold" and d.confidence == pytest.approx(0.62)
+    assert d.leverage == 3 and d.sl_pct == pytest.approx(1.6)
+    assert "RSI 超买" in d.reason and "手续费" in d.reason
+    assert "RSI 81.8" in d.reason and "ATR% 0.95" in d.reason  # 数值占位
+    assert "wait for pullback" in d.reason
+    assert "强平价" in "".join(d.risk_flags)
+    assert "RSI 回落至 70" in d.invalidation
+
+
+def test_v1_output_still_parses_and_auto_detection_works():
+    from nanoquant.ai.compact import is_compact_payload
+    from nanoquant.ai.decision import parse_decision
+
+    v1 = json.dumps({
+        "action": "open_long", "confidence": 0.7, "leverage": 5,
+        "sl_pct": 1.2, "tp_pct": 2.4, "reason": "趋势确认",
+        "risk_flags": ["追高"], "invalidation": "跌破 EMA21",
+    })
+    assert not is_compact_payload(json.loads(v1))
+    d = parse_decision(v1, _ai_ctx())
+    assert d.action == "open_long" and d.reason == "趋势确认"
+
+
+def test_truncation_is_reported_explicitly():
+    from nanoquant.ai.client import output_problem
+
+    assert "max_tokens" in output_problem("{\"a\":", "length", 1200)
+    assert "thinking" in output_problem("", "stop", 3000)
+    assert output_problem('{"a":"H"}', "stop", 3000) == ""
+
+
+def test_compact_defaults_are_enabled():
+    from nanoquant.models import AiProvider
+    from nanoquant.services.settings import AiSettings
+
+    assert AiSettings().decision_schema_version == 2
+    # SQLAlchemy 的 default 在 INSERT 时生效，实例化对象上仍是 None
+    assert AiProvider.__table__.c.max_tokens.default.arg == 3000
+
+
 # ------------------------------------------------------ 可用保证金与 -2019
 def test_estimate_qty_caps_by_available_margin():
     """复现 -2019: 按总权益算得起的仓位，可用余额其实付不起初始保证金."""

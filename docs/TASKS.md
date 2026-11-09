@@ -884,6 +884,38 @@
   新 qty 7552、需 **2221.80 < 可用 2468.84**，留 247 USDT 缓冲。
 - **验证**：新增 3 条用例（可用余额截断、高杠杆仍受限、-2019 文案）→ **64 passed**。
 
+### 66. 紧凑决策协议 v2：省 token + 后台转译中文（本次执行）
+- **状态**：✅ 已完成（用户确认 P0 + P1 + 输入英文短键 + max_tokens 3000 全部实施）
+- **背景**：实测 `decision_messages()` 约 **1324 tokens**，其中 `features._bars` 与 `recent_bars_ohlc`
+  是同一份 14 根 K 线被序列化两遍（约 330 tokens）；心法 rule / 新闻标题又占约 470 tokens。
+  输出侧中文 `reason + invalidation + risk_flags` 约 134 tokens，且推理型模型 `max_tokens=1200`
+  常被 thinking 吃光导致 JSON 截断 → 近 7 天 **182 条信号**因「无法解析出 JSON 对象」被拒。
+- **P0 纯裁剪（协议不变，v1 也受益）**：
+  - `prompts.clean_features()` 白名单，去掉 `_bars` / 重复派生素；K 线只序列化一份；
+    新闻 6→3 条且标题截 40 字、心法 8→4 条且去掉 rule 长文本。
+  - v1 实测 1324 → **878 tokens（−33.7%）**。
+- **P1 紧凑协议 v2**（新增 `ai/compact.py`）：
+  - 输入英文短键 + 数组（`s/p/q/d/f/k/m/a/c/n/t`），心法/新闻改结构化摘要（条数/情绪/健康度，全 ASCII）；
+    system 提示压到 781 字符。实测 1324 → **673 tokens（−49.2%）**。
+  - 输出只回 `{"a":"H","c":0.62,"l":3,"s":1.6,"t":2.0,"r":[12,9],"k":[21,11],"x":1,"n":{...},"f":"..."}`：
+    动作码 + 数值 + 枚举 code + 可选 ≤12 词英文短语；输出 134 → **50 tokens（−63%）**。
+  - `localize()` 用码表 `CODE_TEXT/INVALIDATION_CODES` 生成中文 `reason/risk_flags/invalidation`，
+    数值由 `n` 占位填充，保证「引用具体数值」铁律；`AiDecision` 结构不变，下游零改动。
+  - `decision_schema_version`（原字段全仓未使用）改为 `Literal[1,2] = 2`；解析时按内容**自动探测**
+    v1/v2，自定义模型回旧格式也能跑；议会模式同样走 v2。
+- **截断归因与审计**：
+  - `client.output_problem()` 检测 `finish_reason=length` / 只有 thinking 输出，直接报
+    「输出被 max_tokens 截断」/「模型只返回 thinking」，不再笼统报「无法解析 JSON」；
+    `_extract_text()` 不再把 `reasoning_content` 当决策正文。
+  - `AiCallLog.raw_text` 新增列（老库自动 ALTER）保存模型原文；`/ai/logs` 返回该字段。
+  - `AiProvider.max_tokens` 默认 900 → **3000**，运行库 provider 同步改 3000；AI 页表单加提示。
+- **前端**：`AiView.vue` 新增「决策演练 · 原文 / 中文对照」面板（协议版本、token 估算、原始输出、
+  中文译文、prompt 预览），配置项「决策协议 v1/v2」；e2e 冒烟加入 AI 页断言。
+- **实测**（真实服务 `/ai/decision-preview` BTCUSDT）：`schema_version=2`、`prompt_tokens_est=695`、
+  `ok=True`、模型回紧凑 JSON、中文 reason 含 `RSI 55.78 / ATR% 0.2722` 等指标与英文补充短语。
+- **验证**：新增 6 条用例（P0 裁剪、v2 快照更短且全 ASCII、v1/v2 自动探测与中文转译、码表完整性、
+  截断归因、默认值）→ **70 passed**；`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
+
 ---
 
 ## 二、未开始
