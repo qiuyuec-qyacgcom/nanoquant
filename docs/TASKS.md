@@ -916,6 +916,28 @@
 - **验证**：新增 6 条用例（P0 裁剪、v2 快照更短且全 ASCII、v1/v2 自动探测与中文转译、码表完整性、
   截断归因、默认值）→ **70 passed**；`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
 
+### 67. 修复 -1111 Precision is over the maximum defined for this asset（本次执行）
+- **状态**：✅ 已完成
+- **现象**：`ARBUSDT 开多被拒 下单失败 -1111`，近 7 天共 4 次，但同标的其它单能成功（时好时坏）。
+- **根因**（真实规格复算）：ARBUSDT 池规格 `qty_step=0.1`（只允许 1 位小数）、`price_tick=0.0001`。
+  `floor_to_step(2250/0.1812, 0.1)` 得到数值上正确的 `12417.2`，但主单用
+  `f"{qty:.12f}".rstrip("0").rstrip(".")` 发字符串 → **`12417.200000000001`（12 位小数）**，
+  超过交易所允许的 1 位 → -1111。float 无法精确表示 0.1 的倍数，
+  所以「数值对齐过了」不等于「发出去的字符串符合精度」；能否报错取决于浮点尾是否恰好出现。
+- **修复**：
+  - `precision.py` 新增 `SymbolFilters.format_qty()` / `format_price()`：按 `qty_step` / `price_tick`
+    的小数位定格字符串，并先 `align_qty` / `align_price`；`floor_to_step` 等改用 `_to_step()`
+    f-string 定格，减少累计误差（注释明确 float 本身仍有二进制近似，最终必须靠 format_*）。
+  - 所有下单参数统一改走 `format_*`：主单 `quantity` 与 `limit_post_only` 的 `price`、
+    平仓 `quantity`（含部分止盈）、保护单 `triggerPrice/stopPrice`、`amend_stop` 的 `triggerPrice`。
+    顺带删掉 `broker.py` 重复 import 与不再使用的 `math` / `round_to_tick`。
+  - `-1111` 捕获时给出 `precision_hint()`：显示 qty / qty_step / price_tick，并提示检查标的池
+    `precision/tick_sz` 是否与交易所一致（可删除后重新添加）。
+- **实测**（真实池规格 + 当前风控参数复算）：旧 `12417.200000000001`（12 位小数）→
+  新 **`12417.2`（1 位小数）**；止损触发价 `0.1795`（4 位小数，符合 tick）。
+- **验证**：新增 4 条用例（步进与旧格式器对比、`format_qty/format_price` 多标的、ARB 端到端复算、
+  -1111 文案）→ **74 passed**。
+
 ---
 
 ## 二、未开始

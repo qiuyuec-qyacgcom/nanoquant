@@ -18,18 +18,26 @@ def _decimals(step: float) -> int:
     return len(text.split(".")[1])
 
 
+def _to_step(value: float, step: float, n: int) -> float:
+    """按 step 的小数位定格，减少浮点累积误差（落库/比较用）.
+
+    注意：float 本身无法精确表示 0.1 的倍数，`float("12417.2")` 在 `:.12f` 下
+    仍会显示 `12417.200000000001`。因此**发给交易所的最终字符串必须走
+    `SymbolFilters.format_qty()`**，而不是 `:.12f`；这里只保证数值语义干净。
+    """
+    return float(f"{n * step:.{_decimals(step)}f}")
+
+
 def floor_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
-    n = math.floor(value / step + 1e-9)
-    return round(n * step, _decimals(step))
+    return _to_step(value, step, math.floor(value / step + 1e-9))
 
 
 def ceil_to_step(value: float, step: float) -> float:
     if step <= 0:
         return value
-    n = math.ceil(value / step - 1e-9)
-    return round(n * step, _decimals(step))
+    return _to_step(value, step, math.ceil(value / step - 1e-9))
 
 
 def round_to_tick(price: float, tick: float, *, mode: str = "nearest") -> float:
@@ -39,8 +47,7 @@ def round_to_tick(price: float, tick: float, *, mode: str = "nearest") -> float:
         return floor_to_step(price, tick)
     if mode == "up":
         return ceil_to_step(price, tick)
-    n = round(price / tick)
-    return round(n * tick, _decimals(tick))
+    return _to_step(price, tick, round(price / tick))
 
 
 @dataclass
@@ -63,6 +70,23 @@ class SymbolFilters:
 
     def align_price(self, price: float, *, up: bool = False) -> float:
         return ceil_to_step(price, self.price_tick) if up else floor_to_step(price, self.price_tick)
+
+    def qty_decimals(self) -> int:
+        return _decimals(self.qty_step)
+
+    def price_decimals(self) -> int:
+        return _decimals(self.price_tick)
+
+    def format_qty(self, qty: float) -> str:
+        """给交易所的 quantity 字符串：必须严格等于 qty_step 的小数位，不能用 :.12f.
+
+        否则 `12417.200000000001` 这种浮点尾会变成 12 位小数，命中 -1111。
+        """
+        return f"{self.align_qty(qty):.{self.qty_decimals()}f}"
+
+    def format_price(self, price: float) -> str:
+        """给交易所的 price / triggerPrice 字符串，严格按 price_tick 的小数位."""
+        return f"{self.align_price(price):.{self.price_decimals()}f}"
 
     def effective_min_qty(self, price: float | None = None) -> float:
         """按步进上取整后的真实最小可下单量."""

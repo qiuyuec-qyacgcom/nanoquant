@@ -6,7 +6,6 @@ Engine 只依赖 Broker 协议, 因此可以在同一套风控与策略下切换
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -20,7 +19,6 @@ from ..services.exec_metrics import exec_metrics
 from ..services.settings import get_engine, get_risk, normalize_mode
 from . import client as binance_client
 from .client import STAGE_SINK, BinanceError, NoCredentials, UncertainSubmission
-from .precision import SymbolFilters, floor_to_step, round_to_tick
 from .precision import SymbolFilters, floor_to_step
 
 log = get_logger("broker")
@@ -324,7 +322,7 @@ class BinanceBroker:
                 "symbol": symbol,
                 "side": side_txt,
                 "type": "MARKET",
-                "quantity": f"{qty:.12f}".rstrip("0").rstrip("."),
+                "quantity": filters.format_qty(qty),
                 "newClientOrderId": cid,
                 "recvWindow": engine.recv_window_ms,
             }
@@ -333,7 +331,7 @@ class BinanceBroker:
                 if px > 0:
                     params["type"] = "LIMIT"
                     params["timeInForce"] = "GTX"
-                    params["price"] = f"{px:.12f}".rstrip("0").rstrip(".")
+                    params["price"] = filters.format_price(px)
             stage["plan_ms"] = (time.perf_counter() - t_call) * 1000
             t0 = time.perf_counter()
             sink_token = STAGE_SINK.set(stage)
@@ -421,6 +419,8 @@ class BinanceBroker:
             if exc.code == -2019:
                 need = qty * (filters.last_price or 0) / max(1.0, leverage)
                 return ExecResult(False, message=margin_insufficient_hint(need, leverage))
+            if exc.code == -1111:
+                return ExecResult(False, message=precision_hint(filters, qty))
             return ExecResult(False, message=f"下单失败 {exc.code}: {exc.message}")
 
     async def _place_protection(
@@ -431,10 +431,8 @@ class BinanceBroker:
         async def place(kind: str, price: float) -> None:
             if price <= 0:
                 return
-            if filters is not None and getattr(filters, "price_tick", 0):
-                price = round_to_tick(price, filters.price_tick, mode="down")
-                decimals = max(0, -int(math.floor(math.log10(filters.price_tick))))
-                px = f"{price:.{decimals}f}"
+            if isinstance(filters, SymbolFilters) and filters.price_tick > 0:
+                px = filters.format_price(price)
             else:
                 px = f"{price:.8f}".rstrip("0").rstrip(".")
             # 币安已要求 closePosition 类条件单走 Algo 接口(-4120), 老接口仅作回落
@@ -514,6 +512,7 @@ class BinanceBroker:
                 if close_qty < (f.min_qty or 0) - 1e-12:
                     _CLOSING.discard(pid)
                     return ExecResult(False, message=f"平仓数量 {close_qty} 低于最小下单量 {f.min_qty}")
+            qty_text = f.format_qty(close_qty) if f is not None else f"{close_qty:.8f}".rstrip("0").rstrip(".")
             t0 = time.perf_counter()
             sink_token = STAGE_SINK.set(stage)
             try:
@@ -521,7 +520,7 @@ class BinanceBroker:
                     symbol=position.symbol,
                     side=side,
                     type="MARKET",
-                    quantity=f"{close_qty:.12f}".rstrip("0").rstrip("."),
+                    quantity=qty_text,
                     reduceOnly="true",
                     newClientOrderId=new_client_order_id("nx"),
                 )
@@ -582,12 +581,18 @@ class BinanceBroker:
         try:
             await binance_client.client.cancel_all(symbol)
             await binance_client.client.cancel_all_algo(symbol)
+            try:
+                fmap = await binance_client.client.symbol_filters()
+                pf = fmap.get(symbol)
+            except BinanceError:
+                pf = None
+            px = pf.format_price(stop_price) if pf is not None else f"{stop_price:.8f}".rstrip("0").rstrip(".")
             params = {
                 "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": close_side,
                 "type": "STOP_MARKET",
-                "triggerPrice": f"{stop_price:.8f}".rstrip("0").rstrip("."),
+                "triggerPrice": px,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
@@ -644,6 +649,16 @@ def margin_insufficient_hint(required_margin: float, leverage: float = 1.0) -> s
     return (
         f"下单失败 -2019: 可用保证金不足（本单约需 {required_margin:.2f} USDT 初始保证金 @ {leverage:g}x）。"
         "已有仓位/挂单占用了保证金；可先平掉部分仓位，或降低「单仓保证金/单笔风险」、提高杠杆。"
+    )
+
+
+def precision_hint(filters: SymbolFilters | None, qty: float) -> str:
+    """-1111 的可读解释：数量/价格小数位超过该合约允许精度."""
+    step = getattr(filters, "qty_step", 0) or 0
+    tick = getattr(filters, "price_tick", 0) or 0
+    return (
+        f"下单失败 -1111: 数量/价格精度超出交易所限制（qty={qty!r}, qty_step={step:g}, price_tick={tick:g}）。"
+        "已按合约步进对齐；若仍出现，请检查标的池里的 precision/tick_sz 是否与交易所一致（可删除后重新添加）。"
     )
 
 

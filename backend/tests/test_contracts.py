@@ -423,6 +423,62 @@ def test_compact_defaults_are_enabled():
     assert AiProvider.__table__.c.max_tokens.default.arg == 3000
 
 
+# ------------------------------------------------------------ 下单精度 -1111
+def test_floor_to_step_and_legacy_formatter():
+    """根因：float(12417.2) 在 :.12f 下就是 12417.200000000001 → -1111。
+
+    数值层面 floor_to_step 正确，但发给交易所的字符串必须用 format_qty 定格小数位。
+    """
+    from nanoquant.exchange.precision import SymbolFilters, ceil_to_step, floor_to_step, round_to_tick
+
+    qty = floor_to_step(2250.0 / 0.1812, 0.1)
+    assert qty == pytest.approx(12417.2)
+    legacy = f"{qty:.12f}".rstrip("0").rstrip(".")
+    assert legacy.count(".") == 1 and len(legacy.split(".")[1]) > 1  # 旧写法超出 1 位精度
+    f = SymbolFilters(symbol="ARBUSDT", qty_step=0.1, price_tick=0.0001)
+    assert f.format_qty(qty) == "12417.2"
+    assert ceil_to_step(3.14159, 0.01) == 3.15
+    assert round_to_tick(0.18126, 0.0001) == 0.1813
+
+
+def test_symbol_filters_formats_exchange_precision():
+    from nanoquant.exchange.precision import SymbolFilters
+
+    arb = SymbolFilters(symbol="ARBUSDT", price_tick=0.0001, qty_step=0.1, min_qty=0.1)
+    assert arb.format_qty(12417.200000000001) == "12417.2"
+    assert arb.format_price(0.181249999) == "0.1812"
+    assert arb.qty_decimals() == 1 and arb.price_decimals() == 4
+
+    btc = SymbolFilters(symbol="BTCUSDT", price_tick=0.1, qty_step=0.0001, min_qty=0.0001)
+    assert btc.format_qty(0.082399999999) == "0.0823"
+    assert btc.format_price(74374.66) == "74374.6"
+
+
+def test_arb_order_quantity_would_not_trigger_1111():
+    """按真实账户/ARB 规格复算：修复前发送 12417.200000000001，修复后 12417.2."""
+    from nanoquant.exchange.broker import estimate_qty
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import RiskSettings
+
+    cfg = RiskSettings(risk_per_trade_pct=10.0, margin_pct=50.0, default_leverage=1)
+    f = SymbolFilters(symbol="ARBUSDT", price_tick=0.0001, qty_step=0.1, min_qty=0.1, min_notional=5.0)
+    f.last_price = 0.1812
+    qty, note = estimate_qty(5000.0, 0.1812, 1, cfg, 0.009, f, available=2500.0)
+    assert note == "ok"
+    sent = f.format_qty(qty)
+    assert sent.count(".") == 1 and len(sent.split(".")[1]) <= 1
+    # 即使外部传入带二进制尾的旧值，format_qty 也必须救回来
+    assert f.format_qty(12417.200000000001) == "12417.2"
+
+
+def test_precision_hint_is_actionable():
+    from nanoquant.exchange.broker import precision_hint
+    from nanoquant.exchange.precision import SymbolFilters
+
+    text = precision_hint(SymbolFilters(symbol="ARBUSDT", qty_step=0.1, price_tick=0.0001), 12417.2)
+    assert "-1111" in text and "qty_step=0.1" in text and "重新添加" in text
+
+
 # ------------------------------------------------------ 可用保证金与 -2019
 def test_estimate_qty_caps_by_available_margin():
     """复现 -2019: 按总权益算得起的仓位，可用余额其实付不起初始保证金."""
