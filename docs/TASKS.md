@@ -979,6 +979,28 @@
 - **验证**：新增 3 条用例（协议映射与边界、schema 默认值、API 往返与非法档 422）→ **79 passed**；
   `vue-tsc` 0 error、`npm run build` 通过；重启后运行库 provider 已带 `reasoning_effort=auto`（行为不变）。
 
+### 70. 更新推理型模型库（本次执行）
+- **状态**：✅ 已完成
+- **背景**：#69 的识别逻辑是一串散落的子串 tuple，覆盖不全（缺 qwen3-vl / claude-4 /
+  kimi-k2.7/k3 / minimax-m2 / mimo-v2 / gpt-oss / grok），且没有「是否支持 xhigh/max」的区分，
+  前端也无法告诉用户「当前模型到底支不支持思考强度」。
+- **实现**：
+  - `ai/reasoning.py` 重构为**可维护模型库** `REASONING_FAMILIES`（14 个族，`dataclass`
+    含 key/label/hints/extreme/note），新增 `_NON_REASONING_HINTS` 负向表（gpt-4o/gpt-4.1/gpt-3/
+    qwen2.5/llama/mistral/-chat/instruct），避免 "o1"/"v4.1" 等子串误判。
+  - 新增 `match_family()/supports_extreme_effort()/effort_options()/library()`；
+    `xhigh/max` 仅 GPT-5/6、o 系列、grok 3 mini/4 标为可用（其余档位最高 high，选了会自动回退）。
+  - 新端点 `GET /ai/reasoning-models`（只读）；带 `?model=` 时附 `matched` 与逐档 `enabled`。
+  - 前端「思考强度」下方显示「已识别为推理型：xxx · 支持 xhigh/max」或未识别提示，
+    并提供可折叠的「支持的推理模型族（14）」清单；数据全部来自后端，避免前后端两套规则。
+- **模型库覆盖**：GPT-6/ChatGPT-6、GPT-5、o1/o3/o4、GPT-OSS、Claude 3.7+/4、Gemini 2.5/3、
+  DeepSeek V4/V4.1、DeepSeek R1/Reasoner、Qwen3 全系/QwQ、Kimi K2.7/K3、GLM-5、MiniMax M2、
+  MiMo V2、Grok 3 mini/4。
+- **实测**：`GET /ai/reasoning-models?model=cn:deepseek-v4.1-flash` → 14 族、匹配
+  `deepseek-v4`、`xhigh/max` 为不可用，与预期一致。
+- **验证**：新增 2 条用例（23 个正例 + 7 个反例 + extreme 判定 + 库结构、API 端点与
+  `?model=` 选项）→ **81 passed**；`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
+
 ---
 
 ## 二、未开始

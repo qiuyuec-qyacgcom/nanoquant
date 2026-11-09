@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ...ai.client import ai_client, fetch_remote_models, list_models
 from ...ai.decision import analyze
 from ...ai.diagnostics import diagnose
+from ...ai.reasoning import effort_options, library, match_family
 from ...db import session_scope
 from ...exchange.client import BinanceError, NoCredentials
 from ...exchange.client import client as binance_client
@@ -47,6 +48,23 @@ def _serialize(p: AiProvider) -> dict[str, Any]:
         "created_at": p.created_at,
         "updated_at": p.updated_at,
     }
+
+
+@router.get("/ai/reasoning-models")
+def reasoning_models(model: str = Query(""), user: str = Depends(current_user)) -> dict:
+    """推理型模型库（只读，供思考强度下拉与提示）.
+
+    传 `?model=` 时额外返回该模型的匹配结果与每档可用性，方便前端直接渲染。
+    """
+    data = library()
+    if model:
+        fam = match_family(model)
+        data["matched"] = (
+            {"key": fam.key, "label": fam.label, "extreme": fam.extreme, "note": fam.note}
+            if fam else None
+        )
+        data["options"] = effort_options(model)
+    return data
 
 
 @router.get("/ai/providers")

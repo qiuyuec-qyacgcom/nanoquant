@@ -474,6 +474,45 @@ def test_reasoning_effort_maps_to_protocol_params():
     assert p_resp["reasoning"] == {"effort": "high"}
 
 
+def test_reasoning_model_library_covers_2026_families():
+    from nanoquant.ai.reasoning import (
+        effort_options,
+        library,
+        match_family,
+        supports_effort,
+        supports_extreme_effort,
+    )
+
+    reasoning_models = [
+        "gpt-6", "chatgpt-6", "gpt-5-mini", "o1-preview", "o3-mini", "o4-mini",
+        "gpt-oss-120b", "claude-4-opus", "claude-3-7-sonnet", "gemini-3-pro",
+        "gemini-2.5-flash", "deepseek-v4.1-flash", "deepseek-reasoner",
+        "qwen3-vl-235b", "qwen-3-max", "qwq-32b", "kimi-k3", "kimi-k2.7",
+        "glm-5", "minimax-m2", "mimo-v2", "grok-4", "grok-3-mini",
+    ]
+    for model in reasoning_models:
+        assert supports_effort(model), model
+        assert match_family(model) is not None
+
+    for model in ["gpt-4o-mini", "gpt-3.5-turbo", "qwen2.5-72b", "llama-3.1-70b",
+                  "mistral-large", "deepseek-chat", "claude-3-5-haiku"]:
+        assert not supports_effort(model), model
+
+    assert supports_extreme_effort("gpt-5")
+    assert supports_extreme_effort("o4-mini")
+    assert supports_extreme_effort("grok-4")
+    assert not supports_extreme_effort("deepseek-v4.1-flash")
+    assert not supports_extreme_effort("qwen3-max")
+
+    opts = {o["value"]: o for o in effort_options("deepseek-v4.1-flash")}
+    assert opts["high"]["enabled"] and not opts["xhigh"]["enabled"]
+    assert opts["xhigh"]["requires_extreme"] is True
+
+    lib = library()
+    assert {f["key"] for f in lib["families"]} >= {"openai-gpt5", "qwen3", "minimax", "gpt-oss"}
+    assert "qwen2.5" in lib["non_reasoning_hints"]
+
+
 def test_provider_schema_defaults_for_reasoning():
     from nanoquant.api.schemas import ProviderIn, ProviderPatch
 

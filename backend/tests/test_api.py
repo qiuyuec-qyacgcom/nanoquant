@@ -229,6 +229,20 @@ def test_provider_reasoning_effort_roundtrip(client):
         client.delete(f"{API}/ai/providers/{pid}", headers=headers)
 
 
+def test_reasoning_models_endpoint(client):
+    headers = _token(client)
+    res = client.get(f"{API}/ai/reasoning-models", headers=headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["levels"][0] == "auto"
+    assert any(f["key"] == "qwen3" for f in body["families"])
+
+    matched = client.get(f"{API}/ai/reasoning-models?model=qwen3-max", headers=headers).json()
+    assert matched["matched"]["key"] == "qwen3"
+    assert matched["matched"]["extreme"] is False
+    assert any(o["value"] == "xhigh" and not o["enabled"] for o in matched["options"])
+
+
 def test_metrics_is_public_text_without_secrets(client):
     res = client.get(f"{API}/metrics")
     assert res.status_code == 200

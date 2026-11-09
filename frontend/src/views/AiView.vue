@@ -124,8 +124,24 @@ const budgetPct = computed(() => {
   return Math.min(100, (used / total) * 100)
 })
 
+/** 推理型模型库（GET /ai/reasoning-models）：前端只做提示，是否注入由后端判定 */
+const reasoningLib = ref<any>(null)
+const modelFamily = computed(() => {
+  const lib = reasoningLib.value
+  const model = (form.model || '').toLowerCase()
+  if (!lib || !model) return null
+  if ((lib.non_reasoning_hints || []).some((h: string) => model.includes(h))) return null
+  return (lib.families || []).find((f: any) => (f.hints || []).some((h: string) => model.includes(h))) || null
+})
+const extremeSupported = computed(() => !!modelFamily.value?.extreme)
+
 async function loadAll() {
-  const [p, u, l] = await Promise.allSettled([http.get('/ai/providers'), http.get('/ai/usage'), http.get('/ai/logs?limit=40')])
+  const [p, u, l, r] = await Promise.allSettled([
+    http.get('/ai/providers'),
+    http.get('/ai/usage'),
+    http.get('/ai/logs?limit=40'),
+    http.get('/ai/reasoning-models'),
+  ])
   if (p.status === 'fulfilled') {
     providers.value = p.value.items
     active.value = p.value.active
@@ -133,6 +149,7 @@ async function loadAll() {
   }
   if (u.status === 'fulfilled') usage.value = u.value
   if (l.status === 'fulfilled') logs.value = l.value.items
+  if (r.status === 'fulfilled') reasoningLib.value = r.value
   if (!Object.keys(app.settings).length) await app.loadSettings()
   const cfg = app.settings.ai
   if (cfg) Object.assign(aiCfg, cfg)
@@ -637,6 +654,29 @@ onMounted(loadAll)
               Anthropic 协议映射 thinking 预算（low 2k / medium 8k / high 16k / xhigh 32k / max 64k）；
               OpenAI 兼容映射 reasoning_effort（仅推理型模型注入）；服务端不支持时自动回退默认。
             </span>
+            <div class="hint" style="margin-top: 4px">
+              <template v-if="modelFamily">
+                已识别为推理型：<b>{{ modelFamily.label }}</b>
+                {{ modelFamily.extreme ? '· 支持 xhigh/max' : '· 最高到 high（xhigh/max 会自动回退）' }}
+                <template v-if="modelFamily.note"> · {{ modelFamily.note }}</template>
+              </template>
+              <template v-else>
+                该模型未识别为推理型；OpenAI 兼容协议下不会注入 reasoning_effort（Anthropic 协议仍按预算生效）。
+              </template>
+            </div>
+            <details v-if="reasoningLib?.families?.length" style="margin-top: 4px">
+              <summary class="muted" style="font-size: 11px; cursor: pointer">
+                支持的推理模型族（{{ reasoningLib.families.length }}）
+              </summary>
+              <div class="muted" style="font-size: 11px; line-height: 1.7; max-height: 160px; overflow: auto">
+                <div v-for="f in reasoningLib.families" :key="f.key">
+                  <b>{{ f.label }}</b>
+                  <span v-if="f.extreme" class="tag tag-dim" style="margin-left: 4px">xhigh/max</span>
+                  <span v-if="f.note"> · {{ f.note }}</span>
+                  <span style="opacity: 0.6"> · {{ f.hints.join(' / ') }}</span>
+                </div>
+              </div>
+            </details>
           </div>
           <div class="field"><span class="label">超时 (秒)</span><input v-model.number="form.timeout_sec" type="number" min="5" max="300" class="input mono" /></div>
           <div class="field"><span class="label">优先级 (越小越先)</span><input v-model.number="form.priority" type="number" min="1" max="999" class="input mono" /></div>

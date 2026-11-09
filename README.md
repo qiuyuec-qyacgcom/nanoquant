@@ -28,8 +28,9 @@
 > **近期更新（2026-11）**：主网演练手册与只读预检、systemd 部署、组合风险与波动率目标仓位、
 > 心法效果对照与命中率回写、API 限频与 `/metrics`、轮询成本优化、持仓权威浮盈亏、
 > 可用保证金截断与并发保证金账本（修复 `-2019`）、**紧凑决策协议 v2（省 ~50% 输入 / ~63% 输出，后台转中文）**、
-> 下单精度按合约步进格式化（修复 `-1111`）、**模型思考强度可调（对齐 astra-quant-agent）**。
-> 逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#69。
+> 下单精度按合约步进格式化（修复 `-1111`）、**模型思考强度可调（对齐 astra-quant-agent）**、
+> **推理型模型库（14 族，含 GPT-6/o 系列/Gemini 3/Qwen3/Kimi K3/GLM-5 等）**。
+> 逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#70。
 
 ## ✨ 特性
 
@@ -37,7 +38,7 @@
 |---|---|
 | 💸 **1 USDT 起跑** | 按交易所步进计算真实最小名义额，取整不足即明确拒绝；数量/价格严格按 `qty_step`/`price_tick` 定格小数位，避免 `-1111` |
 | 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限与**可用余额**双重截断（留 10% 安全垫，避免 `-2019`）；杠杆只能逐层封顶 |
-| 🤖 **AI 辅助开平仓** | OpenAI 兼容 / Anthropic 协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算；默认紧凑英文协议 v2（后台转中文，省约 50% 输入 / 63% 输出）；**思考强度可调**（auto/none/minimal/low/medium/high/xhigh/max，Anthropic 映射 thinking 预算、OpenAI 映射 reasoning_effort） |
+| 🤖 **AI 辅助开平仓** | OpenAI 兼容 / Anthropic 协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算；默认紧凑英文协议 v2（后台转中文，省约 50% 输入 / 63% 输出）；**思考强度可调**（auto/none/minimal/low/medium/high/xhigh/max，Anthropic 映射 thinking 预算、OpenAI 映射 reasoning_effort），内置 **14 族推理模型库**自动识别支持范围 |
 | 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；按健康度回注后续决策，决策时注入的 ID 随成交落库，用「采用 vs 未采用」对照量化效果（观察性，非随机 A/B），胜负回写命中率 |
 | 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽；相同状态的 flat 信号 60s 合并为一行并用 `repeats` 还原真实扫描次数 |
 | 📰 **资讯与情绪** | 10 个源（含币安广场 / 公告），情绪指数与币种共现，可选注入 AI 上下文，源体检逐项给状态码 |
@@ -303,7 +304,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 63 + 路由 16（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 64 + 路由 17（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -380,6 +381,10 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
   Anthropic 走 `thinking.budget_tokens`（low 2k → max 64k，`max_tokens` 自动调大），
   OpenAI 兼容走 `reasoning_effort`（只对推理型模型注入）。网关不支持该参数时会自动移除并重试一次，
   不会导致整次调用失败。
+- **推理模型库**：`ai/reasoning.py` 维护 14 个模型族（GPT-6/5、o 系列、GPT-OSS、Claude 3.7+/4、
+  Gemini 2.5/3、DeepSeek V4/R1、Qwen3/QwQ、Kimi K2.7/K3、GLM-5、MiniMax M2、MiMo V2、Grok），
+  另有一张负向表避免 `gpt-4o/qwen2.5/llama/-chat` 被误判。`GET /ai/reasoning-models?model=` 返回
+  匹配结果与逐档可用性；xhigh/max 仅旗舰推理模型可用，选了会自动回退。
 
 ---
 
@@ -404,6 +409,7 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - [x] 下单数量/价格按合约步进格式化，修复 `-1111 Precision is over the maximum`
 - [x] 同轮并发开仓共享保证金额度（账本串行预留），修复第二笔 `-2019`
 - [x] 模型思考强度（reasoning effort）按供应商可调，对齐 astra-quant-agent 的档位与协议映射
+- [x] 推理型模型库（14 族 + 负向表）与 `/ai/reasoning-models` 查询端点
 
 下一步：
 
@@ -475,6 +481,13 @@ Anthropic 协议会转成 `thinking.budget_tokens`（low 2k / medium 8k / high 1
 `max_tokens` 自动调大以保证大于预算）；OpenAI 兼容协议转成 `reasoning_effort`，只对推理型模型注入。
 强度越高越慢越贵，但决策质量未必线性提升；建议先用「决策演练」对比 20 次再定。
 网关不支持该参数时会自动移除并重试一次，不会导致调用失败。
+支持哪些模型可在表单下方展开「支持的推理模型族」，或直接请求 `GET /ai/reasoning-models?model=你的模型`。
+
+**Q：为什么有些模型没有注入 `reasoning_effort`？**
+A：内置模型库只对识别为推理型的模型注入（14 个族），普通模型（gpt-4o / qwen2.5 / llama / `-chat` 等）
+传了会被服务端 400，所以默认不发。Anthropic 协议不受此限制——`thinking.budget_tokens` 按档位直接生效。
+模型不在库里但确实支持该参数时，可把档位设为 `auto` 之外的任意值并观察日志：服务端接受就说明直连可用，
+返回 400/422 时系统会自动移除参数重试。
 
 **Q：心法会越来越不可控吗？**
 A：不会。心法入库前经防污染审计（拦截提高杠杆、取消止损等危险结论），并带健康度与版本；
