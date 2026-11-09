@@ -68,6 +68,13 @@ const currentTicker = computed(() => tickers.value[selected.value] || null)
 const lastBar = computed<Candle | null>(() => (items.value.length ? items.value[items.value.length - 1] : null))
 const lastPrice = computed(() => currentTicker.value?.last || lastBar.value?.c || 0)
 
+/** 模拟盘里有 92 个合约没有 24h ticker（无真实成交），K 线是交易所返回的静态价格：
+ *  连续多根 high==low 且无成交量 —— 画出来就是一条直线，不是图表坏了。 */
+const chartStatic = computed(() => {
+  const list = items.value.slice(-10)
+  return list.length >= 5 && list.every((c) => Number(c.h) === Number(c.l))
+})
+
 const stats = computed(() => {
   const t = currentTicker.value as any
   if (t?.high) return { high: t.high, low: t.low, quote_volume: t.quote_volume }
@@ -487,13 +494,26 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
+              <div v-if="chartStatic" class="note" style="margin: 0 0 8px; border-left-color: #f2c94c">
+                {{ selected }} 在当前环境（模拟盘）没有真实成交，K 线是交易所返回的静态价格（直线），
+                价格与成交量都不变化；引擎的 ATR / 量比闸门会自动跳过它，不会开仓。
+                切到实盘或换一个有成交的标的即可。
+              </div>
               <KlineChartPanel
+                v-if="items.length"
                 :key="`${mainIndicator}-${subIndicator}`"
                 :items="items"
                 height="430px"
                 :main="mainIndicator"
                 :sub="subIndicator"
               />
+              <div v-else class="kb-empty" style="height: 430px; justify-content: center">
+                <div class="kb-empty-title">{{ chartLoading ? 'K 线加载中…' : '暂无 K 线数据' }}</div>
+                <div v-if="!chartLoading" class="kb-empty-desc">
+                  {{ selected }} 在当前交易环境没有返回 K 线。常见原因是该合约在模拟盘没有行情源/成交，
+                  或所选周期数据不足；可切换周期、换标的，或切到实盘环境。
+                </div>
+              </div>
               <div v-if="chartError" class="note" style="margin: 8px 0 0; border-left-color: #f07178">
                 {{ selected }} 行情暂不可用：{{ chartError }}
               </div>
