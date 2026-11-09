@@ -124,13 +124,29 @@ async function fetchPool(): Promise<PoolSymbol[]> {
   return res.symbols || []
 }
 
+/** REST 历史到达后，把加载期间缓存的第一帧 WS 合并进去（重复 t 就替换） */
+function mergePendingBar() {
+  const bar = pendingBar.value
+  if (!bar || !items.value.length) return
+  pendingBar.value = null
+  const list = items.value
+  if (bar.t === list[list.length - 1].t) {
+    items.value = [...list.slice(0, -1), bar]
+  } else if (bar.t > list[list.length - 1].t) {
+    items.value = [...list, bar].slice(-BARS)
+  }
+}
+
 /** 历史 K 线: reset=true 时先清空 (切标的/切周期立即进入加载态), 避免旧标的数据滞留 */
 async function reloadChart(reset = false) {
   const symbol = selected.value
   const period = interval.value
   if (!symbol) return
   const seq = ++loadSeq
-  if (reset) items.value = []
+  if (reset) {
+    items.value = []
+    pendingBar.value = null
+  }
   chartLoading.value = true
   try {
     const res = isAdmin.value
@@ -140,6 +156,7 @@ async function reloadChart(reset = false) {
       : await publicKlines(symbol, period, BARS)
     if (seq !== loadSeq || symbol !== selected.value || period !== interval.value) return
     items.value = res.items || []
+    mergePendingBar()
     nextCloseAt.value = Number(res.next_close_at || 0)
     const server = Number(res.server_time || 0)
     skew.value = server ? server - Date.now() : 0
@@ -147,6 +164,7 @@ async function reloadChart(reset = false) {
     chartError.value = ''
   } catch (err: any) {
     if (seq !== loadSeq) return
+    pendingBar.value = null
     chartError.value = String(err?.message || 'K 线加载失败')
   } finally {
     if (seq === loadSeq) chartLoading.value = false
@@ -194,6 +212,8 @@ async function syncPool(): Promise<boolean> {
 let socket: WebSocket | null = null
 let wsTimer: number | undefined
 let wsRetry = 0
+/** REST 600 根还没到时的第一帧 WS：先缓存，等历史到达再合并，避免图表只画一根变成点/直线 */
+const pendingBar = ref<Candle | null>(null)
 
 function applyBar(bar: any) {
   if (!bar || typeof bar.t !== 'number') return
@@ -210,8 +230,10 @@ function applyBar(bar: any) {
   }
   const list = items.value
   if (!list.length) {
-    items.value = [next]
-  } else if (next.t === list[list.length - 1].t) {
+    pendingBar.value = next
+    return
+  }
+  if (next.t === list[list.length - 1].t) {
     items.value = [...list.slice(0, -1), next]
   } else if (next.t > list[list.length - 1].t) {
     items.value = [...list, next].slice(-BARS)
@@ -500,7 +522,7 @@ onBeforeUnmount(() => {
                 切到实盘或换一个有成交的标的即可。
               </div>
               <KlineChartPanel
-                v-if="items.length"
+                v-if="items.length > 1"
                 :key="`${mainIndicator}-${subIndicator}`"
                 :items="items"
                 height="430px"
@@ -508,10 +530,17 @@ onBeforeUnmount(() => {
                 :sub="subIndicator"
               />
               <div v-else class="kb-empty" style="height: 430px; justify-content: center">
-                <div class="kb-empty-title">{{ chartLoading ? 'K 线加载中…' : '暂无 K 线数据' }}</div>
+                <div class="kb-empty-title">
+                  {{ chartLoading ? 'K 线加载中…' : items.length ? 'K 线数据不足' : '暂无 K 线数据' }}
+                </div>
                 <div v-if="!chartLoading" class="kb-empty-desc">
-                  {{ selected }} 在当前交易环境没有返回 K 线。常见原因是该合约在模拟盘没有行情源/成交，
-                  或所选周期数据不足；可切换周期、换标的，或切到实盘环境。
+                  <template v-if="items.length">
+                    {{ selected }} 只收到 1 根蜡烛，暂不渲染图表（避免显示成一个点）；稍等下一根或点刷新重试。
+                  </template>
+                  <template v-else>
+                    {{ selected }} 在当前交易环境没有返回 K 线。常见原因是该合约在模拟盘没有行情源/成交，
+                    或所选周期数据不足；可切换周期、换标的，或切到实盘环境。
+                  </template>
                 </div>
               </div>
               <div v-if="chartError" class="note" style="margin: 8px 0 0; border-left-color: #f07178">
