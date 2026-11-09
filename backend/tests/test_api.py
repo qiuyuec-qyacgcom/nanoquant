@@ -201,6 +201,34 @@ def test_evolution_effectiveness_shape(client):
     assert body["injected"]["trades"] == 0  # 临时库无成交
 
 
+def test_provider_reasoning_effort_roundtrip(client):
+    headers = _token(client)
+    body = {
+        "name": "effort-test",
+        "base_url": "http://127.0.0.1:9/v1",
+        "api_key": "sk-test",
+        "model": "deepseek-v4.1",
+        "reasoning_effort": "high",
+    }
+    created = client.post(f"{API}/ai/providers", headers=headers, json=body)
+    assert created.status_code == 200, created.text
+    pid = created.json()["id"]
+    try:
+        items = client.get(f"{API}/ai/providers", headers=headers).json()["items"]
+        row = next(p for p in items if p["id"] == pid)
+        assert row["reasoning_effort"] == "high"
+        assert row["max_tokens"] == 3000  # schema 默认值与模型默认值一致
+
+        bad = client.post(
+            f"{API}/ai/providers",
+            headers=headers,
+            json={**body, "name": "effort-bad", "reasoning_effort": "ultra"},
+        )
+        assert bad.status_code == 422
+    finally:
+        client.delete(f"{API}/ai/providers/{pid}", headers=headers)
+
+
 def test_metrics_is_public_text_without_secrets(client):
     res = client.get(f"{API}/metrics")
     assert res.status_code == 200

@@ -958,6 +958,27 @@
   剩余约 280 USDT 的额度，`plan_position` 会缩量或直接给出「本轮可用保证金已被其它开仓占用」。
 - **验证**：新增 2 条用例（并发只成功一个、剩余额度生效）→ **76 passed**。
 
+### 69. 模型「思考强度」设置（对齐 astra-quant-agent）（本次执行）
+- **状态**：✅ 已完成
+- **参考**：本地 `astra-quant-agent` 的模型设置里有 `reasoning_effort`（high/medium/low/minimal/none/auto，
+  旗舰模型再加 max/xhigh），Anthropic 映射 `thinking.budget_tokens`，OpenAI 兼容映射 `reasoning_effort`。
+- **实现**：
+  - `AiProvider.reasoning_effort` 新字段（默认 `auto`，8 档：auto/none/minimal/low/medium/high/xhigh/max），
+    老库自动 `ALTER`；API 序列化与 create/patch 全链路透传，`ProviderIn/Patch` 用 `Literal` 校验。
+  - 新增 `ai/reasoning.py`：
+    - `normalize()` 容错（非法值回落 `auto`）、`supports_effort()` 判断推理型模型族
+      （o1/o3/o4/gpt-5/gpt-6/gemini/qwen3/qwq/deepseek-v4|r1/kimi-k/glm-5 等）；
+    - Anthropic：`thinking={type: enabled, budget_tokens}`，预算 minimal 1k / low 2k / medium 8k /
+      high 16k / xhigh 32k / max 64k；`max_tokens` 自动调大并保证 **大于 budget**（触顶时下调 budget）；
+      `none` 显式 `{type: disabled}`；
+    - OpenAI Chat：仅对推理型模型注入 `reasoning_effort`（普通模型传了会 400）；
+    - OpenAI Responses：`reasoning={effort}`，极值档收敛到 high。
+  - `client.chat()` 注入后若服务端 400/422 且不接受该参数，**自动移除并重试一次**（与 json_mode 降级合并），
+    不会因为网关不认 `reasoning_effort` 导致整次调用失败。
+  - 前端「模型接入」表单新增「思考强度」下拉与说明；列表接口返回该字段。
+- **验证**：新增 3 条用例（协议映射与边界、schema 默认值、API 往返与非法档 422）→ **79 passed**；
+  `vue-tsc` 0 error、`npm run build` 通过；重启后运行库 provider 已带 `reasoning_effort=auto`（行为不变）。
+
 ---
 
 ## 二、未开始

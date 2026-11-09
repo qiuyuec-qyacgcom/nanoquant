@@ -28,7 +28,8 @@
 > **近期更新（2026-11）**：主网演练手册与只读预检、systemd 部署、组合风险与波动率目标仓位、
 > 心法效果对照与命中率回写、API 限频与 `/metrics`、轮询成本优化、持仓权威浮盈亏、
 > 可用保证金截断与并发保证金账本（修复 `-2019`）、**紧凑决策协议 v2（省 ~50% 输入 / ~63% 输出，后台转中文）**、
-> 下单精度按合约步进格式化（修复 `-1111`）。逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#68。
+> 下单精度按合约步进格式化（修复 `-1111`）、**模型思考强度可调（对齐 astra-quant-agent）**。
+> 逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#69。
 
 ## ✨ 特性
 
@@ -36,7 +37,7 @@
 |---|---|
 | 💸 **1 USDT 起跑** | 按交易所步进计算真实最小名义额，取整不足即明确拒绝；数量/价格严格按 `qty_step`/`price_tick` 定格小数位，避免 `-1111` |
 | 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限与**可用余额**双重截断（留 10% 安全垫，避免 `-2019`）；杠杆只能逐层封顶 |
-| 🤖 **AI 辅助开平仓** | OpenAI 兼容协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算；默认紧凑英文协议 v2（后台转中文，省约 50% 输入 / 63% 输出） |
+| 🤖 **AI 辅助开平仓** | OpenAI 兼容 / Anthropic 协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算；默认紧凑英文协议 v2（后台转中文，省约 50% 输入 / 63% 输出）；**思考强度可调**（auto/none/minimal/low/medium/high/xhigh/max，Anthropic 映射 thinking 预算、OpenAI 映射 reasoning_effort） |
 | 🧬 **自进化心法** | 每笔平仓自动复盘，结论经防污染审计后沉淀为心法；按健康度回注后续决策，决策时注入的 ID 随成交落库，用「采用 vs 未采用」对照量化效果（观察性，非随机 A/B），胜负回写命中率 |
 | 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽；相同状态的 flat 信号 60s 合并为一行并用 `repeats` 还原真实扫描次数 |
 | 📰 **资讯与情绪** | 10 个源（含币安广场 / 公告），情绪指数与币种共现，可选注入 AI 上下文，源体检逐项给状态码 |
@@ -264,6 +265,7 @@ nanoquant/
 | 心法 | 效果对照最小样本 | 每组 ≥ 10 笔才给结论（观察性统计） |
 | AI | 模式 / 最低置信 / 调用上限 / 月预算 | single / 0.45 / 30 次每小时 / $3 |
 | AI | 决策协议 / 供应商 max_tokens | v2 紧凑英文 + 后台转中文 / 3000（推理型模型防截断） |
+| AI | 思考强度 | `auto`（跟随服务端默认）；可选 none/minimal/low/medium/high/xhigh/max |
 
 > 以上均为**出厂默认值**，可在「参数配置」热更新；例如当前运行环境的 AI 配额、杠杆与风险参数可能已被调整。
 
@@ -301,7 +303,7 @@ nanoquant/
 
 ```bash
 cd backend
-python -m pytest tests -q         # 契约 61 + 路由 15（不联网、不碰真实 data/）
+python -m pytest tests -q         # 契约 63 + 路由 16（不联网、不碰真实 data/）
 python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
 python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
 python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
@@ -374,6 +376,10 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - **AI token 与审计**：决策默认走紧凑协议 v2（英文短键进、动作码/枚举码出，后台按码表转中文），
   输入约省 50% / 输出约省 63%；模型原文存 `AiCallLog.raw_text`，`/ai/logs` 与「决策演练」页可对照查看。
   `finish_reason=length` 或只有 thinking 输出时会明确报「输出被 max_tokens 截断」，不再笼统报解析失败。
+- **思考强度**：每个供应商可单独设置 auto/none/minimal/low/medium/high/xhigh/max；
+  Anthropic 走 `thinking.budget_tokens`（low 2k → max 64k，`max_tokens` 自动调大），
+  OpenAI 兼容走 `reasoning_effort`（只对推理型模型注入）。网关不支持该参数时会自动移除并重试一次，
+  不会导致整次调用失败。
 
 ---
 
@@ -397,6 +403,7 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - [x] 紧凑决策协议 v2：token 裁剪 + 后台中文转译 + 截断归因 + 原文审计 + 决策演练对照
 - [x] 下单数量/价格按合约步进格式化，修复 `-1111 Precision is over the maximum`
 - [x] 同轮并发开仓共享保证金额度（账本串行预留），修复第二笔 `-2019`
+- [x] 模型思考强度（reasoning effort）按供应商可调，对齐 astra-quant-agent 的档位与协议映射
 
 下一步：
 
@@ -461,6 +468,13 @@ A：说明模型返回里没有完整 JSON，系统按 **fail-closed 跳过这�
 ① 推理型模型把输出预算花在 thinking 上，`finish_reason=length` 导致 JSON 被截断 → 把供应商
 `max_tokens` 提到 3000+ 或换非推理模型；② 模型只回了 reasoning 没回正文；③ 输出夹了散文/未闭合括号。
 现在前两种会直接报「输出被 max_tokens 截断」/「只返回 thinking」，可在「AI 模型 → 决策演练」复现并查看原文。
+
+**Q：模型设置里的「思考强度」怎么选？**
+A：`auto` 交给服务端默认，`none` 明确关闭思考，其余档位按推理预算递增（minimal < low < medium < high < xhigh < max）。
+Anthropic 协议会转成 `thinking.budget_tokens`（low 2k / medium 8k / high 16k / xhigh 32k / max 64k，
+`max_tokens` 自动调大以保证大于预算）；OpenAI 兼容协议转成 `reasoning_effort`，只对推理型模型注入。
+强度越高越慢越贵，但决策质量未必线性提升；建议先用「决策演练」对比 20 次再定。
+网关不支持该参数时会自动移除并重试一次，不会导致调用失败。
 
 **Q：心法会越来越不可控吗？**
 A：不会。心法入库前经防污染审计（拦截提高杠杆、取消止损等危险结论），并带健康度与版本；

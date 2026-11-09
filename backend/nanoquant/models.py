@@ -90,6 +90,8 @@ class AiProvider(Base):
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
     #: 推理型模型会先把预算花在 thinking 上，900/1200 常被截断导致 JSON 不完整
     max_tokens: Mapped[int] = mapped_column(Integer, default=3000)
+    #: 思考强度: auto/none/minimal/low/medium/high/xhigh/max（映射到 thinking 或 reasoning_effort）
+    reasoning_effort: Mapped[str] = mapped_column(String(16), default="auto")
     timeout_sec: Mapped[int] = mapped_column(Integer, default=45)
     json_mode: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

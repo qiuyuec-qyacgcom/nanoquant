@@ -68,6 +68,7 @@ const form = reactive<any>({
   model: 'deepseek-chat',
   temperature: 0.2,
   max_tokens: 3000,
+  reasoning_effort: 'auto',
   timeout_sec: 45,
   json_mode: true,
   enabled: true,
@@ -141,8 +142,8 @@ function openCreate() {
   editing.value = null
   Object.assign(form, {
     name: '', protocol: 'openai_chat', base_url: 'https://api.deepseek.com/v1', api_key: '',
-    model: 'deepseek-chat', temperature: 0.2, max_tokens: 3000, timeout_sec: 45,
-    json_mode: true, enabled: true, priority: 100, role: 'primary',
+    model: 'deepseek-chat', temperature: 0.2, max_tokens: 3000, reasoning_effort: 'auto',
+    timeout_sec: 45, json_mode: true, enabled: true, priority: 100, role: 'primary',
   })
   probe.value = null
   showForm.value = true
@@ -153,6 +154,7 @@ function openEdit(p: AiProvider) {
   Object.assign(form, {
     name: p.name, protocol: p.protocol, base_url: p.base_url, api_key: '',
     model: p.model, temperature: p.temperature, max_tokens: p.max_tokens,
+    reasoning_effort: p.reasoning_effort || 'auto',
     timeout_sec: p.timeout_sec, json_mode: p.json_mode, enabled: p.enabled,
     priority: p.priority, role: p.role,
   })
@@ -618,6 +620,23 @@ onMounted(loadAll)
             <span class="label">最大输出 tokens</span>
             <input v-model.number="form.max_tokens" type="number" min="64" max="8000" class="input mono" />
             <span class="hint">推理型模型会先消耗 thinking token，建议 ≥ 3000；过小会因 finish_reason=length 截断 JSON。</span>
+          </div>
+          <div class="field">
+            <span class="label">思考强度</span>
+            <select v-model="form.reasoning_effort" class="select">
+              <option value="auto">自动 (auto)</option>
+              <option value="none">关闭 (none)</option>
+              <option value="minimal">极简 (minimal)</option>
+              <option value="low">低 (low)</option>
+              <option value="medium">中 (medium)</option>
+              <option value="high">高 (high)</option>
+              <option value="xhigh">超高 (xhigh)</option>
+              <option value="max">极值 (max)</option>
+            </select>
+            <span class="hint">
+              Anthropic 协议映射 thinking 预算（low 2k / medium 8k / high 16k / xhigh 32k / max 64k）；
+              OpenAI 兼容映射 reasoning_effort（仅推理型模型注入）；服务端不支持时自动回退默认。
+            </span>
           </div>
           <div class="field"><span class="label">超时 (秒)</span><input v-model.number="form.timeout_sec" type="number" min="5" max="300" class="input mono" /></div>
           <div class="field"><span class="label">优先级 (越小越先)</span><input v-model.number="form.priority" type="number" min="1" max="999" class="input mono" /></div>

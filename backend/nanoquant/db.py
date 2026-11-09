@@ -120,6 +120,7 @@ _EXEC_COLUMNS = {
     "signals": {"mode": "VARCHAR(8) DEFAULT 'demo'", "repeats": "INTEGER DEFAULT 1"},
     "write_failures": {"auto_attempts": "INTEGER DEFAULT 0"},
     "ai_call_logs": {"raw_text": "TEXT DEFAULT ''"},
+    "ai_providers": {"reasoning_effort": "VARCHAR(16) DEFAULT 'auto'"},
 }
 
 

@@ -19,6 +19,7 @@ from ..models import AiCallLog, AiProvider
 from ..security import decrypt_secret
 from ..services import state
 from ..services.settings import get_ai
+from .reasoning import apply_effort
 
 log = get_logger("ai.client")
 
@@ -193,6 +194,16 @@ class AiClient:
                 payload["response_format"] = {"type": "json_object"}
             headers["Authorization"] = f"Bearer {api_key}"
 
+        # 思考强度：Anthropic 走 thinking.budget_tokens，OpenAI 兼容走 reasoning_effort；
+        # 网关不认时由下面的 400/422 分支整体回退（不会让整次调用失败）。
+        applied_reasoning = apply_effort(
+            payload,
+            protocol=provider.protocol,
+            model=provider.model,
+            effort=provider.reasoning_effort or "auto",
+            base_max_tokens=mt,
+        )
+
         for attempt in range(retries + 1):
             started = time.perf_counter()
             try:
@@ -201,10 +212,22 @@ class AiClient:
                 latency = int((time.perf_counter() - started) * 1000)
                 if r.status_code >= 400:
                     body = r.text[:300]
-                    # json_object 不被支持时降级重试一次
-                    if r.status_code in (400, 422) and "response_format" in payload and attempt == 0:
+                    # json_object / 思考强度参数不被支持时，各降级一次后重试
+                    dropped: list[str] = []
+                    if r.status_code in (400, 422) and "response_format" in payload:
                         payload.pop("response_format", None)
-                        attempts.append({"status": r.status_code, "note": "服务端不支持 json_object, 降级为纯文本", "latency_ms": latency})
+                        dropped.append("response_format(json_mode)")
+                    if r.status_code in (400, 422) and applied_reasoning:
+                        for key in applied_reasoning:
+                            payload.pop(key, None)
+                        if "max_tokens" in applied_reasoning:
+                            payload["max_tokens"] = mt
+                        dropped.append("reasoning_effort(" + ",".join(applied_reasoning) + ")")
+                        applied_reasoning = []
+                    if dropped and attempt == 0:
+                        attempts.append(
+                            {"status": r.status_code, "note": "服务端不接受 " + " / ".join(dropped) + "，已回退默认", "latency_ms": latency}
+                        )
                         continue
                     attempts.append({"status": r.status_code, "note": body, "latency_ms": latency})
                     last_error = f"HTTP {r.status_code}: {body}"

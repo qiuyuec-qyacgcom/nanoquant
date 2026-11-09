@@ -67,7 +67,8 @@ class ProviderIn(BaseModel):
     api_key: str = ""
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
-    max_tokens: int = 900
+    max_tokens: int = 3000
+    reasoning_effort: Literal["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"] = "auto"
     timeout_sec: int = 45
     json_mode: bool = True
     enabled: bool = True
@@ -84,6 +85,7 @@ class ProviderPatch(BaseModel):
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    reasoning_effort: Literal["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
     timeout_sec: int | None = None
     json_mode: bool | None = None
     enabled: bool | None = None

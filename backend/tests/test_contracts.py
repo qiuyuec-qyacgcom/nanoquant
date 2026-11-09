@@ -423,6 +423,66 @@ def test_compact_defaults_are_enabled():
     assert AiProvider.__table__.c.max_tokens.default.arg == 3000
 
 
+# ------------------------------------------------------------ 思考强度映射
+def test_reasoning_effort_maps_to_protocol_params():
+    from nanoquant.ai.reasoning import apply_effort, normalize, supports_effort
+
+    assert normalize("HIGH") == "high"
+    assert normalize("ultra") == "auto"
+    assert supports_effort("cn:deepseek-v4.1-flash")
+    assert supports_effort("o3-mini")
+    assert not supports_effort("gpt-4o-mini")
+
+    # Anthropic: thinking 预算 + max_tokens 必须大于预算
+    p = {"model": "claude", "max_tokens": 3000}
+    keys = apply_effort(
+        p, protocol="anthropic_messages", model="claude", effort="high", base_max_tokens=3000
+    )
+    assert p["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+    assert p["max_tokens"] == 19000
+    assert keys == ["thinking", "max_tokens"]
+
+    # 极值档触到上限时下调 budget，保证 max_tokens > budget
+    p_max = {"max_tokens": 3000}
+    apply_effort(p_max, protocol="anthropic_messages", model="claude", effort="max", base_max_tokens=3000)
+    assert p_max["max_tokens"] == 64000
+    assert p_max["thinking"]["budget_tokens"] < p_max["max_tokens"]
+
+    p_none = {}
+    apply_effort(p_none, protocol="anthropic_messages", model="claude", effort="none", base_max_tokens=3000)
+    assert p_none["thinking"] == {"type": "disabled"}
+
+    # auto 不注入
+    p_auto = {}
+    assert apply_effort(p_auto, protocol="openai_chat", model="deepseek-v4.1", effort="auto", base_max_tokens=3000) == []
+    assert p_auto == {}
+
+    # OpenAI 兼容：只对推理型模型注入
+    p_openai = {}
+    assert apply_effort(
+        p_openai, protocol="openai_chat", model="deepseek-v4.1-flash", effort="low", base_max_tokens=3000
+    ) == ["reasoning_effort"]
+    assert p_openai["reasoning_effort"] == "low"
+
+    p_plain = {}
+    assert apply_effort(p_plain, protocol="openai_chat", model="gpt-4o-mini", effort="high", base_max_tokens=3000) == []
+    assert p_plain == {}
+
+    # Responses API 用 reasoning.effort，极值档收敛到 high
+    p_resp = {}
+    apply_effort(p_resp, protocol="openai_responses", model="o3-mini", effort="max", base_max_tokens=3000)
+    assert p_resp["reasoning"] == {"effort": "high"}
+
+
+def test_provider_schema_defaults_for_reasoning():
+    from nanoquant.api.schemas import ProviderIn, ProviderPatch
+
+    p = ProviderIn(name="x", base_url="http://localhost:9/v1")
+    assert p.reasoning_effort == "auto"
+    assert p.max_tokens == 3000
+    assert ProviderPatch().reasoning_effort is None
+
+
 # ------------------------------------------------------------ 下单精度 -1111
 def test_floor_to_step_and_legacy_formatter():
     """根因：float(12417.2) 在 :.12f 下就是 12417.200000000001 → -1111。

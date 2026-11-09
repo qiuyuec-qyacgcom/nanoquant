@@ -123,6 +123,7 @@ export interface AiProvider {
   model: string
   temperature: number
   max_tokens: number
+  reasoning_effort?: 'auto' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   timeout_sec: number
   json_mode: boolean
   enabled: boolean
