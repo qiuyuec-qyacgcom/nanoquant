@@ -479,6 +479,64 @@ def test_precision_hint_is_actionable():
     assert "-1111" in text and "qty_step=0.1" in text and "重新添加" in text
 
 
+# ------------------------------------------------ 并发开仓的保证金账本
+def test_margin_ledger_serializes_concurrent_opens():
+    """复现 20:40 那一轮：DOGE/ARB 同一秒各按 available 算满额，第二笔 -2019."""
+    import asyncio
+
+    from nanoquant.engine.margin import MarginLedger
+
+    async def run():
+        ledger = MarginLedger()
+        ledger.begin_cycle(3000.0)
+        assert ledger.remaining == 3000.0
+        gen = await ledger.reserve(2720.0)
+        assert gen == 1
+        assert await ledger.reserve(2720.0) == 0  # 第二笔没有额度了
+        assert ledger.remaining == pytest.approx(280.0)
+
+        await ledger.release(2720.0, gen)  # 下单失败要归还
+        assert await ledger.reserve(2720.0) == 1
+
+        # 跨轮迟到的归还不能动新一轮的预算（用剩余 280 占满本轮）
+        old_gen = await ledger.reserve(280.0)
+        assert old_gen == 1
+        ledger.begin_cycle(3000.0)
+        assert await ledger.reserve(500.0) == 2
+        await ledger.release(280.0, old_gen)
+        assert ledger.used == pytest.approx(500.0)
+
+        ledger.begin_cycle(3000.0)  # 下一轮用新快照重置
+        assert ledger.remaining == 3000.0
+        # 真并发：只允许一个成功
+        results = await asyncio.gather(ledger.reserve(2000.0), ledger.reserve(2000.0))
+        assert sorted(results) == [0, 3]
+
+    asyncio.run(run())
+
+
+def test_plan_position_respects_ledger_remaining():
+    from nanoquant.engine.risk import plan_position
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import RiskSettings
+
+    account = SimpleNamespace(equity=5000.0, available=3000.0)
+    cfg = RiskSettings(risk_per_trade_pct=10.0, margin_pct=50.0, default_leverage=5)
+    f = SymbolFilters(symbol="ARBUSDT", price_tick=0.0001, qty_step=0.1, min_qty=0.1, min_notional=5.0)
+
+    _, full = plan_position(
+        price=0.1812, filters=f, account=account, cfg_risk=cfg, sl_pct=0.9, leverage=5,
+    )
+    _, rest = plan_position(
+        price=0.1812, filters=f, account=account, cfg_risk=cfg, sl_pct=0.9, leverage=5,
+        available=280.0,
+    )
+    assert full["available"] == 3000.0
+    assert rest["available"] == 280.0
+    assert rest["margin"] <= 280.0 * 0.9 + 1e-6
+    assert rest["margin"] < full["margin"]
+
+
 # ------------------------------------------------------ 可用保证金与 -2019
 def test_estimate_qty_caps_by_available_margin():
     """复现 -2019: 按总权益算得起的仓位，可用余额其实付不起初始保证金."""

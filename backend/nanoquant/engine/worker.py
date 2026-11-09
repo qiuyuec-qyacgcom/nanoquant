@@ -39,6 +39,7 @@ from ..services.settings import (
 from ..evolution import mantra as mantra_store
 from ..evolution import review as evolution_review
 from . import risk as risk_mod
+from .margin import MarginLedger
 from .strategy import build_features, detect_exit, partial_close_qty, partial_tp_r, score_signal
 
 log = get_logger("engine")
@@ -54,6 +55,7 @@ class TradingEngine:
         self._stop = asyncio.Event()
         self._entry_tasks: dict[str, asyncio.Task] = {}
         self._signal_dedup: dict[tuple, int] = {}
+        self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
         self._last_equity = 0.0
         self._last_account: dict[str, Any] = {}
@@ -446,6 +448,9 @@ class TradingEngine:
         risk_cfg: RiskSettings,
         strat_cfg: StrategySettings,
     ) -> list[dict[str, Any]]:
+        # 每轮用最新账户快照重置预算：并发 spawn 的开仓任务共享同一份额度，
+        # 避免 DOGE / ARB 同一秒各自按 available 算出满额、第二笔被 -2019 拒
+        self._margin.begin_cycle(getattr(account, "available", 0.0))
         symbols = await self._symbols(engine_cfg)
         if not symbols:
             return []
@@ -694,9 +699,20 @@ class TradingEngine:
         qty, info = risk_mod.plan_position(
             price=ticker.last, filters=filters, account=account,
             cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage, risk_scale=risk_scale,
+            available=self._margin.remaining,
         )
         if qty <= 0:
             self._update_signal_reject(signal_id, f"仓位不足: {info['note']}")
+            return
+
+        # 串行占额度：并发任务只能用到前一笔剩下的可用保证金
+        reserved = float(info.get("margin") or 0.0)
+        reserved_gen = await self._margin.reserve(reserved)
+        if not reserved_gen:
+            self._update_signal_reject(
+                signal_id,
+                f"本轮可用保证金已被其它开仓占用（剩余 {self._margin.remaining:.2f} USDT），按 fail-closed 跳过",
+            )
             return
 
         sl_price = ticker.last * (1 - sl_pct / 100) if direction == "long" else ticker.last * (1 + sl_pct / 100)
@@ -704,20 +720,26 @@ class TradingEngine:
         sl_price = filters.align_price(sl_price)
         tp_price = filters.align_price(tp_price)
 
-        res = await broker.open_position(
-            symbol=sig.symbol,
-            side=direction,
-            qty=qty,
-            leverage=leverage,
-            sl_price=sl_price,
-            tp_price=tp_price,
-            filters=filters,
-            ai_confidence=ai_meta.get("confidence", 0.0),
-            ai_reason=(ai_meta.get("reason") or "")[:800],
-            signal_score=sig.score,
-            features={**sig.features, "ai": ai_meta, "plan": info},
-        )
+        try:
+            res = await broker.open_position(
+                symbol=sig.symbol,
+                side=direction,
+                qty=qty,
+                leverage=leverage,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                filters=filters,
+                ai_confidence=ai_meta.get("confidence", 0.0),
+                ai_reason=(ai_meta.get("reason") or "")[:800],
+                signal_score=sig.score,
+                features={**sig.features, "ai": ai_meta, "plan": info},
+            )
+        except Exception:
+            await self._margin.release(reserved, reserved_gen)
+            raise
         if not res.ok:
+            # 成交前失败 → 归还预留额度；成交后保留到下一轮 begin_cycle
+            await self._margin.release(reserved, reserved_gen)
             # broker 的错误文案已带「下单失败 N:」，不要拼成「下单失败: 下单失败 N:」
             detail = res.message if res.message.startswith("下单失败") else f"下单失败: {res.message}"
             self._update_signal_reject(signal_id, detail[:200])

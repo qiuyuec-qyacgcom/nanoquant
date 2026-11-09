@@ -938,6 +938,26 @@
 - **验证**：新增 4 条用例（步进与旧格式器对比、`format_qty/format_price` 多标的、ARB 端到端复算、
   -1111 文案）→ **74 passed**。
 
+### 68. 修复并发开仓共用可用余额导致的 -2019（本次执行）
+- **状态**：✅ 已完成
+- **现象**：20:40:15 同一轮扫描里 ARBUSDT 报
+  「-2019 可用保证金不足（本单约需 2720.51 USDT @ 5x）」，
+  而同一秒 DOGEUSDT 开多成功、占用保证金 **2720.49555**。
+- **根因**：`_scan` 对候选并发 spawn `_open_entry`（`Semaphore(2)`），每个任务都拿
+  **cycle 开始时的同一份 `account.available`**（当时约 3023）计算仓位。
+  `MARGIN_SAFETY=0.9` 只保证「单笔不超可用」，不保证「两笔合计不超」：
+  DOGE 先成交占走 2720，ARB 的 2720 就必然付不起。
+- **修复**：
+  - 新增 `engine/margin.py::MarginLedger`：`begin_cycle(available)` 每轮用最新账户快照重置预算；
+    `reserve/release` 在锁内串行占用，`remaining` 给 `plan_position` 使用。
+  - `_scan` 开头 `begin_cycle(account.available)`；`_open_entry` 用 `self._margin.remaining`
+    计算仓位，下单前 `reserve(plan.margin)`，占用失败直接 fail-closed 并写明剩余额度；
+    下单失败/异常 `release`，**成交后保留**到下一轮快照重置（交易所已实际占用）。
+  - `plan_position(..., available=...)` 支持显式额度覆盖，`plan.available` 记录实际使用的额度。
+- **实测**：复现数据（DOGE 2720.49555 成功 / ARB 2720.51 被拒）在账本下第二笔只能拿到
+  剩余约 280 USDT 的额度，`plan_position` 会缩量或直接给出「本轮可用保证金已被其它开仓占用」。
+- **验证**：新增 2 条用例（并发只成功一个、剩余额度生效）→ **76 passed**。
+
 ---
 
 ## 二、未开始
