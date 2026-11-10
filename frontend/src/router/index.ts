@@ -24,6 +24,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'onboarding', name: 'onboarding', component: () => import('../views/OnboardingView.vue'), meta: { title: '开仓检查' } },
       { path: 'signals', name: 'signals', component: () => import('../views/SignalAuditView.vue'), meta: { title: '信号审计' } },
       { path: 'signal-follow', name: 'signal-follow', component: () => import('../views/SignalFollowView.vue'), meta: { title: '信号跟单' } },
+      { path: 'strategies', name: 'strategies', component: () => import('../views/StrategiesView.vue'), meta: { title: '策略' } },
       { path: 'symbols', name: 'symbols', component: () => import('../views/SymbolsView.vue'), meta: { title: '标的池' } },
       { path: 'chart', name: 'chart', component: () => import('../views/AdminChartView.vue'), meta: { title: 'K 线工作站' } },
       { path: 'backtest', name: 'backtest', component: () => import('../views/BacktestView.vue'), meta: { title: '回测' } },

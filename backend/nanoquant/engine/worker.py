@@ -506,6 +506,32 @@ class TradingEngine:
             pool = [r.symbol for r in rows]
         return pool[: cfg.max_symbols_per_cycle]
 
+    def _record_strategy_filter(self, picked: dict[str, Any], profile_count: int) -> None:
+        """把本轮粗筛结果落状态（供总览展示），只有放行名单变化时才写事件，避免每轮刷屏."""
+        json = __import__("json")
+        payload = {
+            "default": picked["default"],
+            "profiles": profile_count,
+            "kept": picked["kept"],
+            "dropped": picked["dropped"],
+            "matched": picked["matched"],
+        }
+        prev_raw = state.get("strategy_filter", "")
+        state.set("strategy_filter", json.dumps(payload, ensure_ascii=False))
+        try:
+            prev = json.loads(prev_raw) if prev_raw else {}
+        except ValueError:
+            prev = {}
+        if prev.get("kept") != payload["kept"]:
+            passed = len(picked["kept"])
+            total = passed + len(picked["dropped"])
+            detail = f", 过滤 {', '.join(picked['dropped'][:6])}" if picked["dropped"] else ""
+            events.record(
+                "info", "strategy",
+                f"策略粗筛: {passed}/{total} 个标的通过{detail}",
+                {"kept": picked["kept"], "dropped": picked["dropped"], "matched": picked["matched"]},
+            )
+
     async def _scan(
         self,
         broker: Broker,
@@ -529,12 +555,41 @@ class TradingEngine:
             }
         try:
             tickers = await binance_client.tickers(symbols)
-            funding = await binance_client.funding_rates(symbols)
-            oi = await binance_client.open_interest(symbols[:6])
         except (BinanceError, NoCredentials) as exc:
             events.record("warn", "engine", f"行情取数失败, 本轮跳过扫描: {str(exc)[:160]}")
             return []
         prices = {s: t.last for s, t in tickers.items()}
+
+        # ---- 策略粗筛：先按启用策略过滤标的池，再对命中标的拉 K 线/资金费/持仓量 ----
+        # 没有启用策略时 default=True，等价于旧行为（全池扫描）。
+        from ..services import strategy_profiles as strategy_service
+
+        profiles = strategy_service.active_profiles()
+        side_bias: dict[str, str] = {}
+        if profiles:
+            books: dict[str, tuple[float, float]] = {}
+            need_book = any(
+                strategy_service.normalize_filters(p.get("filters"))["max_spread_bps"] > 0
+                for p in profiles
+            )
+            if need_book:
+                try:
+                    books = await binance_client.book_tickers(symbols)
+                except (BinanceError, NoCredentials) as exc:
+                    log.warning("策略点差取数失败, 本次忽略点差条件: %s", str(exc)[:120])
+            picked = strategy_service.prefilter(symbols, tickers, books, profiles)
+            symbols = picked["kept"]
+            side_bias = picked["side_bias"]
+            self._record_strategy_filter(picked, len(profiles))
+            if not symbols:
+                return []
+
+        try:
+            funding = await binance_client.funding_rates(symbols)
+            oi = await binance_client.open_interest(symbols[:6])
+        except (BinanceError, NoCredentials) as exc:
+            log.warning("资金费/持仓量取数失败, 本轮按 0 处理: %s", str(exc)[:120])
+            funding, oi = {}, {}
         results: list[dict[str, Any]] = []
 
         for symbol in symbols:
@@ -562,6 +617,10 @@ class TradingEngine:
             per_symbol_min = min_scores.get(symbol, 0.0)
             if sig.direction != "flat" and per_symbol_min > 0 and abs(sig.score) < per_symbol_min:
                 sig.blocked = f"信号分 {sig.score:.3f} 低于该标的最低要求 {per_symbol_min:.2f}"
+                sig.direction = "flat"
+            bias = side_bias.get(symbol)
+            if sig.direction != "flat" and bias and sig.direction != bias:
+                sig.blocked = f"策略方向限制为{'做多' if bias == 'long' else '做空'}"
                 sig.direction = "flat"
             rec = self._record_signal(sig, ticker, "scan")
             results.append(rec)
@@ -1546,6 +1605,8 @@ class TradingEngine:
                 "used_weight": binance_client.weight.used_weight,
                 "capacity": binance_client.weight.capacity,
             },
+            # 最近一轮策略粗筛结果（未配置策略时 default=true 表示全池）
+            "strategy": __import__("json").loads(state.get("strategy_filter", "{}") or "{}"),
             "cycle_timings": __import__("json").loads(state.get("cycle_timings", "{}") or "{}"),
         }
 

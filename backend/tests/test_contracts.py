@@ -1857,6 +1857,107 @@ def test_choose_leverage_clamps_ai_to_global_floor_and_cap():
     assert choose_leverage("BTCUSDT", engine, low, f, 1) == 1        # 下限最低 1x
 
 
+def test_strategy_prefilter_defaults_to_full_pool():
+    """没有任何启用策略时默认全池，保持旧行为."""
+    from types import SimpleNamespace
+
+    from nanoquant.services import strategy_profiles as sp
+
+    tickers = {
+        "BTCUSDT": SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9),
+        "ETHUSDT": SimpleNamespace(last=10.0, change_pct=-1.0, quote_volume=1e8),
+    }
+    out = sp.prefilter(list(tickers), tickers, {}, [])
+    assert out["default"] is True
+    assert out["kept"] == ["BTCUSDT", "ETHUSDT"] and out["dropped"] == []
+
+
+def test_strategy_prefilter_priority_side_and_volume():
+    from types import SimpleNamespace
+
+    from nanoquant.services import strategy_profiles as sp
+
+    profiles = [
+        {"id": 1, "name": "小币", "enabled": True, "priority": 10,
+         "filters": sp.normalize_filters({"symbols": ["DOGEUSDT"], "side": "long"})},
+        {"id": 2, "name": "主流", "enabled": True, "priority": 20,
+         "filters": sp.normalize_filters({"min_quote_volume": 5e8})},
+    ]
+    tickers = {
+        "DOGEUSDT": SimpleNamespace(last=0.1, change_pct=2.0, quote_volume=1e7),
+        "BTCUSDT": SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9),
+        "ETHUSDT": SimpleNamespace(last=10.0, change_pct=-1.0, quote_volume=1e8),
+    }
+    out = sp.prefilter(list(tickers), tickers, {}, profiles)
+    assert out["default"] is False
+    assert out["kept"] == ["DOGEUSDT", "BTCUSDT"]  # ETH 成交额不足
+    assert out["dropped"] == ["ETHUSDT"]
+    assert out["side_bias"] == {"DOGEUSDT": "long"}
+    assert out["matched"] == {1: 1, 2: 1}
+
+
+def test_strategy_filters_normalize_bounds_and_swap():
+    from nanoquant.services import strategy_profiles as sp
+
+    f = sp.normalize_filters({
+        "symbols": "btcusdt, ethusdt", "side": "LONG",
+        "change_24h_min": 50, "change_24h_max": -10, "min_price": -5,
+    })
+    assert f["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert f["side"] == "long"
+    assert f["change_24h_min"] == -10 and f["change_24h_max"] == 50
+    assert f["min_price"] == 0
+    assert "全池" not in sp.summarize(f) and "只做多" in sp.summarize(f)
+
+
+def test_engine_scan_only_requests_klines_for_strategy_hits(monkeypatch):
+    """策略命中才拉 K 线：未命中的标的本轮连 K 线请求都不发."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from nanoquant.engine import worker as w
+    from nanoquant.services import strategy_profiles as sp
+    from nanoquant.services.settings import EngineSettings, RiskSettings, StrategySettings
+
+    engine = w.TradingEngine()
+
+    async def fake_symbols(_cfg):
+        return ["AAAUSDT", "BBBUSDT"]
+
+    monkeypatch.setattr(engine, "_symbols", fake_symbols)
+    tickers = {
+        s: SimpleNamespace(last=1.0, change_pct=1.0, quote_volume=1e9) for s in ("AAAUSDT", "BBBUSDT")
+    }
+
+    async def fake_tickers(symbols):
+        return {s: tickers[s] for s in symbols}
+
+    async def fake_empty(_symbols):
+        return {}
+
+    calls: list[str] = []
+
+    async def fake_klines(symbol, _interval, _limit=60):
+        calls.append(symbol)
+        return []
+
+    monkeypatch.setattr(w.binance_client, "tickers", fake_tickers)
+    monkeypatch.setattr(w.binance_client, "funding_rates", fake_empty)
+    monkeypatch.setattr(w.binance_client, "open_interest", fake_empty)
+    monkeypatch.setattr(w.binance_client, "klines", fake_klines)
+    monkeypatch.setattr(sp, "active_profiles", lambda: [
+        {"id": 1, "name": "只做 AAA", "enabled": True, "priority": 10,
+         "filters": sp.normalize_filters({"symbols": ["AAAUSDT"]})},
+    ])
+
+    account = SimpleNamespace(available=1000.0, equity=1000.0)
+    out = asyncio.run(
+        engine._scan(None, account, EngineSettings(), RiskSettings(), StrategySettings())
+    )
+    assert calls == ["AAAUSDT"]
+    assert out == []
+
+
 def test_weight_limiter_fails_fast_instead_of_queueing(monkeypatch):
     """令牌不足时最多排队 MAX_WAIT_SEC，超时快速失败，避免限频期间请求堆积."""
     import asyncio

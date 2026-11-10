@@ -1162,6 +1162,20 @@
   - `/engine/status` 新增 `rate_limit`（`banned` / `ban_remaining` / `used_weight` / `capacity`）；总览展示「交易所限频冷却 Ns（权重 x/2400）」，保护单空态在限频时说明原因而不是假装没有保护单。
 - **验证**：`pytest tests -q` → **105 passed**（新增保护单限频降级/非限频 503、权重快速失败 2 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
+### 81. 策略模块：轮询标的前先按策略粗筛
+- **状态**：✅ 已完成
+- **背景**：引擎每轮对标的池**全量**拉 K 线、资金费与持仓量，标的多了又慢又吃权重；缺少「先用廉价行情筛一遍，再对候选做深度分析」的层。
+- **过程要点**：
+  - 新表 `strategy_profiles`（`name` / `description` / `enabled` / `priority` / `filters`），随 `create_all` 自动建。
+  - 新增纯函数服务 `services/strategy_profiles.py`：`normalize_filters`（类型收敛、区间交换、边界钳制）、`match_profile`、`prefilter`（按 `priority` 升序，第一条命中即放行）、`summarize`。
+  - 粗筛条件只用**已有批量 ticker**：标的白名单、方向偏好（只做多/只做空/不限）、24h 成交额下限、最新价区间、24h 涨跌幅区间、盘口点差上限（`>0` 才拉盘口，命中 2s 缓存）。RSI/ATR/信号分等需要 K 线的条件仍由粗筛后的全局策略参数判断。
+  - **未配置策略 = 默认全池**（`default=true`），保持旧行为；有策略但全部不命中 ⇒ 该标的本轮连 K 线请求都不发。
+  - 引擎 `_scan` 顺序改为：`tickers` → 策略粗筛 → 只对命中标的拉 `funding/oi/klines`；命中策略的 `side` 会限制信号方向（与量化方向相反则标 `flat` 并写明原因）。
+  - 粗筛结果写入 `engine_state.strategy_filter`，`/engine/status` 暴露 `strategy`（`kept/dropped/matched/profiles`），只有放行名单变化时才写 `strategy` 事件，避免每轮刷屏。
+  - API：`GET/POST/PATCH/DELETE /strategies` + `GET /strategies/preview`（只读、手动触发、用当前行情预览放行结果）；同名策略拒绝、名称长度校验。
+  - 前端新增「策略」页（交易分组）：KPI（总数/当前模式/最近通过/方向偏好）、条件列表、开关、新增/编辑弹窗、预览弹窗；菜单入口 `⚑ 策略`。
+- **验证**：`pytest tests -q` → **110 passed**（新增默认全池、优先级/方向/成交额、区间归一、引擎只对命中标的拉 K 线、策略 CRUD+预览共 5 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+
 ---
 
 ## 二、未开始

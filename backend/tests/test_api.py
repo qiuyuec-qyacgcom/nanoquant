@@ -219,6 +219,56 @@ def test_evolution_batch_review_and_health_endpoints(client):
     assert inj["stats"]["min_lesson_sample"] >= 2
 
 
+def test_strategy_crud_and_preview(client, monkeypatch):
+    """策略 CRUD + 停用后回落到默认全池 + 预览只读."""
+    from nanoquant.api.routes import strategies as strategy_routes
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.models import StrategyProfile
+
+    init_db()
+    headers = _token(client)
+    with session_scope() as s:
+        s.query(StrategyProfile).delete()
+
+    created = client.post(
+        f"{API}/strategies",
+        headers=headers,
+        json={
+            "name": "单元策略", "priority": 10,
+            "filters": {"side": "long", "symbols": ["BTCUSDT"], "min_quote_volume": 1e6},
+        },
+    )
+    assert created.status_code == 200, created.text
+    item = created.json()["item"]
+    assert item["filters"]["side"] == "long"
+    assert "BTCUSDT" in item["summary"] and "只做多" in item["summary"]
+
+    dup = client.post(f"{API}/strategies", headers=headers, json={"name": "单元策略"})
+    assert dup.status_code == 400
+
+    patched = client.patch(
+        f"{API}/strategies/{item['id']}", headers=headers,
+        json={"enabled": False, "priority": 30},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["item"]["enabled"] is False
+
+    listed = client.get(f"{API}/strategies", headers=headers).json()
+    assert listed["stats"]["total"] == 1
+    assert listed["stats"]["default"] is True  # 唯一策略已停用 => 默认全池
+
+    async def fake_tickers(_symbols):
+        return {}
+
+    monkeypatch.setattr(strategy_routes.binance_client, "tickers", fake_tickers)
+    preview = client.get(f"{API}/strategies/preview", headers=headers)
+    assert preview.status_code == 200
+    assert preview.json()["ok"] is True
+
+    assert client.delete(f"{API}/strategies/{item['id']}", headers=headers).status_code == 200
+    assert client.delete(f"{API}/strategies/{item['id']}", headers=headers).status_code == 404
+
+
 def test_engine_protection_degrades_on_rate_limit(client, monkeypatch):
     """限频时保护单接口降级为 200 空列表，其它交易所错误仍应是 503 而不是 NameError 500."""
     from nanoquant.api.routes import trade as trade_routes
