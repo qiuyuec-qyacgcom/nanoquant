@@ -356,6 +356,22 @@ def dedupe() -> dict[str, Any]:
     return {"ok": True, "kept": len(kept), "replaced": replaced, "total": len(rows)}
 
 
+def purge_superseded() -> int:
+    """物理删除所有已被新版本替代的旧心法（每轮复盘结束后自动调用）.
+
+    替代时先标记 `superseded_by` 保留审计；复盘完成后由本函数清理，
+    避免旧版本长期堆积在列表里只置灰不消失。手动「停用」（superseded_by=0）不会被删。
+    """
+    with session_scope() as s:
+        rows = s.query(Mantra).filter(Mantra.superseded_by != 0).all()
+        count = len(rows)
+        for row in rows:
+            s.delete(row)
+    if count:
+        log.info("清理被替代心法 %d 条", count)
+    return count
+
+
 def stats() -> dict[str, Any]:
     cfg = get_evolution()
     with session_scope() as s:

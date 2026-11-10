@@ -191,6 +191,8 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
         )
         applied.append(outcome)
 
+    # 每轮复盘结束后物理删除被替代的旧版本（含历史遗留），列表里不再堆积置灰条目
+    purged = mantra_store.purge_superseded()
     created_ids = [a["mantra"]["id"] for a in applied if a.get("mantra")]
     with session_scope() as s:
         row = s.get(TradeRecord, trade_id)
@@ -207,7 +209,7 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
                 replaced=sum(1 for a in applied if a["action"] == "replaced"),
                 ok=True,
                 summary=(verdict or f"trade#{trade_id} 复盘完成")[:500],
-                raw={"applied": applied, "used_ai": used_ai, "error": error, "score": score},
+                raw={"applied": applied, "used_ai": used_ai, "error": error, "score": score, "purged": purged},
             )
         )
     return {
@@ -216,6 +218,7 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
         "error": error,
         "verdict": verdict,
         "score": score,
+        "purged": purged,
         "applied": [{"action": a["action"], "reason": a.get("reason", ""), "title": (a.get("mantra") or {}).get("title", a.get("title", ""))} for a in applied],
     }
 
@@ -428,6 +431,7 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
                 )
         diagnosis = [f"{k}: {v['n']} 笔, 胜率 {v['wins'] / v['n'] * 100:.0f}%, 净 {v['pnl']:.4f}U" for k, v in by_reason.items()]
 
+    purged = mantra_store.purge_superseded()
     with session_scope() as s:
         s.add(
             EvolutionRun(
@@ -438,7 +442,7 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
                 replaced=sum(1 for a in applied if a["action"] == "replaced"),
                 ok=True,
                 summary="; ".join(diagnosis)[:500] or "全局复盘完成",
-                raw={"applied": applied, "retired": retired, "stats": stats, "used_ai": used_ai, "error": error},
+                raw={"applied": applied, "retired": retired, "stats": stats, "used_ai": used_ai, "error": error, "purged": purged},
             )
         )
     return {
@@ -448,6 +452,7 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
         "diagnosis": diagnosis,
         "applied": [{"action": a["action"], "title": (a.get("mantra") or {}).get("title", ""), "reason": a.get("reason", "")} for a in applied],
         "retired": retired,
+        "purged": purged,
         "stats": stats,
     }
 

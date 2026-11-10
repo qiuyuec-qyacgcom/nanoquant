@@ -1094,6 +1094,20 @@
 - **验证**：新增 4 条用例（相似替代 + 冷却、AI 点名跨分类替代、存量去重、AI 分批去重）→ **86 passed**；
   `vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
 
+### 76. 复盘后自动删除被替代的旧心法（本次执行）
+- **状态**：✅ 已完成
+- **需求**：每轮心法复盘结束后，被新版本（v2…）替代的旧心法自动删除，不再在列表里置灰堆积。
+- **实现**：
+  - `mantra_store.purge_superseded()`：物理删除所有 `superseded_by != 0` 的记录
+    （手动「停用」`enabled=False, superseded_by=0` 不删），返回删除条数，幂等；
+  - `review_trade` 在 `applied` 落库后调用，结果写入 `EvolutionRun.raw.purged` 并随 API 返回；
+  - `global_review` 同样在结束前清理；
+  - 替代过程仍先标记 `superseded_by` 保留审计，复盘结束时再清理，避免事务中途丢失可追溯性。
+- **实测**：force 复盘一笔 → `used_ai=True`、`purged=1`、`action=replaced`；
+  复盘前后 `total` 均为 23（新增 1 条 + 删除 1 条），`superseded=0`，
+  心法列表里 `superseded_by != 0` 的行数为 **0**。
+- **验证**：新增 1 条用例（删除被替代、保留手动停用、幂等）并扩展替代用例 → **87 passed**。
+
 ---
 
 ## 二、未开始

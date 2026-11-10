@@ -913,6 +913,11 @@ def test_mantra_replaces_similar_version_after_cooldown():
     # 被替代的不再进入注入排名
     assert all(m["id"] != old_id for m in store.rank_lessons(20))
 
+    # 复盘结束后会物理清理旧版本：列表里不再出现「被替代」条目
+    assert store.purge_superseded() == 1
+    with session_scope() as s:
+        assert s.get(Mantra, old_id) is None
+
 
 def test_mantra_ai_replaces_by_title_even_across_category():
     from nanoquant.evolution import mantra as store
@@ -971,6 +976,48 @@ def test_mantra_dedupe_collapses_existing_duplicates():
     assert {m["title"] for m in active} == {"低量能追单容易被止损", "超时离场仍盈利"}
     with session_scope() as s:
         assert s.query(Mantra).filter(Mantra.superseded_by != 0).count() == 1
+
+
+def test_purge_superseded_removes_old_versions():
+    """每轮复盘结束后：被替代的旧心法物理删除，手动停用的保留."""
+    import time
+
+    from nanoquant.db import session_scope
+    from nanoquant.evolution import mantra as store
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    now = int(time.time())
+    with session_scope() as s:
+        keep = Mantra(
+            title="正常生效心法", rule="当量比低于 0.9 时不开仓，等待确认。", category="entry",
+            source="test", confidence=0.6, health=0.6, enabled=True, version=1,
+            superseded_by=0, evidence={}, created_at=now, updated_at=now, expires_at=now + 86400,
+        )
+        s.add(keep)
+        s.flush()
+        keep_id = keep.id
+        s.add(
+            Mantra(
+                title="旧版本心法", rule="当量比低于 0.9 时不开仓，等待量能放大。", category="entry",
+                source="test", confidence=0.55, health=0.55, enabled=False, version=1,
+                superseded_by=keep_id, evidence={"superseded_reason": "test"},
+                created_at=now, updated_at=now, expires_at=now + 86400,
+            )
+        )
+        s.add(
+            Mantra(
+                title="手动停用心法", rule="当 ATR 占比低于 0.2% 时降低仓位。", category="risk",
+                source="test", confidence=0.5, health=0.5, enabled=False, version=1,
+                superseded_by=0, evidence={}, created_at=now, updated_at=now, expires_at=now + 86400,
+            )
+        )
+
+    assert store.purge_superseded() == 1
+    assert store.purge_superseded() == 0  # 幂等
+    with session_scope() as s:
+        titles = {m.title for m in s.query(Mantra).all()}
+    assert titles == {"正常生效心法", "手动停用心法"}
 
 
 def test_ai_dedupe_merges_semantically_similar(monkeypatch):
