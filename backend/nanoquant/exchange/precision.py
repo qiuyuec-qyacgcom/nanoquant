@@ -128,9 +128,10 @@ class SymbolFilters:
 def parse_exchange_info(info: dict) -> dict[str, SymbolFilters]:
     out: dict[str, SymbolFilters] = {}
     for item in info.get("symbols", []):
-        if item.get("contractType") not in (None, "PERPETUAL"):
+        # 股票/商品类合约是 TRADIFI_PERPETUAL（underlyingType=EQUITY|COMMODITY），休市为 BREAK
+        if item.get("contractType") not in (None, "PERPETUAL", "TRADIFI_PERPETUAL"):
             continue
-        if item.get("status") not in (None, "TRADING"):
+        if item.get("status") not in (None, "TRADING", "BREAK"):
             continue
         f = SymbolFilters(symbol=item["symbol"], source="live")
         for flt in item.get("filters", []):

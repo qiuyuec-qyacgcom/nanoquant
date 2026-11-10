@@ -38,6 +38,9 @@ interface Candidate {
   tick_sz: string
   min_sz: string
   min_notional: number
+  contract_type?: string
+  underlying_type?: string
+  is_equity?: boolean
   in_pool: boolean
 }
 
@@ -219,7 +222,8 @@ onMounted(loadPool)
           </button>
         </div>
         <div class="hint">
-          添加前会用币安在线合约表校验：必须精确匹配、USDT 计价、状态为交易中；重复与超限会被拒绝。
+          添加前会用币安在线合约表校验：必须精确匹配、USDT 计价、在线可交易；支持加密永续与股票/商品类永续
+          （TRADIFI，休市状态也可先入池）。模拟盘只上线部分股票合约，找不到时可切到实盘。
           规格（精度 / 最小下单 / 分层 / 杠杆）随合约落库，不依赖任何本地行情。
         </div>
 
@@ -248,6 +252,7 @@ onMounted(loadPool)
               <tr v-for="c in candidates" :key="c.symbol">
                 <td>
                   <b class="mono">{{ c.symbol }}</b>
+                  <span v-if="c.is_equity" class="tag tag-warn" style="margin-left: 6px">股票</span>
                   <div class="muted" style="font-size: 10px">{{ c.name }}</div>
                 </td>
                 <td><span class="tag" :class="c.tier === 'tier_1_bluechip' ? 'tag-blue' : 'tag-dim'">{{ c.tier_label }}</span></td>

@@ -1650,6 +1650,78 @@ def test_margin_inflight_reservation_survives_engine_cycle():
     asyncio.run(run())
 
 
+# ------------------------------------------- 标的池：股票/商品类永续（TRADIFI）
+def test_pool_accepts_tradifi_equity_contract():
+    """币安股票合约是 TRADIFI_PERPETUAL（underlyingType=EQUITY），旧逻辑只认 PERPETUAL 会全拒."""
+    import pytest
+
+    from nanoquant.exchange.precision import parse_exchange_info
+    from nanoquant.services import symbols as pool
+
+    equity = {
+        "symbol": "AAPLUSDT",
+        "baseAsset": "AAPL",
+        "quoteAsset": "USDT",
+        "marginAsset": "USDT",
+        "contractType": "TRADIFI_PERPETUAL",
+        "status": "TRADING",
+        "underlyingType": "EQUITY",
+        "filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01000"},
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        ],
+    }
+    pool._validate_contract(equity, "AAPLUSDT")  # 不抛即通过
+    row = pool.build_pool_row(equity)
+    assert row["symbol"] == "AAPLUSDT" and row["name"] == "AAPL"
+    assert row["precision"] == 2 and row["min_notional"] == 5.0
+
+    # 休市（BREAK）允许先入池
+    pool._validate_contract({**equity, "status": "BREAK"}, "AAPLUSDT")
+
+    # 交割合约与异常状态仍然拒绝
+    with pytest.raises(pool.PoolError):
+        pool._validate_contract({**equity, "contractType": "CURRENT_QUARTER"}, "AAPLUSDT")
+    with pytest.raises(pool.PoolError):
+        pool._validate_contract({**equity, "status": "SETTLING"}, "AAPLUSDT")
+
+    # 当前环境没有该合约：提示模拟盘只上线部分股票合约
+    with pytest.raises(pool.PoolError) as exc:
+        pool._validate_contract({}, "AAPLUSDT")
+    assert "模拟盘" in str(exc.value)
+
+    # 行情精度表同样纳入 TRADIFI 与休市状态
+    parsed = parse_exchange_info(
+        {"symbols": [equity, {**equity, "symbol": "TSLAUSDT", "status": "BREAK"}]}
+    )
+    assert {"AAPLUSDT", "TSLAUSDT"} <= set(parsed)
+
+
+def test_candidates_marks_equity_contracts(monkeypatch):
+    import asyncio
+
+    from nanoquant.services import symbols as pool
+
+    rows = {
+        "AAPLUSDT": {
+            "symbol": "AAPLUSDT", "baseAsset": "AAPL", "quoteAsset": "USDT",
+            "contractType": "TRADIFI_PERPETUAL", "status": "TRADING", "underlyingType": "EQUITY",
+            "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"}],
+        }
+    }
+
+    async def fake_symbols(force: bool = False):  # noqa: ARG001
+        return rows
+
+    monkeypatch.setattr(pool.binance_client, "exchange_symbols", fake_symbols)
+    out = asyncio.run(pool.candidates("AAPL"))
+    assert len(out) == 1
+    assert out[0]["symbol"] == "AAPLUSDT"
+    assert out[0]["is_equity"] is True
+    assert out[0]["contract_type"] == "TRADIFI_PERPETUAL"
+
+
 # ------------------------------------------- 自进化：宪法 Linter / 证据健康分
 def test_guard_rejects_single_event_and_risk_tampering():
     from nanoquant.evolution.guard import audit

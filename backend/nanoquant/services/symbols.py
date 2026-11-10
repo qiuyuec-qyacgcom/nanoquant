@@ -30,6 +30,13 @@ log = get_logger("symbols")
 #: 币安 U 本位永续合约名: 大写字母数字 + USDT 计价 (如 BTCUSDT / 1000SHIBUSDT)
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,18}(?:USDT)$")
 
+#: 可加入标的池的合约类型：加密永续 + 股票/商品类永续（2026 起币安上线 TRADIFI_PERPETUAL）
+SUPPORTED_CONTRACT_TYPES = {"PERPETUAL", "TRADIFI_PERPETUAL"}
+#: 股票/商品类合约：休市时 status=BREAK，允许先入池，开市后自动恢复可交易
+TRADIFI_CONTRACT_TYPES = {"TRADIFI_PERPETUAL"}
+_ALLOWED_STATUS = {"TRADING"}
+_ALLOWED_STATUS_TRADIFI = {"TRADING", "BREAK"}
+
 TIER_PROFILES: dict[str, dict[str, Any]] = {
     "tier_1_bluechip": {"label": "蓝筹主流", "sl_atr_mult": 1.8, "min_vol_24h_usd": 100_000_000},
     "tier_2_momentum": {"label": "高弹性动量", "sl_atr_mult": 2.2, "min_vol_24h_usd": 20_000_000},
@@ -80,13 +87,29 @@ def _filter_value(raw: dict[str, Any], filter_type: str, key: str, default: str 
 
 
 def _validate_contract(raw: dict[str, Any], symbol: str) -> None:
-    """与 astra 一致的三段校验: 精确匹配 / USDT 结算 / 在线可交易."""
+    """校验: 精确匹配 / 支持的合约类型 / 在线可交易 / USDT 计价.
+
+    2026 起币安把股票与商品类合约放在 ``contractType=TRADIFI_PERPETUAL``、
+    ``underlyingType=EQUITY|COMMODITY``，旧逻辑只认 ``PERPETUAL`` 会把它们全部拒掉。
+    """
+    if not raw:
+        raise PoolError(
+            400,
+            f"{symbol} 不在当前环境的币安合约表中：股票/商品类合约在模拟盘只上线部分标的，"
+            "可换一个已上线的标的，或切到实盘环境后再添加",
+        )
     if str(raw.get("symbol") or "") != symbol:
-        raise PoolError(400, "仅允许添加币安 USDⓈ-M 在线可交易的 USDT 永续合约")
-    if str(raw.get("contractType") or "") != "PERPETUAL":
-        raise PoolError(400, "仅允许添加币安 U 本位永续合约（不支持交割/杠杆代币）")
-    if str(raw.get("status") or "") != "TRADING":
-        raise PoolError(400, "该合约当前不可交易（状态不是 TRADING）")
+        raise PoolError(400, "仅允许添加币安 USDⓈ-M 在线可交易的 USDT 合约")
+    contract_type = str(raw.get("contractType") or "")
+    if contract_type not in SUPPORTED_CONTRACT_TYPES:
+        raise PoolError(
+            400,
+            f"仅支持 U 本位永续与股票/商品类永续合约（当前类型 {contract_type or '未知'}，不支持交割/杠杆代币）",
+        )
+    status = str(raw.get("status") or "")
+    allowed = _ALLOWED_STATUS_TRADIFI if contract_type in TRADIFI_CONTRACT_TYPES else _ALLOWED_STATUS
+    if status not in allowed:
+        raise PoolError(400, f"该合约当前不可交易（状态 {status or '未知'}）")
     if str(raw.get("quoteAsset") or "") != "USDT":
         raise PoolError(400, "仅允许添加 USDT 计价的永续合约")
 
@@ -223,7 +246,12 @@ async def add_symbol(raw_symbol: str) -> dict[str, Any]:
         # 追加到队尾: 前台 K 线、引擎扫描都严格按添加顺序
         last = s.query(TradingSymbol).order_by(TradingSymbol.sort_order.desc()).first()
         next_order = int(getattr(last, "sort_order", 0) or 0) + 1
-        s.add(TradingSymbol(enabled=True, min_score=0.0, note="", sort_order=next_order, **row))
+        note = (
+            "股票/商品类永续"
+            if str(raw.get("underlyingType") or "").upper() in {"EQUITY", "COMMODITY"}
+            else ""
+        )
+        s.add(TradingSymbol(enabled=True, min_score=0.0, note=note, sort_order=next_order, **row))
     log.info("标的池新增 %s (%s)", symbol, row["tier"])
     return row
 
@@ -322,6 +350,9 @@ async def candidates(keyword: str, limit: int = 50) -> list[dict[str, Any]]:
                 "tick_sz": row["tick_sz"],
                 "min_sz": row["min_sz"],
                 "min_notional": row["min_notional"],
+                "contract_type": str(raw.get("contractType") or ""),
+                "underlying_type": str(raw.get("underlyingType") or ""),
+                "is_equity": str(raw.get("underlyingType") or "").upper() == "EQUITY",
                 "in_pool": symbol in pool,
             }
         )

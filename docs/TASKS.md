@@ -1175,6 +1175,20 @@
   - 前端「策略」页改为编辑策略正文（textarea）、适用标的、方向偏好、优先级、启用开关，展示「最近应用」与本地适用范围预览；菜单入口 `⚑ 策略`。
 - **验证**：`pytest tests -q` → **109 passed**（策略优先级/范围选中、无策略返回 None、归一与摘要、AI 上下文注入 v1/v2、CRUD+预览）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
+### 82. 标的池支持股票/商品类永续合约（TRADIFI_PERPETUAL）
+- **状态**：✅ 已完成
+- **现象**：添加 `AAPLUSDT` / `TSLAUSDT` 等币安股票合约被拒，提示「仅允许添加币安 U 本位永续合约」。
+- **根因**（用 `fapi.binance.com/fapi/v1/exchangeInfo` 实测确认）：
+  1. 2026 起币安把股票/商品类合约放在 `contractType=TRADIFI_PERPETUAL`、`underlyingType=EQUITY|COMMODITY`（实盘 235 个），而 `symbols._validate_contract` 与 `precision.parse_exchange_info` 都写死只认 `PERPETUAL`，全部被过滤；
+  2. 股票合约休市时 `status=BREAK`，原逻辑只允许 `TRADING`；
+  3. 模拟盘 testnet 只上线部分股票合约（46 个 TRADIFI，含 TSLA/NVDA/MSTR/AMZN 等，**不含 AAPL**），原提示未区分环境。
+- **修复**：
+  - 新增 `SUPPORTED_CONTRACT_TYPES = {PERPETUAL, TRADIFI_PERPETUAL}`；TRADIFI 允许 `TRADING | BREAK` 入池（交割/季度合约仍拒绝）；
+  - 合约表缺失时返回「模拟盘只上线部分股票合约，可换标的或切到实盘」的可操作提示；
+  - `parse_exchange_info` 同步纳入 TRADIFI 与 BREAK，行情精度表不再漏股票合约；
+  - 入池 `note` 标注「股票/商品类永续」；候选接口返回 `contract_type / underlying_type / is_equity`，前端候选列表加「股票」标签并更新说明文案。
+- **验证**：`pytest tests -q` → **111 passed**（新增 TRADIFI 入池、休市 BREAK、交割拒绝、环境提示、候选标注共 2 条用例）；`compileall`/`vue-tsc`/`npm run build` 通过；重启后实测模拟盘 `TSLAUSDT` 添加成功（precision=2、tick=0.01000、min_notional=5）并删除恢复，`AAPLUSDT` 返回环境提示，池恢复原 8 个标的。
+
 ---
 
 ## 二、未开始
