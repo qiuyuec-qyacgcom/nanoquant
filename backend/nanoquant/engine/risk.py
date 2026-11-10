@@ -188,11 +188,20 @@ def symbol_gates(
 
 
 def choose_leverage(symbol: str, cfg_engine: EngineSettings, cfg_risk: RiskSettings, filters: SymbolFilters, ai_leverage: float = 0.0) -> int:
-    lev = cfg_risk.default_leverage
-    if ai_leverage > 0:
-        lev = ai_leverage
-    lev = min(lev, cfg_risk.max_leverage, filters.max_leverage, 100)
-    return max(1, int(round(lev)))
+    """开仓杠杆统一由「参数配置 → 风控」的**全局杠杆下限/上限**决定.
+
+    - 上限 = min(全局杠杆上限, 该标的交易所上限, 100)；
+    - 下限 = min(全局杠杆下限, 上限)：交易所上限更低时以交易所为准（安全优先）；
+    - AI（含注入心法影响）或外部信号给出的杠杆只是区间内的**建议值**，
+      低于下限抬到下限、高于上限压到上限；心法文本里的杠杆数值不参与决策；
+    - 没有建议值时直接用下限（原「默认杠杆」语义）。
+
+    ``cfg_engine`` 保留在签名中以兼容既有调用，杠杆不受引擎分组参数干预。
+    """
+    upper = max(1, min(int(cfg_risk.max_leverage), int(filters.max_leverage or 100), 100))
+    lower = max(1, min(int(cfg_risk.default_leverage), upper))
+    desired = float(ai_leverage) if ai_leverage and ai_leverage > 0 else float(lower)
+    return int(max(lower, min(round(desired), upper)))
 
 
 def plan_position(

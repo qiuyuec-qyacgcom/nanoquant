@@ -375,8 +375,9 @@ onMounted(loadAll)
             <input v-model.number="aiCfg.temperature" type="number" step="0.1" min="0" max="2" class="input mono" />
           </div>
           <div class="field">
-            <span class="label">AI 可设最大杠杆</span>
-            <input v-model.number="aiCfg.max_position_leverage" type="number" min="1" max="100" class="input mono" />
+            <span class="label">AI 可设最大杠杆（已停用）</span>
+            <input v-model.number="aiCfg.max_position_leverage" type="number" min="1" max="100" class="input mono" disabled />
+            <div class="hint">开仓杠杆统一由「参数配置 → 风控 → 杠杆下限 / 杠杆上限」钳制，心法与模型建议不再影响杠杆。</div>
           </div>
           <div class="field">
             <span class="label">决策协议</span>

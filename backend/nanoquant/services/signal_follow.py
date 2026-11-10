@@ -114,9 +114,9 @@ def classify_event(row: dict[str, Any]) -> str:
 
 
 def follow_leverage(signal_leverage: float, default_leverage: float, bonus: int = 10) -> int:
-    """目标杠杆 = 原信号杠杆 + 加成; 信号没给杠杆时回落到本系统默认杠杆.
+    """目标杠杆 = 原信号杠杆 + 加成; 信号没给杠杆时回落到风控「杠杆下限」.
 
-    最终仍由 `risk.choose_leverage` 按本系统 max_leverage / 交易所上限钳制,
+    最终仍由 `risk.choose_leverage` 钳到风控全局杠杆下限/上限与交易所上限，
     这里只负责给出「在原信号基础上 +N」的原始意图, 保证可单测。
     """
     lev = float(signal_leverage or 0.0)

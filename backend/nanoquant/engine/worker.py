@@ -929,7 +929,7 @@ class TradingEngine:
             if not gate.ok:
                 return self._follow_skip(key, parsed, "skipped", gate.reason, mode)
 
-            # 杠杆 = 原信号杠杆 +10x（没给杠杆就回落本系统默认），再受本系统/交易所上限钳制
+            # 杠杆 = 原信号杠杆 +10x（没给杠杆就回落风控杠杆下限），再钳到全局杠杆下限/上限
             base_lev = signal_feed.follow_leverage(
                 parsed["leverage"], risk_cfg.default_leverage, cfg.leverage_bonus
             )
@@ -1184,8 +1184,10 @@ class TradingEngine:
                 )
                 return
             if d.leverage > 0:
+                # 模型（含注入心法）给出的杠杆只是区间内建议值，
+                # 统一由风控全局「杠杆下限/上限」钳制；不再走 AI 模型页的独立上限
                 leverage = risk_mod.choose_leverage(
-                    sig.symbol, engine_cfg, risk_cfg, filters, min(d.leverage, ai_cfg.max_position_leverage)
+                    sig.symbol, engine_cfg, risk_cfg, filters, d.leverage
                 )
             if d.sl_pct > 0:
                 sl_pct = min(max(0.12, d.sl_pct), 3.0)
@@ -1269,7 +1271,9 @@ class TradingEngine:
         injected_ids: list[int] = []
         if ai_cfg.inject_mantras:
             lessons = mantra_store.rank_lessons()
-            mantras = [{"title": m["title"], "rule": m["rule"], "health": m["health"]} for m in lessons]
+            # 只传标题与健康度，**不传规则原文**：心法文本里可能含「用 Nx 杠杆」之类的历史表述，
+            # 开仓杠杆必须只由风控全局上下限决定，不能让模型照着心法给杠杆。
+            mantras = [{"title": m["title"], "health": m["health"]} for m in lessons]
             # 只记 id，不把 id 塞进 prompt（快照用于事后「采用/未采用」对照）
             injected_ids = [int(m["id"]) for m in lessons if m.get("id")]
         news_items = news_service.digest(6) if ai_cfg.inject_news else []
@@ -1278,6 +1282,8 @@ class TradingEngine:
         day_start = state.get_float("day_start_equity", account.equity)
         if day_start > 0:
             today_pnl = (account.equity - day_start) / day_start * 100
+        lev_upper = max(1, min(int(risk_cfg.max_leverage), int(filters.max_leverage or 100), 100))
+        lev_lower = max(1, min(int(risk_cfg.default_leverage), lev_upper))
         return {
             "symbol": sig.symbol,
             "price": ticker.last,
@@ -1300,8 +1306,9 @@ class TradingEngine:
                 "today_pnl_pct": round(today_pnl, 3),
             },
             "constraints": {
-                "max_leverage": min(risk_cfg.max_leverage, filters.max_leverage, 100),
-                "leverage_range": "1-100",
+                "min_leverage": lev_lower,
+                "max_leverage": lev_upper,
+                "leverage_range": f"{lev_lower}-{lev_upper}",
                 "risk_per_trade_pct": risk_cfg.risk_per_trade_pct,
                 "margin_pct": risk_cfg.margin_pct,
                 "min_confidence": ai_cfg.min_confidence,

@@ -66,8 +66,11 @@ class EngineSettings(BaseModel):
 
 class RiskSettings(BaseModel):
     risk_per_trade_pct: float = Field(default=10.0, gt=0, le=100, description="单笔最大亏损占权益%")
-    max_leverage: int = Field(default=100, ge=1, le=100)
-    default_leverage: int = Field(default=20, ge=1, le=100)
+    max_leverage: int = Field(default=100, ge=1, le=100, description="杠杆上限: 全局硬上限, 最高 100x; AI 开仓杠杆与单标的配置都只能收紧不能突破")
+    default_leverage: int = Field(
+        default=20, ge=1, le=100,
+        description="杠杆下限: 全局硬下限, 最低 1x; AI/外部信号给出的杠杆低于该值时自动抬到下限",
+    )
     margin_pct: float = Field(default=50.0, gt=0, le=100, description="单仓保证金占权益%")
     max_exposure_pct: float = Field(default=2000.0, gt=0, le=20000, description="总名义额/权益 上限%")
     max_same_direction: int = Field(
@@ -169,7 +172,9 @@ class AiSettings(BaseModel):
     monthly_budget_usd: float = Field(default=3.0, ge=0, le=10000)
     timeout_sec: int = Field(default=45, ge=5, le=300)
     temperature: float = Field(default=0.2, ge=0, le=2)
-    max_position_leverage: int = Field(default=20, ge=1, le=100)
+    #: 已停用（保留字段兼容老配置）：AI 开仓杠杆统一由「风控 → 杠杆下限/上限」钳制，
+    #: 不再由模型侧单独设上限，也不跟随心法里的杠杆建议。
+    max_position_leverage: int = Field(default=20, ge=1, le=100, description="已停用: 开仓杠杆由风控全局上下限决定")
     inject_news: bool = True
     inject_mantras: bool = True
     personas: list[AiPersona] = Field(

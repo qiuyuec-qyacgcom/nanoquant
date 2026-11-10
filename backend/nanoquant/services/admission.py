@@ -197,7 +197,9 @@ async def evaluate() -> dict[str, Any]:
                 {"symbol": symbol, "tradeable": False, "reason": "缺少交易规则或行情", "max_leverage": 0}
             )
             continue
-        leverage = min(risk_cfg.default_leverage, filters.max_leverage, risk_cfg.max_leverage, 100)
+        # 与真实开仓一致：杠杆下限/上限取全局风控，交易所上限更低时以交易所为准
+        lev_upper = max(1, min(int(risk_cfg.max_leverage), int(filters.max_leverage or 100), 100))
+        leverage = max(1, min(int(risk_cfg.default_leverage), lev_upper))
         qty, note = estimate_qty(
             equity, ticker.last, leverage, risk_cfg, 0.005, filters,
             # 账户接口不可用时不要把"可用 0"误判成余额不足
@@ -217,10 +219,8 @@ async def evaluate() -> dict[str, Any]:
                 # 该杠杆下开最小仓所需的保证金 (名义额 / 杠杆), 余额门槛就是它
                 "required_margin": round(min_notional / max(1.0, leverage), 4),
                 # 用该标的允许的最高杠杆时的保证金下限: 余额只有零点几个 U 也能开的场景
-                "max_leverage_used": min(filters.max_leverage, risk_cfg.max_leverage, 100),
-                "required_margin_at_max": round(
-                    min_notional / max(1.0, min(filters.max_leverage, risk_cfg.max_leverage, 100)), 4
-                ),
+                "max_leverage_used": lev_upper,
+                "required_margin_at_max": round(min_notional / max(1.0, lev_upper), 4),
                 "allocatable_notional": round(allocatable, 4),
                 "qty_if_open": qty,
                 "notional_if_open": round(qty * ticker.last, 4) if qty else 0.0,

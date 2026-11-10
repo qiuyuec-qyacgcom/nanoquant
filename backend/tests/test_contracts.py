@@ -1826,3 +1826,69 @@ def test_injection_report_discloses_not_injected():
         assert len(report["not_injected"]) == 2
     finally:
         update_group("evolution", {"max_injected": old})
+
+
+# ---------------------------------------------- 全局杠杆下限 / 上限
+def test_choose_leverage_clamps_ai_to_global_floor_and_cap():
+    """AI/心法给出的杠杆只是区间内建议值，越界一律钳回全局下限/上限."""
+    from nanoquant.engine.risk import choose_leverage
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import EngineSettings, RiskSettings
+
+    engine = EngineSettings()
+    f = SymbolFilters(symbol="BTCUSDT", max_leverage=125, price_tick=0.01, qty_step=0.001)
+    cfg = RiskSettings(default_leverage=20, max_leverage=100)
+
+    assert choose_leverage("BTCUSDT", engine, cfg, f) == 20           # 无建议 → 下限
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 1) == 20        # 过低 → 抬到下限
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 5) == 20
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 35) == 35       # 区间内采纳
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 125) == 100     # 过高 → 压到上限
+
+    tight = RiskSettings(default_leverage=20, max_leverage=30)
+    assert choose_leverage("BTCUSDT", engine, tight, f, 99) == 30
+
+    # 交易所上限更低时以交易所为准，即使全局下限更高也不能突破
+    f12 = SymbolFilters(symbol="BTCUSDT", max_leverage=12, price_tick=0.01, qty_step=0.001)
+    assert choose_leverage("BTCUSDT", engine, cfg, f12, 80) == 12
+    assert choose_leverage("BTCUSDT", engine, cfg, f12) == 12
+
+    low = RiskSettings(default_leverage=1, max_leverage=100)
+    assert choose_leverage("BTCUSDT", engine, low, f, 1) == 1        # 下限最低 1x
+
+
+def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeypatch):
+    """决策上下文显式给出全局区间，且不再把心法规则原文（可能含杠杆建议）塞给模型."""
+    from types import SimpleNamespace
+
+    from nanoquant.ai.compact import format_snapshot_v2
+    from nanoquant.ai.prompts import DECISION_SYSTEM, format_snapshot
+    from nanoquant.engine import worker as w
+    from nanoquant.services.settings import EngineSettings, RiskSettings
+
+    assert "全局" in DECISION_SYSTEM and "心法" in DECISION_SYSTEM
+    assert "min_leverage" in DECISION_SYSTEM and "max_leverage" in DECISION_SYSTEM
+
+    monkeypatch.setattr(
+        w, "get_ai",
+        lambda: SimpleNamespace(inject_mantras=True, inject_news=False, min_confidence=0.45),
+    )
+    monkeypatch.setattr(w.mantra_store, "rank_lessons", lambda: [
+        {"id": 1, "title": "高波动技巧", "rule": "当信号强时可用 30x 杠杆", "health": 0.7},
+    ])
+    monkeypatch.setattr(w.risk_mod, "open_positions", lambda: [])
+    monkeypatch.setattr(w.state, "get_float", lambda *a, **k: 1000.0)
+
+    sig = SimpleNamespace(symbol="BTCUSDT", score=0.5, direction="long", features={}, reasons=[])
+    ticker = SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9)
+    account = SimpleNamespace(equity=1000.0, available=1000.0)
+    filters = SimpleNamespace(max_leverage=125, effective_min_notional=lambda p: 5.0)
+    ctx = w.TradingEngine()._build_ai_context(
+        sig, ticker, account, EngineSettings(),
+        RiskSettings(default_leverage=20, max_leverage=100), filters,
+    )
+    assert all("rule" not in m for m in ctx["mantras"])
+    assert "30x" not in format_snapshot(ctx)
+    assert ctx["constraints"]["min_leverage"] == 20
+    assert ctx["constraints"]["max_leverage"] == 100
+    assert "levmin" in format_snapshot_v2(ctx)

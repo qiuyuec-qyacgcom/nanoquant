@@ -24,6 +24,7 @@ interface FieldMeta {
   widget?: Widget
   options?: [string, string][]
   min?: number
+  max?: number
 }
 
 interface SectionDef {
@@ -78,8 +79,14 @@ const BASE_META: Record<string, FieldMeta> = {
 
   risk_per_trade_pct: { label: '单笔风险', unit: '%', hint: '止损打掉时的最大亏损占权益比例' },
   margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额' },
-  default_leverage: { label: '默认杠杆', unit: 'x' },
-  max_leverage: { label: '杠杆上限', unit: 'x', hint: '1–100x，单标的配置只能收紧不能突破' },
+  default_leverage: {
+    label: '杠杆下限', unit: 'x', min: 1,
+    hint: '最低 1x；全局硬下限，AI 与外部信号给出的杠杆低于下限时自动抬到下限',
+  },
+  max_leverage: {
+    label: '杠杆上限', unit: 'x', max: 100,
+    hint: '最高 100x；全局硬上限，AI 开仓杠杆与单标的配置都只能收紧不能突破',
+  },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
   max_same_direction: {
     label: '同向持仓上限',
@@ -261,7 +268,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
   risk: [
     {
       title: '仓位与杠杆',
-      hint: '先由风险预算反推名义额，再被保证金、敞口与同向集中度截断',
+      hint: '先由风险预算反推名义额，再被保证金、敞口与同向集中度截断；AI 开仓杠杆统一按下面的下限/上限钳制，不跟随心法',
       fields: [
         'risk_per_trade_pct',
         'margin_pct',
@@ -402,7 +409,7 @@ function widgetOf(value: any, meta: FieldMeta): Widget {
 
 function rowOf(group: string, key: string, value: any): Row {
   const meta = metaOf(group, key)
-  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min }
+  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min, max: meta.max }
 }
 
 const currentSections = computed(() => {
@@ -776,7 +783,7 @@ onMounted(async () => {
                   </select>
 
                   <div v-else-if="f.widget === 'number'" class="num-wrap">
-                    <input v-model.number="draft[f.key]" type="number" step="any" :min="f.min" class="input mono" />
+                    <input v-model.number="draft[f.key]" type="number" step="any" :min="f.min" :max="f.max" class="input mono" />
                     <span v-if="f.unit" class="num-unit">{{ f.unit }}</span>
                   </div>
 

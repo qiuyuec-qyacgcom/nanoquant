@@ -1137,6 +1137,17 @@
 - **验证**：`pytest tests -q` → **101 passed**（新增宪法 Linter、证据健康分、NO_CHANGE 不入库、样本门槛、CAS、注入披露、效果反馈共 6 条契约 + 1 条路由用例，另更新 3 条旧契约以适配归档/替代门槛）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 - **边界**：效果对照仍是观察性、非随机 A/B；健康分依赖决策时 `features` 快照，旧成交缺快照会落入 legacy 不参与对照。
 
+### 79. 风控杠杆改为全局下限/上限，AI 开仓杠杆不再跟心法走
+- **状态**：✅ 已完成
+- **背景**：`risk.default_leverage` 原语义「默认杠杆」只作无建议时的回落值；AI 决策输出的 `leverage` 会被 `min(d.leverage, ai.max_position_leverage)` 后直接采纳（只压上限、不设下限），且决策上下文把心法 `rule` 原文一并塞进 ctx，心法里若含「用 Nx 杠杆」可能诱导模型给杠杆。
+- **过程要点**：
+  - **配置语义**：`default_leverage` 正式定义为「杠杆下限」（最低 1x），`max_leverage` 为「杠杆上限」（最高 100x）；字段名保留以兼容老库/API/前端，仅改 description。参数配置页字段改为「杠杆下限 / 杠杆上限」并写明 1x / 100x 边界（数字输入也带 min/max）；README 与总览页同步为「杠杆区间 下限–上限」。
+  - **统一钳制**：`choose_leverage` 改为 `upper = min(全局上限, 交易所上限, 100)`、`lower = min(全局下限, upper)`，AI/信号给出的杠杆只是区间内**建议值**，低于下限抬到下限、高于上限压到上限；交易所上限更低时以交易所为准。无建议值时用下限。
+  - **去掉模型侧独立上限**：worker 不再用 `ai.max_position_leverage`（`AiSettings` 字段保留但标注已停用，AI 模型页输入框禁用并给出说明）。
+  - **隔离心法**：`_build_ai_context` 只把心法 title/health 放进上下文，**不再传 rule 原文**；`constraints` 增加 `min_leverage` / `max_leverage` / 实际 `leverage_range`，v1 `DECISION_SYSTEM` 与 v2 `SYSTEM_V2` 都明写「输出 leverage 仅作区间内参考、心法/新闻中的杠杆数值不得作为依据」。
+  - 信号跟单与「开仓检查」页的杠杆口径同步到同一套上下限，避免两处漂移。
+- **验证**：`pytest tests -q` → **103 passed**（新增 `choose_leverage` 上下限钳制、交易所优先、决策上下文隔离心法规则 2 条契约）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+
 ---
 
 ## 二、未开始
