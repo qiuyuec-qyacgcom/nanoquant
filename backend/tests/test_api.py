@@ -281,6 +281,171 @@ def test_api_rate_limit_returns_429_with_retry_after(client):
         assert client.get(f"{API}/health").status_code == 200
         assert client.get(f"{API}/metrics").status_code == 200
     finally:
+        # 先清窗口: 否则"恢复配置为 0"这次 PUT 自己会被刚设的 2 次上限挡成 429
+        limiter.clear()
         client.put(f"{API}/settings/system", headers=headers, json={"patch": {"api_rate_limit_per_min": 0}})
         limiter.clear()
     assert client.get(f"{API}/auth/me", headers=headers).status_code == 200
+
+
+def test_signal_follow_routes_and_idempotent_claim(client):
+    """路由必须真的挂载（上一版只 import 未 include），且同一信号只能占位一次."""
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.engine.worker import TradingEngine
+    from nanoquant.models import SignalFollow
+    from nanoquant.services import signal_follow as sf
+
+    init_db()
+    assert client.get(f"{API}/signal-follow/status").status_code == 401
+    headers = _token(client)
+    status = client.get(f"{API}/signal-follow/status", headers=headers)
+    assert status.status_code == 200
+    body = status.json()
+    assert {"settings", "counts", "path", "offset", "inflight_margin"} <= set(body)
+    assert client.get(f"{API}/signal-follow/events", headers=headers).status_code == 200
+    assert client.post(f"{API}/signal-follow/read-once", headers=headers).json()["processed"] == 0
+
+    parsed = sf.parse_signal({"id": "unit-claim", "symbol": "BTCUSDT", "side": "long", "event": "开仓"})
+    key = sf.signal_identity(parsed)
+    eng = TradingEngine()
+    with session_scope() as s:
+        s.query(SignalFollow).filter(SignalFollow.signal_id == key).delete()
+    try:
+        assert eng._claim_follow(key, parsed, "demo") is True
+        assert eng._claim_follow(key, parsed, "demo") is False  # HTTP 重推 / 文件重读
+        eng._finish_follow(key, parsed, "skipped", "测试", "demo")
+        with session_scope() as s:
+            rows = s.query(SignalFollow).filter(SignalFollow.signal_id == key).all()
+            assert len(rows) == 1 and rows[0].status == "skipped"
+    finally:
+        with session_scope() as s:
+            s.query(SignalFollow).filter(SignalFollow.signal_id == key).delete()
+
+
+def test_signal_follow_ingest_auth_and_event_filter(client):
+    """直推鉴权 + 平仓事件不跟单 + 状态接口对密钥脱敏."""
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.models import SignalFollow
+    from nanoquant.services.settings import update_group
+
+    init_db()
+    headers = _token(client)
+    off = client.post(f"{API}/signal-follow/ingest", headers=headers, json={"symbol": "X"})
+    assert off.status_code == 200 and off.json()["status"] == "skipped"
+    assert client.post(f"{API}/signal-follow/ingest", json={"symbol": "X"}).status_code == 401
+
+    update_group("signal_follow", {"enabled": True, "ingest_token": "unit-secret"})
+    try:
+        assert client.post(f"{API}/signal-follow/ingest", json={"symbol": "X"}).status_code == 401
+        res = client.post(
+            f"{API}/signal-follow/ingest",
+            headers={"X-Signal-Token": "unit-secret"},
+            json={"id": "unit-exit", "event": "平仓", "symbol": "BTCUSDT", "side": "long"},
+        )
+        assert res.status_code == 200 and res.json()["status"] == "skipped"
+        assert "非开仓" in res.json()["reason"]
+        masked = client.get(f"{API}/signal-follow/status", headers=headers).json()
+        assert masked["settings"]["ingest_token"] == "******" and masked["ingest_token_set"]
+    finally:
+        update_group("signal_follow", {"enabled": False, "ingest_token": ""})
+        with session_scope() as s:
+            s.query(SignalFollow).filter(SignalFollow.signal_id.like("unit-exit%")).delete()
+
+
+def test_follow_signal_end_to_end_uses_system_sizing(monkeypatch):
+    """桩交易所跑通全链路：+10x / 自动补池 / 系统资金 / 幂等 / 平仓事件不跟."""
+    import asyncio
+    import time
+
+    import nanoquant.engine.worker as worker
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.models import SignalFollow, TradingSymbol
+    from nanoquant.services import state
+    from nanoquant.services import symbols as symbol_service
+    from nanoquant.services.settings import get_group, update_group
+
+    init_db()
+    symbol = "FOLLOWUSDT"
+    with session_scope() as s:
+        s.query(SignalFollow).filter(SignalFollow.symbol == symbol).delete()
+        s.query(TradingSymbol).filter(TradingSymbol.symbol == symbol).delete()
+
+    async def fake_add_symbol(raw):
+        with session_scope() as s:
+            if s.get(TradingSymbol, raw) is None:
+                s.add(TradingSymbol(
+                    symbol=raw, enabled=True, max_leverage=100, precision=3,
+                    tick_sz="0.01", min_sz="0.001", min_notional=5.0, sort_order=999,
+                ))
+        return {"symbol": raw}
+
+    async def fake_tickers(symbols):  # noqa: ARG001
+        from types import SimpleNamespace
+
+        return {symbol: SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9)}
+
+    calls: list[dict] = []
+
+    class FakeBroker:
+        mode = "demo"
+
+        async def account(self):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                equity=5000.0, available=3000.0, wallet=5000.0,
+                unrealized=0.0, margin_used=0.0, as_dict=lambda: {},
+            )
+
+        async def open_position(self, **kwargs):
+            from types import SimpleNamespace
+
+            calls.append(kwargs)
+            return SimpleNamespace(ok=True, price=100.0, qty=kwargs["qty"], message="ok")
+
+    monkeypatch.setattr(symbol_service, "add_symbol", fake_add_symbol)
+    monkeypatch.setattr(worker.binance_client, "tickers", fake_tickers)
+    monkeypatch.setattr(worker, "get_broker", lambda mode: FakeBroker())  # noqa: ARG005
+    for key in ("halted", "consecutive_losses", "loss_halt_until", "sl_guard_until"):
+        state.set(key, "" if key == "halted" else "0")
+
+    old_engine_cfg = get_group("engine", use_cache=False)
+    old_follow_cfg = get_group("signal_follow", use_cache=False)
+    eng = worker.engine
+    old_lock = eng._follow_lock
+    eng._follow_lock = asyncio.Lock()
+    update_group("engine", {"enabled": True})
+    update_group("signal_follow", {"enabled": True, "dry_run": False, "leverage_bonus": 10})
+
+    row = {
+        "id": "e2e-open", "symbol": symbol, "side": "long", "event": "开仓",
+        "leverage": "20x", "ts": int(time.time()),
+    }
+
+    async def run():
+        first = await eng.follow_signal_now(row)
+        again = await eng.follow_signal_now(row)
+        closed = await eng.follow_signal_now({**row, "id": "e2e-close", "event": "平仓"})
+        return first, again, closed
+
+    try:
+        first, again, closed = asyncio.run(run())
+        assert first["status"] == "opened" and first["leverage"] == 30  # 20x + 10x
+        assert again["status"] == "duplicate"  # 文件重读 / HTTP 重推只跟一次
+        assert closed["status"] == "skipped" and "非开仓" in closed["reason"]
+        assert len(calls) == 1
+        kw = calls[0]
+        assert kw["leverage"] == 30 and kw["qty"] > 0
+        assert kw["features"]["source"] == "signal_follow"
+        assert kw["features"]["plan"]["available"] > 0  # 资金按本系统账本算
+        with session_scope() as s:
+            assert s.get(TradingSymbol, symbol) is not None  # 自动补池
+            rows = s.query(SignalFollow).filter(SignalFollow.symbol == symbol).all()
+            assert sorted(r.status for r in rows) == ["opened", "skipped"]
+    finally:
+        eng._follow_lock = old_lock
+        update_group("engine", old_engine_cfg)
+        update_group("signal_follow", old_follow_cfg)
+        with session_scope() as s:
+            s.query(SignalFollow).filter(SignalFollow.symbol == symbol).delete()
+            s.query(TradingSymbol).filter(TradingSymbol.symbol == symbol).delete()

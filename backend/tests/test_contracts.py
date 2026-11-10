@@ -1495,3 +1495,122 @@ def test_exec_shadow_off_skips_everything():
     assert fake.counters["requests"] == 0
     assert shadow.counts["matched"] == 0 and shadow.counts["mismatched"] == 0
     assert "未启用" in shadow.status()["verdict"]
+
+
+# ---------------------------------------------- 外部信号跟单 (RUNBOOK 管道)
+def test_parse_signal_normalizes_templates_and_events():
+    from nanoquant.services import signal_follow as sf
+
+    parsed = sf.parse_signal({
+        "id": "msg-42", "symbol": "btc/usdt", "side": "开多", "event": "开仓",
+        "leverage": "20x", "entry": "1,234.5", "stop": 1200, "tp": 1300,
+        "ts": 1730000000000,
+    })
+    assert parsed["symbol"] == "BTCUSDT" and parsed["side"] == "long"
+    assert parsed["leverage"] == 20.0 and parsed["entry"] == 1234.5
+    assert parsed["ts"] == 1730000000 and parsed["event"] == "open"
+
+    assert sf.classify_event({"event": "平仓"}) == "exit"
+    assert sf.classify_event({"event": "止盈更新"}) == "exit"
+    assert sf.classify_event({"action": "buy"}) == "open"
+    assert sf.classify_event({"symbol": "BTCUSDT"}) == ""  # 模板变体: 无事件字段
+    assert sf.classify_event({"event": "something_odd"}) == "unknown"
+    assert sf.parse_signal({"symbol": "BTCUSDT", "action": "平多"}) is None
+
+    from datetime import datetime
+
+    iso = sf.parse_signal({"symbol": "ETHUSDT", "side": "short", "ts": "2026-11-10T10:00:00+00:00"})
+    assert iso["ts"] == int(datetime.fromisoformat("2026-11-10T10:00:00+00:00").timestamp())
+    assert sf.signal_identity(parsed) == "msg-42:BTCUSDT:long"
+
+
+def test_follow_leverage_adds_bonus_and_obeys_system_cap():
+    from nanoquant.engine.risk import choose_leverage
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services import signal_follow as sf
+    from nanoquant.services.settings import EngineSettings, RiskSettings, SignalFollowSettings
+
+    cfg = SignalFollowSettings()
+    assert cfg.leverage_bonus == 10 and cfg.auto_add_symbol and cfg.dry_run
+    assert cfg.poll_sec == 1  # 本地文件增量读, 不受 Telegram 轮询 10s 下限约束
+    assert sf.follow_leverage(20.0, 5.0, cfg.leverage_bonus) == 30
+    assert sf.follow_leverage(0.0, 5.0, cfg.leverage_bonus) == 5  # 缺杠杆不凭空 +10
+
+    engine = EngineSettings()
+    risk = RiskSettings(default_leverage=5, max_leverage=25)
+    f25 = SymbolFilters(symbol="BTCUSDT", max_leverage=50, price_tick=0.01, qty_step=0.001)
+    base = sf.follow_leverage(20.0, risk.default_leverage, cfg.leverage_bonus)
+    assert choose_leverage("BTCUSDT", engine, risk, f25, ai_leverage=float(base)) == 25
+    f12 = SymbolFilters(symbol="BTCUSDT", max_leverage=12, price_tick=0.01, qty_step=0.001)
+    assert choose_leverage("BTCUSDT", engine, risk, f12, ai_leverage=float(base)) == 12
+
+
+def test_read_new_lines_incremental_partial_and_truncated(tmp_path):
+    import json
+    import os
+    import time
+
+    from nanoquant.services import signal_follow as sf
+
+    path = tmp_path / "signals.jsonl"
+    path.write_text(json.dumps({"id": 1}) + "\n" + json.dumps({"id": 2}) + "\n", encoding="utf-8")
+    rows, offset = sf.read_new_lines(str(path), 0)
+    assert [r["id"] for r in rows] == [1, 2] and offset == path.stat().st_size
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"id": 3}))  # 半行不消费
+    assert sf.read_new_lines(str(path), offset) == ([], offset)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n" + json.dumps({"id": 4}) + "\n")
+    rows, offset = sf.read_new_lines(str(path), offset)
+    assert [r["id"] for r in rows] == [3, 4]
+
+    path.write_text(json.dumps({"id": 9}) + "\n", encoding="utf-8")  # --reset 截断
+    rows, offset = sf.read_new_lines(str(path), offset)
+    assert [r["id"] for r in rows] == [9] and offset == path.stat().st_size
+
+    root = tmp_path / "ao-monitor" / "data"
+    (root / "chan_a").mkdir(parents=True)
+    (root / "chan_b").mkdir(parents=True)
+    a, b = root / "chan_a" / "signals.jsonl", root / "chan_b" / "signals.jsonl"
+    a.write_text("{}\n", encoding="utf-8")
+    b.write_text("{}\n", encoding="utf-8")
+    os.utime(str(b), (time.time() + 10, time.time() + 10))
+    import nanoquant.services.signal_follow as module
+
+    assert module._ENV_ROOT
+    from pytest import MonkeyPatch
+
+    mp = MonkeyPatch()
+    try:
+        mp.delenv(sf._ENV_PATH, raising=False)
+        mp.setenv(sf._ENV_ROOT, str(root))
+        assert sf.resolve_path("", str(tmp_path / "nanoquant")) == str(b)
+        assert sf.resolve_path(str(root / "chan_a"), str(tmp_path)) == str(a)
+    finally:
+        mp.undo()
+
+
+def test_margin_inflight_reservation_survives_engine_cycle():
+    import asyncio
+
+    from nanoquant.engine.margin import MarginLedger
+
+    async def run():
+        ledger = MarginLedger()
+        ledger.begin_cycle(1000.0)
+        rid = await ledger.reserve_tracked(400.0)
+        assert rid > 0 and ledger.inflight == 400.0
+        ledger.begin_cycle(1000.0)  # 引擎下一轮快照尚未扣到跟仓在途单
+        assert ledger.remaining == 600.0
+        assert await ledger.reserve_tracked(700.0) == 0  # 轮询开仓不能重复占额度
+        await ledger.settle(rid, opened=False)
+        assert ledger.remaining == 1000.0
+
+        rid2 = await ledger.reserve_tracked(300.0)
+        ledger.refresh(700.0)  # 新快照已扣掉另一笔成交
+        assert ledger.inflight == 300.0
+        await ledger.settle(rid2, opened=True)
+        assert ledger.used == 300.0 and ledger.remaining == 400.0
+
+    asyncio.run(run())

@@ -203,6 +203,28 @@ class PositionRecord(Base):
     trade_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
 
+class SignalFollow(Base):
+    """外部频道信号跟单记录（幂等 + 审计）.
+
+    `signal_id` 唯一：同一条信号无论文件重读、进程重启还是 HTTP 重推，都只处理一次。
+    """
+
+    __tablename__ = "signal_follows"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(8), default="")
+    status: Mapped[str] = mapped_column(String(16), default="opened", index=True)
+    reason: Mapped[str] = mapped_column(String(240), default="")
+    leverage: Mapped[int] = mapped_column(Integer, default=0)
+    qty: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    margin: Mapped[float] = mapped_column(Float, default=0.0)
+    mode: Mapped[str] = mapped_column(String(8), default="demo", index=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=now_ts, index=True)
+
+
 class TradeRecord(Base):
     """闭环交易 (用于复盘/统计/心法)."""
 

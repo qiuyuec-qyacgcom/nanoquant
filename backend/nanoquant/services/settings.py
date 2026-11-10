@@ -311,6 +311,26 @@ class SystemSettings(BaseModel):
     metrics_enabled: bool = Field(default=True, description="是否开放只读 /metrics（Prometheus 文本）")
 
 
+class SignalFollowSettings(BaseModel):
+    """外部频道信号跟单（对接 ao-monitor 的 signals.jsonl / HTTP 推送）.
+
+    即时性：HTTP 直推是零延迟；文件通道只做**本地增量读**，不是 Telegram 轮询，
+    因此不受 RUNBOOK M1 的 10s 下限约束。
+    """
+
+    enabled: bool = Field(default=False, description="开启后才会读取或接收外部信号")
+    jsonl_path: str = Field(default="", description="signals.jsonl 绝对路径（或频道目录）; 留空自动找 ao-monitor/data/*/signals.jsonl")
+    poll_sec: int = Field(default=1, ge=1, le=60, description="本地 jsonl 增量轮询间隔秒（非 Telegram 轮询）")
+    ingest_token: str = Field(default="", description="HTTP 直推共享密钥; 留空则直推接口只接受登录态")
+    leverage_bonus: int = Field(default=10, ge=0, le=100, description="在原信号杠杆基础上增加的倍数（默认 +10x）")
+    max_age_sec: int = Field(default=180, ge=5, le=3600, description="信号超过该秒数不再跟单（防重启补开旧信号）")
+    max_per_hour: int = Field(default=6, ge=1, le=100, description="每小时最多跟单笔数")
+    auto_add_symbol: bool = Field(default=True, description="标的池没有该标的时自动添加")
+    strict_events: bool = Field(default=False, description="开启后未知事件一律拒绝; 关闭时只告警并按方向跟单")
+    default_sl_pct: float = Field(default=1.2, gt=0, le=20, description="信号未给止损时使用的止损百分比")
+    dry_run: bool = Field(default=True, description="只记录意图不下单; 人工明确授权后才可关闭（RUNBOOK M4）")
+
+
 class PublicSettings(BaseModel):
     """公开前台 (无需登录) 的展示配置."""
 
@@ -335,6 +355,7 @@ GROUPS: dict[str, type[BaseModel]] = {
     "security": SecuritySettings,
     "system": SystemSettings,
     "public": PublicSettings,
+    "signal_follow": SignalFollowSettings,
 }
 
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -528,3 +549,7 @@ def get_security() -> SecuritySettings:
 
 def get_system() -> SystemSettings:
     return SystemSettings(**get_group("system"))
+
+
+def get_signal_follow() -> SignalFollowSettings:
+    return SignalFollowSettings(**get_group("signal_follow"))

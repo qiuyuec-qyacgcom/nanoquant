@@ -38,10 +38,26 @@ def _persist_entry(order_fields: dict[str, Any], position_fields: dict[str, Any]
     """开仓落库 (在写线程执行, 不在下单关键路径上).
 
     订单与持仓放在同一个事务里, 避免出现"有订单无持仓"的中间态.
+    另外做一层同标的去重: 信号跟单可以在引擎两轮之间成交, 交易所仓位对账
+    (`record_external_position`) 可能先写了一条外部仓位; 若这里再无条件 INSERT,
+    会变成同标的两条 open 仓位, 风控计数与平仓都会错乱。
     """
     with session_scope() as s:
+        existing = (
+            s.query(PositionRecord)
+            .filter(
+                PositionRecord.symbol == position_fields["symbol"],
+                PositionRecord.mode == position_fields["mode"],
+                PositionRecord.status == "open",
+            )
+            .first()
+        )
+        if existing is not None:
+            for key, value in position_fields.items():
+                setattr(existing, key, value)
+        else:
+            s.add(PositionRecord(**position_fields))
         s.add(OrderRecord(**order_fields))
-        s.add(PositionRecord(**position_fields))
 
 
 #: 正在平仓的仓位 id (互斥闸门, 写库完成后释放)

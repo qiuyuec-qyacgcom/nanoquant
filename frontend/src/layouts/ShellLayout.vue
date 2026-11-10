@@ -16,6 +16,7 @@ const nav = [
     { path: '/admin/dashboard', label: '总览', ico: '◈' },
     { path: '/admin/onboarding', label: '开仓检查', ico: '⇥' },
     { path: '/admin/signals', label: '信号审计', ico: '▥' },
+    { path: '/admin/signal-follow', label: '信号跟单', ico: '⇄' },
     { path: '/admin/symbols', label: '标的池', ico: '☰' },
     { path: '/admin/chart', label: 'K 线工作站', ico: '▤' },
     { path: '/admin/backtest', label: '回测', ico: '◇' },

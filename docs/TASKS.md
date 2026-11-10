@@ -1108,6 +1108,20 @@
   心法列表里 `superseded_by != 0` 的行数为 **0**。
 - **验证**：新增 1 条用例（删除被替代、保留手动停用、幂等）并扩展替代用例 → **87 passed**。
 
+### 77. 外部频道信号跟单模块（按 `C:\RUNBOOK.md` 续做完成）
+- **状态**：✅ 已完成（真实下单默认 `dry_run=true`，需人工明确授权后关闭，对应 RUNBOOK M4）
+- **背景**：上一个模型已落 `SignalFollow` 表、`signal_follow` 配置组、解析服务、worker 跟单逻辑与路由文件，但路由**只 import 未 include**（接口全 404），且幂等占位在下单之后、跨轮保证金会被重置、重启会回放历史。
+- **过程要点**：
+  - 路由挂载补齐：`/signal-follow/status|events|ingest|read-once|reset-cursor`；直推支持 `X-Signal-Token` 共享密钥，状态接口对密钥脱敏。
+  - **即时跟仓**：文件通道 1s 增量读本地 `signals.jsonl`（非 Telegram 轮询，不受 M1 的 10s 下限约束）+ HTTP 直推零延迟；首次接入从文件尾部开始，不回放历史（RUNBOOK 非目标）；按频道路径独立游标，切频道不重放。
+  - **不与轮询开仓冲突**：`MarginLedger` 新增 `reserve_tracked/settle`，在途预留跨 `begin_cycle` 保留；两条链路共用同标的互斥与全局风控闸门（交易时段/回撤/熔断/持仓上限）；成交后延迟释放同标的忙碌标记，覆盖异步落库窗口；`_persist_entry` 按 symbol+mode 去重，避免对账先写的外部仓位形成双份持仓。
+  - **杠杆 +10x**：`follow_leverage(信号杠杆, 系统默认杠杆, 加成)` → `choose_leverage` 再按系统 `max_leverage` 与交易所上限钳制；信号没给杠杆时回落系统默认，不凭空 +10。
+  - **自动补池**：池内没有就走 `add_symbol`（币安在线合约表校验），池内已停用则不擅自启用。
+  - **资金按本系统**：`plan_position(..., available=margin.remaining)`，仓位/保证金/止损止盈都由本系统风险参数决定，不复制信号方仓位。
+  - 幂等改为「下单前唯一键占位 + 结束时更新裁决」，配合 `_follow_lock` 串行化与重启时 `processing` 结案；只跟开仓事件，平仓/止损/更新忽略，未知事件按 S6-06 先告警再放行（可开 `strict_events` 严格拒绝）。
+  - 新增后台「信号跟单」页：链路状态/参数/流水/立即读一轮/重置游标。
+- **验证**：`pytest tests -q` → **94 passed**（含桩交易所端到端用例：20x→30x、自动补池、系统资金、幂等、平仓事件不跟）；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+
 ---
 
 ## 二、未开始

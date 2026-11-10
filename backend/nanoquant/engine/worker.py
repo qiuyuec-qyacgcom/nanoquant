@@ -10,9 +10,12 @@ AI 评估在后台任务中执行 (带并发闸), 绝不阻塞仓位管理与止
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from typing import Any
+
+from sqlalchemy.exc import IntegrityError
 
 from ..ai.decision import decide
 from ..db import session_scope
@@ -20,9 +23,10 @@ from ..exchange.broker import Broker, get_broker, record_external_position
 from ..exchange.client import BinanceError, NoCredentials
 from ..exchange.client import client as binance_client
 from ..logging_setup import get_logger
-from ..models import EquityPoint, OrderRecord, PositionRecord, Signal, TradeRecord
+from ..models import EquityPoint, OrderRecord, PositionRecord, Signal, SignalFollow, TradeRecord
 from ..news import service as news_service
 from ..services import events, position_view, state
+from ..services import signal_follow as signal_feed
 from ..services import symbols as symbol_service
 from ..services.settings import (
     EngineSettings,
@@ -33,6 +37,7 @@ from ..services.settings import (
     get_evolution,
     get_news,
     get_risk,
+    get_signal_follow,
     get_strategy,
     normalize_mode,
 )
@@ -70,6 +75,15 @@ class TradingEngine:
         self._reviewing: set[int] = set()
         self._ai_warn_ts = 0.0
         self._started_at = 0
+        # ---- 外部信号跟单 ----
+        self._follow_task: asyncio.Task | None = None
+        self._follow_lock = asyncio.Lock()
+        #: 同标的开仓在途标记: symbol -> 时间戳，引擎扫描与信号跟单互斥
+        self._symbol_busy: dict[str, float] = {}
+        self._follow_path = ""
+        self._follow_cursor_key = ""
+        self._follow_last_poll = 0.0
+        self._follow_last_error = ""
 
     # ------------------------------------------------------------- lifecycle
     def _acquire_lock(self) -> bool:
@@ -119,7 +133,11 @@ class TradingEngine:
             return False
         self._stop.clear()
         self._started_at = int(time.time())
+        self._recover_stale_follows()
         self._task = asyncio.create_task(self._loop(), name="nanoquant-engine")
+        self._follow_task = asyncio.create_task(
+            self._signal_follow_loop(), name="nanoquant-signal-follow"
+        )
         events.record("info", "engine", "交易引擎已启动")
         return True
 
@@ -134,6 +152,13 @@ class TradingEngine:
         for t in list(self._entry_tasks.values()):
             t.cancel()
         self._entry_tasks.clear()
+        if self._follow_task:
+            self._follow_task.cancel()
+            try:
+                await self._follow_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._follow_task = None
         self._release_lock()
         events.record("info", "engine", "交易引擎已停止")
 
@@ -546,7 +571,9 @@ class TradingEngine:
                 self._update_signal_reject(rec["signal_id"], gate.reason)
                 continue
             self._entry_tasks[symbol] = asyncio.create_task(
-                self._open_entry(broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, rec["signal_id"])
+                self._open_entry_guarded(
+                    broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, rec["signal_id"]
+                )
             )
             self._entry_tasks[symbol].add_done_callback(lambda t, s=symbol: self._entry_tasks.pop(s, None))
         return results
@@ -611,6 +638,438 @@ class TradingEngine:
             if row:
                 row.decision = "rejected"
                 row.reject_reason = reason[:250]
+
+    # ------------------------------------------------------- 外部信号跟单
+    def _symbol_acquire(self, symbol: str, ttl: float = 90.0) -> bool:
+        """同标的开仓互斥：引擎扫描 / 信号跟单谁先拿到锁谁开，另一个直接跳过."""
+        now = time.time()
+        if now - self._symbol_busy.get(symbol, 0.0) < ttl:
+            return False
+        self._symbol_busy[symbol] = now
+        return True
+
+    def _symbol_release(self, symbol: str) -> None:
+        self._symbol_busy.pop(symbol, None)
+
+    async def _open_entry_guarded(
+        self, broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, signal_id
+    ) -> None:
+        if not self._symbol_acquire(sig.symbol):
+            self._update_signal_reject(signal_id, "同标的开仓任务在途, 跳过本轮")
+            return
+        try:
+            await self._open_entry(
+                broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, signal_id
+            )
+        finally:
+            self._symbol_release(sig.symbol)
+
+    @staticmethod
+    def _follow_offset_key(path: str) -> str:
+        """每个频道文件独立游标：自动发现换频道时不重放另一个频道的历史."""
+        digest = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
+        return f"signal_follow_offset:{digest}"
+
+    def _recover_stale_follows(self) -> None:
+        """进程在下单途中崩溃会留下 processing 行；按 fail-closed 结案，避免重启后重复开仓."""
+        cutoff = int(time.time()) - 15 * 60
+        try:
+            with session_scope() as s:
+                rows = (
+                    s.query(SignalFollow)
+                    .filter(SignalFollow.status == "processing", SignalFollow.created_at < cutoff)
+                    .all()
+                )
+                for row in rows:
+                    row.status = "skipped"
+                    row.reason = "跟单中断(进程重启), 是否成交未确认; 已按 fail-closed 跳过"
+                if rows:
+                    events.record("warn", "signal_follow", f"重启后结案 {len(rows)} 条中断的跟单")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("跟单中断记录恢复失败: %s", exc)
+
+    async def _poll_signal_feed_once(self) -> int:
+        """读一轮 signals.jsonl，返回本次处理的行数.
+
+        首次接入某个文件从**文件尾部**开始（RUNBOOK 非目标: 历史回填）；上游
+        `--reset` 截断文件时 `read_new_lines` 会自动从 0 重读新文件。
+        """
+        cfg = get_signal_follow()
+        if not cfg.enabled:
+            self._follow_last_error = ""
+            return 0
+        from ..config import paths
+
+        path = signal_feed.resolve_path(cfg.jsonl_path, str(paths.HOME))
+        if not path:
+            self._follow_last_error = "未找到 signals.jsonl（请配置 jsonl_path 或 AO_MONITOR_DATA）"
+            return 0
+        if path != self._follow_path:
+            self._follow_path = path
+            state.set("signal_follow_path", path)
+        self._follow_cursor_key = self._follow_offset_key(path)
+        if not os.path.isfile(path):
+            self._follow_last_error = f"等待信号文件: {path}"
+            return 0
+        raw = state.get(self._follow_cursor_key, "")
+        if raw == "":
+            offset = os.path.getsize(path)
+            state.set(self._follow_cursor_key, str(offset))
+            events.record(
+                "info", "signal_follow",
+                f"接入信号文件 {path}, 从尾部 #{offset} 开始（不回放历史）",
+            )
+        else:
+            offset = state.get_int(self._follow_cursor_key, 0)
+        rows, new_offset = signal_feed.read_new_lines(path, offset)
+        if new_offset != offset:
+            state.set(self._follow_cursor_key, str(new_offset))
+        self._follow_last_poll = time.time()
+        self._follow_last_error = ""
+        for row in rows:
+            await self._handle_signal_row(row)
+        return len(rows)
+
+    def reset_follow_cursor(self) -> dict[str, Any]:
+        """手动把游标移到当前文件尾部（切换频道 / 清掉积压旧信号时用）."""
+        path = self._follow_path
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "reason": "信号文件尚不可用"}
+        key = self._follow_offset_key(path)
+        offset = os.path.getsize(path)
+        state.set(key, str(offset))
+        self._follow_cursor_key = key
+        return {"ok": True, "path": path, "offset": offset}
+
+    async def _signal_follow_loop(self) -> None:
+        """每 poll_sec 增量读本地 jsonl，收到即跟（不走 15s 的 cycle）."""
+        while not self._stop.is_set():
+            cfg = get_signal_follow()
+            try:
+                if cfg.enabled:
+                    await self._poll_signal_feed_once()
+            except Exception as exc:  # noqa: BLE001
+                self._follow_last_error = str(exc)[:200]
+                log.warning("信号跟单轮询失败: %s", exc)
+            await asyncio.sleep(max(1, cfg.poll_sec if cfg.enabled else 5))
+
+    async def _handle_signal_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        parsed = signal_feed.parse_signal(row)
+        if parsed is None:
+            return {"ok": False, "status": "invalid", "reason": "无法识别的信号格式"}
+        return await self._follow_signal(parsed)
+
+    async def follow_signal_now(self, row: dict[str, Any]) -> dict[str, Any]:
+        """HTTP 直推入口（与文件轮询共用去重/风控/幂等），信号到达即刻处理."""
+        if not get_signal_follow().enabled:
+            return {"ok": False, "status": "skipped", "reason": "信号跟单未开启"}
+        return await self._handle_signal_row(row)
+
+    def _claim_follow(self, key: str, parsed: dict[str, Any], mode: str) -> bool:
+        """下单**之前**用唯一键占位：文件轮询与 HTTP 重推同时到达也只会有一条进下单链路."""
+        try:
+            with session_scope() as s:
+                if s.query(SignalFollow).filter(SignalFollow.signal_id == key).first():
+                    return False
+                s.add(
+                    SignalFollow(
+                        signal_id=key, symbol=parsed["symbol"], side=parsed["side"],
+                        status="processing", reason="处理中", mode=mode,
+                        leverage=int(parsed.get("leverage") or 0),
+                        payload={"raw": parsed.get("raw"), "signal_ts": parsed.get("ts")},
+                    )
+                )
+            return True
+        except IntegrityError:
+            return False
+
+    def _finish_follow(
+        self, key: str, parsed: dict[str, Any], status: str, reason: str, mode: str, **extra: Any
+    ) -> None:
+        """把占位行更新成最终裁决（同一信号只落一行，审计链完整）."""
+        payload = {
+            "raw": parsed.get("raw"),
+            "signal_ts": parsed.get("ts"),
+            "entry": parsed.get("entry"),
+            "stop": parsed.get("stop"),
+            "tp": parsed.get("tp"),
+            "event": parsed.get("event"),
+            **{k: v for k, v in extra.items() if k not in ("qty", "price", "margin", "leverage")},
+        }
+        try:
+            with session_scope() as s:
+                row = s.query(SignalFollow).filter(SignalFollow.signal_id == key).first()
+                if row is None:
+                    row = SignalFollow(
+                        signal_id=key, symbol=parsed["symbol"], side=parsed["side"], mode=mode
+                    )
+                    s.add(row)
+                row.status = status
+                row.reason = (reason or "")[:240]
+                row.leverage = int(extra.get("leverage") or row.leverage or 0)
+                row.qty = float(extra.get("qty") or 0)
+                row.price = float(extra.get("price") or 0)
+                row.margin = float(extra.get("margin") or 0)
+                row.payload = payload
+        except Exception as exc:  # noqa: BLE001
+            log.warning("信号跟单记录写入失败: %s", exc)
+
+    def _follow_skip(
+        self, key: str, parsed: dict[str, Any], status: str, reason: str, mode: str, **extra: Any
+    ) -> dict[str, Any]:
+        self._finish_follow(key, parsed, status, reason, mode, **extra)
+        label = "info" if status in {"skipped", "dry_run", "duplicate"} else "warn"
+        events.record(label, "signal_follow", f"{parsed['symbol']} {parsed['side']} {status}: {reason}"[:220])
+        return {"ok": status == "dry_run", "status": status, "reason": reason, **extra}
+
+    async def _follow_signal(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        """串行处理一条信号，避免文件轮询与 HTTP 直推并发时重复占用额度."""
+        async with self._follow_lock:
+            return await self._follow_signal_locked(parsed)
+
+    async def _follow_signal_locked(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        """跟一条外部信号：风控/资金/杠杆全部走本系统，不复制信号方的仓位参数."""
+        cfg = get_signal_follow()
+        engine_cfg = get_engine()
+        risk_cfg = get_risk()
+        mode = normalize_mode(engine_cfg.mode)
+        key = signal_feed.signal_identity(parsed)
+        symbol, side = parsed["symbol"], parsed["side"]
+        now = int(time.time())
+
+        if not cfg.enabled:
+            return {"ok": False, "status": "skipped", "reason": "信号跟单未开启"}
+        if not self._claim_follow(key, parsed, mode):
+            return {"ok": True, "status": "duplicate", "reason": "该信号已处理过"}
+
+        # 平仓/止损/更新一律不跟; 未知事件按 RUNBOOK S6-06「先记录原文 + 报告需扩充规则」
+        # 再放行（有明确方向、且不含任何平仓词），strict_events 开启时改为 fail-closed。
+        if parsed.get("event") == "exit":
+            return self._follow_skip(key, parsed, "skipped", "非开仓事件(平仓/止损/更新), 忽略", mode)
+        if parsed.get("event") == "unknown":
+            events.record(
+                "warn", "signal_follow",
+                f"未识别的事件字段, 需扩充规则: {str((parsed.get('raw') or {}).get('event') or '')[:60]}",
+                {"raw": parsed.get("raw")},
+            )
+            if cfg.strict_events:
+                return self._follow_skip(key, parsed, "skipped", "未识别事件类型(严格模式已拒绝)", mode)
+
+        if not engine_cfg.enabled:
+            return self._follow_skip(key, parsed, "skipped", "交易引擎未启动", mode)
+        age = now - int(parsed["ts"])
+        if age > cfg.max_age_sec or age < -60:
+            return self._follow_skip(
+                key, parsed, "skipped", f"信号时间异常或已过期 {age}s (上限 {cfg.max_age_sec}s)", mode
+            )
+        with session_scope() as s:
+            opened_last_hour = (
+                s.query(SignalFollow)
+                .filter(SignalFollow.status == "opened", SignalFollow.created_at >= now - 3600)
+                .count()
+            )
+        if opened_last_hour >= cfg.max_per_hour:
+            return self._follow_skip(
+                key, parsed, "skipped", f"每小时跟单已达上限 {cfg.max_per_hour} 笔", mode
+            )
+
+        if not self._symbol_acquire(symbol):
+            return self._follow_skip(key, parsed, "skipped", "同标的开仓任务在途", mode)
+        rid = 0
+        follow_opened = False
+        try:
+            # 自动补池：信号里的标的可能不在本系统池内（池内但停用则不擅自启用）
+            pool = symbol_service.known_symbols()
+            if symbol not in pool:
+                if not cfg.auto_add_symbol:
+                    return self._follow_skip(key, parsed, "skipped", "标的不在池内且未开启自动添加", mode)
+                try:
+                    await symbol_service.add_symbol(symbol)
+                    events.record("info", "signal_follow", f"{symbol} 不在标的池, 已自动添加")
+                except symbol_service.PoolError as exc:
+                    return self._follow_skip(key, parsed, "skipped", f"自动加池失败: {exc.detail}", mode)
+            elif symbol not in set(symbol_service.ordered_symbols(enabled_only=True)):
+                return self._follow_skip(key, parsed, "skipped", "标的在池内但已停用, 不自动启用", mode)
+
+            filters = symbol_service.filters_for(symbol)
+            if filters is None:
+                return self._follow_skip(key, parsed, "skipped", "缺少交易规则(标的未就绪)", mode)
+            broker = get_broker(mode)
+            try:
+                account = await broker.account()
+            except Exception as exc:  # noqa: BLE001
+                return self._follow_skip(key, parsed, "skipped", f"账户读取失败: {str(exc)[:120]}", mode)
+
+            # 与轮询开仓同一套全局闸门: 交易时段 / 日内亏损 / 回撤 / 止损熔断 / 停机
+            window_ok, window_why = risk_mod.trading_window_open(engine_cfg)
+            if not window_ok:
+                return self._follow_skip(key, parsed, "skipped", window_why, mode)
+            global_gate = risk_mod.global_gates(account, engine_cfg, risk_cfg)
+            if not global_gate.ok:
+                return self._follow_skip(key, parsed, "skipped", global_gate.reason, mode)
+
+            try:
+                tickers = await binance_client.tickers([symbol])
+            except (BinanceError, NoCredentials) as exc:
+                return self._follow_skip(key, parsed, "skipped", f"取价失败: {str(exc)[:120]}", mode)
+            ticker = tickers.get(symbol)
+            if ticker is None or ticker.last <= 0:
+                return self._follow_skip(key, parsed, "skipped", "行情暂不可用", mode)
+            filters.last_price = ticker.last
+
+            gate = risk_mod.symbol_gates(
+                symbol, account, engine_cfg, risk_cfg,
+                prices={symbol: ticker.last}, side=side,
+            )
+            if not gate.ok:
+                return self._follow_skip(key, parsed, "skipped", gate.reason, mode)
+
+            # 杠杆 = 原信号杠杆 +10x（没给杠杆就回落本系统默认），再受本系统/交易所上限钳制
+            base_lev = signal_feed.follow_leverage(
+                parsed["leverage"], risk_cfg.default_leverage, cfg.leverage_bonus
+            )
+            leverage = risk_mod.choose_leverage(
+                symbol, engine_cfg, risk_cfg, filters, ai_leverage=float(base_lev)
+            )
+            ref = parsed["entry"] if parsed["entry"] > 0 else ticker.last
+            if parsed["stop"] > 0:
+                sl_pct = abs(ref - parsed["stop"]) / ref * 100
+            else:
+                sl_pct = cfg.default_sl_pct
+            sl_pct = max(0.05, min(sl_pct, 20.0))
+            tp_pct = (
+                abs(parsed["tp"] - ref) / ref * 100 if parsed["tp"] > 0 else max(sl_pct * 1.6, sl_pct + 0.1)
+            )
+
+            # 资金完全按本系统来: 风险预算 / 保证金比例 / 可用余额，且与轮询开仓共用账本
+            self._margin.refresh(account.available)
+            qty, info = risk_mod.plan_position(
+                price=ticker.last, filters=filters, account=account,
+                cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage,
+                available=self._margin.remaining,
+            )
+            if qty <= 0:
+                return self._follow_skip(key, parsed, "skipped", f"仓位不足: {info['note']}", mode)
+
+            reserved = float(info.get("margin") or 0)
+            rid = await self._margin.reserve_tracked(reserved)
+            if not rid:
+                return self._follow_skip(key, parsed, "skipped", "本轮可用保证金已被其它开仓占用", mode)
+
+            sl_price = parsed["stop"] if parsed["stop"] > 0 else ticker.last * (
+                1 - sl_pct / 100 if side == "long" else 1 + sl_pct / 100
+            )
+            tp_price = parsed["tp"] if parsed["tp"] > 0 else ticker.last * (
+                1 + tp_pct / 100 if side == "long" else 1 - tp_pct / 100
+            )
+            sl_price = filters.align_price(sl_price)
+            tp_price = filters.align_price(tp_price)
+
+            if cfg.dry_run:
+                await self._margin.settle(rid, opened=False)
+                rid = 0
+                self._finish_follow(
+                    key, parsed, "dry_run", "演练模式: 只记录不下单", mode,
+                    qty=qty, price=ticker.last, margin=reserved, leverage=leverage,
+                    sl_pct=round(sl_pct, 4), tp_pct=round(tp_pct, 4), plan=info,
+                )
+                events.record(
+                    "info", "signal_follow",
+                    f"{symbol} {side} 演练: qty={qty} lev={leverage}x 保证金≈{reserved:.2f}U",
+                )
+                return {"ok": True, "status": "dry_run", "qty": qty, "leverage": leverage}
+
+            try:
+                res = await broker.open_position(
+                    symbol=symbol, side=side, qty=qty, leverage=leverage,
+                    sl_price=sl_price, tp_price=tp_price, filters=filters,
+                    ai_confidence=0.0, ai_reason=f"外部信号跟单 {key}"[:800],
+                    signal_score=0.0,
+                    features={
+                        "source": "signal_follow", "signal_id": key,
+                        "signal": {k: v for k, v in parsed.items() if k != "raw"},
+                        "plan": info, "leverage_bonus": cfg.leverage_bonus,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("信号跟单下单异常")
+                await self._margin.settle(rid, opened=False)
+                rid = 0
+                return self._follow_skip(
+                    key, parsed, "error", f"下单异常: {str(exc)[:150]}", mode,
+                    qty=qty, price=ticker.last, margin=reserved, leverage=leverage,
+                )
+            if not res.ok:
+                await self._margin.settle(rid, opened=False)
+                rid = 0
+                return self._follow_skip(
+                    key, parsed, "error", f"下单失败: {res.message}"[:200], mode,
+                    qty=qty, price=ticker.last, margin=reserved, leverage=leverage,
+                )
+            await self._margin.settle(rid, opened=True)
+            rid = 0
+            follow_opened = True
+            self._finish_follow(
+                key, parsed, "opened", f"跟单成交 @{res.price:.8g}", mode,
+                qty=res.qty, price=res.price, margin=reserved, leverage=leverage,
+                sl_pct=round(sl_pct, 4), tp_pct=round(tp_pct, 4),
+            )
+            events.record(
+                "info", "signal_follow",
+                f"{symbol} {side} 跟单 {res.qty} @{res.price:.8g} lev={leverage}x "
+                f"(信号 {parsed['leverage']:g}x +{cfg.leverage_bonus}) 保证金≈{reserved:.2f}U",
+            )
+            return {"ok": True, "status": "opened", "qty": res.qty, "price": res.price, "leverage": leverage}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("信号跟单处理异常")
+            if rid:
+                await self._margin.settle(rid, opened=False)
+            return self._follow_skip(key, parsed, "error", f"跟单异常: {str(exc)[:150]}", mode)
+        finally:
+            # 成交后刻意保留同标的忙碌标记直到 TTL 自然过期: 异步落库还没写完时,
+            # 下一轮轮询扫描不能对同一标的再开一单（90s 后或持仓可见即安全）。
+            if not follow_opened:
+                self._symbol_release(symbol)
+
+    def signal_follow_status(self) -> dict[str, Any]:
+        cfg = get_signal_follow()
+        settings = cfg.model_dump()
+        if settings.get("ingest_token"):
+            settings["ingest_token"] = "******"  # 观测接口不回传直推密钥
+        key = self._follow_cursor_key or (
+            self._follow_offset_key(self._follow_path) if self._follow_path else ""
+        )
+        with session_scope() as s:
+            recent = (
+                s.query(SignalFollow).order_by(SignalFollow.created_at.desc()).limit(20).all()
+            )
+            counts = {
+                status: s.query(SignalFollow).filter(SignalFollow.status == status).count()
+                for status in ("opened", "dry_run", "skipped", "error", "duplicate", "processing")
+            }
+            items = [
+                {
+                    "id": r.id, "signal_id": r.signal_id, "symbol": r.symbol, "side": r.side,
+                    "status": r.status, "reason": r.reason, "leverage": r.leverage,
+                    "qty": r.qty, "price": r.price, "margin": r.margin,
+                    "mode": r.mode, "created_at": r.created_at,
+                }
+                for r in recent
+            ]
+        return {
+            "settings": settings,
+            "ingest_token_set": bool(cfg.ingest_token),
+            "running": bool(self._follow_task and not self._follow_task.done()),
+            "engine_enabled": get_engine().enabled,
+            "path": self._follow_path,
+            "path_exists": bool(self._follow_path and os.path.isfile(self._follow_path)),
+            "offset": state.get_int(key, 0) if key else 0,
+            "inflight_margin": round(self._margin.inflight, 6),
+            "last_poll": int(self._follow_last_poll),
+            "last_error": self._follow_last_error,
+            "counts": counts,
+            "items": items,
+        }
 
     async def _open_entry(
         self,
@@ -743,8 +1202,8 @@ class TradingEngine:
 
         # 串行占额度：并发任务只能用到前一笔剩下的可用保证金
         reserved = float(info.get("margin") or 0.0)
-        reserved_gen = await self._margin.reserve(reserved)
-        if not reserved_gen:
+        rid = await self._margin.reserve_tracked(reserved)
+        if not rid:
             self._update_signal_reject(
                 signal_id,
                 f"本轮可用保证金已被其它开仓占用（剩余 {self._margin.remaining:.2f} USDT），按 fail-closed 跳过",
@@ -771,16 +1230,17 @@ class TradingEngine:
                 features={**sig.features, "ai": ai_meta, "plan": info},
             )
         except Exception:
-            await self._margin.release(reserved, reserved_gen)
+            await self._margin.settle(rid, opened=False)
             raise
         if not res.ok:
             # 成交前失败 → 归还预留额度；成交后保留到下一轮 begin_cycle
-            await self._margin.release(reserved, reserved_gen)
+            await self._margin.settle(rid, opened=False)
             # broker 的错误文案已带「下单失败 N:」，不要拼成「下单失败: 下单失败 N:」
             detail = res.message if res.message.startswith("下单失败") else f"下单失败: {res.message}"
             self._update_signal_reject(signal_id, detail[:200])
             events.record("error", "trade", f"{sig.symbol} 开仓失败: {res.message}"[:250])
             return
+        await self._margin.settle(rid, opened=True)
         with session_scope() as s:
             row = s.get(Signal, signal_id)
             if row:

@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .ai.client import ai_client
-from .api.routes import ai, auth, backup, backtest, evolution, news, public, symbols, system, trade, ws
+from .api.routes import ai, auth, backup, backtest, evolution, news, public, signal_follow, symbols, system, trade, ws
 from .config import APP_NAME, DEBUG, paths
 from .db import init_db, session_scope
 from .engine.worker import engine
@@ -145,7 +145,9 @@ def create_app() -> FastAPI:
         log.exception("未处理异常 %s %s", request.method, request.url.path)
         return JSONResponse(status_code=500, content={"detail": f"服务端异常: {type(exc).__name__}: {exc}"[:300]})
 
-    for module in (auth, public, system, symbols, trade, ai, evolution, news, backup, backtest):
+    for module in (
+        auth, public, system, symbols, trade, ai, evolution, news, backup, backtest, signal_follow
+    ):
         app.include_router(module.router, prefix="/api/v1")
     app.include_router(ws.router, prefix="/api/v1")
 
