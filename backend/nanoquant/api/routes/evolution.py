@@ -73,7 +73,10 @@ async def dedupe_evolution_mantras(use_ai: bool = True, user: str = Depends(curr
 @router.get("/evolution/injection")
 def injection_preview(user: str = Depends(current_user)) -> dict:
     text, detail = mantra_store.injection()
-    return {"text": text, "injected": detail, "count": len(detail), "stats": mantra_store.stats()}
+    return {
+        "text": text, "injected": detail, "count": len(detail),
+        "stats": mantra_store.stats(), "report": mantra_store.injection_report(),
+    }
 
 
 @router.get("/evolution/runs")
@@ -87,6 +90,30 @@ async def review_trade(trade_id: int, force: bool = True, user: str = Depends(cu
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "复盘失败")
     return result
+
+
+@router.post("/evolution/review-batch")
+async def review_batch(
+    limit: int = Query(default=0, ge=0, le=100),
+    force: bool = False,
+    user: str = Depends(current_user),
+) -> dict:
+    """手动触发批量复盘：攒够样本才调模型；NO_CHANGE 与 AI 失败都不写心法."""
+    result = await evolution_review.review_batch(limit=limit or None, force=force)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "批量复盘失败")
+    events.record(
+        "info", "evolution",
+        f"{user} 触发批量复盘: {result.get('sample_size', 0)} 笔, {result.get('change_status')}",
+        {"applied": result.get("applied")},
+    )
+    return result
+
+
+@router.post("/evolution/health-refresh")
+def health_refresh(user: str = Depends(current_user)) -> dict:
+    """按最近平仓证据重算全部心法健康分并按需归档（只读面板之外的人工触发入口）."""
+    return mantra_store.refresh_health_from_evidence()
 
 
 @router.post("/evolution/global-review")

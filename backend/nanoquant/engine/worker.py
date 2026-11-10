@@ -431,11 +431,14 @@ class TradingEngine:
             return
         self._reviewing.add(trade_id)
         try:
+            # 平仓只累计样本；攒够 batch_review_size 笔才由 review_batch 真正调模型
             result = await asyncio.wait_for(evolution_review.review_trade(trade_id), timeout=120)
             if result.get("ok") and not result.get("skipped"):
                 events.record(
                     "info", "evolution",
-                    f"交易 #{trade_id} 复盘完成, 产出/更新心法 {len(result.get('applied', []))} 条",
+                    f"批量复盘完成: {result.get('sample_size', 0)} 笔样本, "
+                    f"change_status={result.get('change_status')}, "
+                    f"产出/更新心法 {len(result.get('applied', []))} 条",
                     {"trade_id": trade_id, "result": result},
                 )
         except Exception as exc:  # noqa: BLE001
@@ -455,19 +458,21 @@ class TradingEngine:
         asyncio.create_task(self._review_backfill_async())
 
     async def _review_backfill_async(self) -> None:
+        """补扫：攒够批量样本才真正复盘，避免每 5 分钟重复扫同一笔."""
         from ..models import TradeRecord
 
         try:
+            cfg = get_evolution()
             with session_scope() as s:
-                row = (
-                    s.query(TradeRecord.id)
-                    .filter(TradeRecord.reviewed.is_(False))
-                    .order_by(TradeRecord.closed_at.asc())
-                    .first()
-                )
-                trade_id = int(row[0]) if row else 0
-            if trade_id:
-                await self._review_trade(trade_id)
+                pending = s.query(TradeRecord).filter(TradeRecord.reviewed.is_(False)).count()
+            if pending >= cfg.batch_review_size:
+                result = await evolution_review.review_batch()
+                if result.get("ok") and not result.get("skipped"):
+                    events.record(
+                        "info", "evolution",
+                        f"补扫批量复盘: {result.get('sample_size', 0)} 笔, {result.get('change_status')}",
+                        result,
+                    )
         except Exception as exc:  # noqa: BLE001
             log.warning("复盘补扫失败: %s", exc)
 

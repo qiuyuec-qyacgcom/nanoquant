@@ -913,14 +913,23 @@ def test_mantra_replaces_similar_version_after_cooldown():
     # 被替代的不再进入注入排名
     assert all(m["id"] != old_id for m in store.rank_lessons(20))
 
-    # 复盘结束后会物理清理旧版本：列表里不再出现「被替代」条目
+    # 复盘结束后归档旧版本（保留审计链，绝不物理删除）
     assert store.purge_superseded() == 1
+    assert store.purge_superseded() == 0  # 幂等
     with session_scope() as s:
-        assert s.get(Mantra, old_id) is None
+        old = s.get(Mantra, old_id)
+        assert old is not None
+        assert old.enabled is False
+        assert "archived_reason" in (old.evidence or {})
 
 
-def test_mantra_ai_replaces_by_title_even_across_category():
+def test_mantra_ai_replaces_respects_cooldown_gate():
+    """AI 点名 replaces 也不再绕过冷却/置信度门槛；过门槛后才允许跨分类替代."""
+    import time
+
+    from nanoquant.db import session_scope
     from nanoquant.evolution import mantra as store
+    from nanoquant.models import Mantra
 
     _clean_mantras()
     first = store.upsert_lesson(
@@ -930,6 +939,28 @@ def test_mantra_ai_replaces_by_title_even_across_category():
         confidence=0.55,
     )
     assert first["action"] == "created"
+    old_id = first["mantra"]["id"]
+    fresh = store.upsert_lesson(
+        title="指标互相矛盾时先观望",
+        rule="当趋势分与动量分符号相反时等待一根 K 线收盘确认。",
+        category="risk",
+        confidence=0.6,
+        replaces="多空信号冲突时观望",
+    )
+    # 刚入库且 hits=0：模型一句话不能直接换掉既有心法
+    assert fresh["action"] != "replaced", fresh
+
+    _clean_mantras()
+    again = store.upsert_lesson(
+        title="多空信号冲突时观望",
+        rule="当方向分与量能方向相反时不开仓，等待结构确认。",
+        category="entry",
+        confidence=0.55,
+    )
+    with session_scope() as s:
+        row = s.get(Mantra, again["mantra"]["id"])
+        row.created_at = int(time.time()) - 7 * 3600
+        row.hits = 2
     second = store.upsert_lesson(
         title="指标互相矛盾时先观望",
         rule="当趋势分与动量分符号相反时等待一根 K 线收盘确认。",
@@ -938,7 +969,7 @@ def test_mantra_ai_replaces_by_title_even_across_category():
         replaces="多空信号冲突时观望",
     )
     assert second["action"] == "replaced", second
-    assert second["replaced_id"] == first["mantra"]["id"]
+    assert second["replaced_id"] == again["mantra"]["id"]
 
 
 def test_mantra_dedupe_collapses_existing_duplicates():
@@ -978,8 +1009,8 @@ def test_mantra_dedupe_collapses_existing_duplicates():
         assert s.query(Mantra).filter(Mantra.superseded_by != 0).count() == 1
 
 
-def test_purge_superseded_removes_old_versions():
-    """每轮复盘结束后：被替代的旧心法物理删除，手动停用的保留."""
+def test_purge_superseded_archives_old_versions():
+    """每轮复盘结束后：被替代的旧心法归档停用留痕，绝不物理删除."""
     import time
 
     from nanoquant.db import session_scope
@@ -1017,7 +1048,10 @@ def test_purge_superseded_removes_old_versions():
     assert store.purge_superseded() == 0  # 幂等
     with session_scope() as s:
         titles = {m.title for m in s.query(Mantra).all()}
-    assert titles == {"正常生效心法", "手动停用心法"}
+        old = next(m for m in s.query(Mantra).all() if m.title == "旧版本心法")
+        assert old.enabled is False
+        assert "archived_reason" in (old.evidence or {})
+    assert titles == {"正常生效心法", "手动停用心法", "旧版本心法"}
 
 
 def test_ai_dedupe_merges_semantically_similar(monkeypatch):
@@ -1614,3 +1648,181 @@ def test_margin_inflight_reservation_survives_engine_cycle():
         assert ledger.used == 300.0 and ledger.remaining == 400.0
 
     asyncio.run(run())
+
+
+# ------------------------------------------- 自进化：宪法 Linter / 证据健康分
+def test_guard_rejects_single_event_and_risk_tampering():
+    from nanoquant.evolution.guard import audit
+
+    good = "当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大后再介入。"
+    assert audit("低量能不追单", good, "entry", 0.6)[0] is True
+    # 单笔偶发事件不得写入长期心法
+    ok, why = audit("低量能不追单", good, "entry", 0.6, sample_size=1, min_sample=2)
+    assert not ok and "样本量不足" in why
+    assert audit("低量能不追单", good, "entry", 0.6, sample_size=2, min_sample=2)[0] is True
+    # 变更动词 × 风险名词共现兜底
+    assert audit("提高杠杆", "当胜率回升时应提高杠杆以放大收益。", "position", 0.6)[0] is False
+    assert audit("放宽止损", "当波动放大时应放宽止损以避免被扫。", "risk", 0.6)[0] is False
+    # 禁止式表述属安全知识，不得误杀
+    assert audit("严禁放宽止损", "当波动放大时严禁放宽止损，避免扛单。", "risk", 0.6)[0] is True
+    # 硬编码绝对资金金额
+    assert audit("固定仓位", "当信号分大于 0.5 时固定使用 500 USDT 名义额开仓。", "position", 0.6)[0] is False
+    # 不可评估因子
+    assert audit("动能失效", "当 velocity 转负且 ATR 抬升时不开仓。", "entry", 0.6)[0] is False
+
+
+def test_health_scores_by_cohort_and_needs_min_sample():
+    from nanoquant.evolution import health
+
+    rows = [
+        {"symbol": "BTCUSDT", "side": "long", "pnl": 2.0, "exit_reason": "roi", "observability": "FULL"},
+        {"symbol": "BTCUSDT", "side": "long", "pnl": 2.0, "exit_reason": "roi", "observability": "FULL"},
+        {"symbol": "ETHUSDT", "side": "short", "pnl": -1.0, "exit_reason": "trailing_stop", "observability": "FULL"},
+    ] * 4
+    scored = health.score_lesson_against_trades(
+        "当 BTCUSDT 做多且量比不足时不开仓", closed_trades=rows, min_sample=3
+    )
+    assert scored is not None and scored["sample_size"] == 8
+    assert "BTCUSDT" in scored["basis"] and "多头" in scored["basis"]
+    assert scored["health"] > 0.5
+    # 样本不足 = 未知，绝不改分、绝不归档
+    assert health.score_lesson_against_trades("当 BTCUSDT 做多时不开仓", closed_trades=rows[:2], min_sample=10) is None
+    assert health.decide_archive({"enabled": True}, None)[0] is False
+    low = {"health": 0.2, "sample_size": 20, "basis": "全样本"}
+    should, _ = health.decide_archive({"enabled": True}, low, threshold=0.45)
+    assert should is True
+    low2 = {**low, "sample_size": 3}
+    assert health.decide_archive({"enabled": True}, low2, threshold=0.45)[0] is False
+    assert health.snapshot_observability({"rsi": 50}) == "PRICE_ONLY"
+    assert health.snapshot_observability({}) == "NONE"
+
+
+def test_batch_review_no_change_never_writes_mantras(monkeypatch):
+    """模型说 NO_CHANGE / 给不出提案 / AI 挂掉，都不允许规则兜底造心法."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.evolution import review as ev
+    from nanoquant.models import Mantra, TradeRecord
+
+    init_db()
+    _clean_mantras()
+    now = 1700000000
+    with session_scope() as s:
+        for i in range(4):
+            s.add(TradeRecord(
+                symbol="BTCUSDT", side="long", qty=1, entry_price=100, exit_price=99,
+                pnl=-1.0, pnl_pct=-1, roi_pct=-1, fees=0.1, opened_at=now + i,
+                closed_at=now + i + 60, hold_seconds=60, exit_reason="trailing_stop",
+                reviewed=False, features={"rsi": 50, "atr_pct": 0.5, "vol_ratio": 0.8},
+            ))
+
+    async def fake_chat(*args, **kwargs):  # noqa: ARG001
+        return SimpleNamespace(ok=True, text='{"change_status":"NO_CHANGE","lessons":[],"diagnosis":[]}')
+
+    monkeypatch.setattr(ev.ai_client, "chat_with_fallback", fake_chat)
+    out = asyncio.run(ev.review_batch(limit=4))
+    assert out["ok"] and out["change_status"] == "NO_CHANGE"
+    assert out["applied"] == []
+    with session_scope() as s:
+        assert s.query(Mantra).count() == 0
+
+    # LLM 全链失败：只产出台账事实（带前缀），仍 NO_CHANGE、不入库
+    async def failing_chat(*args, **kwargs):  # noqa: ARG001
+        return SimpleNamespace(ok=False, error="upstream down", text="")
+
+    monkeypatch.setattr(ev.ai_client, "chat_with_fallback", failing_chat)
+    out2 = asyncio.run(ev.review_batch(limit=4, force=True))
+    assert out2["change_status"] == "NO_CHANGE" and out2["applied"] == []
+    assert out2["insights"] and out2["insights"][0].startswith("[本地台账推导]")
+    with session_scope() as s:
+        assert s.query(Mantra).count() == 0
+        s.query(TradeRecord).delete()
+
+
+def test_effectiveness_feedback_blocks_repeated_proposals():
+    """已证伪心法会降权，并让生成侧拒绝语义重复的新提案."""
+    import time
+
+    from nanoquant.db import session_scope
+    from nanoquant.evolution import mantra as store
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    now = int(time.time())
+    with session_scope() as s:
+        s.add(Mantra(
+            title="低量能追单易被止损",
+            rule="当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大。",
+            category="entry", source="test", confidence=0.7, health=0.9,
+            enabled=True, version=1, superseded_by=0,
+            evidence={"effectiveness_verdict": "underperform"},
+            created_at=now, updated_at=now, expires_at=now + 86400,
+        ))
+        s.add(Mantra(
+            title="量能确认后再入场",
+            rule="当 RSI 高于 78 且价格远离均线时不开仓，等待回踩确认。",
+            category="entry", source="test", confidence=0.7, health=0.7,
+            enabled=True, version=1, superseded_by=0, evidence={},
+            created_at=now, updated_at=now, expires_at=now + 86400,
+        ))
+    hit = store.underperforming_similar(
+        "低量能追单容易被止损", "当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大后介入。"
+    )
+    assert hit and hit["title"] == "低量能追单易被止损"
+    assert store.underperforming_similar("超买不追多", "当 RSI 高于 80 时不开仓，等待回踩。") is None
+    ranked = store.rank_lessons(10)
+    under = next(m for m in ranked if m["id"] == hit["id"])
+    assert under["health"] <= 0.9 * 0.8 + 1e-6  # 注入排序已降权
+
+
+def test_upsert_lesson_honors_sample_size_and_cas():
+    from nanoquant.evolution import mantra as store
+    from nanoquant.services import state
+
+    _clean_mantras()
+    rule = "当 ATR 占比低于 0.25% 且量比不足时不开仓，等待确认。"
+    rejected = store.upsert_lesson(title="小样本噪声", rule=rule, category="entry", confidence=0.6, sample_size=1)
+    assert rejected["action"] == "rejected" and "样本量不足" in rejected["reason"]
+    created = store.upsert_lesson(title="足样本结论", rule=rule, category="entry", confidence=0.6, sample_size=12)
+    assert created["action"] == "created"
+    assert state.get("mantra_version", "0") != "0"  # CAS 版本已推进
+    conflict = store.upsert_lesson(
+        title="陈旧快照写入", rule=rule, category="entry", confidence=0.6,
+        sample_size=12, expected_version="stale-version",
+    )
+    assert conflict["action"] == "conflict"
+
+
+def test_injection_report_discloses_not_injected():
+    from nanoquant.evolution import mantra as store
+    from nanoquant.services.settings import get_evolution, update_group
+
+    import time
+
+    from nanoquant.db import session_scope
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    old = get_evolution().max_injected
+    update_group("evolution", {"max_injected": 1})
+    try:
+        now = int(time.time())
+        with session_scope() as s:
+            for i, (title, rule) in enumerate([
+                ("量能不足不追单", "当量比低于 0.8 且 ATR 占比偏低时不开仓，等待放量确认。"),
+                ("超买不追多", "当 RSI 高于 80 且价格远离均线时不开仓，等待回踩。"),
+                ("持仓超时离场", "当持仓超过 180 分钟且浮盈不足时主动离场，不扛单。"),
+            ]):
+                s.add(Mantra(
+                    title=title, rule=rule, category="entry", source="test",
+                    confidence=0.6, health=0.6, enabled=True, version=1,
+                    superseded_by=0, evidence={}, created_at=now + i, updated_at=now,
+                    expires_at=now + 86400,
+                ))
+        report = store.injection_report()
+        assert report["active"] == 3 and report["injected"] == 1 and report["limit"] == 1
+        assert len(report["not_injected"]) == 2
+    finally:
+        update_group("evolution", {"max_injected": old})

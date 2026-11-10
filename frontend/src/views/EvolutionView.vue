@@ -107,7 +107,7 @@ async function globalReview() {
   busy.value = true
   reviewResult.value = null
   try {
-    reviewResult.value = await http.post('/evolution/global-review')
+    reviewResult.value = { ...(await http.post('/evolution/global-review')), title: '全局复盘结果' }
     app.notify('全局复盘完成', 'ok')
     await load()
   } catch (err: any) {
@@ -121,7 +121,37 @@ async function reviewTrade(t: Trade) {
   busy.value = true
   try {
     const res = await http.post(`/evolution/review/${t.id}?force=true`)
-    app.notify(`复盘完成, 产出 ${res.applied?.length || 0} 条`, 'ok')
+    if (res.skipped) app.notify(res.reason || '等待批量样本', 'ok')
+    else app.notify(`批量复盘 ${res.sample_size || 0} 笔 · ${res.change_status} · 产出 ${res.applied?.length || 0} 条`, 'ok')
+    await load()
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 手动批量复盘：攒够样本才调模型，NO_CHANGE / AI 失败都不写心法 */
+async function batchReview(force = false) {
+  busy.value = true
+  try {
+    const res = await http.post(`/evolution/review-batch${force ? '?force=true' : ''}`)
+    reviewResult.value = { ...res, title: '批量台账复盘结果' }
+    app.notify(res.skipped ? (res.reason || '等待批量样本') : `${res.sample_size} 笔样本 · ${res.change_status}`, 'ok')
+    await load()
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 按真实平仓证据重算健康分并归档低分条目 */
+async function healthRefresh() {
+  busy.value = true
+  try {
+    const res = await http.post('/evolution/health-refresh')
+    app.notify(`健康分重算: 更新 ${res.rescored || 0} 条 · 归档 ${res.archived || 0} 条`, 'ok')
     await load()
   } catch (err: any) {
     app.notify(err.message, 'error')
@@ -139,17 +169,17 @@ onMounted(load)
       <div class="kpi">
         <div class="kpi-label">心法总数</div>
         <div class="kpi-value">{{ stats?.total ?? 0 }}</div>
-        <div class="kpi-foot">生效中 {{ stats?.active ?? 0 }} · 已替代 {{ stats?.superseded ?? 0 }}</div>
+        <div class="kpi-foot">生效中 {{ stats?.active ?? 0 }} · 归档 {{ stats?.archived ?? 0 }} · 已替代 {{ stats?.superseded ?? 0 }}</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">平均置信度</div>
-        <div class="kpi-value">{{ ((stats?.avg_confidence ?? 0) * 100).toFixed(0) }}%</div>
-        <div class="kpi-foot">有效 TTL {{ stats?.ttl_days ?? 7 }} 天</div>
+        <div class="kpi-label">证据健康分覆盖</div>
+        <div class="kpi-value">{{ stats?.evidence_scored ?? 0 }} <span class="muted" style="font-size: 14px">/ {{ stats?.total ?? 0 }}</span></div>
+        <div class="kpi-foot">按平仓样本重算 · 需 {{ stats?.min_health_sample ?? 10 }} 笔</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">注入上限</div>
         <div class="kpi-value">{{ stats?.max_injected ?? 8 }}</div>
-        <div class="kpi-foot">按健康分排序取前 N 条</div>
+        <div class="kpi-foot">实际注入 {{ injection?.report?.injected ?? injection?.count ?? 0 }} 条 · 批量 {{ stats?.batch_review_size ?? 10 }} 笔</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">分类分布</div>
@@ -170,8 +200,9 @@ onMounted(load)
           <pre v-if="injection?.text" class="code">{{ injection.text }}</pre>
           <div v-else class="empty">暂无可注入心法 · 完成交易复盘后会自动沉淀</div>
           <div class="hint" style="margin-top: 8px">
-            这里是同批心法的预览；真实决策上下文是 title/rule/health 的 JSON 快照。
-            决策时注入的心法 ID 会随成交落库，供下方效果对照与命中率回写使用。
+            生效 {{ injection?.report?.active ?? 0 }} 条 → 实际注入 {{ injection?.report?.injected ?? 0 }} 条（上限 {{ injection?.report?.limit ?? 0 }}），
+            未注入 {{ injection?.report?.not_injected?.length ?? 0 }} 条、未经证据重算 {{ injection?.report?.unscored ?? 0 }} 条。
+            决策时注入的心法 ID 会随成交落库，供效果对照与命中率回写使用。
           </div>
         </div>
       </div>
@@ -179,9 +210,15 @@ onMounted(load)
       <div class="panel">
         <div class="panel-hd">
           <span class="panel-title">复盘动作</span>
-          <div class="right">
-            <button class="btn btn-sm" :disabled="busy" @click="globalReview">{{ busy ? '执行中…' : '立即全局复盘' }}</button>
+          <div class="right" style="gap: 6px; flex-wrap: wrap">
+            <button class="btn btn-sm btn-primary" :disabled="busy" @click="batchReview(false)">批量复盘</button>
+            <button class="btn btn-sm" :disabled="busy" @click="batchReview(true)">强制复盘</button>
+            <button class="btn btn-sm" :disabled="busy" @click="healthRefresh">重算健康分</button>
+            <button class="btn btn-sm" :disabled="busy" @click="globalReview">全局复盘</button>
           </div>
+        </div>
+        <div class="hint" style="padding: 8px 12px 0">
+          攒够批量样本才调模型；证据不足或模型判定 NO_CHANGE 时只记录台账事实、不写心法。
         </div>
         <div class="panel-body flush table-scroll" style="max-height: 250px">
           <table class="table">
@@ -325,7 +362,7 @@ onMounted(load)
           <tbody>
             <tr v-for="r in runs" :key="r.id">
               <td class="mono muted">{{ timeStr(r.ts) }}</td>
-              <td><span class="tag" :class="r.kind === 'global_review' ? 'tag-blue' : 'tag-dim'">{{ r.kind === 'global_review' ? '全局复盘' : '逐笔复盘' }}</span></td>
+              <td><span class="tag" :class="r.kind === 'global_review' ? 'tag-blue' : r.kind === 'batch_review' ? 'tag-long' : 'tag-dim'">{{ r.kind === 'global_review' ? '全局复盘' : r.kind === 'batch_review' ? '批量复盘' : '逐笔复盘' }}</span></td>
               <td class="mono">{{ r.input_count }}</td>
               <td class="mono up">{{ r.produced }}</td>
               <td class="mono warn">{{ r.replaced }}</td>
@@ -353,7 +390,7 @@ onMounted(load)
           </div>
           <div class="field"><span class="label">置信度</span><input v-model.number="form.confidence" type="number" step="0.05" min="0" max="1" class="input mono" /></div>
         </div>
-        <div class="hint">含「加大杠杆 / 取消止损 / 满仓」等放大风险的表述会被防污染审计拦截。</div>
+        <div class="hint">手工录入豁免样本量门槛，但仍受宪法门禁：抬升杠杆 / 放宽止损 / 下调风控阈值 / 硬编码绝对金额 / 引用不可观测因子一律拒收。</div>
       </div>
       <template #footer>
         <button class="btn" @click="showForm = false">取消</button>
@@ -361,11 +398,19 @@ onMounted(load)
       </template>
     </Modal>
 
-    <Modal v-if="reviewResult" title="全局复盘结果" wide @close="reviewResult = null">
+    <Modal v-if="reviewResult" :title="reviewResult.title || '全局复盘结果'" wide @close="reviewResult = null">
       <div class="stack">
         <div class="row">
           <span class="tag" :class="reviewResult.ok ? 'tag-long' : 'tag-short'">{{ reviewResult.ok ? '完成' : '失败' }}</span>
-          <span class="muted" style="font-size: 11px">{{ reviewResult.used_ai ? 'AI 参与' : '规则兜底' }} · {{ reviewResult.error }}</span>
+          <span v-if="reviewResult.change_status" class="tag" :class="reviewResult.change_status === 'NO_CHANGE' ? 'tag-dim' : 'tag-blue'">
+            {{ reviewResult.change_status }}
+          </span>
+          <span v-if="reviewResult.sample_size" class="tag tag-dim">{{ reviewResult.sample_size }} 笔样本</span>
+          <span class="muted" style="font-size: 11px">{{ reviewResult.used_ai ? 'AI 参与' : '台账事实兜底' }} · {{ reviewResult.error }}</span>
+        </div>
+        <div v-if="reviewResult.insights?.length" class="stack" style="gap: 4px">
+          <div class="label">台账事实（不写心法）</div>
+          <div v-for="d in reviewResult.insights" :key="d" class="note" style="margin: 0">{{ d }}</div>
         </div>
         <div v-if="reviewResult.diagnosis?.length" class="stack" style="gap: 4px">
           <div class="label">识别到的不足</div>

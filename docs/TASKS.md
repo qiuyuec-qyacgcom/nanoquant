@@ -1122,6 +1122,21 @@
   - 新增后台「信号跟单」页：链路状态/参数/流水/立即读一轮/重置游标。
 - **验证**：`pytest tests -q` → **94 passed**（含桩交易所端到端用例：20x→30x、自动补池、系统资金、幂等、平仓事件不跟）；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
+### 78. 自进化心法质量闭环（对齐 astra-quant-agent 的宿主宪章）
+- **状态**：✅ 已完成（`C:\RUNBOOK.md` 无关，本次为「生成心法太随意」的质量改造）
+- **背景**：原链路逐笔复盘 + 每笔最多 3 条心法；AI 判定「没有教训」会被 `deterministic_lessons()` 规则兜底强行造心法；置信度采信模型自报；`replaces` 可绕过替代门槛；`purge_superseded()` 物理删除旧版本；效果评估只展示不反馈。
+- **过程要点**：
+  - **NO_CHANGE 真通道**：`REVIEW_SYSTEM` / `GLOBAL_REVIEW_SYSTEM` 引入 `change_status ∈ NO_CHANGE|ADD|REVISE|INVALIDATE`；AI 返回空 lessons 或判定证据不足 ⇒ 不写库。规则兜底改名 `deterministic_insights()`，只产出带 `[本地台账推导]` 前缀的台账事实，恒 NO_CHANGE、只进 `EvolutionRun.raw`。
+  - **批量攒样**：`review_trade()` 退化为累计器（攒够 `batch_review_size=10` 笔才调模型），新增 `review_batch()` / `POST /evolution/review-batch`；入库硬门槛 `min_lesson_sample=2`，单笔偶发事件一律拒收。
+  - **宪法 Linter**（`guard.py`）：分句判定 + 禁止式子句剥离（"严禁放宽止损"不误杀）+ 变更动词×风险名词共现兜底 + 绝对资金金额禁令 + 不可观测/退役因子门禁 + 样本量门槛；`guard_strict=False` 可退回纯形式校验。
+  - **证据健康分**（新增 `evolution/health.py` 纯函数）：按心法正文析出 cohort（标的/方向/离场机制）→ 用该人群胜率 + 归一化期望打分 → 按样本量向 0.5 回归，可观测性不足再折价；样本 <`min_health_sample=10` 返回 `None`=未知，绝不改分。`refresh_health_from_evidence()` 每轮复盘后按真实平仓证据重算，低分且样本达标才 `enabled=False` 归档留痕，**取消物理删除**（`purge_superseded()` 语义改为归档）。
+  - **替代/并发**：`replaces` 不再绕过 `_can_replace` 冷却与置信度门槛；合并不再抬高模型自报置信度；`touch()` 只记 hits/wins/losses；`upsert_lesson` 增加 `sample_size`、`max_active_mantras` 容量上限与 `expected_version` CAS（同事务推进 `mantra_version`）。
+  - **输入证据**：复盘 payload 增加 `snapshot_observability`（FULL/PARTIAL/PRICE_ONLY/NONE）与 MFE/MAE、吐回比、兑现率；`batch_stats()` 附「不可据以断言」清单；prompt 明令缺失字段不得作因果归因。
+  - **注入与反馈闭环**：`injection_report()` 披露 active/injected/not_injected/unscored；`rank_lessons` 按证据健康分排序、未重算的降权、已证伪的 ×0.8；`effectiveness` 的逐条结果写回 `evidence.effectiveness_verdict`，并让生成侧拒绝与已证伪心法语义重复的新提案。
+  - **前端**：复盘动作区新增「批量复盘 / 强制复盘 / 重算健康分」，KPI 增加证据健康分覆盖与归档数，弹窗展示 `change_status`、样本量与台账事实。
+- **验证**：`pytest tests -q` → **101 passed**（新增宪法 Linter、证据健康分、NO_CHANGE 不入库、样本门槛、CAS、注入披露、效果反馈共 6 条契约 + 1 条路由用例，另更新 3 条旧契约以适配归档/替代门槛）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+- **边界**：效果对照仍是观察性、非随机 A/B；健康分依赖决策时 `features` 快照，旧成交缺快照会落入 legacy 不参与对照。
+
 ---
 
 ## 二、未开始

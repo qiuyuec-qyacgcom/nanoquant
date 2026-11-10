@@ -100,41 +100,78 @@ def decision_messages(ctx: dict[str, Any], persona: str = "", focus: str = "") -
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-REVIEW_SYSTEM = """你是交易复盘官. 输入是一笔已平仓交易的全过程数据. 你的任务是提炼一条
-可迁移、可执行的「分析心法」, 而不是复述这笔交易.
+REVIEW_SYSTEM = """你是交易复盘官. 输入是一批已平仓交易台账与统计. 你的任务是判断**是否值得修改长期心法库**,
+而不是每笔交易都写一条感悟.
 
-心法要求:
-1. 一句话标题 (<= 24 字) + 一条规则 (<= 200 字), 规则必须包含可判定的触发条件与动作.
-2. 不得包含"加大杠杆/放宽止损/满仓/无视风控"等放大风险的建议.
-3. 必须与具体交易解耦: 不写"这笔 BTC", 写"当 ATR 骤降且量比<1 时".
-4. 如果这笔交易没有可提炼的教训, 返回 {"lessons": []}.
-5. 如果新心法与 existing_mantras 中某条语义重复且你的版本更优, 在 lesson 里给出
-   "replaces": "旧心法的 title（必须逐字复制）"; 不重复则留空字符串. 不要为了替代而硬凑.
+铁律 (宿主代码会复核, 违反的提案会被物理拦截):
+1. 证据不足、只是单笔偶发、样本相互矛盾 ⇒ change_status 必须是 "NO_CHANGE" 且 lessons 为空数组.
+2. 每条新心法必须由 >= 2 笔独立样本支持, evidence 里必须引用台账中的具体数值;
+   只写"这笔 BTC"不行, 要写"当 ATR 骤降且量比<1 时"这类可迁移条件.
+3. 禁止提出抬升杠杆 / 放宽止损 / 放宽保证金或仓位上限 / 下调风控阈值 / 满仓 / 亏损摊平;
+   禁止硬编码绝对资金金额 (必须用 R / ATR / 百分比 / 动态风险预算表达).
+4. 只统计台账里**真实可观测**的字段; 快照标注 PRICE_ONLY / NONE 的交易不得作因子因果归因,
+   字段缺失本身不是证据, 严禁编造或倒推未提供的指标数值.
+5. 不得引用系统不采集的因子 (velocity / KINETIC_* / 动能加速度 / 条件延续概率 等).
+6. NO_CHANGE 永不覆盖或清空既有心法; 不为替代而硬凑 replaces.
 
 输出 JSON:
-{"lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":"引用交易中的具体数值","replaces":""}],
- "verdict":"这笔交易的执行与信号是否一致, 一句话",
- "score": 0-100}"""
+{"change_status":"NO_CHANGE|ADD|REVISE|INVALIDATE",
+ "lessons":[],
+ "diagnosis":["0~4 条有台账字段支持的诊断, 每条区分已验证事实与待验证假设"],
+ "verdict":"一句话说明本批交易的执行与信号是否一致",
+ "score":0-100}
+
+仅当 change_status != "NO_CHANGE" 时 lessons 才允许非空, 每项:
+{"title":"<=24 字","rule":"<=200 字, 含可判定触发条件与动作","category":"entry|exit|risk|timing|position|market",
+ "confidence":0.0-1.0,"evidence":"引用台账具体数值","replaces":"旧心法 title（逐字复制）或空字符串"}"""
 
 
 def review_messages(trade: dict[str, Any], mantras: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
-    payload = {"trade": trade, "existing_mantras": mantras or []}
+    """兼容旧签名：单笔包装成一批，走同一套批量复盘协议."""
+    return review_batch_messages({"closed_trades": [trade], "sample_size": 1}, [trade], mantras)
+
+
+def review_batch_messages(
+    stats: dict[str, Any], trades: list[dict[str, Any]], mantras: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """批量复盘输入：统计 + 逐笔明细（含证据可观测性与离场质量）+ 现有心法标题."""
+    payload = {
+        "stats": stats,
+        "closed_trades": trades,
+        "existing_mantras": mantras or [],
+        "constitution": {
+            "insufficient_evidence": "NO_CHANGE",
+            "no_absolute_capital": True,
+            "no_risk_parameter_tampering": True,
+            "observable_fields_only": True,
+            "min_independent_samples": 2,
+            "do_not_assert": ["样本不足 (<10 笔) 的分组结论", "PRICE_ONLY/NONE 交易的因子归因", "单笔极值外推"],
+        },
+    }
     return [
         {"role": "system", "content": REVIEW_SYSTEM},
-        {"role": "user", "content": "交易数据 (JSON):\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+        {"role": "user", "content": "已平仓交易台账 (JSON):\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
     ]
 
 
-GLOBAL_REVIEW_SYSTEM = """你是量化系统的自我进化官. 输入是最近一段时间的交易统计与逐笔明细摘要,
-以及现有心法库. 请识别系统性不足, 并产出新的心法; 对已经过时/被证伪的心法给出淘汰建议.
+GLOBAL_REVIEW_SYSTEM = """你是量化系统的自我进化官. 输入是最近一段时间的交易统计、逐笔摘要与现有心法库.
+请识别系统性不足, 但**证据不足时必须 NO_CHANGE、不得强行生成新规律**.
+
+铁律:
+1. 新心法须有 >= 2 笔独立样本支持, evidence 引用具体数值; 单笔偶发/极端插针不是规律.
+2. 禁止抬升杠杆/放宽止损/放宽保证金或仓位上限/下调风控阈值/满仓/亏损摊平,
+   禁止硬编码绝对资金金额, 禁止引用系统不采集的因子.
+3. PRICE_ONLY / NONE 的交易不得作因子因果归因; 字段缺失本身不是证据.
+4. 每条 diagnosis 区分「已验证事实」与「待验证假设」.
 
 输出 JSON:
-{"diagnosis":["不足点1","不足点2"],
- "lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":"","replaces":""}],
+{"change_status":"NO_CHANGE|ADD|REVISE|INVALIDATE",
+ "diagnosis":["不足点1","不足点2"],
+ "lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position|market","confidence":0.0-1.0,"evidence":"","replaces":""}],
  "retire":[{"title":"","reason":""}],
  "adjust":["建议调整的参数方向 (只描述方向, 不得给出放宽风控的建议)"]}
 
-lessons 里的 "replaces" 填现有心法的 title（逐字复制）表示新版本要替代它；不替代则留空。"""
+change_status = NO_CHANGE 时 lessons 必须是空数组。replaces 填现有心法 title（逐字复制）或留空。"""
 
 
 def global_review_messages(stats: dict[str, Any], trades: list[dict[str, Any]], mantras: list[dict[str, Any]]) -> list[dict[str, str]]:

@@ -201,6 +201,24 @@ def test_evolution_effectiveness_shape(client):
     assert body["injected"]["trades"] == 0  # 临时库无成交
 
 
+def test_evolution_batch_review_and_health_endpoints(client):
+    """批量复盘样本不足时 NO_CHANGE，健康分重算与注入披露接口可用."""
+    headers = _token(client)
+    batch = client.post(f"{API}/evolution/review-batch", headers=headers)
+    assert batch.status_code == 200, batch.text
+    body = batch.json()
+    assert body["ok"] and body["change_status"] == "NO_CHANGE"
+    assert body["applied"] == []  # 样本不足/AI 失败都不允许造心法
+
+    health = client.post(f"{API}/evolution/health-refresh", headers=headers)
+    assert health.status_code == 200
+    assert {"status", "rescored", "archived", "changes"} <= set(health.json())
+
+    inj = client.get(f"{API}/evolution/injection", headers=headers).json()
+    assert {"active", "injected", "limit", "not_injected", "unscored"} <= set(inj["report"])
+    assert inj["stats"]["min_lesson_sample"] >= 2
+
+
 def test_provider_reasoning_effort_roundtrip(client):
     headers = _token(client)
     body = {

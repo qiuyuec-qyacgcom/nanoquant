@@ -254,6 +254,16 @@ class EvolutionSettings(BaseModel):
     guard_strict: bool = True
     auto_disable_negative: bool = True
     max_rule_chars: int = Field(default=420, ge=80, le=2000)
+    #: 入库硬门槛：支持该结论的独立平仓样本数，低于此值一律拒收（单笔偶发事件不写长期心法）
+    min_lesson_sample: int = Field(default=2, ge=1, le=50)
+    #: 批量复盘：攒够 N 笔未复盘成交才调模型，避免逐笔编故事
+    batch_review_size: int = Field(default=10, ge=2, le=100)
+    #: 健康分重算所需样本；不足返回「未知」，不改分、不归档
+    min_health_sample: int = Field(default=10, ge=2, le=200)
+    #: 健康分低于此值且样本达标才归档（0-1）
+    archive_health_threshold: float = Field(default=0.45, ge=0.05, le=0.9)
+    #: 生效心法上限，防止只增不减
+    max_active_mantras: int = Field(default=40, ge=5, le=300)
 
 
 class BackupSettings(BaseModel):
