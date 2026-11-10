@@ -1066,6 +1066,34 @@
   `close=0.001438`；截图确认 ONEUSDT 5m 轴刻度 `0.00144 ~ 0.00152`、蜡烛 OHLC 清晰，不再是一条线。
 - **验证**：82 passed、`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
 
+### 75. 修复心法库不替代 + AI 逐笔复盘产出心法（本次执行）
+- **状态**：✅ 已完成
+- **现象**：心法库 25 条全部 `v1`、`superseded_by=0`，每笔 AI 复盘都是 `created`，
+  语义重复的「低量能追单 / 低分信号 / 多空冲突」并列堆积，从不替代；且近半复盘 `used_ai=False`（回退规则）。
+- **根因**：
+  1. 旧相似度是整段 `title+rule` 的字符 Jaccard，阈值 0.62；中文近义改写（"回踩确认" vs "双向确认"）
+     会被稀释到 0.4 以下 → 永远新建；
+  2. 即使相似度达标，替代还要求置信度高 0.03 或规则长 20 字，AI 每笔置信度接近 → 永远 `merged`；
+  3. 复盘 prompt 只给了 6 条现有心法（按健康度），且没有 `replaces` 字段，AI 无法点名替代；
+  4. 复盘输入带 `_bars`（14 根 K 线）+ 30 条完整规则，推理模型 thinking 动辄 4k+，
+     `max_tokens=2902/4000` 频繁截断 → `used_ai=False`。
+- **修复**：
+  - `lesson_similarity()`（标题 0.35 + 规则 0.65 加权），替代阈值 **0.48**、合并 0.32；
+    `_can_replace()` 加 6h 冷却（刚入库且 hits=0 只合并），避免同一晚反复替代；
+  - `upsert_lesson(..., replaces=...)`：AI 明确点名时按标题匹配并**强制替代**（可跨 category）；
+  - `REVIEW_SYSTEM` / `GLOBAL_REVIEW_SYSTEM` 增加 `replaces` 字段；复盘时把**全部生效心法**
+    （只给 title，避免挤占预算）交给 AI；
+  - 复盘 / 全局复盘调用 `reasoning_effort="low"` + `max_tokens=8000`；交易 payload 去掉 `_bars`，
+    全局复盘用 compact 版本；去重按 4 条一批（3000 tokens），失败单批不影响其它批；
+  - 新增 `POST /evolution/mantras/dedupe`（AI 优先、规则兜底）与心法库「合并重复」按钮；
+  - worker 每 5 分钟补扫 1 笔未复盘交易，进程内 `_reviewing` 去重，避免重复消耗 AI 额度。
+- **实测**：
+  - `dedupe` 合并 4 条（`23→24`、`10→7`、`11→8`、`3→5`），心法库 `total=30 / active=23 / superseded=7`；
+  - force 复盘 HYPEUSDT：`used_ai=True`、`error 空`、`action=replaced`、
+    理由「AI 判定语义重复并给出更优版本（相似度 1.00）」，新条目 `v2`。
+- **验证**：新增 4 条用例（相似替代 + 冷却、AI 点名跨分类替代、存量去重、AI 分批去重）→ **86 passed**；
+  `vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
+
 ---
 
 ## 二、未开始

@@ -108,9 +108,11 @@ REVIEW_SYSTEM = """你是交易复盘官. 输入是一笔已平仓交易的全�
 2. 不得包含"加大杠杆/放宽止损/满仓/无视风控"等放大风险的建议.
 3. 必须与具体交易解耦: 不写"这笔 BTC", 写"当 ATR 骤降且量比<1 时".
 4. 如果这笔交易没有可提炼的教训, 返回 {"lessons": []}.
+5. 如果新心法与 existing_mantras 中某条语义重复且你的版本更优, 在 lesson 里给出
+   "replaces": "旧心法的 title（必须逐字复制）"; 不重复则留空字符串. 不要为了替代而硬凑.
 
 输出 JSON:
-{"lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":"引用交易中的具体数值"}],
+{"lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":"引用交易中的具体数值","replaces":""}],
  "verdict":"这笔交易的执行与信号是否一致, 一句话",
  "score": 0-100}"""
 
@@ -128,9 +130,11 @@ GLOBAL_REVIEW_SYSTEM = """你是量化系统的自我进化官. 输入是最近�
 
 输出 JSON:
 {"diagnosis":["不足点1","不足点2"],
- "lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":""}],
+ "lessons":[{"title":"","rule":"","category":"entry|exit|risk|timing|position","confidence":0.0-1.0,"evidence":"","replaces":""}],
  "retire":[{"title":"","reason":""}],
- "adjust":["建议调整的参数方向 (只描述方向, 不得给出放宽风控的建议)"]}"""
+ "adjust":["建议调整的参数方向 (只描述方向, 不得给出放宽风控的建议)"]}
+
+lessons 里的 "replaces" 填现有心法的 title（逐字复制）表示新版本要替代它；不替代则留空。"""
 
 
 def global_review_messages(stats: dict[str, Any], trades: list[dict[str, Any]], mantras: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -138,6 +142,26 @@ def global_review_messages(stats: dict[str, Any], trades: list[dict[str, Any]], 
     return [
         {"role": "system", "content": GLOBAL_REVIEW_SYSTEM},
         {"role": "user", "content": "数据 (JSON):\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+    ]
+
+
+MANTRA_DEDUPE_SYSTEM = """你是心法库管理员. 输入是全部生效中的分析心法的 id/title/category/confidence（已省略规则原文，按标题判断主题即可）.
+请找出**语义确实重复、可以互相替代**的条目, 每组只保留一条最适合继续生效的 (通常是置信度更高、标题更具体的那条).
+
+约束:
+1. 只合并同一个交易主题的不同措辞; 主题不同 (如"手续费"与"止损") 绝不合并.
+2. 每组必须给出 keep 与 replaced, replaced 里的 id 必须存在于输入中.
+3. 不确定就不要合并, 返回空数组是允许的.
+4. 不得改写规则内容, 只做取舍.
+
+输出 JSON:
+{"merge":[{"keep":1,"replaced":[2,3],"reason":"为什么这几条是同一主题"}]}"""
+
+
+def mantra_dedupe_messages(items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": MANTRA_DEDUPE_SYSTEM},
+        {"role": "user", "content": "心法库 (JSON):\n" + json.dumps(items, ensure_ascii=False, separators=(",", ":"))},
     ]
 
 

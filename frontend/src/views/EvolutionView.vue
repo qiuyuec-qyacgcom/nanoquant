@@ -23,6 +23,25 @@ const form = reactive({ title: '', rule: '', category: 'entry', confidence: 0.55
 const filtered = computed(() => (category.value ? mantras.value.filter((m) => m.category === category.value) : mantras.value))
 const perMantra = computed(() => effect.value?.per_mantra || [])
 
+const deduping = ref(false)
+
+/** 一次性整理存量重复心法（新复盘已会自动替代，这里清历史遗留） */
+async function dedupe() {
+  if (!confirm('把语义重复的旧心法标记为「被替代」？保留每组中置信度最高的一条。')) return
+  deduping.value = true
+  try {
+    const res = await http.post('/evolution/mantras/dedupe', {})
+    const mode = res.mode === 'ai' ? 'AI 去重' : res.mode === 'rule' ? '规则去重' : '去重'
+    const suffix = res.error ? ` · AI 未生效：${String(res.error).slice(0, 50)}` : ''
+    app.notify(`${mode}：合并 ${res.replaced?.length || 0} 条，保留 ${res.kept || 0} 条${suffix}`, 'ok')
+    await load()
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    deduping.value = false
+  }
+}
+
 async function load() {
   const [m, inj, r, t, e] = await Promise.allSettled([
     http.get('/evolution/mantras?limit=300'),
@@ -248,6 +267,9 @@ onMounted(load)
             <option value="">全部分类</option>
             <option v-for="(label, key) in CATEGORY_LABELS" :key="key" :value="key">{{ label }}</option>
           </select>
+          <button class="btn btn-sm" :disabled="deduping" @click="dedupe">
+            {{ deduping ? '合并中…' : '合并重复' }}
+          </button>
           <button class="btn btn-sm btn-primary" @click="openCreate">+ 手工新增</button>
         </div>
       </div>

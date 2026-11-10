@@ -22,6 +22,13 @@ log = get_logger("evolution.mantra")
 
 _WORD_RE = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]")
 
+#: 自动替代阈值：标题 + 规则加权相似度
+REPLACE_SIM = 0.48
+#: 合并强化阈值（低于替代，只累加命中/微调置信度）
+MERGE_SIM = 0.32
+#: 替代冷却：刚入库且从未被验证的心法先不替代，避免同一晚反复翻烧饼
+REPLACE_COOLDOWN_SEC = 6 * 3600
+
 
 def _tokens(text: str) -> set[str]:
     chars = _WORD_RE.findall((text or "").lower())
@@ -37,6 +44,28 @@ def similarity(a: str, b: str) -> float:
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / len(ta | tb)
+
+
+def lesson_similarity(old_title: str, old_rule: str, title: str, rule: str) -> float:
+    """标题 + 规则加权相似度.
+
+    只看整段文本时，中文近义改写（"回踩确认" vs "双向确认"）会被稀释到 0.4 以下，
+    导致语义重复的心法不断新建、旧版本永远不替代。标题权重更高。
+    """
+    return round(
+        0.35 * similarity(old_title, title) + 0.65 * similarity(old_rule, rule), 4
+    )
+
+
+def _can_replace(old: Mantra, confidence: float, rule: str, now: int) -> bool:
+    """是否允许新版本替代旧心法.
+
+    - 6 小时内刚入库且一次都没被注入验证过：只合并，不替代（防抖动）；
+    - 置信度不低于旧版本 0.05，或规则明显更具体（长 15% 以上）。
+    """
+    if now - int(old.created_at or 0) < REPLACE_COOLDOWN_SEC and int(old.hits or 0) == 0:
+        return False
+    return confidence >= float(old.confidence) - 0.05 or len(rule) >= len(old.rule) * 1.15
 
 
 def health_of(m: Mantra, ttl_days: int) -> float:
@@ -131,6 +160,7 @@ def upsert_lesson(
     evidence: dict | None = None,
     source: str = "trade_review",
     tags: list[str] | None = None,
+    replaces: str = "",
 ) -> dict[str, Any]:
     """写入一条候选心法, 返回 {action, mantra, reason}."""
     cfg = get_evolution()
@@ -143,59 +173,78 @@ def upsert_lesson(
     now = int(time.time())
     expires = now + cfg.ttl_days * 86400
     with session_scope() as s:
-        pool = (
-            s.query(Mantra)
-            .filter(Mantra.category == category, Mantra.superseded_by == 0)
-            .all()
-        )
+        # 已生效的全部心法（跨 category，AI 点名替代时也要能找到）
+        active_all = s.query(Mantra).filter(Mantra.superseded_by == 0).all()
+        pool = [m for m in active_all if m.category == category]
+
+        def _create(version: int) -> Mantra:
+            new = Mantra(
+                title=title, rule=rule, tags=tags or [], category=category,
+                source=source, confidence=confidence, health=confidence,
+                enabled=True, version=max(1, version),
+                evidence=evidence or {}, created_at=now, updated_at=now, expires_at=expires,
+            )
+            s.add(new)
+            s.flush()
+            return new
+
+        def _replace(old: Mantra, sim: float, why: str) -> dict[str, Any]:
+            new = _create(old.version + 1)
+            old.enabled = False
+            old.superseded_by = new.id
+            old.updated_at = now
+            old.evidence = {
+                **(old.evidence or {}),
+                "superseded_reason": why[:200],
+                "superseded_by_title": title[:80],
+            }
+            log.info("心法替代: #%s v%s -> #%s v%s", old.id, old.version, new.id, new.version)
+            return {
+                "action": "replaced",
+                "mantra": serialize(new, cfg.ttl_days),
+                "replaced_id": old.id,
+                "reason": f"{why}（相似度 {sim:.2f}）",
+            }
+
+        # 1) AI 明确点名要替代的旧心法：按标题找最接近的一条，跳过硬性门槛
+        if replaces:
+            target: Mantra | None = None
+            target_sim = 0.0
+            for m in active_all:
+                sim = similarity(m.title, replaces)
+                if sim > target_sim:
+                    target, target_sim = m, sim
+            if target is not None and target_sim >= 0.45:
+                return _replace(target, target_sim, "AI 判定语义重复并给出更优版本")
+
+        # 2) 自动判定：标题 + 规则加权相似度
         best: Mantra | None = None
         best_sim = 0.0
         for m in pool:
-            sim = similarity(f"{m.title} {m.rule}", f"{title} {rule}")
+            sim = lesson_similarity(m.title, m.rule, title, rule)
             if sim > best_sim:
                 best, best_sim = m, sim
 
-        if best is not None and best_sim >= 0.62:
-            if confidence > best.confidence + 0.03 or len(rule) > len(best.rule) + 20:
-                best.superseded_by = 0
-                best.enabled = False
-                best.updated_at = now
-                new = Mantra(
-                    title=title, rule=rule, tags=tags or [], category=category,
-                    source=source, confidence=confidence, health=confidence,
-                    enabled=True, version=best.version + 1,
-                    evidence=evidence or {}, created_at=now, updated_at=now, expires_at=expires,
-                )
-                s.add(new)
-                s.flush()
-                best.superseded_by = new.id
-                return {
-                    "action": "replaced",
-                    "mantra": serialize(new, cfg.ttl_days),
-                    "replaced_id": best.id,
-                    "reason": f"与旧心法相似度 {best_sim:.2f}, 新版本置信度更高",
-                }
+        if best is not None and best_sim >= REPLACE_SIM and _can_replace(best, confidence, rule, now):
+            return _replace(best, best_sim, "新版本与旧心法语义重合且更优")
+
+        if best is not None and best_sim >= MERGE_SIM:
             best.confidence = max(best.confidence, confidence)
             best.hits += 1
             best.updated_at = now
             best.expires_at = expires
-            best.evidence = {**(best.evidence or {}), "last_evidence": evidence or {}, "reinforced": (best.evidence or {}).get("reinforced", 0) + 1}
-            return {"action": "merged", "mantra": serialize(best, cfg.ttl_days), "reason": f"与旧心法相似度 {best_sim:.2f}, 合并强化"}
+            best.evidence = {
+                **(best.evidence or {}),
+                "last_evidence": evidence or {},
+                "reinforced": (best.evidence or {}).get("reinforced", 0) + 1,
+            }
+            return {
+                "action": "merged",
+                "mantra": serialize(best, cfg.ttl_days),
+                "reason": f"与旧心法相似度 {best_sim:.2f}, 合并强化（冷却期内不替代）",
+            }
 
-        if best is not None and best_sim >= 0.42:
-            best.hits += 1
-            best.confidence = min(0.95, best.confidence + 0.02)
-            best.updated_at = now
-            best.expires_at = expires
-            return {"action": "reinforced", "mantra": serialize(best, cfg.ttl_days), "reason": f"相似度 {best_sim:.2f}, 相关强化"}
-
-        new = Mantra(
-            title=title, rule=rule, tags=tags or [], category=category, source=source,
-            confidence=confidence, health=confidence, enabled=True, version=1,
-            evidence=evidence or {}, created_at=now, updated_at=now, expires_at=expires,
-        )
-        s.add(new)
-        s.flush()
+        new = _create(1)
         return {"action": "created", "mantra": serialize(new, cfg.ttl_days), "reason": "新心法入库"}
 
 
@@ -266,6 +315,45 @@ def delete_mantra(mantra_id: int) -> bool:
             return False
         s.delete(row)
         return True
+
+
+def dedupe() -> dict[str, Any]:
+    """一次性整理存量心法：语义重复的只保留置信度最高的一条，其余标记为被替代.
+
+    新复盘已经会自动替代，但修复前积累的重复条目需要一次清理。
+    """
+    cfg = get_evolution()
+    now = int(time.time())
+    replaced: list[dict[str, Any]] = []
+    with session_scope() as s:
+        rows = (
+            s.query(Mantra)
+            .filter(Mantra.enabled.is_(True), Mantra.superseded_by == 0)
+            .order_by(Mantra.confidence.desc(), Mantra.created_at.desc())
+            .all()
+        )
+        kept: list[Mantra] = []
+        for m in rows:
+            match = next(
+                (
+                    k for k in kept
+                    if lesson_similarity(k.title, k.rule, m.title, m.rule) >= REPLACE_SIM
+                ),
+                None,
+            )
+            if match is None:
+                kept.append(m)
+                continue
+            m.enabled = False
+            m.superseded_by = match.id
+            m.updated_at = now
+            m.evidence = {
+                **(m.evidence or {}),
+                "superseded_reason": "存量去重：与更高置信度心法语义重复",
+                "superseded_by_title": match.title[:80],
+            }
+            replaced.append({"id": m.id, "title": m.title, "kept_id": match.id, "kept_title": match.title})
+    return {"ok": True, "kept": len(kept), "replaced": replaced, "total": len(rows)}
 
 
 def stats() -> dict[str, Any]:

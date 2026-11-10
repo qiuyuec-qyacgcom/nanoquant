@@ -152,6 +152,7 @@ class AiClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool | None = None,
+        reasoning_effort: str | None = None,
         retries: int = 2,
     ) -> ChatResult:
         cfg = get_ai()
@@ -200,7 +201,7 @@ class AiClient:
             payload,
             protocol=provider.protocol,
             model=provider.model,
-            effort=provider.reasoning_effort or "auto",
+            effort=reasoning_effort or provider.reasoning_effort or "auto",
             base_max_tokens=mt,
         )
 

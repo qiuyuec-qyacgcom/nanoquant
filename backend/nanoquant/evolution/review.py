@@ -9,7 +9,7 @@ from typing import Any
 
 from ..ai.client import ai_client
 from ..ai.decision import extract_json
-from ..ai.prompts import global_review_messages, review_messages
+from ..ai.prompts import global_review_messages, mantra_dedupe_messages, review_messages
 from ..db import session_scope
 from ..logging_setup import get_logger
 from ..models import EvolutionRun, TradeRecord
@@ -19,8 +19,8 @@ from . import mantra as mantra_store
 log = get_logger("evolution.review")
 
 
-def _trade_payload(t: TradeRecord) -> dict[str, Any]:
-    return {
+def _trade_payload(t: TradeRecord, *, compact: bool = False) -> dict[str, Any]:
+    payload = {
         "symbol": t.symbol,
         "side": t.side,
         "leverage": t.leverage,
@@ -35,9 +35,12 @@ def _trade_payload(t: TradeRecord) -> dict[str, Any]:
         "exit_reason": t.exit_reason,
         "signal_score": t.signal_score,
         "ai_confidence": t.ai_confidence,
-        "ai_reason": t.ai_reason[:300],
-        "features": t.features or {},
+        "ai_reason": t.ai_reason[:120] if compact else t.ai_reason[:300],
     }
+    if not compact:
+        # _bars 是 14 根 K 线明细，复盘只用指标特征；带上它会让 prompt 翻倍并挤压 thinking 预算
+        payload["features"] = {k: v for k, v in (t.features or {}).items() if k != "_bars"}
+    return payload
 
 
 def deterministic_lessons(t: TradeRecord) -> list[dict[str, Any]]:
@@ -131,7 +134,13 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
         mantra_store.touch(ids, pnl > 0)
 
     ai_cfg = get_ai()
-    existing = [{"title": m["title"], "rule": m["rule"]} for m in mantra_store.rank_lessons(6)]
+    # 给 AI 看全部生效心法（不只按健康度取前 6 条），否则它看不到该被替代的旧版本
+    # 替代判断只需要标题（prompt 要求 AI 逐字复制 title），规则原文只会挤占输入预算
+    existing = [
+        {"title": m["title"]}
+        for m in mantra_store.list_mantras(include_disabled=False, limit=30)
+        if not m["superseded_by"]
+    ]
     verdict = ""
     score = 0
     lessons: list[dict[str, Any]] = []
@@ -145,6 +154,9 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
             provider_id=ai_cfg.provider_id,
             fallback_ids=ai_cfg.fallback_provider_ids,
             temperature=0.3,
+            # 推理型模型对复盘平均要 2.5k~4k thinking，4000 仍会偶发截断；单笔一次调用，给足 8000
+            reasoning_effort="low",
+            max_tokens=8000,
         )
         if result.ok:
             try:
@@ -175,6 +187,7 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
                 "detail": str(item.get("evidence") or "")[:300],
             },
             source="trade_review",
+            replaces=str(item.get("replaces") or ""),
         )
         applied.append(outcome)
 
@@ -205,6 +218,87 @@ async def review_trade(trade_id: int, *, force: bool = False) -> dict[str, Any]:
         "score": score,
         "applied": [{"action": a["action"], "reason": a.get("reason", ""), "title": (a.get("mantra") or {}).get("title", a.get("title", ""))} for a in applied],
     }
+
+
+async def dedupe_mantras(use_ai: bool = True) -> dict[str, Any]:
+    """存量心法去重：优先让 AI 判断语义重复，失败时回退字符相似度."""
+    # 只给标题/分类/置信度：判断语义重复不需要完整规则，能显著缩短推理型模型的 thinking
+    items = [
+        {
+            "id": m["id"], "title": m["title"],
+            "category": m["category"], "confidence": m["confidence"],
+        }
+        for m in mantra_store.list_mantras(include_disabled=False, limit=40)
+        if not m["superseded_by"]
+    ]
+    if len(items) < 2:
+        return {"ok": True, "mode": "none", "kept": len(items), "replaced": [], "reason": "生效心法不足 2 条"}
+
+    ai_error = ""
+    replaced: list[dict[str, Any]] = []
+    ok_batches = 0
+    ai_cfg = get_ai()
+    if use_ai and ai_cfg.enabled:
+        # 推理型模型对整库一次判断会把 thinking 烧到几千 tokens 并被截断：
+        # 按 4 条一批拆分（实测 8 条仍会被 max_tokens 截断），单批失败不影响其它批。
+        batches = [items[i:i + 4] for i in range(0, len(items), 4)]
+        for batch in batches:
+            batch_ids = {m["id"]: m for m in batch}
+            result = await ai_client.chat_with_fallback(
+                mantra_dedupe_messages(batch),
+                purpose="mantra_dedupe",
+                provider_id=ai_cfg.provider_id,
+                fallback_ids=ai_cfg.fallback_provider_ids,
+                temperature=0.1,
+                reasoning_effort="low",
+                max_tokens=3000,
+            )
+            if not result.ok:
+                ai_error = result.error
+                log.warning("AI 心法去重单批失败: %s", result.error[:160])
+                continue
+            try:
+                data = extract_json(result.text)
+            except ValueError as exc:
+                ai_error = str(exc)
+                log.warning("AI 心法去重解析失败: %s", exc)
+                continue
+            ok_batches += 1
+            for group in (data.get("merge") or [])[:10]:
+                if not isinstance(group, dict):
+                    continue
+                try:
+                    keep_id = int(group.get("keep") or 0)
+                except (TypeError, ValueError):
+                    continue
+                keep = batch_ids.get(keep_id)
+                if keep is None:
+                    continue
+                for raw in group.get("replaced") or []:
+                    try:
+                        old_id = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if old_id == keep_id or old_id not in batch_ids:
+                        continue
+                    if mantra_store.retire(
+                        old_id,
+                        f"AI 去重：并入 #{keep_id} {keep['title'][:40]}",
+                        by_id=keep_id,
+                    ):
+                        replaced.append({"id": old_id, "kept_id": keep_id, "kept_title": keep["title"]})
+
+    if ok_batches:
+        return {
+            "ok": True,
+            "mode": "ai" if not ai_error else "ai_partial",
+            "kept": len(items) - len(replaced),
+            "replaced": replaced,
+            "error": ai_error,
+        }
+
+    fallback = mantra_store.dedupe()
+    return {**fallback, "mode": "rule", "error": ai_error}
 
 
 def trade_stats(limit: int = 200, mode: str = "") -> dict[str, Any]:
@@ -255,8 +349,10 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
         return {"ok": False, "error": "样本不足 (至少 2 笔闭环交易)"}
     with session_scope() as s:
         rows = s.query(TradeRecord).order_by(TradeRecord.closed_at.desc()).limit(limit).all()
-        trades = [_trade_payload(r) for r in rows]
-    existing = mantra_store.rank_lessons(12)
+        trades = [_trade_payload(r, compact=True) for r in rows]
+    existing = [
+        m for m in mantra_store.list_mantras(include_disabled=False, limit=40) if not m["superseded_by"]
+    ]
     ai_cfg = get_ai()
     diagnosis: list[str] = []
     applied: list[dict[str, Any]] = []
@@ -266,11 +362,13 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
 
     if ai_cfg.enabled:
         result = await ai_client.chat_with_fallback(
-            global_review_messages(stats, trades, [{"title": m["title"], "rule": m["rule"], "health": m["health"]} for m in existing]),
+            global_review_messages(stats, trades, [{"title": m["title"], "health": m["health"]} for m in existing]),
             purpose="global_review",
             provider_id=ai_cfg.provider_id,
             fallback_ids=ai_cfg.fallback_provider_ids,
             temperature=0.35,
+            reasoning_effort="low",
+            max_tokens=8000,
         )
         if result.ok:
             try:
@@ -288,6 +386,7 @@ async def global_review(limit: int = 60) -> dict[str, Any]:
                             confidence=float(item.get("confidence") or 0.55),
                             evidence={"source": "global_review", "detail": str(item.get("evidence") or "")[:300], "stats": stats},
                             source="global_review",
+                            replaces=str(item.get("replaces") or ""),
                         )
                     )
                 for item in (data.get("retire") or [])[:5]:

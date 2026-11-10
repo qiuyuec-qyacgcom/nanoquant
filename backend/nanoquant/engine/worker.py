@@ -66,6 +66,8 @@ class TradingEngine:
         self._last_cleanup = 0.0
         self._last_dlq = 0.0
         self._last_digest = 0.0
+        self._last_review_backfill = 0.0
+        self._reviewing: set[int] = set()
         self._ai_warn_ts = 0.0
         self._started_at = 0
 
@@ -394,10 +396,15 @@ class TradingEngine:
             {"symbol": pos.symbol, "reason": reason, "pnl": round(pnl, 8), "mark": mark},
         )
         self._trades_since_review += 1
-        if trade_id and get_evolution().review_on_close:
+        evo_cfg = get_evolution()
+        if trade_id and evo_cfg.enabled and evo_cfg.review_on_close:
             asyncio.create_task(self._review_trade(trade_id))
 
     async def _review_trade(self, trade_id: int) -> None:
+        # 平仓触发与补扫可能同时命中同一笔，用进程内集合去重，避免重复消耗 AI 额度
+        if trade_id in self._reviewing:
+            return
+        self._reviewing.add(trade_id)
         try:
             result = await asyncio.wait_for(evolution_review.review_trade(trade_id), timeout=120)
             if result.get("ok") and not result.get("skipped"):
@@ -409,6 +416,35 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("复盘失败: %s", exc)
             events.record("warn", "evolution", f"交易 #{trade_id} 复盘失败: {exc}"[:200])
+        finally:
+            self._reviewing.discard(trade_id)
+
+    def _review_backfill_if_due(self, now: int) -> None:
+        """每 5 分钟补扫一笔漏掉的复盘（进程重启/任务丢失时兜底）."""
+        cfg = get_evolution()
+        if not cfg.enabled or not cfg.review_on_close:
+            return
+        if now - self._last_review_backfill < 300:
+            return
+        self._last_review_backfill = now
+        asyncio.create_task(self._review_backfill_async())
+
+    async def _review_backfill_async(self) -> None:
+        from ..models import TradeRecord
+
+        try:
+            with session_scope() as s:
+                row = (
+                    s.query(TradeRecord.id)
+                    .filter(TradeRecord.reviewed.is_(False))
+                    .order_by(TradeRecord.closed_at.asc())
+                    .first()
+                )
+                trade_id = int(row[0]) if row else 0
+            if trade_id:
+                await self._review_trade(trade_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("复盘补扫失败: %s", exc)
 
     async def _maybe_global_review(self) -> None:
         cfg = get_evolution()
@@ -817,6 +853,7 @@ class TradingEngine:
         self._cleanup_if_due(now)
         self._dlq_if_due(now)
         self._digest_if_due(now)
+        self._review_backfill_if_due(now)
         last = state.get_int("last_equity_sample", 0)
         if now - last < 60:
             return

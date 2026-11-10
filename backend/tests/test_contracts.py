@@ -863,6 +863,165 @@ def _trade(pnl: float, *, ai_used=True, ids=None, features=None):
     return {"pnl": pnl, "features": feat}
 
 
+def _clean_mantras():
+    from nanoquant.db import init_db, session_scope
+    from nanoquant.models import Mantra
+
+    init_db()
+    with session_scope() as s:
+        s.query(Mantra).delete()
+
+
+def test_mantra_replaces_similar_version_after_cooldown():
+    """语义重复时新版本必须替代旧版本，而不是无限 merged 出 25 条并列心法."""
+    import time
+
+    from nanoquant.db import session_scope
+    from nanoquant.evolution import mantra as store
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    rule = "当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大后再介入。"
+    first = store.upsert_lesson(title="低量能追单易被止损", rule=rule, category="entry", confidence=0.55)
+    assert first["action"] == "created"
+    old_id = first["mantra"]["id"]
+
+    # 冷却期内（刚建、hits=0）先合并，避免同一晚反复翻烧饼
+    second = store.upsert_lesson(
+        title="低量能追单容易被止损", rule=rule, category="entry", confidence=0.6,
+    )
+    assert second["action"] == "merged"
+
+    # 过了冷却且被验证过：相似度达标的新版本直接替代
+    with session_scope() as s:
+        row = s.get(Mantra, old_id)
+        row.created_at = int(time.time()) - 7 * 3600
+        row.hits = 2
+    third = store.upsert_lesson(
+        title="低量能追单易被止损",
+        rule=rule + "连续两根放量确认后再入场。",
+        category="entry",
+        confidence=0.62,
+    )
+    assert third["action"] == "replaced", third
+    assert third["replaced_id"] == old_id
+    assert third["mantra"]["version"] == 2
+    with session_scope() as s:
+        old = s.get(Mantra, old_id)
+        assert old.enabled is False and old.superseded_by == third["mantra"]["id"]
+        assert old.evidence.get("superseded_reason")
+    # 被替代的不再进入注入排名
+    assert all(m["id"] != old_id for m in store.rank_lessons(20))
+
+
+def test_mantra_ai_replaces_by_title_even_across_category():
+    from nanoquant.evolution import mantra as store
+
+    _clean_mantras()
+    first = store.upsert_lesson(
+        title="多空信号冲突时观望",
+        rule="当方向分与量能方向相反时不开仓，等待结构确认。",
+        category="entry",
+        confidence=0.55,
+    )
+    assert first["action"] == "created"
+    second = store.upsert_lesson(
+        title="指标互相矛盾时先观望",
+        rule="当趋势分与动量分符号相反时等待一根 K 线收盘确认。",
+        category="risk",
+        confidence=0.6,
+        replaces="多空信号冲突时观望",
+    )
+    assert second["action"] == "replaced", second
+    assert second["replaced_id"] == first["mantra"]["id"]
+
+
+def test_mantra_dedupe_collapses_existing_duplicates():
+    """修复前积累的重复心法：保留置信度最高的一条，其余标记被替代."""
+    import time
+
+    from nanoquant.db import session_scope
+    from nanoquant.evolution import mantra as store
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    now = int(time.time())
+    expires = now + 7 * 86400
+    rows = [
+        ("低量能追单易被止损", "当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大后再介入。", 0.5),
+        ("低量能追单容易被止损", "当量比低于 0.9 且 ATR 占比低于 0.25% 时不开仓，等待量能放大后再介入。", 0.78),
+        ("超时离场仍盈利", "当持仓超时且浮盈仍大于 1% 时，下次把止盈目标下调到 0.8%。", 0.6),
+    ]
+    with session_scope() as s:
+        for title, rule, conf in rows:
+            s.add(
+                Mantra(
+                    title=title, rule=rule, category="entry", source="test",
+                    confidence=conf, health=conf, enabled=True, version=1,
+                    superseded_by=0, evidence={}, created_at=now, updated_at=now,
+                    expires_at=expires,
+                )
+            )
+
+    out = store.dedupe()
+    assert out["ok"] and len(out["replaced"]) == 1
+    assert out["replaced"][0]["kept_title"] == "低量能追单容易被止损"  # 保留置信度最高
+    assert out["kept"] == 2
+    active = store.list_mantras(include_disabled=False, limit=20)
+    assert {m["title"] for m in active} == {"低量能追单容易被止损", "超时离场仍盈利"}
+    with session_scope() as s:
+        assert s.query(Mantra).filter(Mantra.superseded_by != 0).count() == 1
+
+
+def test_ai_dedupe_merges_semantically_similar(monkeypatch):
+    """存量去重优先交给 AI：它按语义分组，规则只做兜底."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from nanoquant.db import session_scope
+    from nanoquant.evolution import review as evolution_review
+    from nanoquant.models import Mantra
+
+    _clean_mantras()
+    now = int(__import__("time").time())
+    with session_scope() as s:
+        ids = []
+        for title, rule, conf in (
+            ("低分信号不追单", "当方向分低于 0.45 且量比低于 0.9 时不开仓，等待确认。", 0.72),
+            ("弱势信号先观望", "当方向分不足 0.45 且量比不足 0.9 时保持观望，等结构确认。", 0.58),
+            ("超时离场止盈过远", "当持仓超时而浮盈仍大于 1% 时，下次把止盈下调到 0.8%。", 0.6),
+        ):
+            row = Mantra(
+                title=title, rule=rule, category="entry", source="test",
+                confidence=conf, health=conf, enabled=True, version=1,
+                superseded_by=0, evidence={}, created_at=now, updated_at=now,
+                expires_at=now + 7 * 86400,
+            )
+            s.add(row)
+            s.flush()
+            ids.append(row.id)
+    keep_id, old_id, other_id = ids
+
+    async def fake_chat(*args, **kwargs):  # noqa: ARG001
+        return SimpleNamespace(
+            ok=True,
+            text=json.dumps({"merge": [{"keep": keep_id, "replaced": [old_id], "reason": "同一主题不同措辞"}]}),
+        )
+
+    monkeypatch.setattr(evolution_review.ai_client, "chat_with_fallback", fake_chat)
+    monkeypatch.setattr(
+        evolution_review, "get_ai",
+        lambda: SimpleNamespace(enabled=True, provider_id=0, fallback_provider_ids=[]),
+    )
+    out = asyncio.run(evolution_review.dedupe_mantras(use_ai=True))
+    assert out["mode"] == "ai" and len(out["replaced"]) == 1
+    assert out["replaced"][0]["id"] == old_id
+    with session_scope() as s:
+        assert s.get(Mantra, old_id).enabled is False
+        assert s.get(Mantra, old_id).superseded_by == keep_id
+        assert s.get(Mantra, other_id).enabled is True
+
+
 def test_effectiveness_splits_by_injection_snapshot():
     from nanoquant.evolution.effectiveness import compare_groups
 

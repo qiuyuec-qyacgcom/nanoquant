@@ -58,6 +58,18 @@ def delete_mantra(mantra_id: int, user: str = Depends(current_user)) -> dict:
     return {"ok": True}
 
 
+@router.post("/evolution/mantras/dedupe")
+async def dedupe_evolution_mantras(use_ai: bool = True, user: str = Depends(current_user)) -> dict:
+    """合并存量重复心法：默认由 AI 判断语义重复，失败回退字符相似度."""
+    result = await evolution_review.dedupe_mantras(use_ai=use_ai)
+    events.record(
+        "info", "evolution",
+        f"{user} 合并重复心法({result.get('mode')}): {len(result.get('replaced') or [])} 条并入 {result.get('kept')} 条",
+        {"replaced": (result.get("replaced") or [])[:20]},
+    )
+    return result
+
+
 @router.get("/evolution/injection")
 def injection_preview(user: str = Depends(current_user)) -> dict:
     text, detail = mantra_store.injection()
