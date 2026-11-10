@@ -1,11 +1,11 @@
-"""标的粗筛策略: 引擎轮询标的池**之前**先按策略过滤，命中才拉 K 线做深度分析.
+"""AI 分析策略：把用户显式配置的交易策略注入 AI 决策上下文.
 
-设计要点:
-- 一条启用的策略都没有 ⇒ 默认全池（保持旧行为，用户不加策略就不会被拦住）；
-- 有策略时按 ``priority`` 升序匹配，命中第一条即放行；全部不命中 ⇒ 本轮不分析该标的；
-- 粗筛只用**已有批量 ticker**（24h 涨跌/成交额/最新价）与可选的盘口点差，
-  不额外消耗 K 线权重；``max_spread_bps>0`` 时才拉盘口（有 2s 缓存）；
-- 均为纯函数 + 轻量 CRUD，便于契约测试。
+定位澄清（2026-11 修正）：
+- 策略**不筛选标的池**，引擎仍全量轮询标的池；
+- 每个标的决策前，按 ``priority`` 找出**适用范围匹配**的第一条启用策略，
+  把它的 ``rule`` 交给 AI，让模型按这条策略分析是否开仓、方向与节奏；
+- 一条策略都没启用（或该标的不在适用范围）⇒ ``strategy=None``，
+  AI 按通用铁律分析，即「未添加策略则默认」。
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from ..db import session_scope
 from ..models import StrategyProfile
 
 SIDES = ("any", "long", "short")
+MAX_RULE_CHARS = 2000
 
 
 class StrategyError(ValueError):
@@ -26,64 +27,30 @@ class StrategyError(ValueError):
 
 
 def normalize_filters(raw: Any) -> dict[str, Any]:
-    """把任意输入收敛成固定结构，越界值钳回合法区间."""
+    """适用范围：标的白名单 + 方向偏好（其余旧字段忽略，保持向后兼容）."""
     src = raw if isinstance(raw, dict) else {}
     symbols = src.get("symbols") or []
     if isinstance(symbols, str):
-        symbols = [s for s in symbols.replace("，", ",").split(",")]
+        symbols = symbols.replace("，", ",").split(",")
     symbols = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
-
     side = str(src.get("side") or "any").strip().lower()
     if side not in SIDES:
         side = "any"
+    return {"symbols": symbols, "side": side}
 
-    def num(key: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
-        try:
-            value = float(src.get(key, default))
-        except (TypeError, ValueError):
-            value = default
-        if lo is not None:
-            value = max(lo, value)
-        if hi is not None:
-            value = min(hi, value)
-        return value
 
-    chg_min = num("change_24h_min", -100.0, -100.0, 100.0)
-    chg_max = num("change_24h_max", 100.0, -100.0, 100.0)
-    if chg_min > chg_max:
-        chg_min, chg_max = chg_max, chg_min
-
-    return {
-        "symbols": symbols,
-        "side": side,
-        "min_quote_volume": num("min_quote_volume", 0.0, 0.0),
-        "min_price": num("min_price", 0.0, 0.0),
-        "max_price": num("max_price", 0.0, 0.0),
-        "change_24h_min": chg_min,
-        "change_24h_max": chg_max,
-        "max_spread_bps": num("max_spread_bps", 0.0, 0.0, 500.0),
-    }
+def normalize_rule(text: Any) -> str:
+    rule = str(text or "").strip()
+    if len(rule) > MAX_RULE_CHARS:
+        rule = rule[:MAX_RULE_CHARS]
+    return rule
 
 
 def summarize(filters: dict[str, Any]) -> str:
-    """一句话条件摘要（列表页展示用）."""
     f = normalize_filters(filters)
-    parts: list[str] = []
-    if f["symbols"]:
-        parts.append("/".join(f["symbols"][:4]) + ("…" if len(f["symbols"]) > 4 else ""))
-    else:
-        parts.append("全池")
-    if f["side"] != "any":
-        parts.append("只做多" if f["side"] == "long" else "只做空")
-    if f["min_quote_volume"] > 0:
-        parts.append(f"成交额≥{f['min_quote_volume'] / 1e6:.1f}M")
-    if f["min_price"] > 0 or f["max_price"] > 0:
-        parts.append(f"价格 {f['min_price'] or 0:g}–{f['max_price'] or '∞'}")
-    if f["change_24h_min"] > -100 or f["change_24h_max"] < 100:
-        parts.append(f"24h涨跌 {f['change_24h_min']:g}%~{f['change_24h_max']:g}%")
-    if f["max_spread_bps"] > 0:
-        parts.append(f"点差≤{f['max_spread_bps']:g}bps")
-    return " · ".join(parts)
+    scope = "/".join(f["symbols"][:4]) + ("…" if len(f["symbols"]) > 4 else "") if f["symbols"] else "全池"
+    side = {"long": "只做多", "short": "只做空"}.get(f["side"], "不限方向")
+    return f"{scope} · {side}"
 
 
 def serialize(row: StrategyProfile) -> dict[str, Any]:
@@ -92,6 +59,7 @@ def serialize(row: StrategyProfile) -> dict[str, Any]:
         "id": row.id,
         "name": row.name,
         "description": row.description or "",
+        "rule": row.rule or "",
         "enabled": bool(row.enabled),
         "priority": int(row.priority or 100),
         "filters": filters,
@@ -111,11 +79,11 @@ def list_profiles() -> list[dict[str, Any]]:
 
 
 def active_profiles() -> list[dict[str, Any]]:
-    """启用的策略（按优先级）；空列表 = 默认全池."""
+    """启用的策略（按优先级）；空列表 = 全部走默认分析."""
     with session_scope() as s:
-        rows = (
-            _order(s.query(StrategyProfile).filter(StrategyProfile.enabled.is_(True))).all()
-        )
+        rows = _order(
+            s.query(StrategyProfile).filter(StrategyProfile.enabled.is_(True))
+        ).all()
         return [serialize(r) for r in rows]
 
 
@@ -127,7 +95,10 @@ def stats() -> dict[str, Any]:
             "total": len(rows),
             "enabled": len(enabled),
             "default": len(enabled) == 0,
-            "by_side": {side: sum(1 for r in enabled if (r.filters or {}).get("side") == side) for side in SIDES},
+            "by_side": {
+                side: sum(1 for r in enabled if normalize_filters(r.filters)["side"] == side)
+                for side in SIDES
+            },
         }
 
 
@@ -135,6 +106,7 @@ def create_profile(
     *,
     name: str,
     description: str = "",
+    rule: str = "",
     enabled: bool = True,
     priority: int = 100,
     filters: Any = None,
@@ -142,6 +114,9 @@ def create_profile(
     name = (name or "").strip()
     if len(name) < 2:
         raise StrategyError("策略名称至少 2 个字")
+    body = normalize_rule(rule)
+    if len(body) < 8:
+        raise StrategyError("策略内容至少 8 个字（AI 需要可执行的判断依据）")
     payload = normalize_filters(filters)
     with session_scope() as s:
         if s.query(StrategyProfile).filter(StrategyProfile.name == name).first():
@@ -149,6 +124,7 @@ def create_profile(
         row = StrategyProfile(
             name=name,
             description=(description or "")[:200],
+            rule=body,
             enabled=bool(enabled),
             priority=int(priority),
             filters=payload,
@@ -177,6 +153,11 @@ def update_profile(profile_id: int, patch: dict[str, Any]) -> dict[str, Any] | N
             row.name = name
         if "description" in patch and patch["description"] is not None:
             row.description = str(patch["description"])[:200]
+        if "rule" in patch and patch["rule"] is not None:
+            body = normalize_rule(patch["rule"])
+            if len(body) < 8:
+                raise StrategyError("策略内容至少 8 个字（AI 需要可执行的判断依据）")
+            row.rule = body
         if "enabled" in patch and patch["enabled"] is not None:
             row.enabled = bool(patch["enabled"])
         if "priority" in patch and patch["priority"] is not None:
@@ -197,88 +178,23 @@ def delete_profile(profile_id: int) -> bool:
 
 
 # ------------------------------------------------------------------ 纯匹配逻辑
-def _attr(obj: Any, key: str, default: float = 0.0) -> float:
-    value = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, default)
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return default
-
-
-def match_profile(symbol: str, ticker: Any, book: tuple[float, float] | None, profile: dict[str, Any]) -> bool:
-    """单标的是否满足一条策略；``ticker`` 支持 dataclass 或 dict."""
+def matches_symbol(symbol: str, profile: dict[str, Any]) -> bool:
+    """该策略是否适用于这个标的（只按 symbols 白名单，方向偏好不影响适用范围）."""
     if not profile.get("enabled", True):
         return False
-    f = normalize_filters(profile.get("filters"))
-    if f["symbols"] and symbol not in f["symbols"]:
-        return False
-    last = _attr(ticker, "last")
-    if last <= 0:
-        return False
-    if f["min_price"] > 0 and last < f["min_price"]:
-        return False
-    if f["max_price"] > 0 and last > f["max_price"]:
-        return False
-    if f["min_quote_volume"] > 0 and _attr(ticker, "quote_volume") < f["min_quote_volume"]:
-        return False
-    change = _attr(ticker, "change_pct")
-    if change < f["change_24h_min"] or change > f["change_24h_max"]:
-        return False
-    if f["max_spread_bps"] > 0 and book:
-        bid, ask = float(book[0]), float(book[1])
-        mid = (bid + ask) / 2
-        if mid > 0 and (ask - bid) / mid * 10000 > f["max_spread_bps"]:
-            return False
-    return True
+    scope = normalize_filters(profile.get("filters"))["symbols"]
+    return not scope or symbol.upper() in scope
 
 
-def prefilter(
-    symbols: list[str],
-    tickers: dict[str, Any],
-    books: dict[str, tuple[float, float]] | None = None,
-    profiles: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """按策略过滤标的池.
+def pick_from(symbol: str, profiles: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """按优先级取第一条适用的策略；None 表示该标的走默认分析."""
+    ordered = sorted(
+        [p for p in (profiles or []) if p.get("enabled", True)],
+        key=lambda p: (int(p.get("priority") or 100), int(p.get("id") or 0)),
+    )
+    return next((p for p in ordered if matches_symbol(symbol, p)), None)
 
-    返回 ``{"default": bool, "kept": [...], "dropped": [...], "side_bias": {...},
-    "matched": {profile_id: n}, "profiles": n}``。
-    ``default=True`` 表示没有启用策略，已全量放行。
-    """
-    active = [p for p in (profiles or []) if p.get("enabled", True)]
-    symbols = list(symbols or [])
-    if not active:
-        return {
-            "default": True, "kept": symbols, "dropped": [],
-            "side_bias": {}, "matched": {}, "profiles": 0,
-        }
-    active = sorted(active, key=lambda p: (int(p.get("priority") or 100), int(p.get("id") or 0)))
-    kept: list[str] = []
-    dropped: list[str] = []
-    side_bias: dict[str, str] = {}
-    matched: dict[int, int] = {}
-    for symbol in symbols:
-        ticker = (tickers or {}).get(symbol)
-        if ticker is None:
-            dropped.append(symbol)
-            continue
-        hit = next(
-            (p for p in active if match_profile(symbol, ticker, (books or {}).get(symbol), p)),
-            None,
-        )
-        if hit is None:
-            dropped.append(symbol)
-            continue
-        kept.append(symbol)
-        pid = int(hit.get("id") or 0)
-        matched[pid] = matched.get(pid, 0) + 1
-        side = normalize_filters(hit.get("filters"))["side"]
-        if side in ("long", "short"):
-            side_bias[symbol] = side
-    return {
-        "default": False,
-        "kept": kept,
-        "dropped": dropped,
-        "side_bias": side_bias,
-        "matched": matched,
-        "profiles": len(active),
-    }
+
+def pick_for(symbol: str) -> dict[str, Any] | None:
+    """单标的取策略（便捷入口，内部查一次库；引擎批量场景请用 pick_from）."""
+    return pick_from(symbol, active_profiles())

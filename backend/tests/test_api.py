@@ -219,9 +219,8 @@ def test_evolution_batch_review_and_health_endpoints(client):
     assert inj["stats"]["min_lesson_sample"] >= 2
 
 
-def test_strategy_crud_and_preview(client, monkeypatch):
-    """策略 CRUD + 停用后回落到默认全池 + 预览只读."""
-    from nanoquant.api.routes import strategies as strategy_routes
+def test_strategy_crud_and_preview(client):
+    """策略 CRUD + 停用后回落到默认分析 + 适用范围预览只做本地匹配."""
     from nanoquant.db import init_db, session_scope
     from nanoquant.models import StrategyProfile
 
@@ -235,15 +234,26 @@ def test_strategy_crud_and_preview(client, monkeypatch):
         headers=headers,
         json={
             "name": "单元策略", "priority": 10,
-            "filters": {"side": "long", "symbols": ["BTCUSDT"], "min_quote_volume": 1e6},
+            "rule": "当 15m 回踩 EMA21 不破且量比大于 1.2 时做多。",
+            "filters": {"side": "long", "symbols": ["BTCUSDT"]},
         },
     )
     assert created.status_code == 200, created.text
     item = created.json()["item"]
     assert item["filters"]["side"] == "long"
+    assert "回踩 EMA21" in item["rule"]
     assert "BTCUSDT" in item["summary"] and "只做多" in item["summary"]
 
-    dup = client.post(f"{API}/strategies", headers=headers, json={"name": "单元策略"})
+    # 策略内容太短会被拒
+    short = client.post(
+        f"{API}/strategies", headers=headers, json={"name": "太短", "rule": "做多"},
+    )
+    assert short.status_code == 400
+
+    dup = client.post(
+        f"{API}/strategies", headers=headers,
+        json={"name": "单元策略", "rule": "当 15m 回踩 EMA21 不破时做多。"},
+    )
     assert dup.status_code == 400
 
     patched = client.patch(
@@ -255,15 +265,12 @@ def test_strategy_crud_and_preview(client, monkeypatch):
 
     listed = client.get(f"{API}/strategies", headers=headers).json()
     assert listed["stats"]["total"] == 1
-    assert listed["stats"]["default"] is True  # 唯一策略已停用 => 默认全池
+    assert listed["stats"]["default"] is True  # 唯一策略已停用 => 默认分析
 
-    async def fake_tickers(_symbols):
-        return {}
-
-    monkeypatch.setattr(strategy_routes.binance_client, "tickers", fake_tickers)
     preview = client.get(f"{API}/strategies/preview", headers=headers)
     assert preview.status_code == 200
-    assert preview.json()["ok"] is True
+    body = preview.json()
+    assert body["ok"] is True and body["default"] is True
 
     assert client.delete(f"{API}/strategies/{item['id']}", headers=headers).status_code == 200
     assert client.delete(f"{API}/strategies/{item['id']}", headers=headers).status_code == 404

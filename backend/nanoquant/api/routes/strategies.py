@@ -1,15 +1,13 @@
-"""策略模块: 标的粗筛策略 CRUD + 实时预览.
+"""策略模块：AI 分析策略 CRUD + 适用范围预览.
 
-引擎每轮先按启用的策略过滤标的池，命中才拉 K 线做深度分析；
-一条策略都没启用时默认全池扫描。
+策略是给 AI 的交易指令，在决策阶段注入（不是标的池预筛）。
+未配置策略时 AI 按通用铁律分析，即默认行为。
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from ...db import session_scope
-from ...exchange.client import BinanceError, NoCredentials
-from ...exchange.client import client as binance_client
 from ...models import TradingSymbol
 from ...services import events, state
 from ...services import strategy_profiles as strategy_service
@@ -25,7 +23,7 @@ def list_strategies(user: str = Depends(current_user)) -> dict:
     return {
         "items": strategy_service.list_profiles(),
         "stats": strategy_service.stats(),
-        "last_filter": __import__("json").loads(state.get("strategy_filter", "{}") or "{}"),
+        "last_applied": state.get("strategy_applied", ""),
     }
 
 
@@ -35,6 +33,7 @@ def create_strategy(payload: StrategyIn, user: str = Depends(current_user)) -> d
         item = strategy_service.create_profile(
             name=payload.name,
             description=payload.description,
+            rule=payload.rule,
             enabled=payload.enabled,
             priority=payload.priority,
             filters=payload.filters,
@@ -66,8 +65,8 @@ def delete_strategy(profile_id: int, user: str = Depends(current_user)) -> dict:
 
 
 @router.get("/strategies/preview")
-async def preview_strategies(user: str = Depends(current_user)) -> dict:
-    """用当前行情预览会放行哪些标的（只读，手动触发，不写库）."""
+def preview_strategies(user: str = Depends(current_user)) -> dict:
+    """按标的池预览每个标的会应用哪条策略（纯本地匹配，不拉行情/不写库）."""
     engine_cfg = get_engine()
     with session_scope() as s:
         pool = [
@@ -76,43 +75,21 @@ async def preview_strategies(user: str = Depends(current_user)) -> dict:
         ]
     pool = pool[: engine_cfg.max_symbols_per_cycle]
     profiles = strategy_service.active_profiles()
-    if not pool:
-        return {"ok": True, "default": not profiles, "items": [], "summary": {"kept": [], "dropped": []}}
-    try:
-        tickers = await binance_client.tickers(pool)
-    except (BinanceError, NoCredentials) as exc:
-        return {"ok": False, "error": f"行情取数失败: {str(exc)[:160]}", "items": [], "summary": {}}
-    books: dict[str, tuple[float, float]] = {}
-    if any(strategy_service.normalize_filters(p.get("filters"))["max_spread_bps"] > 0 for p in profiles):
-        try:
-            books = await binance_client.book_tickers(pool)
-        except (BinanceError, NoCredentials):
-            books = {}
-    picked = strategy_service.prefilter(pool, tickers, books, profiles)
-    kept = set(picked["kept"])
     items = []
     for symbol in pool:
-        ticker = tickers.get(symbol)
-        if ticker is None:
-            continue
+        picked = strategy_service.pick_from(symbol, profiles)
+        filters = strategy_service.normalize_filters((picked or {}).get("filters"))
         items.append(
             {
                 "symbol": symbol,
-                "price": ticker.last,
-                "change_24h_pct": ticker.change_pct,
-                "quote_volume": ticker.quote_volume,
-                "kept": symbol in kept,
-                "side_bias": picked["side_bias"].get(symbol, "any"),
+                "profile": picked["name"] if picked else "",
+                "side": filters["side"] if picked else "any",
+                "default": picked is None,
             }
         )
     return {
         "ok": True,
-        "default": picked["default"],
+        "default": len(profiles) == 0,
+        "profiles": len(profiles),
         "items": items,
-        "summary": {
-            "kept": picked["kept"],
-            "dropped": picked["dropped"],
-            "profiles": picked["profiles"],
-            "matched": picked["matched"],
-        },
     }

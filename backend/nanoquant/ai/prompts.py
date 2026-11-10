@@ -16,6 +16,9 @@ DECISION_SYSTEM = """你是「NanoQuant」系统的合约交易决策官, 服务
 4. 爆仓距离必须显著大于止损距离; 缺数据或信号矛盾时必须 hold, 禁止猜测.
 5. 你只能"否决"或"降杠杆/收窄风险", 不能放宽系统风控参数.
 6. 必须给出可被证伪的 reason (引用具体数值), 以及 invalidation (什么情况证明你错了).
+7. 输入 JSON 里的 "strategy" 是当前标的适用的交易策略（用户显式配置）：
+   有值时严格按 strategy.rule 分析入场条件、方向与节奏，strategy.filters.side 指定方向时不得反向；
+   为 null 时按上面的通用铁律判断。策略只约束"怎么分析、做不做"，不能覆盖杠杆上下限、止损与仓位等风控铁律。
 
 输出 JSON 字段:
 {
@@ -88,6 +91,10 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
         "news": news,
         "mantras": mantras,
     }
+    # 没有适用策略时不输出该键：默认分析不该为 null 字段付 token
+    strategy = ctx.get("strategy")
+    if strategy:
+        payload["strategy"] = strategy
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 

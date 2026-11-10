@@ -69,6 +69,7 @@ def init_db() -> None:
     migrate_legacy_demo_naming()
     migrate_pool_columns()
     migrate_exec_columns()
+    migrate_strategy_columns()
 
 
 #: 标的池新增列 (CREATE TABLE 只对新库生效, 老库必须 ALTER)
@@ -138,6 +139,27 @@ def migrate_exec_columns() -> None:
                     log.info("%s 补齐字段: %s", table, column)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s 字段补齐跳过: %s", table, exc)
+
+
+def migrate_strategy_columns() -> None:
+    """给老库的 strategy_profiles 补齐 rule 列（幂等）.
+
+    该表首个版本只有 filters；策略改为「注入 AI 的分析指令」后新增 rule。
+    """
+    with engine.begin() as conn:
+        try:
+            rows = conn.exec_driver_sql("PRAGMA table_info(strategy_profiles)").fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("策略表列探测失败: %s", exc)
+            return
+        existing = {row[1] for row in rows}
+        if "rule" in existing:
+            return
+        try:
+            conn.exec_driver_sql("ALTER TABLE strategy_profiles ADD COLUMN rule TEXT DEFAULT ''")
+            log.info("策略表补齐字段: rule")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("策略表字段 rule 添加失败: %s", exc)
 
 
 def _backfill_sort_order() -> None:

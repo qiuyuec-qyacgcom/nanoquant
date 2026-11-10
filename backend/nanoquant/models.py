@@ -78,20 +78,23 @@ class TradingSymbol(Base):
 
 
 class StrategyProfile(Base):
-    """标的粗筛策略.
+    """AI 分析策略.
 
-    引擎每轮扫描前先按启用的策略过滤标的池，命中才拉 K 线做深度分析；
-    一条策略都没启用时走默认（全池扫描），保持旧行为。
+    策略是**给 AI 的交易指令**（用户显式配置），在 AI 决策时注入上下文，
+    由模型据此分析该标的是否开仓、方向与节奏；标的池仍全量扫描。
+    一条启用的策略都没有时，AI 按通用铁律分析（默认行为）。
     """
 
     __tablename__ = "strategy_profiles"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     description: Mapped[str] = mapped_column(String(200), default="")
+    #: 策略正文：给 AI 的可执行分析指令（入场条件/方向/节奏/回避情形）
+    rule: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     #: 匹配顺序：数值越小越先命中（同分按 id）
     priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
-    #: 粗筛条件（symbols/side/成交额/价格/涨跌幅/点差），见 services/strategy_profiles.py
+    #: 适用范围（symbols 白名单 / side 方向偏好），见 services/strategy_profiles.py
     filters: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, default=now_ts)
     updated_at: Mapped[int] = mapped_column(Integer, default=now_ts, onupdate=now_ts)

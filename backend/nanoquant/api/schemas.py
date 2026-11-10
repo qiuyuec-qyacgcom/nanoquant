@@ -126,10 +126,11 @@ class EngineControl(BaseModel):
 
 
 class StrategyIn(BaseModel):
-    """标的粗筛策略：引擎轮询前先按它过滤标的池."""
+    """AI 分析策略：决策时注入，指导模型如何分析该标的."""
 
     name: str = Field(min_length=2, max_length=64)
     description: str = Field(default="", max_length=200)
+    rule: str = Field(default="", max_length=2000)
     enabled: bool = True
     priority: int = Field(default=100, ge=0, le=10000)
     filters: dict[str, Any] = Field(default_factory=dict)
@@ -138,6 +139,7 @@ class StrategyIn(BaseModel):
 class StrategyPatch(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=64)
     description: str | None = Field(default=None, max_length=200)
+    rule: str | None = Field(default=None, max_length=2000)
     enabled: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=10000)
     filters: dict[str, Any] | None = None

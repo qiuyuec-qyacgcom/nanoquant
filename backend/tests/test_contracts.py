@@ -1857,105 +1857,39 @@ def test_choose_leverage_clamps_ai_to_global_floor_and_cap():
     assert choose_leverage("BTCUSDT", engine, low, f, 1) == 1        # 下限最低 1x
 
 
-def test_strategy_prefilter_defaults_to_full_pool():
-    """没有任何启用策略时默认全池，保持旧行为."""
-    from types import SimpleNamespace
-
+def test_strategy_pick_defaults_to_none_without_profiles():
+    """没有任何启用策略时 pick_from 返回 None ⇒ AI 走默认分析."""
     from nanoquant.services import strategy_profiles as sp
 
-    tickers = {
-        "BTCUSDT": SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9),
-        "ETHUSDT": SimpleNamespace(last=10.0, change_pct=-1.0, quote_volume=1e8),
-    }
-    out = sp.prefilter(list(tickers), tickers, {}, [])
-    assert out["default"] is True
-    assert out["kept"] == ["BTCUSDT", "ETHUSDT"] and out["dropped"] == []
+    assert sp.pick_from("BTCUSDT", []) is None
+    assert sp.pick_from("BTCUSDT", [{"id": 1, "name": "停用", "enabled": False, "filters": {}}]) is None
 
 
-def test_strategy_prefilter_priority_side_and_volume():
-    from types import SimpleNamespace
-
+def test_strategy_pick_priority_and_symbol_scope():
     from nanoquant.services import strategy_profiles as sp
 
     profiles = [
-        {"id": 1, "name": "小币", "enabled": True, "priority": 10,
+        {"id": 1, "name": "只给 DOGE", "enabled": True, "priority": 10,
          "filters": sp.normalize_filters({"symbols": ["DOGEUSDT"], "side": "long"})},
-        {"id": 2, "name": "主流", "enabled": True, "priority": 20,
-         "filters": sp.normalize_filters({"min_quote_volume": 5e8})},
+        {"id": 2, "name": "全池通用", "enabled": True, "priority": 20,
+         "filters": sp.normalize_filters({"side": "any"})},
     ]
-    tickers = {
-        "DOGEUSDT": SimpleNamespace(last=0.1, change_pct=2.0, quote_volume=1e7),
-        "BTCUSDT": SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9),
-        "ETHUSDT": SimpleNamespace(last=10.0, change_pct=-1.0, quote_volume=1e8),
-    }
-    out = sp.prefilter(list(tickers), tickers, {}, profiles)
-    assert out["default"] is False
-    assert out["kept"] == ["DOGEUSDT", "BTCUSDT"]  # ETH 成交额不足
-    assert out["dropped"] == ["ETHUSDT"]
-    assert out["side_bias"] == {"DOGEUSDT": "long"}
-    assert out["matched"] == {1: 1, 2: 1}
+    assert sp.pick_from("DOGEUSDT", profiles)["name"] == "只给 DOGE"
+    assert sp.pick_from("BTCUSDT", profiles)["name"] == "全池通用"
+    # 优先级更高的通用策略先命中
+    profiles[1]["priority"] = 5
+    assert sp.pick_from("DOGEUSDT", profiles)["name"] == "全池通用"
 
 
-def test_strategy_filters_normalize_bounds_and_swap():
+def test_strategy_filters_normalize_scope_and_summary():
     from nanoquant.services import strategy_profiles as sp
 
-    f = sp.normalize_filters({
-        "symbols": "btcusdt, ethusdt", "side": "LONG",
-        "change_24h_min": 50, "change_24h_max": -10, "min_price": -5,
-    })
-    assert f["symbols"] == ["BTCUSDT", "ETHUSDT"]
-    assert f["side"] == "long"
-    assert f["change_24h_min"] == -10 and f["change_24h_max"] == 50
-    assert f["min_price"] == 0
-    assert "全池" not in sp.summarize(f) and "只做多" in sp.summarize(f)
-
-
-def test_engine_scan_only_requests_klines_for_strategy_hits(monkeypatch):
-    """策略命中才拉 K 线：未命中的标的本轮连 K 线请求都不发."""
-    import asyncio
-    from types import SimpleNamespace
-
-    from nanoquant.engine import worker as w
-    from nanoquant.services import strategy_profiles as sp
-    from nanoquant.services.settings import EngineSettings, RiskSettings, StrategySettings
-
-    engine = w.TradingEngine()
-
-    async def fake_symbols(_cfg):
-        return ["AAAUSDT", "BBBUSDT"]
-
-    monkeypatch.setattr(engine, "_symbols", fake_symbols)
-    tickers = {
-        s: SimpleNamespace(last=1.0, change_pct=1.0, quote_volume=1e9) for s in ("AAAUSDT", "BBBUSDT")
-    }
-
-    async def fake_tickers(symbols):
-        return {s: tickers[s] for s in symbols}
-
-    async def fake_empty(_symbols):
-        return {}
-
-    calls: list[str] = []
-
-    async def fake_klines(symbol, _interval, _limit=60):
-        calls.append(symbol)
-        return []
-
-    monkeypatch.setattr(w.binance_client, "tickers", fake_tickers)
-    monkeypatch.setattr(w.binance_client, "funding_rates", fake_empty)
-    monkeypatch.setattr(w.binance_client, "open_interest", fake_empty)
-    monkeypatch.setattr(w.binance_client, "klines", fake_klines)
-    monkeypatch.setattr(sp, "active_profiles", lambda: [
-        {"id": 1, "name": "只做 AAA", "enabled": True, "priority": 10,
-         "filters": sp.normalize_filters({"symbols": ["AAAUSDT"]})},
-    ])
-
-    account = SimpleNamespace(available=1000.0, equity=1000.0)
-    out = asyncio.run(
-        engine._scan(None, account, EngineSettings(), RiskSettings(), StrategySettings())
-    )
-    assert calls == ["AAAUSDT"]
-    assert out == []
+    f = sp.normalize_filters({"symbols": "btcusdt, ethusdt", "side": "LONG", "min_quote_volume": 5e8})
+    assert f == {"symbols": ["BTCUSDT", "ETHUSDT"], "side": "long"}
+    summary = sp.summarize(f)
+    assert "BTCUSDT/ETHUSDT" in summary and "只做多" in summary
+    assert "全池" in sp.summarize({})
+    assert len(sp.normalize_rule("x" * 5000)) == sp.MAX_RULE_CHARS
 
 
 def test_weight_limiter_fails_fast_instead_of_queueing(monkeypatch):
@@ -1979,16 +1913,18 @@ def test_weight_limiter_fails_fast_instead_of_queueing(monkeypatch):
 
 
 def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeypatch):
-    """决策上下文显式给出全局区间，且不再把心法规则原文（可能含杠杆建议）塞给模型."""
+    """决策上下文显式给出全局区间，不再把心法规则原文塞给模型，同时注入适用策略."""
     from types import SimpleNamespace
 
     from nanoquant.ai.compact import format_snapshot_v2
     from nanoquant.ai.prompts import DECISION_SYSTEM, format_snapshot
     from nanoquant.engine import worker as w
+    from nanoquant.services import strategy_profiles as sp
     from nanoquant.services.settings import EngineSettings, RiskSettings
 
     assert "全局" in DECISION_SYSTEM and "心法" in DECISION_SYSTEM
     assert "min_leverage" in DECISION_SYSTEM and "max_leverage" in DECISION_SYSTEM
+    assert "strategy" in DECISION_SYSTEM
 
     monkeypatch.setattr(
         w, "get_ai",
@@ -1999,6 +1935,11 @@ def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeyp
     ])
     monkeypatch.setattr(w.risk_mod, "open_positions", lambda: [])
     monkeypatch.setattr(w.state, "get_float", lambda *a, **k: 1000.0)
+    monkeypatch.setattr(sp, "pick_for", lambda _symbol: {
+        "id": 9, "name": "回踩做多", "enabled": True, "priority": 10,
+        "rule": "当 15m 回踩 EMA21 不破且量比大于 1.2 时做多；跌破回踩低点离场。",
+        "filters": {"symbols": ["BTCUSDT"], "side": "long"},
+    })
 
     sig = SimpleNamespace(symbol="BTCUSDT", score=0.5, direction="long", features={}, reasons=[])
     ticker = SimpleNamespace(last=100.0, change_pct=1.0, quote_volume=1e9)
@@ -2013,3 +1954,16 @@ def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeyp
     assert ctx["constraints"]["min_leverage"] == 20
     assert ctx["constraints"]["max_leverage"] == 100
     assert "levmin" in format_snapshot_v2(ctx)
+
+    # 策略作为分析指令进入上下文与两种 prompt 协议
+    assert ctx["strategy"]["name"] == "回踩做多"
+    assert "回踩 EMA21" in format_snapshot(ctx)
+    assert '"st"' in format_snapshot_v2(ctx) and "回踩 EMA21" in format_snapshot_v2(ctx)
+
+    # 没有适用策略时是 None（默认分析）
+    monkeypatch.setattr(sp, "pick_for", lambda _symbol: None)
+    ctx2 = w.TradingEngine()._build_ai_context(
+        sig, ticker, account, EngineSettings(),
+        RiskSettings(default_leverage=20, max_leverage=100), filters,
+    )
+    assert ctx2["strategy"] is None

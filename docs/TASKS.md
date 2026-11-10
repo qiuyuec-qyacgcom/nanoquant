@@ -1162,19 +1162,18 @@
   - `/engine/status` 新增 `rate_limit`（`banned` / `ban_remaining` / `used_weight` / `capacity`）；总览展示「交易所限频冷却 Ns（权重 x/2400）」，保护单空态在限频时说明原因而不是假装没有保护单。
 - **验证**：`pytest tests -q` → **105 passed**（新增保护单限频降级/非限频 503、权重快速失败 2 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
-### 81. 策略模块：轮询标的前先按策略粗筛
-- **状态**：✅ 已完成
-- **背景**：引擎每轮对标的池**全量**拉 K 线、资金费与持仓量，标的多了又慢又吃权重；缺少「先用廉价行情筛一遍，再对候选做深度分析」的层。
+### 81. 策略模块：AI 按策略分析开仓（不是标的池粗筛）
+- **状态**：✅ 已完成（2026-11-11 按用户澄清返工：策略是给 AI 的分析指令，不做标的预筛）
+- **背景**：首版误做成「先用 ticker 粗筛标的池」，但用户要的是「AI 根据这条策略分析是否开仓」。返工后标的池恢复全量扫描，策略在决策阶段注入。
 - **过程要点**：
-  - 新表 `strategy_profiles`（`name` / `description` / `enabled` / `priority` / `filters`），随 `create_all` 自动建。
-  - 新增纯函数服务 `services/strategy_profiles.py`：`normalize_filters`（类型收敛、区间交换、边界钳制）、`match_profile`、`prefilter`（按 `priority` 升序，第一条命中即放行）、`summarize`。
-  - 粗筛条件只用**已有批量 ticker**：标的白名单、方向偏好（只做多/只做空/不限）、24h 成交额下限、最新价区间、24h 涨跌幅区间、盘口点差上限（`>0` 才拉盘口，命中 2s 缓存）。RSI/ATR/信号分等需要 K 线的条件仍由粗筛后的全局策略参数判断。
-  - **未配置策略 = 默认全池**（`default=true`），保持旧行为；有策略但全部不命中 ⇒ 该标的本轮连 K 线请求都不发。
-  - 引擎 `_scan` 顺序改为：`tickers` → 策略粗筛 → 只对命中标的拉 `funding/oi/klines`；命中策略的 `side` 会限制信号方向（与量化方向相反则标 `flat` 并写明原因）。
-  - 粗筛结果写入 `engine_state.strategy_filter`，`/engine/status` 暴露 `strategy`（`kept/dropped/matched/profiles`），只有放行名单变化时才写 `strategy` 事件，避免每轮刷屏。
-  - API：`GET/POST/PATCH/DELETE /strategies` + `GET /strategies/preview`（只读、手动触发、用当前行情预览放行结果）；同名策略拒绝、名称长度校验。
-  - 前端新增「策略」页（交易分组）：KPI（总数/当前模式/最近通过/方向偏好）、条件列表、开关、新增/编辑弹窗、预览弹窗；菜单入口 `⚑ 策略`。
-- **验证**：`pytest tests -q` → **110 passed**（新增默认全池、优先级/方向/成交额、区间归一、引擎只对命中标的拉 K 线、策略 CRUD+预览共 5 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+  - 新表 `strategy_profiles`：`name` / `description` / **`rule`（给 AI 的策略正文）** / `enabled` / `priority` / `filters`（仅 `symbols` 白名单 + `side` 方向偏好）；老库启动时幂等 `ALTER` 补 `rule` 列。
+  - 引擎不再预筛标的：`_scan` 恢复 `tickers + funding + oi` 全量取数；`_build_ai_context` 用 `pick_from(symbol, profiles)` 按优先级 + 适用范围挑一条启用策略，放进 `ctx["strategy"]`。
+  - v1 `format_snapshot` 注入 `strategy`；v2 `format_snapshot_v2` 压缩为 `st={n,r,s}`（无策略时省略该键，保持快照体积契约）。`DECISION_SYSTEM` / `SYSTEM_V2` 明写：有策略时按 `rule` 分析，`side=L/S` 锁定方向，策略不可覆盖杠杆上下限、止损与仓位风控。
+  - 策略方向锁在 AI 决策后兜底：策略限定只做多/只做空而 AI 给反向提案 ⇒ 直接拒绝并写入信号原因。
+  - **未配置策略 / 标的不在适用范围 ⇒ `strategy=None`**，AI 按通用铁律分析（默认行为）。
+  - `/engine/status.strategy` 返回 `total/enabled/default/by_side/last_applied`，`last_applied` 只在变化时写库；API `GET/POST/PATCH/DELETE /strategies`（`rule` ≥ 8 字、同名拒绝）+ `/strategies/preview`（纯本地匹配，不拉行情、不耗权重）。
+  - 前端「策略」页改为编辑策略正文（textarea）、适用标的、方向偏好、优先级、启用开关，展示「最近应用」与本地适用范围预览；菜单入口 `⚑ 策略`。
+- **验证**：`pytest tests -q` → **109 passed**（策略优先级/范围选中、无策略返回 None、归一与摘要、AI 上下文注入 v1/v2、CRUD+预览）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
 ---
 
