@@ -102,6 +102,28 @@ function toData(items: Candle[]) {
   }))
 }
 
+/** klinecharts 默认价格精度是 2 位小数：ONE/JCT 这类 0.001~0.01 的币会被显示成 0.00，
+ *  坐标轴也按 0.01 步长展开，看起来像一条直线。按最近价格自动定精度。 */
+function pricePrecisionOf(items: Candle[]): number {
+  const prices = items
+    .slice(-120)
+    .map((c) => Math.abs(Number(c.c)))
+    .filter((v) => v > 0)
+  if (!prices.length) return 2
+  const min = Math.min(...prices)
+  return Math.min(8, Math.max(2, Math.ceil(-Math.log10(min)) + 2))
+}
+
+let appliedPrecision = -1
+
+function applyPrecision() {
+  if (!chart) return
+  const digits = pricePrecisionOf(props.items || [])
+  if (digits === appliedPrecision) return
+  appliedPrecision = digits
+  chart.setPriceVolumePrecision(digits, 2)
+}
+
 function restoreViewport() {
   const space = (chart as any).getBarSpace?.()
   const offset = (chart as any).getOffsetRightDistance?.()
@@ -116,6 +138,7 @@ function restoreViewport() {
 function syncData() {
   if (!chart) return
   const items = props.items || []
+  applyPrecision()
   if (!items.length) {
     chart.applyNewData([])
     rendered = { length: 0, first: 0 }
@@ -150,6 +173,7 @@ function buildChart() {
   if (!el.value) return
   chart = init(el.value, { styles: STYLES })
   if (!chart) return
+  appliedPrecision = -1 // 新实例必须重新设一次精度
   if (props.main && props.main !== 'NONE') {
     chart.createIndicator(props.main, false, { id: 'candle_pane' })
   }

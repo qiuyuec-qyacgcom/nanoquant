@@ -1052,6 +1052,20 @@
   无「静态价格」、无「暂无 K 线数据」；82 passed、`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
 - **提示**：前端 dist 更新后浏览器可能仍用旧 `index.html`，遇到异常先 `Ctrl+F5` 强刷。
 
+### 74. 修复小价格标的 K 线精度（直线 / 0 的真正原因）（本次执行）
+- **状态**：✅ 已完成
+- **现象**：修完 #73 后用户截图仍异常 —— `JCTUSDT 5m`、`ONEUSDT 5m/15m` 的 K 线是一条直线，
+  tooltip 的 Open/High/Low/Close 全是 `0.00`，价格轴却从 `-0.02` 到 `0.05`；顶部报价正常（0.009523 / 0.001485）。
+- **根因**：`klinecharts` 默认价格精度是 **2 位小数**。BTC/ETH 在 1e3 级别没问题，但 ONE（0.001485）、
+  JCT（0.009523）会被四舍五入成 `0.00 / 0.01`；坐标轴按 0.01 步长展开，所有蜡烛挤在同一根水平线上。
+  与行情源、模拟盘、标的池都无关，**纯前端显示精度问题**。
+- **修复**：`KlineChartPanel` 新增 `pricePrecisionOf()`：取最近 120 根最小价格，
+  `digits = clamp(ceil(-log10(minPrice)) + 2, 2, 8)`（ONE→5 位、JCT→5 位、BTC→2 位），
+  调 `chart.setPriceVolumePrecision(digits, 2)`；数据/标的变化时重算，图表实例重建时重置缓存。
+- **实测**：Playwright 读图表实例 `precision={price:5, volume:2}`、最后一根
+  `close=0.001438`；截图确认 ONEUSDT 5m 轴刻度 `0.00144 ~ 0.00152`、蜡烛 OHLC 清晰，不再是一条线。
+- **验证**：82 passed、`vue-tsc` 0 error、`npm run build` 通过、Edge e2e 3 passed。
+
 ---
 
 ## 二、未开始
