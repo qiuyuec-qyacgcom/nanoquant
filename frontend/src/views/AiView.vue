@@ -528,7 +528,7 @@ onMounted(loadAll)
         </table>
       </div>
       <div v-if="testResult" class="panel-body">
-        <div class="note" :style="{ borderLeftColor: testResult.ok ? '#12c48b' : '#f04b5a' }">
+        <div class="note" :class="testResult.ok ? 'ok' : 'error'">
           <div class="row" style="gap: 8px; margin-bottom: 4px">
             <span class="tag" :class="testResult.ok ? 'tag-long' : 'tag-short'">{{ testResult.ok ? '连通正常' : '调用失败' }}</span>
             <span class="muted">{{ testResult.latency_ms }}ms · {{ testResult.model }}</span>

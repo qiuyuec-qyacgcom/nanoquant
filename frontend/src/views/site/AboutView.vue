@@ -48,7 +48,7 @@ onMounted(async () => {
         <div v-for="(c, i) in chain" :key="c.step" class="panel">
           <div class="panel-body">
             <div class="row" style="gap: 8px; margin-bottom: 6px">
-              <span class="flow-idx" style="background: #16233a; border: 1px solid var(--line); color: #9fb6d6">{{ i + 1 }}</span>
+              <span class="step-idx">{{ i + 1 }}</span>
               <b style="font-size: 12.5px">{{ c.step }}</b>
             </div>
             <div class="muted" style="font-size: 11.5px; line-height: 1.8">{{ c.desc }}</div>

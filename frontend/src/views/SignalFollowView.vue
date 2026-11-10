@@ -276,7 +276,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         </div>
 
         <div class="panel-body stack" style="gap: 14px">
-          <div class="note" style="border-left-color: var(--warn)">
+          <div class="note warn">
             开仓杠杆 = 原信号杠杆 + {{ form.leverage_bonus }}x，再受本系统 <code>max_leverage</code> 与交易所上限钳制；
             数量、保证金、止损止盈全部按本系统风险预算与可用余额计算，不复制信号方仓位。
             <b>关闭「演练模式」即会真实下单，需人工明确授权。</b>
@@ -389,11 +389,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
               {{ !ready ? '状态接口不可用' : (status?.path || '未发现 signals.jsonl') }}
             </div>
           </div>
-          <div v-if="loadError" class="note" style="border-left-color: var(--down)">
+          <div v-if="loadError" class="note error">
             {{ loadError }}
             <div class="hint">原因只在此处常驻展示，不会随自动刷新反复弹出；打开「启用信号跟单」开关时提醒一次。</div>
           </div>
-          <div v-if="status?.last_error" class="note" style="border-left-color: var(--down)">
+          <div v-if="status?.last_error" class="note error">
             最近错误：{{ status.last_error }}
           </div>
 

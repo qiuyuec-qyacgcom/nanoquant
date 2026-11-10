@@ -516,7 +516,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <div v-if="chartStatic" class="note" style="margin: 0 0 8px; border-left-color: #f2c94c">
+              <div v-if="chartStatic" class="note warn" style="margin: 0 0 8px">
                 {{ selected }} 在当前环境（模拟盘）没有真实成交，K 线是交易所返回的静态价格（直线），
                 价格与成交量都不变化；引擎的 ATR / 量比闸门会自动跳过它，不会开仓。
                 切到实盘或换一个有成交的标的即可。
@@ -543,7 +543,7 @@ onBeforeUnmount(() => {
                   </template>
                 </div>
               </div>
-              <div v-if="chartError" class="note" style="margin: 8px 0 0; border-left-color: #f07178">
+              <div v-if="chartError" class="note error" style="margin: 8px 0 0">
                 {{ selected }} 行情暂不可用：{{ chartError }}
               </div>
             </div>

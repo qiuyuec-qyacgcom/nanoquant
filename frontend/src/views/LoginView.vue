@@ -50,7 +50,7 @@ async function submit() {
           <span class="label">密码</span>
           <input v-model="password" type="password" class="input" autocomplete="current-password" placeholder="首次登录: admin123" />
         </div>
-        <div v-if="error" class="note" style="border-left-color: #f04b5a; color: #ff9aa3">{{ error }}</div>
+        <div v-if="error" class="note error">{{ error }}</div>
         <button class="btn btn-primary" type="submit" :disabled="loading" style="justify-content: center; padding: 10px">
           {{ loading ? '验证中…' : '进入后台' }}
         </button>

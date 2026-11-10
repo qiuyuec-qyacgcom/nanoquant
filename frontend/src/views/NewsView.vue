@@ -153,7 +153,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
       </div>
     </div>
 
-    <div v-if="failedSources.length" class="note" style="border-left-color: #f0a92a">
+    <div v-if="failedSources.length" class="note warn">
       以下源抓取失败:
       <b v-for="s in failedSources" :key="s.id" style="margin: 0 6px">{{ s.label }}</b>
       —— {{ failedSources[0].error }}
@@ -187,7 +187,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         </div>
 
         <div v-if="aiResult" class="note" style="margin-top: 12px">
-          <div v-if="!aiResult.ok" style="color: #ff9aa3">{{ aiResult.error }}</div>
+          <div v-if="!aiResult.ok" class="down">{{ aiResult.error }}</div>
           <template v-else>
             <div style="font-size: 12.5px; line-height: 1.8">{{ aiResult.summary?.summary }}</div>
             <div class="row" style="margin-top: 6px; gap: 6px">
@@ -239,7 +239,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <div class="spacer" />
           <button class="btn btn-sm" :disabled="checking" @click="checkSources">重新检测</button>
         </div>
-        <div v-if="diag.suggestion" class="note" style="border-left-color: #f04b5a">{{ diag.suggestion }}</div>
+        <div v-if="diag.suggestion" class="note error">{{ diag.suggestion }}</div>
         <table class="table">
           <thead>
             <tr><th>资讯源</th><th>状态</th><th>耗时</th><th>条数</th><th>失败原因 / 建议</th></tr>

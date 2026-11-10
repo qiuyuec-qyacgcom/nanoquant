@@ -76,7 +76,7 @@ onMounted(async () => {
       </aside>
 
       <main class="site-main">
-        <div v-if="error" class="note" style="border-left-color: #f07178">
+        <div v-if="error" class="note error">
           无法连接服务: {{ error }}。请确认后端已启动（默认 8899 端口）。
         </div>
 

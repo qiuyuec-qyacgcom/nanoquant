@@ -158,9 +158,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
 .landing-hero {
   overflow: hidden;
   background:
-    radial-gradient(120% 140% at 0% 0%, rgba(59, 130, 246, 0.16), transparent 55%),
-    radial-gradient(90% 120% at 100% 0%, rgba(18, 196, 139, 0.1), transparent 60%),
-    #0a1220;
+    radial-gradient(120% 140% at 0% 0%, rgba(16, 185, 129, 0.14), transparent 55%),
+    radial-gradient(90% 120% at 100% 0%, rgba(52, 211, 153, 0.1), transparent 60%),
+    #0e1118;
 }
 .landing-grid {
   display: grid;
@@ -235,14 +235,14 @@ onBeforeUnmount(() => window.clearInterval(timer))
   margin-top: 4px;
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(59, 130, 246, 0.16);
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  color: #9dc1ff;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.32);
+  color: #6ee7b7;
   font-size: 11.5px;
   text-decoration: none;
 }
 .status-cta:hover {
-  background: rgba(59, 130, 246, 0.24);
+  background: rgba(16, 185, 129, 0.22);
 }
 .entry {
   text-decoration: none;
@@ -250,7 +250,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
   transition: border-color 0.15s, transform 0.15s;
 }
 .entry:hover {
-  border-color: #2f5fa8;
+  border-color: rgba(16, 185, 129, 0.38);
   transform: translateY(-1px);
 }
 .entry-ico {
@@ -259,8 +259,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
   display: grid;
   place-items: center;
   border-radius: 8px;
-  background: rgba(59, 130, 246, 0.12);
-  color: #9dc1ff;
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
   margin-bottom: 10px;
 }
 .entry-title {

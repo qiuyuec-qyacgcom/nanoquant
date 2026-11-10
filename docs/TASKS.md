@@ -1189,6 +1189,17 @@
   - 入池 `note` 标注「股票/商品类永续」；候选接口返回 `contract_type / underlying_type / is_equity`，前端候选列表加「股票」标签并更新说明文案。
 - **验证**：`pytest tests -q` → **111 passed**（新增 TRADIFI 入池、休市 BREAK、交割拒绝、环境提示、候选标注共 2 条用例）；`compileall`/`vue-tsc`/`npm run build` 通过；重启后实测模拟盘 `TSLAUSDT` 添加成功（precision=2、tick=0.01000、min_notional=5）并删除恢复，`AAPLUSDT` 返回环境提示，池恢复原 8 个标的。
 
+### 83. 前后台 UI / 视觉体系统一
+- **状态**：✅ 已完成（仅样式层与两处模板结构，业务逻辑与接口零改动）
+- **目标**：统一设计语言与组件规范，优化信息层级与响应式，消除样式冗余与内联硬编码。
+- **过程要点**：
+  - **设计令牌**：`:root` 补齐间距 `--sp-*`、字号 `--fs-*`、圆角 `--r-*`、阴影 `--shadow-*`、动效 `--ease/--dur-*`、层级 `--z-*`、布局 `--content-max/--sidebar-w/--topbar-h`；侧栏、顶栏、内容区改用变量，宽屏内容居中限宽 1440。
+  - **组件统一层**（`main.css` 末尾，兼容既有类名）：按钮补 `:active` / `:focus-visible` / `.btn-ghost` / `.btn-icon` / `.btn-block`；输入框统一圆角与 hover/focus/disabled 态；表格数字对齐、`.table-sm`、滚动容器内 `min-width:max-content`（宽表横滚而非压缩列）；标签统一高度/圆角；新增语义便签 `.note.warn/.error/.ok`；弹窗统一圆角/阴影/进出场动画，移动端变底部抽屉；`.panel` 圆角过渡；`.skeleton` 加载态；`.step-idx` 徽章。
+  - **响应式**：后台 ≤860px 侧栏改为**抽屉**（汉堡按钮 + 遮罩 + 点击/Esc 关闭 + 路由切换自动收起 + 背景滚动锁定），删除横向滚动 `mobile-nav`；≤560px 面板头换行、事件行两行布局、小屏隐藏权益；前台 tabbar 适配 `safe-area-inset-bottom`，头部单行化。
+  - **前后台一致性**：前台语义色（涨/跌/警告）与后台统一，圆角尺度对齐；首页/关于页蓝色硬编码改品牌绿，`.site .brand-mark` 绿色渐变。
+  - **消除冗余**：删除 `mobile-nav` / `flatNav` 死代码；9 处内联便签颜色改语义类；3 处内联十六进制颜色改变量/语义类；`Modal` 补 `role="dialog"` / `aria-modal` / Esc 关闭。
+- **验证**：`vue-tsc --noEmit` 0 error、`npm run build` 通过；Playwright 实拍桌面 1440 与移动 390（后台总览/策略/参数配置、移动抽屉、底部抽屉弹窗、前台首页）均正常；宽表在移动端横向滚动、不再重叠。
+
 ---
 
 ## 二、未开始

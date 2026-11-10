@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
@@ -35,11 +35,23 @@ const nav = [
   ]},
 ]
 
-const flatNav = computed(() => nav.flatMap((g) => g.items))
 const title = computed(() => (route.meta.title as string) || 'NanoQuant')
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
+
+/** 移动端抽屉：切换路由后自动收起，避免遮挡内容 */
+const navOpen = ref(false)
+watch(
+  () => route.path,
+  () => {
+    navOpen.value = false
+  },
+)
+// 抽屉展开时锁定背景滚动，收起/卸载时恢复
+watch(navOpen, (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+})
 
 let timer: number | undefined
 let ws: WebSocket | null = null
@@ -105,12 +117,15 @@ onBeforeUnmount(() => {
   window.clearInterval(timer)
   window.clearTimeout(wsRetry)
   ws?.close()
+  document.body.style.overflow = ''
 })
 </script>
 
 <template>
-  <div class="shell">
+  <div class="shell" :class="{ 'nav-open': navOpen }">
+    <div v-if="navOpen" class="drawer-mask" @click="navOpen = false" />
     <aside class="sidebar">
+      <button class="drawer-close" type="button" aria-label="关闭菜单" @click="navOpen = false">×</button>
       <div class="brand">
         <div class="brand-mark">N</div>
         <div>
@@ -151,6 +166,7 @@ onBeforeUnmount(() => {
 
     <div class="main">
       <header class="topbar">
+        <button class="nav-toggle" type="button" aria-label="打开菜单" @click="navOpen = true">☰</button>
         <div>
           <div class="page-title">{{ title }}</div>
           <div class="page-sub">小资金 · 币安 U 本位永续 · 超短线</div>
@@ -159,7 +175,7 @@ onBeforeUnmount(() => {
           <span class="tag" :class="status?.mode === 'live' ? 'tag-short' : 'tag-long'">
             {{ status?.mode === 'live' ? 'LIVE 实盘' : 'DEMO 模拟盘' }}
           </span>
-          <div class="field" style="align-items: flex-end; gap: 2px">
+          <div class="field hide-sm" style="align-items: flex-end; gap: 2px">
             <span class="mono" style="font-size: 14px">{{ fmt(equity, 4) }} USDT</span>
             <span class="mono" style="font-size: 10.5px" :class="pnl >= 0 ? 'up' : 'down'">
               浮盈亏 {{ pnl >= 0 ? '+' : '' }}{{ fmt(pnl, 4) }}
@@ -168,26 +184,15 @@ onBeforeUnmount(() => {
           <button class="btn" :class="status?.enabled ? 'btn-danger' : 'btn-primary'" :disabled="!status" @click="toggleEngine">
             {{ status?.enabled ? '停止引擎' : '启动引擎' }}
           </button>
-          <button class="btn btn-sm" title="退出登录" @click="logout">退出</button>
+          <button class="btn btn-sm btn-ghost" title="退出登录" @click="logout">退出</button>
         </div>
       </header>
 
-      <nav class="mobile-nav">
-        <router-link
-          v-for="item in flatNav"
-          :key="item.path"
-          :to="item.path"
-          :class="{ active: route.path === item.path }"
-        >
-          {{ item.label }}
-        </router-link>
-      </nav>
-
       <main class="content">
-        <div v-if="status?.last_error" class="note" style="margin-bottom: 12px; border-left-color: #f04b5a">
+        <div v-if="status?.last_error" class="note error" style="margin-bottom: 12px">
           引擎最近错误: {{ status.last_error }}
         </div>
-        <div v-if="status?.halted" class="note" style="margin-bottom: 12px; border-left-color: #f0a92a">
+        <div v-if="status?.halted" class="note warn" style="margin-bottom: 12px">
           风控提示: {{ status.halted }}
         </div>
         <router-view />
