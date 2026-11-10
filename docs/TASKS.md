@@ -1148,6 +1148,20 @@
   - 信号跟单与「开仓检查」页的杠杆口径同步到同一套上下限，避免两处漂移。
 - **验证**：`pytest tests -q` → **103 passed**（新增 `choose_leverage` 上下限钳制、交易所优先、决策上下文隔离心法规则 2 条契约）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
 
+### 80. 币安限频（-1003）治理
+- **状态**：✅ 已完成
+- **现象**：`BinanceError: [-1003] 币安限频冷却中, 剩余 143s`；同时 `/api/v1/engine/protection` 返回 500，日志为 `NameError: name 'BinanceError' is not defined`（`trade.py` 忘记导入）。
+- **根因**：
+  1. `protection_orders()` 的 `except BinanceError` 名字未定义，限频时把本可降级的错误放大成 500 堆栈；
+  2. 总览每 8s 轮询 `account()`(权重 5) + `open_algo_orders()` + `book_tickers()`，多标签页/多面板并发时重复打交易所；
+  3. `WeightLimiter.acquire` 令牌不足时无限 sleep 排队，限频期间请求堆积到超时。
+- **过程要点**：
+  - `trade.py` 补 `BinanceError` 导入；保护单接口在 `-1003` 时返回 `200 + {items: [], degraded: true, reason}`，其它交易所错误仍是 503。
+  - `client.account()` 增加 1.5s 短缓存（多面板同一时刻只打一次 `/fapi/v3/account`）；`open_algo_orders()` 增加 5s 缓存，撤单链路 `cancel_all_algo` 强制 `fresh=True` 防漏撤。
+  - `WeightLimiter.acquire` 增加 `MAX_WAIT_SEC=5s` 上限，超时快速失败（`RateLimited`），避免排队雪崩；封禁仍按 `MAX_BAN_HONOR_SEC=180s` 试探式恢复。
+  - `/engine/status` 新增 `rate_limit`（`banned` / `ban_remaining` / `used_weight` / `capacity`）；总览展示「交易所限频冷却 Ns（权重 x/2400）」，保护单空态在限频时说明原因而不是假装没有保护单。
+- **验证**：`pytest tests -q` → **105 passed**（新增保护单限频降级/非限频 503、权重快速失败 2 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过。
+
 ---
 
 ## 二、未开始

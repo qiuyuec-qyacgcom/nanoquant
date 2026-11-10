@@ -255,6 +255,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
             · 账户 {{ (status?.account as any)?.error ? '不可用：' + (status?.account as any)?.error : '已同步' }}
             · 心跳 {{ (status?.heartbeat_age ?? -1) >= 0 ? status?.heartbeat_age + 's 前' : '无' }}
             · 数据延迟 {{ status?.last_cycle_ms }}ms
+            <template v-if="status?.rate_limit?.banned">
+              · <span class="down">交易所限频冷却 {{ status.rate_limit.ban_remaining }}s（权重 {{ status.rate_limit.used_weight }}/{{ status.rate_limit.capacity }}）</span>
+            </template>
           </div>
           <div class="grid g3" style="gap: 10px">
             <div class="metric"><span>单笔风险</span><span>{{ app.settings.risk?.risk_per_trade_pct ?? '-' }}%</span></div>
@@ -476,7 +479,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
               </td>
             </tr>
             <tr v-if="!protection.length">
-              <td colspan="8" class="empty">当前没有挂着保护单 · 开仓成功后会自动挂止损与止盈</td>
+              <td colspan="8" class="empty">
+                {{ status?.rate_limit?.banned
+                  ? `交易所限频冷却中（剩余 ${status.rate_limit.ban_remaining}s），保护单列表暂不可用；冷却结束后自动恢复`
+                  : '当前没有挂着保护单 · 开仓成功后会自动挂止损与止盈' }}
+              </td>
             </tr>
           </tbody>
         </table>

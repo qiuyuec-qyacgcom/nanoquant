@@ -1539,6 +1539,13 @@ class TradingEngine:
                 "dead_letters": dead_letters,
             },
             "ai_ready": self._ai_ready(),
+            # 交易所限频观测: 前端据此提示「冷却剩余 Ns」，而不是反复弹 -1003 错误
+            "rate_limit": {
+                "banned": binance_client.weight.banned,
+                "ban_remaining": int(binance_client.weight.ban_remaining()),
+                "used_weight": binance_client.weight.used_weight,
+                "capacity": binance_client.weight.capacity,
+            },
             "cycle_timings": __import__("json").loads(state.get("cycle_timings", "{}") or "{}"),
         }
 

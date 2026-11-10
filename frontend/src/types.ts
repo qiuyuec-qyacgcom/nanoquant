@@ -58,6 +58,13 @@ export interface EngineStatus {
   halted: string
   account: Account
   positions: Position[]
+  /** 交易所限频观测（后端 WeightLimiter 状态） */
+  rate_limit?: {
+    banned: boolean
+    ban_remaining: number
+    used_weight: number
+    capacity: number
+  }
   stats: {
     trades: number
     win_rate: number

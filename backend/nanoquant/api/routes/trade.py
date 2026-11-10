@@ -9,6 +9,7 @@ from ...db import session_scope
 from ...engine.worker import engine
 from ...evolution.review import trade_stats
 from ...exchange.broker import get_broker
+from ...exchange.client import BinanceError
 from ...exchange.client import client as binance_client
 from ...models import EquityPoint, OrderRecord, PositionRecord, Signal, TradeRecord
 from ...security import decrypt_secret
@@ -280,6 +281,10 @@ async def protection_orders(user: str = Depends(current_user)) -> dict:
     try:
         rows = await binance_client.open_algo_orders()
     except BinanceError as exc:
+        # 限频冷却期间降级为空列表而不是 5xx: 前端每 8s 轮询, 报错只会刷屏;
+        # 保护单本身仍挂在交易所, 冷却结束后的下一次轮询即可恢复展示。
+        if exc.code == -1003:
+            return {"items": [], "degraded": True, "reason": f"交易所限频冷却中: {exc.message}"}
         raise HTTPException(status_code=503, detail=f"查询保护单失败: {exc.message}") from exc
 
     symbols = sorted({str(r.get("symbol")) for r in rows if isinstance(r, dict) and r.get("symbol")})

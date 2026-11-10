@@ -20,6 +20,8 @@ _BAN_RE = re.compile(r"banned until (\d{13})")
 #: 直接按字面值熔断会让整个面板"假死", 所以本地最多只认 3 分钟,
 #: 到点先试探一次: 仍被封就再续 3 分钟, 已解封就立即恢复。
 MAX_BAN_HONOR_SEC = 180.0
+#: 令牌不足时的最大排队时间。超过就快速失败，避免请求在网关里堆到超时（雪崩）。
+MAX_WAIT_SEC = 5.0
 
 
 class RateLimited(RuntimeError):
@@ -79,6 +81,7 @@ class WeightLimiter:
         return self._used_header
 
     async def acquire(self, weight: int = 1) -> None:
+        started = time.monotonic()
         while True:
             async with self._lock:
                 self._refill()
@@ -89,6 +92,10 @@ class WeightLimiter:
                     self._tokens -= weight
                     return
                 wait = (weight - self._tokens) * self.window / self.capacity
+            if time.monotonic() - started >= MAX_WAIT_SEC:
+                raise RateLimited(
+                    f"本地权重预算不足 (近1分钟已用 {self._used_header}/{self.capacity}), 请稍后重试"
+                )
             await asyncio.sleep(min(2.0, max(0.03, wait)))
 
 

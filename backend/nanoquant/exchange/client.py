@@ -183,6 +183,12 @@ class BinanceClient:
         self._funding: dict[str, float] = {}
         self._funding_ts = 0.0
         self._oi: dict[str, tuple[float, float]] = {}
+        #: 账户快照短缓存: 多个前端面板/引擎在同一时刻读取时, 只打一次 /fapi/v3/account
+        self._account_cache: dict[str, Any] | None = None
+        self._account_ts = 0.0
+        #: 保护单(Algo)查询短缓存: 前端 8s 轮询, 多标签页合并成一次 REST
+        self._algo_cache: list[dict] | None = None
+        self._algo_ts = 0.0
         self._lock = asyncio.Lock()
 
     # -------------------------------------------------------------- lifecycle
@@ -207,6 +213,10 @@ class BinanceClient:
             self._funding = {}
             self._funding_ts = 0.0
             self._oi = {}
+            self._account_cache = None
+            self._account_ts = 0.0
+            self._algo_cache = None
+            self._algo_ts = 0.0
         return env
 
     async def _client(self) -> httpx.AsyncClient:
@@ -595,8 +605,20 @@ class BinanceClient:
         r = await client.get(f"{base}/fapi/v1/ping", timeout=6)
         return r.status_code == 200
 
-    async def account(self) -> dict:
-        return await self._request("GET", "/fapi/v3/account", weight=5)
+    async def account(self, *, fresh: bool = False) -> dict:
+        """账户快照；默认 1.5s 内复用上一次结果，避免多面板并发重复打点.
+
+        下单/平仓等写操作不受影响（它们走独立的 order 通道）；
+        需要确认余额时传 ``fresh=True`` 跳过缓存。
+        """
+        now = time.time()
+        if not fresh and self._account_cache is not None and now - self._account_ts < 1.5:
+            return dict(self._account_cache)
+        data = await self._request("GET", "/fapi/v3/account", weight=5)
+        if isinstance(data, dict):
+            self._account_cache = dict(data)
+            self._account_ts = now
+        return data
 
     async def balance(self) -> list[dict]:
         return await self._request("GET", "/fapi/v3/balance", weight=5)
@@ -632,18 +654,29 @@ class BinanceClient:
         """条件单(止损/止盈): 币安已把 closePosition 类订单迁到 Algo 接口."""
         return await self._request("POST", "/fapi/v1/algoOrder", params, weight=1, order=True)
 
-    async def open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+    async def open_algo_orders(self, symbol: str | None = None, *, fresh: bool = False) -> list[dict]:
+        """交易所侧保护单；无 symbol 时 5s 内复用，抵掉前端多标签页的重复轮询.
+
+        撤单链路必须传 ``fresh=True``，否则 5s 内刚挂出的保护单可能查不到而漏撤。
+        """
+        now = time.time()
+        if symbol is None and not fresh and self._algo_cache is not None and now - self._algo_ts < 5.0:
+            return list(self._algo_cache)
         params = {"symbol": symbol} if symbol else {}
         data = await self._request("GET", "/fapi/v1/openAlgoOrders", params, weight=1)
         if isinstance(data, dict):
             rows = data.get("orders") or data.get("data") or []
         else:
             rows = data
-        return rows if isinstance(rows, list) else []
+        out = rows if isinstance(rows, list) else []
+        if symbol is None:
+            self._algo_cache = list(out)
+            self._algo_ts = now
+        return out
 
     async def cancel_all_algo(self, symbol: str | None = None) -> int:
         """没有"一键撤全部"接口, 只能列出来逐个撤."""
-        rows = await self.open_algo_orders(symbol)
+        rows = await self.open_algo_orders(symbol, fresh=True)
         count = 0
         for row in rows:
             algo_id = row.get("algoId") if isinstance(row, dict) else None

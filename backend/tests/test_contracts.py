@@ -1857,6 +1857,26 @@ def test_choose_leverage_clamps_ai_to_global_floor_and_cap():
     assert choose_leverage("BTCUSDT", engine, low, f, 1) == 1        # 下限最低 1x
 
 
+def test_weight_limiter_fails_fast_instead_of_queueing(monkeypatch):
+    """令牌不足时最多排队 MAX_WAIT_SEC，超时快速失败，避免限频期间请求堆积."""
+    import asyncio
+
+    from nanoquant.exchange import ratelimit
+
+    async def run():
+        limiter = ratelimit.WeightLimiter(capacity=10, window=60.0)
+        await limiter.acquire(10)  # 用光令牌
+        monkeypatch.setattr(ratelimit, "MAX_WAIT_SEC", 0.0)
+        try:
+            await limiter.acquire(1)
+        except ratelimit.RateLimited as exc:
+            assert "权重预算不足" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("默认应快速失败，而不是挂起排队")
+
+    asyncio.run(run())
+
+
 def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeypatch):
     """决策上下文显式给出全局区间，且不再把心法规则原文（可能含杠杆建议）塞给模型."""
     from types import SimpleNamespace

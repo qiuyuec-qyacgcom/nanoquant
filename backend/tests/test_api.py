@@ -219,6 +219,30 @@ def test_evolution_batch_review_and_health_endpoints(client):
     assert inj["stats"]["min_lesson_sample"] >= 2
 
 
+def test_engine_protection_degrades_on_rate_limit(client, monkeypatch):
+    """限频时保护单接口降级为 200 空列表，其它交易所错误仍应是 503 而不是 NameError 500."""
+    from nanoquant.api.routes import trade as trade_routes
+    from nanoquant.exchange.client import BinanceError
+
+    headers = _token(client)
+
+    async def limited(*args, **kwargs):  # noqa: ARG001
+        raise BinanceError(-1003, "banned until 1794300000000")
+
+    monkeypatch.setattr(trade_routes.binance_client, "open_algo_orders", limited)
+    res = client.get(f"{API}/engine/protection", headers=headers)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["items"] == [] and body["degraded"] is True
+    assert "限频" in body["reason"]
+
+    async def broken(*args, **kwargs):  # noqa: ARG001
+        raise BinanceError(-1021, "timestamp outside recvWindow")
+
+    monkeypatch.setattr(trade_routes.binance_client, "open_algo_orders", broken)
+    assert client.get(f"{API}/engine/protection", headers=headers).status_code == 503
+
+
 def test_provider_reasoning_effort_roundtrip(client):
     headers = _token(client)
     body = {
