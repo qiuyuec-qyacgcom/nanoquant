@@ -7,7 +7,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { http } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { timeStr } from '../utils/format'
+import { ago, fmt, px, timeStr } from '../utils/format'
 
 interface FollowSettings {
   enabled: boolean
@@ -22,6 +22,9 @@ interface FollowSettings {
   default_sl_pct: number
   dry_run: boolean
 }
+
+type BoolKey = 'enabled' | 'auto_add_symbol' | 'strict_events' | 'dry_run'
+type NumKey = 'poll_sec' | 'leverage_bonus' | 'max_age_sec' | 'max_per_hour' | 'default_sl_pct'
 
 interface FollowRow {
   id: number
@@ -68,22 +71,48 @@ const DEFAULTS: FollowSettings = {
 }
 const form = reactive<FollowSettings>({ ...DEFAULTS })
 
-const STATUS_LABEL: Record<string, string> = {
-  opened: '已跟仓', dry_run: '演练', skipped: '跳过', error: '失败',
-  duplicate: '重复', processing: '处理中',
+const STATUS_LABELS: Record<string, { text: string; cls: string }> = {
+  opened: { text: '已跟仓', cls: 'tag-long' },
+  dry_run: { text: '演练', cls: 'tag-blue' },
+  skipped: { text: '跳过', cls: 'tag-warn' },
+  error: { text: '失败', cls: 'tag-short' },
+  duplicate: { text: '重复', cls: 'tag-dim' },
+  processing: { text: '处理中', cls: 'tag-ai' },
 }
-const COUNT_LABEL: Record<string, string> = {
-  opened: '已跟仓', dry_run: '演练', skipped: '跳过', error: '失败',
-  duplicate: '重复', processing: '处理中',
-}
-const numericFields = ['poll_sec', 'leverage_bonus', 'max_age_sec', 'max_per_hour', 'default_sl_pct'] as const
 
-const counts = computed(() => {
-  const out: { key: string; label: string; value: number }[] = []
-  for (const key of Object.keys(COUNT_LABEL)) {
-    out.push({ key, label: COUNT_LABEL[key], value: status.value?.counts?.[key] ?? 0 })
+const toggles: { key: BoolKey; label: string; hint: string }[] = [
+  { key: 'enabled', label: '启用信号跟单', hint: '关闭后既不读文件也不接收直推' },
+  { key: 'auto_add_symbol', label: '标的自动补池', hint: '池内没有时用币安在线合约表校验后加入' },
+  { key: 'strict_events', label: '未知事件严格拒绝', hint: '模板变体默认只告警并放行，开启后一律跳过' },
+  { key: 'dry_run', label: '演练模式', hint: '只记录意图不下单；关闭即真实跟单' },
+]
+const numberFields: { key: NumKey; label: string; hint: string; min: number; max: number; step: number; unit: string }[] = [
+  { key: 'poll_sec', label: '本地文件轮询', hint: '增量读本地 jsonl，非 Telegram 轮询', min: 1, max: 60, step: 1, unit: '秒' },
+  { key: 'max_age_sec', label: '信号有效期', hint: '超时跳过，防重启补开旧单', min: 5, max: 3600, step: 1, unit: '秒' },
+  { key: 'leverage_bonus', label: '杠杆加成', hint: '原信号杠杆 +N，仍受系统上限钳制', min: 0, max: 100, step: 1, unit: 'x' },
+  { key: 'max_per_hour', label: '每小时跟单上限', hint: '按已成交笔数做频控', min: 1, max: 100, step: 1, unit: '笔' },
+  { key: 'default_sl_pct', label: '缺省止损', hint: '信号未给止损时使用', min: 0.1, max: 20, step: 0.1, unit: '%' },
+]
+const NUM_KEYS: NumKey[] = numberFields.map((f) => f.key)
+
+const CURL_EXAMPLE = `curl -X POST /api/v1/signal-follow/ingest \\
+  -H "X-Signal-Token: <密钥>" -H "Content-Type: application/json" \\
+  -d '{"id":"123","event":"开仓","symbol":"BTCUSDT","side":"long","leverage":"20x"}'`
+
+const ready = computed(() => !!status.value)
+const listening = computed(() => !!(status.value?.running && status.value?.settings?.enabled))
+const counts = computed<Record<string, number>>(() => {
+  const raw = status.value?.counts || {}
+  return {
+    opened: raw.opened || 0, dry_run: raw.dry_run || 0, skipped: raw.skipped || 0,
+    error: raw.error || 0, duplicate: raw.duplicate || 0, processing: raw.processing || 0,
   }
-  return out
+})
+const dirty = computed(() => {
+  const saved = status.value?.settings
+  if (!saved) return false
+  const keys = Object.keys(DEFAULTS) as (keyof FollowSettings)[]
+  return keys.some((k) => (k === 'ingest_token' ? !!form[k] : form[k] !== saved[k]))
 })
 
 async function load() {
@@ -96,7 +125,10 @@ async function load() {
     status.value = st
     events.value = ev.items || []
   } catch (err: any) {
-    app.notify(err?.message || '加载失败', 'error')
+    app.notify(
+      err?.status === 404 ? '信号跟单接口不可用：请重启后端服务以加载新路由' : (err?.message || '加载失败'),
+      'error',
+    )
   } finally {
     loading.value = false
   }
@@ -107,15 +139,19 @@ function applySettings(s: FollowSettings) {
   Object.assign(form, s, { ingest_token: '' })
 }
 
+function toggle(key: BoolKey) {
+  form[key] = !form[key]
+}
+
 async function save() {
   saving.value = true
   try {
     const patch: Record<string, any> = { ...form }
-    for (const key of numericFields) patch[key] = Number(patch[key])
+    for (const key of NUM_KEYS) patch[key] = Number(patch[key])
     if (!patch.ingest_token && status.value?.ingest_token_set) delete patch.ingest_token
     const data = await app.saveGroup('signal_follow', patch)
     applySettings(data)
-    app.notify('配置已保存（1 秒内生效，无需重启）', 'ok')
+    app.notify('配置已保存并生效（无需重启）', 'ok')
     await load()
   } catch (err: any) {
     app.notify(err?.message || '保存失败', 'error')
@@ -128,7 +164,10 @@ async function runOp(path: string, label: string) {
   busy.value = true
   try {
     const res = await http.post(path)
-    app.notify(`${label}：${res.processed !== undefined ? `处理 ${res.processed} 行` : res.ok ? '完成' : res.reason || '完成'}`, 'ok')
+    const detail = res.processed !== undefined
+      ? `处理 ${res.processed} 行`
+      : res.ok ? '完成' : (res.reason || '完成')
+    app.notify(`${label}：${detail}`, 'ok')
     await load()
   } catch (err: any) {
     app.notify(err?.message || `${label}失败`, 'error')
@@ -137,8 +176,8 @@ async function runOp(path: string, label: string) {
   }
 }
 
-function statusClass(s: string) {
-  return s === 'opened' ? 'tag-long' : s === 'error' ? 'tag-short' : 'tag-dim'
+function tagOf(s: string) {
+  return (STATUS_LABELS[s] || { text: s, cls: 'tag-dim' })
 }
 
 let timer: number | undefined
@@ -151,110 +190,241 @@ onBeforeUnmount(() => window.clearInterval(timer))
 </script>
 
 <template>
-  <div class="stack" style="gap: 12px">
+  <div class="stack">
     <div class="panel">
-      <div class="panel-hd">
-        <span class="panel-title">信号跟单 · 链路状态</span>
-        <div class="right">
-          <span class="tag" :class="status?.running && status?.settings?.enabled ? 'tag-long' : 'tag-dim'">
-            {{ status?.running && status?.settings?.enabled ? '监听中' : '已关闭' }}
+      <div class="panel-body" style="padding: 16px 20px">
+        <div class="row" style="gap: 10px; flex-wrap: wrap">
+          <span class="panel-title" style="font-size: 14px">外部信号跟单</span>
+          <span class="tag tag-dim">ao-monitor</span>
+          <span class="tag tag-dim">开仓即跟</span>
+          <span class="tag tag-dim">+{{ form.leverage_bonus }}x 杠杆</span>
+          <span class="tag tag-dim">系统资金</span>
+          <div class="spacer" />
+          <span class="dot" :class="!ready ? 'warn' : listening ? 'on' : 'off'" />
+          <span class="muted" style="font-size: 11px">{{ !ready ? '状态读取中' : listening ? '监听中' : '未启用' }}</span>
+          <span v-if="ready" class="tag" :class="status?.settings?.dry_run ? 'tag-warn' : 'tag-short'">
+            {{ status?.settings?.dry_run ? '演练 · 只记录' : '实盘跟单' }}
           </span>
-          <span class="tag" :class="status?.settings?.dry_run ? 'tag-warn' : 'tag-short'">
-            {{ status?.settings?.dry_run ? '演练（只记录不下单）' : '实盘跟单' }}
-          </span>
-          <button class="btn btn-sm" :disabled="loading" @click="load">刷新</button>
-          <button class="btn btn-sm" :disabled="busy" @click="runOp('/signal-follow/read-once', '立即读一轮')">立即读一轮</button>
-          <button class="btn btn-sm" :disabled="busy" @click="runOp('/signal-follow/reset-cursor', '重置游标')">重置游标</button>
+          <span v-else class="tag tag-dim">状态接口不可用</span>
         </div>
-      </div>
-      <div class="panel-body">
-        <div class="hint" style="margin-bottom: 10px">
-          上游 <code>ao-monitor</code> 把信号写入 <code>data/&lt;slug&gt;/signals.jsonl</code>：本模块每
-          {{ status?.settings?.poll_sec ?? 1 }} 秒增量读本地文件，收到开仓信号即刻跟仓；也可以
-          <code>POST /api/v1/signal-follow/ingest</code> 直推，零轮询延迟。首次接入从文件尾部开始，不回放历史。
-        </div>
-        <div class="kpi-row">
-          <div v-for="c in counts" :key="c.key" class="kpi">
-            <div class="kpi-label">{{ c.label }}</div>
-            <div class="kpi-value mono">{{ c.value }}</div>
-          </div>
-        </div>
-        <div class="grid-info">
-          <div><span class="muted">信号文件</span><span class="mono">{{ status?.path || '未发现（请配置路径）' }}</span></div>
-          <div><span class="muted">文件状态</span><span :class="status?.path_exists ? 'up' : 'down'">{{ status?.path_exists ? '已接入' : '等待上游写入' }}</span></div>
-          <div><span class="muted">游标 / 在途保证金</span><span class="mono">#{{ status?.offset ?? 0 }} / {{ (status?.inflight_margin ?? 0).toFixed(2) }} U</span></div>
-          <div><span class="muted">引擎</span><span>{{ status?.engine_enabled ? '已启动' : '未启动（信号会被跳过）' }}</span></div>
-          <div><span class="muted">最近轮询</span><span class="mono">{{ timeStr(status?.last_poll ?? 0) }}</span></div>
-          <div><span class="muted">最近错误</span><span :class="status?.last_error ? 'down' : ''">{{ status?.last_error || '—' }}</span></div>
+        <div class="hint" style="margin-top: 8px">
+          上游把信号写入 <code>data/&lt;slug&gt;/signals.jsonl</code>，本模块每 {{ form.poll_sec }} 秒增量读本地文件，
+          收到开仓信号即刻跟仓；也可 <code>POST /api/v1/signal-follow/ingest</code> 直推，零轮询延迟。
+          开仓走本系统风控与资金，和引擎轮询开仓共用同标的互斥与保证金账本。
         </div>
       </div>
     </div>
 
-    <div class="panel">
-      <div class="panel-hd">
-        <span class="panel-title">跟单参数</span>
-        <div class="right">
-          <button class="btn btn-sm btn-primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="kpi-label">已跟仓</div>
+        <div class="kpi-value up">{{ counts.opened }}</div>
+        <div class="kpi-foot">{{ !ready ? '等待状态接口' : '演练 ' + counts.dry_run + ' 笔 · 失败 ' + counts.error + ' 笔' }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">跳过 / 重复</div>
+        <div class="kpi-value">{{ counts.skipped + counts.duplicate }}</div>
+        <div class="kpi-foot">含过期、风控闸门、非开仓事件</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">信号文件</div>
+        <div class="kpi-value" :class="!ready ? 'flat' : status?.path_exists ? 'up' : 'down'" style="font-size: 17px">
+          {{ !ready ? '--' : status?.path_exists ? '已接入' : '未接入' }}
+        </div>
+        <div class="kpi-foot ellipsis" :title="status?.path || ''">
+          {{ !ready ? '等待状态接口' : (status?.path || '请配置 jsonl_path') }}
         </div>
       </div>
-      <div class="panel-body">
-        <div class="note" style="margin-bottom: 12px">
-          开仓杠杆 = 原信号杠杆 + {{ form.leverage_bonus }}x，再受本系统 <code>max_leverage</code> 与交易所上限钳制；
-          开仓数量/保证金完全按本系统的风险预算、可用余额与共享保证金账本计算，不复制信号方仓位。
-          <strong>关闭「演练」即会真实下单，需人工明确授权。</strong>
-        </div>
-        <div class="form-grid">
-          <label class="check"><input type="checkbox" v-model="form.enabled" /> 启用信号跟单</label>
-          <label class="check"><input type="checkbox" v-model="form.auto_add_symbol" /> 池内没有标的时自动添加</label>
-          <label class="check"><input type="checkbox" v-model="form.dry_run" /> 演练（只记录不下单）</label>
-          <label class="check"><input type="checkbox" v-model="form.strict_events" /> 未知事件严格拒绝</label>
+      <div class="kpi">
+        <div class="kpi-label">在途保证金</div>
+        <div class="kpi-value">{{ fmt(status?.inflight_margin ?? 0, 2) }} <span class="muted" style="font-size: 14px">USDT</span></div>
+        <div class="kpi-foot">游标 #{{ status?.offset ?? 0 }} · 轮询 {{ ago(status?.last_poll ?? 0) }}</div>
+      </div>
+    </div>
 
-          <label class="field"><span>signals.jsonl 路径 / 频道目录</span>
-            <input v-model="form.jsonl_path" placeholder="留空自动发现 ao-monitor/data/*/signals.jsonl" />
-          </label>
-          <label class="field"><span>本地文件轮询（秒）</span><input type="number" min="1" max="60" v-model.number="form.poll_sec" /></label>
-          <label class="field"><span>杠杆加成（x）</span><input type="number" min="0" max="100" v-model.number="form.leverage_bonus" /></label>
-          <label class="field"><span>信号有效期（秒）</span><input type="number" min="5" max="3600" v-model.number="form.max_age_sec" /></label>
-          <label class="field"><span>每小时跟单上限</span><input type="number" min="1" max="100" v-model.number="form.max_per_hour" /></label>
-          <label class="field"><span>缺省止损（%）</span><input type="number" min="0.1" max="20" step="0.1" v-model.number="form.default_sl_pct" /></label>
-          <label class="field"><span>直推共享密钥</span>
-            <input type="password" v-model="form.ingest_token" :placeholder="status?.ingest_token_set ? '已设置，留空表示保持不变' : '留空=仅后台登录态可直推'" />
-          </label>
+    <div class="grid main-grid">
+      <div class="panel">
+        <div class="panel-hd">
+          <div class="stack" style="gap: 2px">
+            <span class="panel-title">跟单参数</span>
+            <span class="muted" style="font-size: 10.5px">热更新 · 保存后无需重启</span>
+          </div>
+          <div class="right">
+            <span v-if="dirty" class="tag tag-warn">未保存</span>
+            <button class="btn btn-sm" :disabled="!status" @click="status && applySettings(status.settings)">还原</button>
+            <button class="btn btn-sm btn-primary" :disabled="saving" @click="save">
+              {{ saving ? '保存中…' : '保存并生效' }}
+            </button>
+          </div>
         </div>
-        <div class="hint" style="margin-top: 10px">
-          直推示例：<code>curl -H "X-Signal-Token: &lt;密钥&gt;" -H "Content-Type: application/json" -d '{"id":"123","event":"开仓","symbol":"BTCUSDT","side":"long","leverage":"20x"}' /api/v1/signal-follow/ingest</code>
+
+        <div class="panel-body stack" style="gap: 14px">
+          <div class="note" style="border-left-color: var(--warn)">
+            开仓杠杆 = 原信号杠杆 + {{ form.leverage_bonus }}x，再受本系统 <code>max_leverage</code> 与交易所上限钳制；
+            数量、保证金、止损止盈全部按本系统风险预算与可用余额计算，不复制信号方仓位。
+            <b>关闭「演练模式」即会真实下单，需人工明确授权。</b>
+          </div>
+
+          <div>
+            <div class="section-hd">
+              <span class="section-title">接入开关</span>
+              <span class="section-hint">信号到达即刻处理，不等待引擎 15s 轮询</span>
+            </div>
+            <div class="grid g2" style="gap: 10px">
+              <div v-for="t in toggles" :key="t.key" class="panel" style="background: rgba(10, 18, 32, 0.6)">
+                <div class="panel-body" style="padding: 10px 12px">
+                  <div class="row" style="gap: 10px">
+                    <div class="stack" style="gap: 3px; flex: 1; min-width: 0">
+                      <span style="font-size: 12px; font-weight: 600">{{ t.label }}</span>
+                      <span class="hint">{{ t.hint }}</span>
+                    </div>
+                    <div class="switch" :class="{ on: form[t.key] }" @click="toggle(t.key)" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div class="section-hd">
+              <span class="section-title">参数</span>
+              <span class="section-hint">生效范围：文件通道与 HTTP 直推共用</span>
+            </div>
+            <div class="grid g2" style="gap: 10px 12px">
+              <div v-for="f in numberFields" :key="f.key" class="field">
+                <span class="label">{{ f.label }} <span class="muted">({{ f.unit }})</span></span>
+                <input
+                  v-model.number="form[f.key]" type="number" class="input mono"
+                  :min="f.min" :max="f.max" :step="f.step"
+                />
+                <span class="hint">{{ f.hint }}</span>
+              </div>
+              <div class="hint" style="align-self: center">参数越界会被后端拒绝并给出具体字段提示。</div>
+            </div>
+          </div>
+
+          <div>
+            <div class="section-hd">
+              <span class="section-title">接入路径与直推</span>
+              <span class="section-hint">频道不写死在代码里</span>
+            </div>
+            <div class="stack" style="gap: 10px">
+              <div class="field">
+                <span class="label">signals.jsonl 路径 / 频道目录</span>
+                <input v-model="form.jsonl_path" class="input mono" placeholder="留空自动发现 ao-monitor/data/*/signals.jsonl" />
+                <span class="hint">也可用环境变量 <code>SIGNAL_FOLLOW_JSONL</code> / <code>AO_MONITOR_DATA</code> 指定；首次接入从文件尾部开始，不回放历史。</span>
+              </div>
+              <div class="field">
+                <span class="label">直推共享密钥</span>
+                <input
+                  v-model="form.ingest_token" type="password" class="input mono" autocomplete="off"
+                  :placeholder="status?.ingest_token_set ? '已设置，留空表示保持不变' : '留空 = 直推接口仅接受后台登录态'"
+                />
+                <span class="hint">状态接口只返回掩码；不改动密钥时请保持输入框为空。</span>
+              </div>
+              <div class="code">{{ CURL_EXAMPLE }}</div>
+            </div>
+          </div>
         </div>
       </div>
+
+      <aside class="panel" style="align-self: start">
+        <div class="panel-hd">
+          <span class="panel-title">链路状态</span>
+          <div class="right">
+            <span class="tag" :class="!ready ? 'tag-dim' : status?.path_exists ? 'tag-long' : 'tag-warn'">
+              {{ !ready ? '状态未读取' : status?.path_exists ? '文件已接入' : '等待上游写入' }}
+            </span>
+          </div>
+        </div>
+        <div class="panel-body stack" style="gap: 10px">
+          <div class="row">
+            <span class="muted" style="font-size: 11.5px">监听协程</span>
+            <div class="spacer" />
+            <span class="dot" :class="!ready ? 'warn' : status?.running ? 'on' : 'off'" />
+            <span style="font-size: 11.5px">{{ !ready ? '--' : status?.running ? '运行中' : '未运行' }}</span>
+          </div>
+          <div class="row">
+            <span class="muted" style="font-size: 11.5px">交易引擎</span>
+            <div class="spacer" />
+            <span v-if="ready" class="tag" :class="status?.engine_enabled ? 'tag-long' : 'tag-warn'">
+              {{ status?.engine_enabled ? '已启动' : '未启动' }}
+            </span>
+            <span v-else class="muted mono">--</span>
+          </div>
+          <div class="row">
+            <span class="muted" style="font-size: 11.5px">最近轮询</span>
+            <div class="spacer" />
+            <span class="mono" style="font-size: 11.5px">{{ timeStr(status?.last_poll ?? 0) }}</span>
+          </div>
+          <div class="row">
+            <span class="muted" style="font-size: 11.5px">在途预留</span>
+            <div class="spacer" />
+            <span class="mono" style="font-size: 11.5px">{{ fmt(status?.inflight_margin ?? 0, 2) }} USDT</span>
+          </div>
+          <div v-if="ready && !status?.engine_enabled" class="hint">引擎未启动时信号会被跳过，请先在总览启动引擎。</div>
+
+          <div class="divider" />
+
+          <div class="field">
+            <span class="label">信号文件</span>
+            <div class="code" style="font-size: 10.5px; max-height: 84px">
+              {{ !ready ? '状态接口不可用' : (status?.path || '未发现 signals.jsonl') }}
+            </div>
+          </div>
+          <div v-if="status?.last_error" class="note" style="border-left-color: var(--down)">
+            最近错误：{{ status.last_error }}
+          </div>
+
+          <div class="row" style="gap: 6px; flex-wrap: wrap">
+            <button class="btn btn-sm" :disabled="busy" @click="runOp('/signal-follow/read-once', '立即读一轮')">立即读一轮</button>
+            <button class="btn btn-sm" :disabled="busy" @click="runOp('/signal-follow/reset-cursor', '重置游标')">重置游标</button>
+            <button class="btn btn-sm" :disabled="loading" @click="load">刷新</button>
+          </div>
+          <div class="hint">切换频道或清理积压旧信号时用「重置游标」，它只把当前文件游标移到尾部，不删除任何数据。</div>
+        </div>
+      </aside>
     </div>
 
     <div class="panel">
       <div class="panel-hd">
         <span class="panel-title">跟单流水</span>
         <div class="right">
-          <select v-model="filter" @change="load" style="min-width: 130px">
+          <span class="muted" style="font-size: 10.5px">{{ events.length }} 条 · 时间倒序</span>
+          <select v-model="filter" class="input" style="width: 112px" @change="load">
             <option value="">全部状态</option>
-            <option v-for="(label, key) in STATUS_LABEL" :key="key" :value="key">{{ label }}</option>
+            <option v-for="(v, k) in STATUS_LABELS" :key="k" :value="k">{{ v.text }}</option>
           </select>
+          <button class="btn btn-sm" :disabled="loading" @click="load">筛选</button>
         </div>
       </div>
-      <div class="panel-body">
-        <div v-if="!events.length" class="empty" style="padding: 36px">
-          {{ loading ? '加载中…' : '暂无跟单记录' }}
-        </div>
+      <div class="panel-body flush">
+        <div v-if="!events.length" class="empty">{{ loading ? '加载中…' : '暂无跟单记录' }}</div>
         <table v-else class="table">
           <thead>
-            <tr><th>时间</th><th>标的 / 方向</th><th>裁决</th><th>杠杆</th><th>数量</th><th>价格</th><th>保证金</th><th>原因</th></tr>
+            <tr>
+              <th style="width: 118px">时间</th>
+              <th style="width: 112px">标的</th>
+              <th style="width: 44px">方向</th>
+              <th style="width: 72px">裁决</th>
+              <th style="width: 56px">杠杆</th>
+              <th style="width: 92px">数量</th>
+              <th style="width: 96px">价格</th>
+              <th style="width: 100px">保证金</th>
+              <th>原因</th>
+            </tr>
           </thead>
           <tbody>
             <tr v-for="row in events" :key="row.id">
               <td class="mono muted">{{ timeStr(row.created_at) }}</td>
-              <td class="mono">{{ row.symbol }} <span :class="row.side === 'long' ? 'up' : 'down'">{{ row.side === 'long' ? '多' : '空' }}</span></td>
-              <td><span class="tag" :class="statusClass(row.status)">{{ STATUS_LABEL[row.status] || row.status }}</span></td>
-              <td class="mono">{{ row.leverage }}x</td>
-              <td class="mono">{{ row.qty || '—' }}</td>
-              <td class="mono">{{ row.price || '—' }}</td>
-              <td class="mono">{{ row.margin ? `${row.margin.toFixed(2)} U` : '—' }}</td>
-              <td class="muted" style="white-space: normal; max-width: 380px">{{ row.reason || '—' }}</td>
+              <td class="mono">{{ row.symbol }}</td>
+              <td :class="row.side === 'long' ? 'up' : 'down'">{{ row.side === 'long' ? '多' : '空' }}</td>
+              <td><span class="tag" :class="tagOf(row.status).cls">{{ tagOf(row.status).text }}</span></td>
+              <td class="mono">{{ row.leverage ? row.leverage + 'x' : '—' }}</td>
+              <td class="mono">{{ row.qty ? fmt(row.qty, 4) : '—' }}</td>
+              <td class="mono">{{ row.price ? px(row.price) : '—' }}</td>
+              <td class="mono">{{ row.margin ? fmt(row.margin, 2) + ' U' : '—' }}</td>
+              <td class="muted" style="white-space: normal; min-width: 220px">{{ row.reason || '—' }}</td>
             </tr>
           </tbody>
         </table>
@@ -264,18 +434,29 @@ onBeforeUnmount(() => window.clearInterval(timer))
 </template>
 
 <style scoped>
-.kpi-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 12px; }
-.kpi { padding: 10px 12px; border: 1px solid rgba(148,170,200,.1); border-radius: 8px; }
-.kpi-label { color: var(--muted); font-size: 10.5px; }
-.kpi-value { font-size: 18px; margin-top: 4px; }
-.grid-info { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 20px; font-size: 11.5px; }
-.grid-info > div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid rgba(148,170,200,.07); padding: 6px 0; }
-.grid-info > div > span:last-child { text-align: right; word-break: break-all; }
-.form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 16px; }
-.check { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-.table th, .table td { padding: 7px 10px; text-align: left; border-bottom: 1px solid rgba(148,170,200,.07); }
-.table th { color: var(--muted); font-size: 10px; font-weight: 500; white-space: nowrap; }
-code { font-size: 11px; color: var(--muted); }
-@media (max-width: 900px) { .kpi-row, .form-grid, .grid-info { grid-template-columns: repeat(2, 1fr); } }
+.main-grid {
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 12px;
+}
+.section-hd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.section-hint {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+code {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+@media (max-width: 960px) {
+  .main-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 </style>
