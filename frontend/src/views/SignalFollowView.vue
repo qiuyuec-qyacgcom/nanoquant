@@ -99,6 +99,8 @@ const CURL_EXAMPLE = `curl -X POST /api/v1/signal-follow/ingest \\
   -H "X-Signal-Token: <密钥>" -H "Content-Type: application/json" \\
   -d '{"id":"123","event":"开仓","symbol":"BTCUSDT","side":"long","leverage":"20x"}'`
 
+const loadError = ref('')
+const errorNotified = ref(false)
 const ready = computed(() => !!status.value)
 const listening = computed(() => !!(status.value?.running && status.value?.settings?.enabled))
 const counts = computed<Record<string, number>>(() => {
@@ -124,14 +126,23 @@ async function load() {
     ])
     status.value = st
     events.value = ev.items || []
+    loadError.value = ''
+    errorNotified.value = false
   } catch (err: any) {
-    app.notify(
-      err?.status === 404 ? '信号跟单接口不可用：请重启后端服务以加载新路由' : (err?.message || '加载失败'),
-      'error',
-    )
+    // 自动轮询不弹右上角：原因常驻在「链路状态」面板，避免每轮刷新刷屏
+    loadError.value = err?.status === 404
+      ? '信号跟单接口不可用：请重启后端服务以加载新路由'
+      : (err?.message || '加载失败')
   } finally {
     loading.value = false
   }
+}
+
+/** 只在「启用信号跟单」开关打开、且链路确实不可用时提醒一次 */
+function notifyLinkError() {
+  if (!form.enabled || !loadError.value || errorNotified.value) return
+  errorNotified.value = true
+  app.notify(loadError.value, 'error')
 }
 
 /** 状态接口返回的密钥是掩码，不能原样写回；留空表示保持已配置的密钥 */
@@ -139,8 +150,13 @@ function applySettings(s: FollowSettings) {
   Object.assign(form, s, { ingest_token: '' })
 }
 
-function toggle(key: BoolKey) {
+async function toggle(key: BoolKey) {
+  const enabling = key === 'enabled' && !form.enabled
   form[key] = !form[key]
+  if (enabling) {
+    await load()
+    notifyLinkError()
+  }
 }
 
 async function save() {
@@ -153,6 +169,7 @@ async function save() {
     applySettings(data)
     app.notify('配置已保存并生效（无需重启）', 'ok')
     await load()
+    notifyLinkError()
   } catch (err: any) {
     app.notify(err?.message || '保存失败', 'error')
   } finally {
@@ -371,6 +388,10 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <div class="code" style="font-size: 10.5px; max-height: 84px">
               {{ !ready ? '状态接口不可用' : (status?.path || '未发现 signals.jsonl') }}
             </div>
+          </div>
+          <div v-if="loadError" class="note" style="border-left-color: var(--down)">
+            {{ loadError }}
+            <div class="hint">原因只在此处常驻展示，不会随自动刷新反复弹出；打开「启用信号跟单」开关时提醒一次。</div>
           </div>
           <div v-if="status?.last_error" class="note" style="border-left-color: var(--down)">
             最近错误：{{ status.last_error }}
