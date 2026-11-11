@@ -513,24 +513,47 @@ function syncJsonText() {
 const tradeMode = ref<any>(null)
 const tradeModeBusy = ref(false)
 const tradeModeResults = ref<any[]>([])
+const tradeModeError = ref('')
+
+const tradeModeLabel = computed(() => {
+  if (tradeModeBusy.value) return '切换中…'
+  const m = tradeMode.value
+  if (!m) return '读取中…'
+  if (m.hedge_mode && !m.need_isolated?.length) return '已是双向逐仓'
+  if (!m.hedge_mode && !m.need_isolated?.length) return '一键开启双向持仓'
+  return '一键切换为双向逐仓'
+})
 
 async function loadTradeMode() {
   try {
-    tradeMode.value = await http.get('/engine/trade-mode')
-  } catch {
+    tradeMode.value = await http.get('/engine/trade-mode', 8000)
+    tradeModeError.value = ''
+  } catch (err: any) {
     tradeMode.value = null
+    tradeModeError.value = err?.message || '交易模式读取失败'
   }
 }
 
 async function fixTradeMode() {
+  const m = tradeMode.value
+  if (!m) return
+  // 只发送真正需要变更的项：网络差时避免把 8 个标的的逐仓请求也一起打出去
+  const payload = {
+    hedge: !m.hedge_mode,
+    isolated: Boolean(m.need_isolated?.length),
+  }
+  if (!payload.hedge && !payload.isolated) return
   if (!confirm('将账户切换为「双向持仓 + 逐仓」？有持仓或挂单时交易所会拒绝，需要先全部平仓。')) return
   tradeModeBusy.value = true
   try {
-    const res = await http.post('/engine/trade-mode', { hedge: true, isolated: true })
+    const res = await http.post('/engine/trade-mode', payload, 15000)
     tradeModeResults.value = res.results || []
-    app.notify(res.ok ? '已切换为双向逐仓' : '部分项目未切换成功，请看下方原因', res.ok ? 'ok' : 'error')
-    await loadTradeMode()
-    await app.loadStatus()
+    const firstFail = (res.results || []).find((r: any) => !r.ok)
+    app.notify(
+      res.ok ? '切换完成' : firstFail?.detail || '切换未完成，请查看下方原因',
+      res.ok ? 'ok' : 'error',
+    )
+    await loadTradeMode() // 不再顺带刷新全量状态，避免二次 REST 卡顿
   } catch (err: any) {
     app.notify(err.message, 'error')
   } finally {
@@ -773,7 +796,7 @@ onMounted(async () => {
             <div v-if="current === 'engine'" class="section">
               <div class="section-hd">
                 <span class="section-title">交易模式</span>
-                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；切换需要账户没有持仓与挂单</span>
+                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；切换需无持仓/挂单，各标的逐仓由开仓前自动保证</span>
               </div>
               <div v-if="tradeMode" class="trade-mode">
                 <div class="tm-row">
@@ -811,19 +834,31 @@ onMounted(async () => {
                     :disabled="tradeModeBusy || (tradeMode.hedge_mode && !tradeMode.need_isolated?.length)"
                     @click="fixTradeMode"
                   >
-                    {{ tradeMode.hedge_mode && !tradeMode.need_isolated?.length ? '已是双向逐仓' : '一键切换为双向逐仓' }}
+                    {{ tradeModeLabel }}
                   </button>
                   <button class="btn btn-sm" :disabled="tradeModeBusy" @click="loadTradeMode">刷新</button>
                   <span v-if="!tradeMode.can_switch" class="tag tag-warn">有持仓，切换前需先平仓</span>
                 </div>
-                <div v-if="tradeModeResults.length" class="stack" style="gap: 4px; margin-top: 8px">
-                  <div v-for="r in tradeModeResults" :key="r.target" class="row" style="font-size: 11.5px">
-                    <span class="tag" :class="r.ok ? 'tag-long' : 'tag-short'">{{ r.ok ? '成功' : '失败' }}</span>
-                    <span class="muted">{{ r.target === 'hedge' ? '双向持仓' : '逐仓' }} · {{ r.detail }}</span>
+                <div v-if="tradeModeResults.length" class="stack" style="gap: 6px; margin-top: 8px">
+                  <div v-for="r in tradeModeResults" :key="r.target" class="stack" style="gap: 2px">
+                    <div class="row" style="font-size: 11.5px">
+                      <span class="tag" :class="r.ok ? 'tag-long' : 'tag-short'">{{ r.ok ? '成功' : '部分失败' }}</span>
+                      <span class="muted">{{ r.target === 'hedge' ? '双向持仓' : '逐仓' }} · {{ r.detail }}</span>
+                    </div>
+                    <div
+                      v-for="f in r.failed || []"
+                      :key="f.symbol"
+                      class="muted"
+                      style="font-size: 10.5px; padding-left: 4px"
+                    >
+                      {{ f.symbol }} · {{ f.detail }}
+                    </div>
                   </div>
                 </div>
               </div>
-              <div v-else class="empty" style="padding: 14px">正在读取账户交易模式…</div>
+              <div v-else class="empty" style="padding: 14px">
+                {{ tradeModeError || '正在读取账户交易模式…' }}
+              </div>
             </div>
 
             <!-- 数据源: 两套环境凭证 (模拟盘=测试网 / 实盘=主网) -->

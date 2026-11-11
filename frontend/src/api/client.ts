@@ -33,15 +33,27 @@ function detailOf(payload: any): string {
   return JSON.stringify(detail)
 }
 
-export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+export async function api<T = any>(path: string, init: RequestInit = {}, timeoutMs = 0): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(init.headers as any) }
   const token = getToken()
   if (token) headers.Authorization = `Bearer ${token}`
+  // 交易所相关操作可能卡在网络超时上：调用方可显式给一个上限，避免按钮一直转圈
+  const ctrl = timeoutMs > 0 ? new AbortController() : null
+  const timer = ctrl ? window.setTimeout(() => ctrl!.abort(), timeoutMs) : null
   let res: Response
   try {
-    res = await fetch(`${BASE}${path}`, { ...init, headers })
+    res = await fetch(`${BASE}${path}`, {
+      ...init,
+      headers,
+      ...(ctrl ? { signal: ctrl.signal } : {}),
+    })
   } catch (err: any) {
+    if (ctrl?.signal.aborted) {
+      throw new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)}s）：交易所响应过慢，请检查网络后重试`)
+    }
     throw new ApiError(0, `网络错误: ${err?.message || '无法连接后端'}`)
+  } finally {
+    if (timer !== null) window.clearTimeout(timer)
   }
   if (res.status === 401) {
     setToken('')
@@ -63,9 +75,9 @@ function safeJson(text: string) {
 }
 
 export const http = {
-  get: <T = any>(path: string) => api<T>(path),
-  post: <T = any>(path: string, body?: any) =>
-    api<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
+  get: <T = any>(path: string, timeoutMs = 0) => api<T>(path, {}, timeoutMs),
+  post: <T = any>(path: string, body?: any, timeoutMs = 0) =>
+    api<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }, timeoutMs),
   put: <T = any>(path: string, body?: any) => api<T>(path, { method: 'PUT', body: JSON.stringify(body ?? {}) }),
   patch: <T = any>(path: string, body?: any) => api<T>(path, { method: 'PATCH', body: JSON.stringify(body ?? {}) }),
   del: <T = any>(path: string, body?: any) =>

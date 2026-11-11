@@ -1225,6 +1225,20 @@
   - **接口与提示**：`GET/POST /engine/trade-mode`（体检 / 引导式切换）；引擎每 5 分钟体检一次，单向或全仓时每小时提示一次；结果写入 `engine_state.trade_mode`，`/engine/status` 暴露 `trade_mode`。
 - **验证**：`pytest tests -q` → **117 passed**（新增双向/单向下单参数、模式体检、切换失败可操作提示、接口共 4 条用例）；`vue-tsc` 0 error、`npm run build` 通过；重启后实测 `GET /engine/trade-mode` 返回 `hedge_mode=false, need_hedge=true, can_switch=true`；桌面 1440 / 移动 390 截图确认交易模式卡片与常用视图正常。
 
+### 86. 一键切换双向逐仓「卡死」修复
+- **状态**：✅ 已完成
+- **现象**：参数页点「一键切换为双向逐仓」后长时间无响应，按钮一直转圈。
+- **根因**：
+  1. `switch_trade_mode` 把 1 次持仓模式探测 + 8 个标的的 `set_margin_type` **串行**发出；日志显示网络差时每个 REST 耗时 5–12s（`GET /positionSide/dual` 12s、`POST /marginType` 5s），累计近 1 分钟；
+  2. 前端 `http.post` 没有超时，`tradeModeBusy` 一直为 true，页面表现为卡死；
+  3. 网络异常（`[-1] 网络异常`）时 hedge 已失败，仍继续对全部标的发逐仓请求，把超时放大 N 倍。
+- **修复**：
+  - `switch_trade_mode` 每步单独限时（探测 4s、切换 6s、单个逐仓 4s、整体 8s），逐仓用 `asyncio.gather` **并发**；上一步失败即跳过后续请求（fail-fast）；超时/网络/限频/有持仓分别给出可操作原因。
+  - `api/client.ts` 的 `get/post` 增加可选 `timeoutMs`（AbortController）；交易模式读取 8s、切换 15s 超时，失败显示原因而不是无限转圈。
+  - 前端按状态只提交真正需要变更的项（已双向则不重复切 hedge、无全仓标的则跳过逐仓），去掉切换后顺带的 `loadStatus()` 二次 REST；按钮显示「切换中…」，结果区逐项展示失败标的与交易所原因。
+  - 汇总文案不再臆断「有持仓需先平仓」，改由逐项明细说明。
+- **验证**：`pytest tests -q` → **119 passed**（新增「超时快速失败且不再发后续请求」「逐仓并发」2 条契约）；`compileall`、`vue-tsc --noEmit` 0 error、`npm run build` 通过；重启后实测 `POST /engine/trade-mode` **1.8s** 返回（原近 1 分钟），`hedge_mode` 由 `false` 变 `true`；1 个标的（ARIAUSDT）因存在挂单未切逐仓，已在结果区列出具体原因。
+
 ---
 
 ## 二、未开始

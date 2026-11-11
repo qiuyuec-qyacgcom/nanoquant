@@ -1719,6 +1719,69 @@ def test_switch_trade_mode_returns_actionable_failure(monkeypatch):
     assert any(r["target"] == "isolated" for r in result["results"])
 
 
+def test_switch_trade_mode_fails_fast_on_network_timeout(monkeypatch):
+    """网络超时必须几秒内返回，且不再把 N 个逐仓请求也串行打出去（前端卡死根因）."""
+    import asyncio
+    import time
+
+    from nanoquant.exchange import broker as broker_mod
+    from nanoquant.services import symbols as symbol_service
+
+    touched: list[str] = []
+
+    async def slow_mode() -> bool:
+        await asyncio.sleep(10)
+        return False
+
+    async def margin(symbol: str, margin_type: str = "ISOLATED") -> dict:  # noqa: ARG001
+        touched.append(symbol)
+        return {}
+
+    monkeypatch.setattr(broker_mod.binance_client.client, "get_position_mode", slow_mode)
+    monkeypatch.setattr(broker_mod.binance_client.client, "set_margin_type", margin)
+    monkeypatch.setattr(symbol_service, "known_symbols", lambda: {"AAAUSDT", "BBBUSDT", "CCCUSDT"})
+
+    started = time.perf_counter()
+    out = asyncio.run(broker_mod.BinanceBroker().switch_trade_mode(hedge=True, isolated=True))
+    elapsed = time.perf_counter() - started
+    assert elapsed < 6.0, elapsed
+    assert out["ok"] is False
+    hedge = next(r for r in out["results"] if r["target"] == "hedge")
+    assert "超时" in hedge["detail"]
+    assert touched == []  # 上一步失败即跳过后续请求
+
+
+def test_switch_trade_mode_isolates_symbols_concurrently(monkeypatch):
+    """逐仓切换并发执行：8 个标的不再累加成 N × 网络超时."""
+    import asyncio
+    import time
+
+    from nanoquant.exchange import broker as broker_mod
+    from nanoquant.services import symbols as symbol_service
+
+    syms = {f"S{i}USDT" for i in range(6)}
+    touched: list[str] = []
+
+    async def already_dual() -> bool:
+        return True
+
+    async def margin(symbol: str, margin_type: str = "ISOLATED") -> dict:  # noqa: ARG001
+        await asyncio.sleep(0.2)
+        touched.append(symbol)
+        return {}
+
+    monkeypatch.setattr(broker_mod.binance_client.client, "get_position_mode", already_dual)
+    monkeypatch.setattr(broker_mod.binance_client.client, "set_margin_type", margin)
+    monkeypatch.setattr(symbol_service, "known_symbols", lambda: syms)
+
+    started = time.perf_counter()
+    out = asyncio.run(broker_mod.BinanceBroker().switch_trade_mode(hedge=True, isolated=True))
+    elapsed = time.perf_counter() - started
+    assert out["ok"] is True
+    assert len(touched) == 6
+    assert elapsed < 1.0, elapsed  # 串行需要 1.2s
+
+
 # ------------------------------------------- 熔断状态回写
 def test_normalize_halted_strips_compounded_prefix():
     """旧 bug 会把「引擎已熔断: 」逐轮拼回去，读侧必须能还原成单条原因."""

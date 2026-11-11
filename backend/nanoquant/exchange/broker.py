@@ -714,45 +714,87 @@ class BinanceBroker:
         }
 
     async def switch_trade_mode(self, *, hedge: bool = True, isolated: bool = True) -> dict[str, Any]:
-        """引导式切换：双向持仓 + 逐仓。逐项返回结果，失败给出可操作原因."""
+        """引导式切换：双向持仓 + 逐仓。逐项返回结果，失败给出可操作原因.
+
+        网络差时必须快速失败：旧实现把 1 次模式探测 + N 个标的逐仓**串行**发送，
+        每个请求 5~12s 超时，累计近 1 分钟，前端表现为「点一下就卡死」。
+        现在每步单独限时、逐仓并发、上一步失败即跳过后续请求。
+        """
+        import asyncio
+
         results: list[dict[str, Any]] = []
+        hedge_ok = True
+
+        def failure(exc: BaseException) -> str:
+            if isinstance(exc, asyncio.TimeoutError):
+                return "连接币安超时：请检查网络/代理后重试（本次未改动账户设置）"
+            if isinstance(exc, BinanceError):
+                if exc.code in (-4059, -4061, -4068):
+                    return "账户仍有持仓或挂单：请先全部平仓（含保护单）后重试"
+                if exc.code in (-1003, -1):
+                    return f"币安连接失败：{exc.message}；请检查网络或限频后重试"
+                return exc.message
+            return str(exc)[:120]
+
         if hedge:
             try:
-                already = await binance_client.client.get_position_mode()
+                already = await asyncio.wait_for(
+                    binance_client.client.get_position_mode(), timeout=4.0
+                )
                 if already:
                     self._dual = True
                     results.append({"target": "hedge", "ok": True, "detail": "已是双向持仓"})
                 else:
-                    await binance_client.client.set_position_mode(True)
+                    await asyncio.wait_for(
+                        binance_client.client.set_position_mode(True), timeout=6.0
+                    )
                     self._dual = True
                     results.append({"target": "hedge", "ok": True, "detail": "已切换为双向持仓"})
-            except BinanceError as exc:
-                detail = (
-                    "账户仍有持仓或挂单：双向/单向只能在无仓时切换，请先全部平仓（含保护单）后重试"
-                    if exc.code in (-4059, -4061, -4068)
-                    else exc.message
-                )
-                results.append({"target": "hedge", "ok": False, "detail": detail})
-        if isolated:
-            from ..services import symbols as symbol_service
+            except (BinanceError, NoCredentials, asyncio.TimeoutError) as exc:
+                hedge_ok = False
+                results.append({"target": "hedge", "ok": False, "detail": failure(exc)})
 
-            done: list[str] = []
-            failed: list[dict[str, str]] = []
-            for sym in sorted(symbol_service.known_symbols()):
+        if isolated:
+            if hedge and not hedge_ok:
+                results.append(
+                    {
+                        "target": "isolated",
+                        "ok": False,
+                        "detail": "上一步连接币安失败，已跳过逐仓切换以避免重复超时；稍后可重试",
+                        "failed": [],
+                    }
+                )
+            else:
+                from ..services import symbols as symbol_service
+
+                syms = sorted(symbol_service.known_symbols())
+
+                async def one(sym: str) -> tuple[str, bool, str]:
+                    try:
+                        await asyncio.wait_for(
+                            binance_client.client.set_margin_type(sym, "ISOLATED"), timeout=4.0
+                        )
+                        return sym, True, ""
+                    except (BinanceError, NoCredentials, asyncio.TimeoutError) as exc:
+                        return sym, False, failure(exc)[:120]
+
                 try:
-                    await binance_client.client.set_margin_type(sym, "ISOLATED")
-                    done.append(sym)
-                except BinanceError as exc:
-                    failed.append({"symbol": sym, "detail": str(exc.message)[:120]})
-            results.append(
-                {
-                    "target": "isolated",
-                    "ok": not failed,
-                    "detail": f"已确保 {len(done)} 个标的为逐仓"
-                    + (f"，{len(failed)} 个失败（有持仓需先平仓）" if failed else ""),
-                    "failed": failed,
-                }
-            )
+                    outcomes = await asyncio.wait_for(
+                        asyncio.gather(*(one(s) for s in syms)), timeout=8.0
+                    )
+                except asyncio.TimeoutError:
+                    outcomes = [(s, False, "逐仓切换整体超时，已中断") for s in syms]
+                done = [s for s, ok, _ in outcomes if ok]
+                failed = [{"symbol": s, "detail": why} for s, ok, why in outcomes if not ok]
+                results.append(
+                    {
+                        "target": "isolated",
+                        "ok": not failed,
+                        "detail": f"已确保 {len(done)} 个标的为逐仓"
+                        + (f"，{len(failed)} 个失败（原因见下方明细）" if failed else ""),
+                        "failed": failed,
+                    }
+                )
         return {"ok": all(r["ok"] for r in results), "results": results}
 
     async def health(self) -> dict[str, Any]:
