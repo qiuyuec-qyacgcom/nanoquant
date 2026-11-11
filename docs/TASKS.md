@@ -1214,6 +1214,17 @@
   - `state.normalize_halted()` 同时用于 `/engine/status` 与开仓体检，历史脏数据在下次读取时自动还原，无需手工改库。
 - **验证**：`pytest tests -q` → **113 passed**（新增 120 层前缀剥离、自愈闸门不持久化、熔断原因不增长 3 条断言）；重启后 `halted` 由上千字符自动还原为 `[]`，`stoploss_guard_remaining=0`、`consecutive_losses=0`，引擎恢复运行。
 
+### 85. 参数页可读性优化 + 引擎改为双向逐仓
+- **状态**：✅ 已完成
+- **背景**：参数页字段多、术语晦涩；且原实现会**强制把账户切成单向持仓**（`_ensure_position_mode`），与「双向逐仓」需求相反，下单参数也按单向着法。
+- **过程要点**：
+  - **参数页简化**：新增「常用参数」白名单（每组 3–9 项）与「显示全部参数」切换，默认只显示影响交易结果的核心项，面板头显示「已隐藏 N 项高级参数」；关键字段改用白话说明（如「每笔最多亏掉权益的百分之几」）覆盖原技术描述。
+  - **交易模式卡片**（参数配置 → 引擎）：展示持仓模式（双向/单向）与保证金模式（逐仓/全仓/无持仓时「开仓自动逐仓」），提供「一键切换为双向逐仓」并逐项展示结果；有持仓时提示需先平仓。总览页同步提示并链接到该卡片。
+  - **引擎改为双向逐仓**：`_ensure_position_mode`（强制切单向）改为 `_ensure_trade_mode`（只探测、**不再改用户账户**）；下单按模式自适应——双向用 `positionSide=LONG/SHORT`（且不与 `reduceOnly` 同用），单向沿用 `reduceOnly`；保护单与移动止损同步带 `positionSide`。
+  - **全仓自动切逐仓**：开仓前 `_ensure_symbol` 对标的调用 `set_margin_type(ISOLATED)`；有持仓被交易所拒绝时只记日志、不阻断开仓，由卡片提示「先平仓再切换」。
+  - **接口与提示**：`GET/POST /engine/trade-mode`（体检 / 引导式切换）；引擎每 5 分钟体检一次，单向或全仓时每小时提示一次；结果写入 `engine_state.trade_mode`，`/engine/status` 暴露 `trade_mode`。
+- **验证**：`pytest tests -q` → **117 passed**（新增双向/单向下单参数、模式体检、切换失败可操作提示、接口共 4 条用例）；`vue-tsc` 0 error、`npm run build` 通过；重启后实测 `GET /engine/trade-mode` 返回 `hedge_mode=false, need_hedge=true, can_switch=true`；桌面 1440 / 移动 390 截图确认交易模式卡片与常用视图正常。
+
 ---
 
 ## 二、未开始

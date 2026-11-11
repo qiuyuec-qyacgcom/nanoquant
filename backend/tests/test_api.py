@@ -219,6 +219,35 @@ def test_evolution_batch_review_and_health_endpoints(client):
     assert inj["stats"]["min_lesson_sample"] >= 2
 
 
+def test_trade_mode_endpoints(client, monkeypatch):
+    """交易模式体检与一键切换接口（双向持仓 + 逐仓）."""
+    from nanoquant.api.routes import trade as trade_routes
+
+    class FakeBroker:
+        async def trade_mode_status(self, symbols=None):  # noqa: ARG002
+            return {
+                "hedge_mode": False, "need_hedge": True, "need_isolated": ["BTCUSDT"],
+                "with_positions": [], "can_switch": True,
+                "margin": {"BTCUSDT": "cross"}, "hint": "账户为单向持仓",
+            }
+
+        async def switch_trade_mode(self, *, hedge=True, isolated=True):  # noqa: ARG002
+            return {"ok": True, "results": [{"target": "hedge", "ok": True, "detail": "已切换为双向持仓"}]}
+
+    monkeypatch.setattr(trade_routes, "get_broker", lambda mode=None: FakeBroker())  # noqa: ARG005
+    headers = _token(client)
+    got = client.get(f"{API}/engine/trade-mode", headers=headers)
+    assert got.status_code == 200
+    assert got.json()["need_hedge"] is True
+    assert got.json()["need_isolated"] == ["BTCUSDT"]
+
+    posted = client.post(
+        f"{API}/engine/trade-mode", headers=headers, json={"hedge": True, "isolated": False}
+    )
+    assert posted.status_code == 200
+    assert posted.json()["ok"] is True
+
+
 def test_strategy_crud_and_preview(client):
     """策略 CRUD + 停用后回落到默认分析 + 适用范围预览只做本地匹配."""
     from nanoquant.db import init_db, session_scope

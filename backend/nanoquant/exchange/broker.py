@@ -224,9 +224,22 @@ class Broker(Protocol):
     async def close_position(self, **kwargs: Any) -> ExecResult: ...
     async def amend_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> ExecResult: ...
     async def health(self) -> dict[str, Any]: ...
+    async def trade_mode_status(self, symbols: list[str] | None = None) -> dict[str, Any]: ...
+    async def switch_trade_mode(self, *, hedge: bool = True, isolated: bool = True) -> dict[str, Any]: ...
 
 
 # -------------------------------------------------------------------- 执行层
+def hedge_order_params(dual: bool, side: str, *, closing: bool = False) -> dict[str, str]:
+    """下单方向参数.
+
+    双向持仓(hedge)必须用 ``positionSide`` 标识仓位方向，且**不能**与 ``reduceOnly`` 同用；
+    单向持仓沿用 ``reduceOnly`` 平仓。两种模式都能下单，账户模式由面板引导切换。
+    """
+    if not dual:
+        return {"reduceOnly": "true"} if closing else {}
+    return {"positionSide": "LONG" if side == "long" else "SHORT"}
+
+
 class BinanceBroker:
     """币安合约执行层.
 
@@ -236,33 +249,44 @@ class BinanceBroker:
 
     def __init__(self) -> None:
         self._configured: set[str] = set()
-        self._one_way: bool | None = None
         self._dual: bool | None = None
 
     @property
     def mode(self) -> str:
         return normalize_mode(get_engine().mode)
 
-    async def _ensure_position_mode(self) -> None:
-        """策略按"单向持仓"实现, 账户若是双向(hedge)会报 -4061.
+    async def _ensure_trade_mode(self) -> bool:
+        """探测并缓存账户持仓模式（True=双向 hedge）.
 
-        首次下单前检查一次: 双向模式则自动切换为单向(无持仓时才能切, 失败只记日志)。
+        系统按「双向逐仓」设计，但**不再擅自把用户账户切成单向**：
+        切换持仓模式属于账户级变更，且只在无持仓/无挂单时允许，统一交给面板
+        「参数配置 → 引擎 → 交易模式」一键操作。单向账户仍可下单（参数自适应）。
         """
-        if self._one_way:
-            return
+        if self._dual is not None:
+            return self._dual
         try:
-            dual = await binance_client.client.get_position_mode()
-            if dual:
-                await binance_client.client.set_position_mode(False)
-                log.warning("账户为双向持仓模式, 已切换为单向持仓")
+            self._dual = bool(await binance_client.client.get_position_mode())
         except BinanceError as exc:
-            log.warning("持仓模式检查/切换失败: %s", exc)
-        self._one_way = True
+            log.warning("持仓模式探测失败，按单向处理: %s", exc)
+            self._dual = False
+        if not self._dual:
+            log.warning(
+                "账户当前为单向持仓；系统按双向逐仓设计，建议在「参数配置 → 引擎 → 交易模式」一键开启双向持仓"
+            )
+        return self._dual
 
     async def _ensure_symbol(self, symbol: str, leverage: int) -> None:
+        """确保逐仓 + 杠杆.
+
+        全仓账户在这里**自动切逐仓**；有持仓时交易所会拒绝切换（-4046 表示已是逐仓），
+        此时只记日志、不阻断开仓，由面板提示「平仓后再切换」。
+        """
         if symbol in self._configured:
             return
-        await binance_client.client.set_margin_type(symbol, "ISOLATED")
+        try:
+            await binance_client.client.set_margin_type(symbol, "ISOLATED")
+        except BinanceError as exc:
+            log.warning("%s 切换逐仓失败（将沿用当前保证金模式）: %s", symbol, exc)
         await binance_client.client.set_leverage(symbol, int(leverage))
         self._configured.add(symbol)
 
@@ -330,7 +354,7 @@ class BinanceBroker:
         t_call = time.perf_counter()
         stage: dict[str, float] = {}
         try:
-            await self._ensure_position_mode()
+            dual = await self._ensure_trade_mode()
             await self._ensure_symbol(symbol, int(leverage))
             cid = new_client_order_id("nq")
             side_txt = "BUY" if side == "long" else "SELL"
@@ -341,6 +365,7 @@ class BinanceBroker:
                 "quantity": filters.format_qty(qty),
                 "newClientOrderId": cid,
                 "recvWindow": engine.recv_window_ms,
+                **hedge_order_params(dual, side),
             }
             if engine.order_type == "limit_post_only":
                 px = filters.last_price or 0
@@ -423,7 +448,7 @@ class BinanceBroker:
             )
             stage["persist_ms"] = (time.perf_counter() - t_persist) * 1000
             t_protect = time.perf_counter()
-            await self._place_protection(symbol, side, sl_price, tp_price, filters)
+            await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
             stage["protect_ms"] = (time.perf_counter() - t_protect) * 1000
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
@@ -440,9 +465,18 @@ class BinanceBroker:
             return ExecResult(False, message=f"下单失败 {exc.code}: {exc.message}")
 
     async def _place_protection(
-        self, symbol: str, side: str, sl_price: float, tp_price: float, filters: Any = None
+        self,
+        symbol: str,
+        side: str,
+        sl_price: float,
+        tp_price: float,
+        filters: Any = None,
+        *,
+        dual: bool = False,
     ) -> None:
         close_side = "SELL" if side == "long" else "BUY"
+        # 双向持仓：closePosition 需配合 positionSide 指明平哪一侧；不能用 reduceOnly
+        side_params = hedge_order_params(dual, side, closing=True) if dual else {}
 
         async def place(kind: str, price: float) -> None:
             if price <= 0:
@@ -462,6 +496,7 @@ class BinanceBroker:
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
                 "clientAlgoId": new_client_order_id("np"),
+                **side_params,
             }
             try:
                 await binance_client.client.place_algo_order(**algo_params)
@@ -476,6 +511,7 @@ class BinanceBroker:
                         "workingType": "MARK_PRICE",
                         "priceProtect": "TRUE",
                         "newClientOrderId": new_client_order_id("np"),
+                        **side_params,
                     }
                     try:
                         await binance_client.client.place_order(**legacy)
@@ -531,14 +567,15 @@ class BinanceBroker:
             qty_text = f.format_qty(close_qty) if f is not None else f"{close_qty:.8f}".rstrip("0").rstrip(".")
             t0 = time.perf_counter()
             sink_token = STAGE_SINK.set(stage)
+            dual = await self._ensure_trade_mode()
             try:
                 resp = await binance_client.client.place_order(
                     symbol=position.symbol,
                     side=side,
                     type="MARKET",
                     quantity=qty_text,
-                    reduceOnly="true",
                     newClientOrderId=new_client_order_id("nx"),
+                    **hedge_order_params(dual, position.side, closing=True),
                 )
             finally:
                 STAGE_SINK.reset(sink_token)
@@ -595,6 +632,7 @@ class BinanceBroker:
     async def amend_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> ExecResult:
         close_side = "SELL" if side == "long" else "BUY"
         try:
+            dual = await self._ensure_trade_mode()
             await binance_client.client.cancel_all(symbol)
             await binance_client.client.cancel_all_algo(symbol)
             try:
@@ -613,6 +651,7 @@ class BinanceBroker:
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
                 "clientAlgoId": new_client_order_id("nt"),
+                **(hedge_order_params(dual, side, closing=True) if dual else {}),
             }
             await binance_client.client.place_algo_order(**params)
             with session_scope() as s:
@@ -626,6 +665,95 @@ class BinanceBroker:
             return ExecResult(True, price=stop_price, message="交易所止损已上移")
         except BinanceError as exc:
             return ExecResult(False, message=f"止损上移失败: {exc.message}")
+
+    async def trade_mode_status(self, symbols: list[str] | None = None) -> dict[str, Any]:
+        """持仓模式与保证金模式体检（只读）.
+
+        ``hedge_mode`` 是否双向；``need_hedge`` 需要引导用户开启；
+        ``need_isolated`` 仍为全仓、需要切换的池内标的；
+        ``with_positions`` 有持仓的标的（有仓时不能改持仓模式/保证金模式）。
+        """
+        dual = await self._ensure_trade_mode()
+        margin: dict[str, str] = {}
+        with_positions: list[str] = []
+        try:
+            rows = await binance_client.client.positions()
+        except (BinanceError, NoCredentials):
+            rows = []
+        for row in rows:
+            sym = str(row.get("symbol") or "")
+            if not sym:
+                continue
+            margin[sym] = str(row.get("marginType") or "").lower()
+            try:
+                if abs(float(row.get("positionAmt", 0) or 0)) > 1e-12:
+                    with_positions.append(sym)
+            except (TypeError, ValueError):
+                continue
+        pool = [s for s in (symbols or with_positions) if s]
+        need_isolated = [s for s in pool if margin.get(s) == "cross"]
+        # 无持仓时交易所通常不回传 marginType：此时不能断言「全部逐仓」
+        margin_known = sum(1 for s in pool if margin.get(s) in ("cross", "isolated"))
+        if dual and not need_isolated:
+            hint = "已是双向逐仓"
+        elif not dual:
+            hint = "账户为单向持仓：请先开启双向持仓（需无持仓/无挂单）"
+        elif not margin_known:
+            hint = "无持仓；开仓时会自动把该标的切为逐仓"
+        else:
+            hint = f"{len(need_isolated)} 个标的仍是全仓，建议切为逐仓"
+        return {
+            "hedge_mode": dual,
+            "need_hedge": not dual,
+            "need_isolated": need_isolated,
+            "margin_known": margin_known,
+            "with_positions": sorted(with_positions),
+            "can_switch": not with_positions,
+            "margin": {s: margin.get(s, "unknown") for s in pool},
+            "hint": hint,
+        }
+
+    async def switch_trade_mode(self, *, hedge: bool = True, isolated: bool = True) -> dict[str, Any]:
+        """引导式切换：双向持仓 + 逐仓。逐项返回结果，失败给出可操作原因."""
+        results: list[dict[str, Any]] = []
+        if hedge:
+            try:
+                already = await binance_client.client.get_position_mode()
+                if already:
+                    self._dual = True
+                    results.append({"target": "hedge", "ok": True, "detail": "已是双向持仓"})
+                else:
+                    await binance_client.client.set_position_mode(True)
+                    self._dual = True
+                    results.append({"target": "hedge", "ok": True, "detail": "已切换为双向持仓"})
+            except BinanceError as exc:
+                detail = (
+                    "账户仍有持仓或挂单：双向/单向只能在无仓时切换，请先全部平仓（含保护单）后重试"
+                    if exc.code in (-4059, -4061, -4068)
+                    else exc.message
+                )
+                results.append({"target": "hedge", "ok": False, "detail": detail})
+        if isolated:
+            from ..services import symbols as symbol_service
+
+            done: list[str] = []
+            failed: list[dict[str, str]] = []
+            for sym in sorted(symbol_service.known_symbols()):
+                try:
+                    await binance_client.client.set_margin_type(sym, "ISOLATED")
+                    done.append(sym)
+                except BinanceError as exc:
+                    failed.append({"symbol": sym, "detail": str(exc.message)[:120]})
+            results.append(
+                {
+                    "target": "isolated",
+                    "ok": not failed,
+                    "detail": f"已确保 {len(done)} 个标的为逐仓"
+                    + (f"，{len(failed)} 个失败（有持仓需先平仓）" if failed else ""),
+                    "failed": failed,
+                }
+            )
+        return {"ok": all(r["ok"] for r in results), "results": results}
 
     async def health(self) -> dict[str, Any]:
         try:

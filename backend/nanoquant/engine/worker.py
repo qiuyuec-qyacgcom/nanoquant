@@ -84,6 +84,9 @@ class TradingEngine:
         self._follow_cursor_key = ""
         self._follow_last_poll = 0.0
         self._follow_last_error = ""
+        #: 交易模式体检（双向持仓 + 逐仓）节流：5 分钟查一次，提示 1 小时一次
+        self._trade_mode_ts = 0.0
+        self._trade_mode_warn_ts = 0.0
 
     # ------------------------------------------------------------- lifecycle
     def _acquire_lock(self) -> bool:
@@ -258,6 +261,9 @@ class TradingEngine:
             state.set("cycle_timings", __import__("json").dumps(timings))
             return {"skipped": gate.reason}
         state.set("halted", "")
+
+        # 交易模式体检：双向持仓 + 逐仓。只提示不阻断（下单参数会按模式自适应）
+        await self._check_trade_mode(broker)
 
         signals = await timed("scan", self._scan(broker, account, engine_cfg, risk_cfg, strat_cfg))
         state.set("cycle_timings", __import__("json").dumps(timings))
@@ -495,6 +501,39 @@ class TradingEngine:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("全局复盘失败: %s", exc)
+
+    async def _check_trade_mode(self, broker: Broker) -> None:
+        """5 分钟一次体检：双向持仓 + 逐仓.
+
+        单向/全仓都不阻断开仓（下单参数自适应），但要在面板与事件里明确提示，
+        避免用户以为系统跑在双向逐仓、实际仍是单向全仓。
+        """
+        now = time.time()
+        if now - self._trade_mode_ts < 300:
+            return
+        self._trade_mode_ts = now
+        try:
+            status = await broker.trade_mode_status(sorted(symbol_service.known_symbols()))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("交易模式体检跳过: %s", exc)
+            return
+        state.set("trade_mode", __import__("json").dumps(status, ensure_ascii=False))
+        if not (status.get("need_hedge") or status.get("need_isolated")):
+            return
+        if now - self._trade_mode_warn_ts < 3600:
+            return
+        self._trade_mode_warn_ts = now
+        if status.get("need_hedge"):
+            events.record(
+                "warn", "engine",
+                "账户为单向持仓：系统按双向逐仓设计，请在「参数配置 → 引擎 → 交易模式」开启双向持仓"
+                "（需先平掉全部仓位与挂单）",
+            )
+        if status.get("need_isolated"):
+            events.record(
+                "warn", "engine",
+                f"{len(status['need_isolated'])} 个标的仍为全仓：无持仓时会自动切逐仓，有持仓需先平仓再切换",
+            )
 
     # ------------------------------------------------------------------ scan
     async def _symbols(self, cfg: EngineSettings) -> list[str]:
@@ -1581,6 +1620,8 @@ class TradingEngine:
                 **strategy_stats,
                 "last_applied": state.get("strategy_applied", ""),
             },
+            # 交易模式体检（双向持仓 + 逐仓）：最近一次探测结果
+            "trade_mode": __import__("json").loads(state.get("trade_mode", "{}") or "{}"),
             "cycle_timings": __import__("json").loads(state.get("cycle_timings", "{}") or "{}"),
         }
 

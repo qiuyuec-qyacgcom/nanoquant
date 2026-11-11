@@ -1650,6 +1650,75 @@ def test_margin_inflight_reservation_survives_engine_cycle():
     asyncio.run(run())
 
 
+# ------------------------------------------- 交易模式：双向持仓 + 逐仓
+def test_hedge_order_params_follow_position_mode():
+    """双向用 positionSide（不能带 reduceOnly），单向沿用 reduceOnly."""
+    from nanoquant.exchange.broker import hedge_order_params
+
+    assert hedge_order_params(True, "long") == {"positionSide": "LONG"}
+    assert hedge_order_params(True, "long", closing=True) == {"positionSide": "LONG"}
+    assert hedge_order_params(True, "short", closing=True) == {"positionSide": "SHORT"}
+    assert hedge_order_params(False, "long") == {}
+    assert hedge_order_params(False, "short", closing=True) == {"reduceOnly": "true"}
+
+
+def test_trade_mode_status_reports_hedge_and_margin(monkeypatch):
+    import asyncio
+
+    from nanoquant.exchange import broker as broker_mod
+
+    b = broker_mod.BinanceBroker()
+
+    async def get_mode() -> bool:
+        return False
+
+    async def positions() -> list[dict]:
+        return [
+            {"symbol": "BTCUSDT", "positionAmt": "0.01", "marginType": "cross"},
+            {"symbol": "ETHUSDT", "positionAmt": "0", "marginType": "isolated"},
+        ]
+
+    monkeypatch.setattr(broker_mod.binance_client.client, "get_position_mode", get_mode)
+    monkeypatch.setattr(broker_mod.binance_client.client, "positions", positions)
+    out = asyncio.run(b.trade_mode_status(["BTCUSDT", "ETHUSDT"]))
+    assert out["hedge_mode"] is False and out["need_hedge"] is True
+    assert out["need_isolated"] == ["BTCUSDT"]
+    assert out["with_positions"] == ["BTCUSDT"]
+    assert out["can_switch"] is False
+    assert out["margin"]["ETHUSDT"] == "isolated"
+
+
+def test_switch_trade_mode_returns_actionable_failure(monkeypatch):
+    """有持仓时切双向会被交易所拒绝：要给出「先平仓」的可操作原因，逐仓仍继续尝试."""
+    import asyncio
+
+    from nanoquant.exchange import broker as broker_mod
+    from nanoquant.exchange.client import BinanceError
+
+    b = broker_mod.BinanceBroker()
+
+    async def get_mode() -> bool:
+        return False
+
+    async def set_mode(_dual: bool) -> dict:
+        raise BinanceError(-4068, "cannot change position side while positions exist")
+
+    touched: list[str] = []
+
+    async def set_margin(symbol: str, margin_type: str = "ISOLATED") -> dict:  # noqa: ARG001
+        touched.append(symbol)
+        return {}
+
+    monkeypatch.setattr(broker_mod.binance_client.client, "get_position_mode", get_mode)
+    monkeypatch.setattr(broker_mod.binance_client.client, "set_position_mode", set_mode)
+    monkeypatch.setattr(broker_mod.binance_client.client, "set_margin_type", set_margin)
+    result = asyncio.run(b.switch_trade_mode(hedge=True, isolated=True))
+    assert result["ok"] is False
+    hedge = next(r for r in result["results"] if r["target"] == "hedge")
+    assert hedge["ok"] is False and "平仓" in hedge["detail"]
+    assert any(r["target"] == "isolated" for r in result["results"])
+
+
 # ------------------------------------------- 熔断状态回写
 def test_normalize_halted_strips_compounded_prefix():
     """旧 bug 会把「引擎已熔断: 」逐轮拼回去，读侧必须能还原成单条原因."""

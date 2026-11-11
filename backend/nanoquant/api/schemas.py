@@ -125,6 +125,13 @@ class EngineControl(BaseModel):
     confirm: str = ""
 
 
+class TradeModeIn(BaseModel):
+    """交易模式引导：双向持仓 + 逐仓（无持仓时才能切换）. """
+
+    hedge: bool = True
+    isolated: bool = True
+
+
 class StrategyIn(BaseModel):
     """AI 分析策略：决策时注入，指导模型如何分析该标的."""
 

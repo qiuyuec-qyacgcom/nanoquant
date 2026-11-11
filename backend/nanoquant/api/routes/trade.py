@@ -16,7 +16,7 @@ from ...security import decrypt_secret
 from ...services import events, position_view, state
 from ...services.settings import get_data, get_engine, normalize_mode, update_group
 from ..deps import current_user
-from ..schemas import ClosePositionIn, EngineControl
+from ..schemas import ClosePositionIn, EngineControl, TradeModeIn
 
 router = APIRouter(tags=["trade"])
 
@@ -32,6 +32,29 @@ async def admission(user: str = Depends(current_user)) -> dict:
     from ...services import admission as admission_service
 
     return await admission_service.evaluate()
+
+
+@router.get("/engine/trade-mode")
+async def trade_mode(user: str = Depends(current_user)) -> dict:
+    """当前持仓模式与保证金模式体检（双向持仓 / 逐仓）."""
+    from ...services import symbols as symbol_service
+
+    broker = get_broker(normalize_mode(get_engine().mode))
+    return await broker.trade_mode_status(sorted(symbol_service.known_symbols()))
+
+
+@router.post("/engine/trade-mode")
+async def switch_trade_mode(payload: TradeModeIn, user: str = Depends(current_user)) -> dict:
+    """引导式切换为双向持仓 + 逐仓；有持仓时会被交易所拒绝，返回可操作原因."""
+    broker = get_broker(normalize_mode(get_engine().mode))
+    result = await broker.switch_trade_mode(hedge=payload.hedge, isolated=payload.isolated)
+    events.record(
+        "info" if result.get("ok") else "warn",
+        "engine",
+        f"{user} 切换交易模式: 双向={'开' if payload.hedge else '不变'}，逐仓={'开' if payload.isolated else '不变'}",
+        result,
+    )
+    return result
 
 
 @router.post("/engine/control")

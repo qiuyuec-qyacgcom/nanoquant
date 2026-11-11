@@ -52,6 +52,53 @@ const groups = [
   { id: 'public', label: '公开站点', hint: '前台展示' },
 ]
 
+//: 常用参数（默认视图）：只保留真正影响交易结果的项，其余收进「显示全部」
+const BASIC_FIELDS: Record<string, string[]> = {
+  engine: ['cycle_interval_sec', 'max_positions', 'trading_windows', 'order_type', 'close_on_halt'],
+  risk: [
+    'risk_per_trade_pct', 'margin_pct', 'default_leverage', 'max_leverage',
+    'daily_loss_limit_pct', 'max_drawdown_pct', 'consecutive_loss_limit', 'max_spread_bps',
+  ],
+  strategy: [
+    'timeframe', 'entry_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max',
+    'sl_atr_mult', 'tp_atr_mult', 'trailing_pct', 'max_hold_minutes',
+  ],
+  data: ['max_pool_size', 'demo_base_url', 'live_base_url', 'proxy'],
+  news: ['enabled', 'refresh_minutes', 'keep_days'],
+  evolution: ['enabled', 'max_injected', 'ttl_days', 'min_lesson_sample'],
+  backup: ['retention', 'encrypt', 'auto_daily'],
+  security: ['require_login', 'session_ttl_hours', 'login_fail_limit'],
+  system: ['log_level', 'heartbeat_sec', 'event_retention_days'],
+  public: ['site_enabled', 'show_engine_status', 'show_mantras', 'show_performance'],
+}
+
+//: 面向普通用户的白话说明：覆盖原始技术描述（仅影响展示）
+const PLAIN_HINTS: Record<string, string> = {
+  cycle_interval_sec: '多久扫描一次行情；15 秒以上，间隔越短越耗交易所额度',
+  max_symbols_per_cycle: '每轮最多检查几个标的（按标的池顺序）',
+  max_positions: '最多同时持有几个仓位',
+  risk_per_trade_pct: '每笔交易最多亏掉权益的百分之几；越大仓位越重',
+  margin_pct: '单个仓位最多占用多少权益作保证金',
+  max_exposure_pct: '所有持仓名义额合计最多是权益的几倍',
+  max_same_direction: '同一方向最多同时持有几个仓；0=不限制',
+  daily_loss_limit_pct: '当天亏到这个比例就停止开新仓',
+  max_drawdown_pct: '权益从最高点回撤到这个比例就停机',
+  entry_threshold: '信号分超过多少才开仓；越高越保守',
+  min_signal_gap: '多空分数太接近时不开仓，避免来回打脸',
+  volume_ratio_min: '成交量低于该倍数时不参与',
+  atr_pct_min: '波动太小（赚不回手续费）时不做',
+  atr_pct_max: '波动太大（容易被扫止损）时不做',
+  sl_atr_mult: '止损距离 = ATR 的几倍；越小止损越紧',
+  tp_atr_mult: '止盈距离 = ATR 的几倍',
+  trailing_pct: '从浮盈高点回撤这么多就离场；0=关闭',
+  max_hold_minutes: '持仓超过这个时间强制离场',
+  max_spread_bps: '买卖价差超过该值就放弃；短线建议 5–12bps',
+  min_notional_buffer: '交易所最小下单额的倍数，防止下单被拒',
+  fee_rate_taker: '吃单手续费率，0.0005 = 0.05%',
+  fee_rate_maker: '挂单手续费率，0.0002 = 0.02%',
+  vol_target_atr_pct: '波动越大自动减仓；0=关闭',
+}
+
 const BASE_META: Record<string, FieldMeta> = {
   enabled: { label: '启用', hint: '关闭后该模块不参与运行' },
   cycle_interval_sec: {
@@ -395,7 +442,9 @@ function clone<T>(v: T): T {
 }
 
 function metaOf(group: string, key: string): FieldMeta {
-  return GROUP_META[group]?.[key] || BASE_META[key] || { label: key }
+  const base = GROUP_META[group]?.[key] || BASE_META[key] || { label: key }
+  const plain = PLAIN_HINTS[key]
+  return plain ? { ...base, hint: plain } : base
 }
 
 function widgetOf(value: any, meta: FieldMeta): Widget {
@@ -412,11 +461,31 @@ function rowOf(group: string, key: string, value: any): Row {
   return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min, max: meta.max }
 }
 
+/** 默认只看「常用参数」，一键展开全部高级项，降低第一次上手的理解成本 */
+const showAll = ref(false)
+
+function skippedKeys(): Set<string> {
+  return new Set([...PROTECTED, ...(SKIP[current.value] || []), 'symbols'])
+}
+
+function allowField(key: string): boolean {
+  if (showAll.value) return true
+  const basic = BASIC_FIELDS[current.value]
+  return !basic || basic.includes(key)
+}
+
+const hiddenCount = computed(() => {
+  const basic = BASIC_FIELDS[current.value]
+  if (showAll.value || !basic) return 0
+  const skip = skippedKeys()
+  return Object.keys(draft.value || {}).filter((k) => !skip.has(k) && !basic.includes(k)).length
+})
+
 const currentSections = computed(() => {
-  const skip = new Set([...PROTECTED, ...(SKIP[current.value] || []), 'symbols'])
+  const skip = skippedKeys()
   const rows = new Map<string, Row>()
   for (const [key, value] of Object.entries(draft.value || {})) {
-    if (skip.has(key)) continue
+    if (skip.has(key) || !allowField(key)) continue
     rows.set(key, rowOf(current.value, key, value))
   }
   const out: { title: string; hint: string; rows: Row[] }[] = []
@@ -440,11 +509,41 @@ function syncJsonText() {
   }
 }
 
+// ---------------------------------------------------- 交易模式（双向逐仓）
+const tradeMode = ref<any>(null)
+const tradeModeBusy = ref(false)
+const tradeModeResults = ref<any[]>([])
+
+async function loadTradeMode() {
+  try {
+    tradeMode.value = await http.get('/engine/trade-mode')
+  } catch {
+    tradeMode.value = null
+  }
+}
+
+async function fixTradeMode() {
+  if (!confirm('将账户切换为「双向持仓 + 逐仓」？有持仓或挂单时交易所会拒绝，需要先全部平仓。')) return
+  tradeModeBusy.value = true
+  try {
+    const res = await http.post('/engine/trade-mode', { hedge: true, isolated: true })
+    tradeModeResults.value = res.results || []
+    app.notify(res.ok ? '已切换为双向逐仓' : '部分项目未切换成功，请看下方原因', res.ok ? 'ok' : 'error')
+    await loadTradeMode()
+    await app.loadStatus()
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    tradeModeBusy.value = false
+  }
+}
+
 function loadGroup(id: string) {
   current.value = id
   draft.value = clone(app.settings[id] || {})
   baseline.value = clone(app.settings[id] || {})
   syncJsonText()
+  if (id === 'engine') loadTradeMode()
 }
 
 function onGroupClick(id: string) {
@@ -656,7 +755,11 @@ onMounted(async () => {
               <span class="panel-title">{{ currentGroup?.label }}参数</span>
               <span class="muted" style="font-size: 10.5px">{{ currentGroup?.hint }}</span>
             </div>
-            <div class="right">
+            <div class="right" style="flex-wrap: wrap">
+              <span v-if="!showAll && hiddenCount" class="tag tag-dim">已隐藏 {{ hiddenCount }} 项高级参数</span>
+              <button class="btn btn-sm btn-ghost" @click="showAll = !showAll">
+                {{ showAll ? '只看常用' : '显示全部参数' }}
+              </button>
               <span v-if="dirty" class="tag tag-warn">未保存</span>
               <button class="btn btn-sm" @click="reset">恢复默认</button>
               <button class="btn btn-sm btn-primary" :disabled="saving" @click="save">
@@ -666,6 +769,63 @@ onMounted(async () => {
           </div>
 
           <div class="panel-body stack" style="gap: 16px">
+            <!-- 引擎: 交易模式（双向持仓 + 逐仓） -->
+            <div v-if="current === 'engine'" class="section">
+              <div class="section-hd">
+                <span class="section-title">交易模式</span>
+                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；切换需要账户没有持仓与挂单</span>
+              </div>
+              <div v-if="tradeMode" class="trade-mode">
+                <div class="tm-row">
+                  <span class="tm-label">持仓模式</span>
+                  <span class="tag" :class="tradeMode.hedge_mode ? 'tag-long' : 'tag-warn'">
+                    {{ tradeMode.hedge_mode ? '双向持仓' : '单向持仓 · 建议切换' }}
+                  </span>
+                  <span class="muted tm-note">
+                    {{ tradeMode.hedge_mode ? '多空可同时持有，符合系统设计' : '单向模式下仍可下单，但不会同时持有多空' }}
+                  </span>
+                </div>
+                <div class="tm-row">
+                  <span class="tm-label">保证金模式</span>
+                  <span class="tag" :class="tradeMode.need_isolated?.length ? 'tag-warn' : 'tag-long'">
+                    {{
+                      tradeMode.need_isolated?.length
+                        ? `${tradeMode.need_isolated.length} 个标的为全仓`
+                        : tradeMode.margin_known
+                          ? '全部逐仓'
+                          : '开仓时自动逐仓'
+                    }}
+                  </span>
+                  <span class="muted tm-note">
+                    {{
+                      tradeMode.need_isolated?.length
+                        ? tradeMode.need_isolated.slice(0, 5).join('、') + (tradeMode.need_isolated.length > 5 ? '…' : '')
+                        : '逐仓隔离单标的风险'
+                    }}
+                  </span>
+                </div>
+                <div class="tm-hint">{{ tradeMode.hint }}</div>
+                <div class="row" style="gap: 8px; flex-wrap: wrap">
+                  <button
+                    class="btn btn-sm btn-primary"
+                    :disabled="tradeModeBusy || (tradeMode.hedge_mode && !tradeMode.need_isolated?.length)"
+                    @click="fixTradeMode"
+                  >
+                    {{ tradeMode.hedge_mode && !tradeMode.need_isolated?.length ? '已是双向逐仓' : '一键切换为双向逐仓' }}
+                  </button>
+                  <button class="btn btn-sm" :disabled="tradeModeBusy" @click="loadTradeMode">刷新</button>
+                  <span v-if="!tradeMode.can_switch" class="tag tag-warn">有持仓，切换前需先平仓</span>
+                </div>
+                <div v-if="tradeModeResults.length" class="stack" style="gap: 4px; margin-top: 8px">
+                  <div v-for="r in tradeModeResults" :key="r.target" class="row" style="font-size: 11.5px">
+                    <span class="tag" :class="r.ok ? 'tag-long' : 'tag-short'">{{ r.ok ? '成功' : '失败' }}</span>
+                    <span class="muted">{{ r.target === 'hedge' ? '双向持仓' : '逐仓' }} · {{ r.detail }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="empty" style="padding: 14px">正在读取账户交易模式…</div>
+            </div>
+
             <!-- 数据源: 两套环境凭证 (模拟盘=测试网 / 实盘=主网) -->
             <div v-if="current === 'data'" class="section">
               <div class="section-hd">
@@ -1053,5 +1213,37 @@ onMounted(async () => {
     grid-template-columns: 1fr;
     gap: 8px;
   }
+}
+
+/* ------------------------------------------------------ 交易模式卡片 */
+.trade-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.tm-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tm-label {
+  width: 84px;
+  flex: 0 0 84px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.tm-note {
+  font-size: 11px;
+  line-height: 1.5;
+}
+.tm-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
 }
 </style>

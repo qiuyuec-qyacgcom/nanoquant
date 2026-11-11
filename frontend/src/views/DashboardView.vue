@@ -259,6 +259,14 @@ onBeforeUnmount(() => window.clearInterval(timer))
               · <span class="down">交易所限频冷却 {{ status.rate_limit.ban_remaining }}s（权重 {{ status.rate_limit.used_weight }}/{{ status.rate_limit.capacity }}）</span>
             </template>
           </div>
+          <div v-if="status?.trade_mode?.need_hedge" class="note warn" style="margin: 0">
+            账户为单向持仓，系统按双向逐仓设计。
+            <router-link to="/admin/strategy?group=engine">前往参数配置一键开启双向持仓</router-link>
+          </div>
+          <div v-else-if="status?.trade_mode?.need_isolated?.length" class="note warn" style="margin: 0">
+            有 {{ status.trade_mode.need_isolated.length }} 个标的仍是全仓，建议在
+            <router-link to="/admin/strategy?group=engine">参数配置 → 交易模式</router-link> 切为逐仓。
+          </div>
           <div class="grid g3" style="gap: 10px">
             <div class="metric"><span>单笔风险</span><span>{{ app.settings.risk?.risk_per_trade_pct ?? '-' }}%</span></div>
             <div class="metric"><span>杠杆区间</span><span>{{ app.settings.risk?.default_leverage ?? '-' }}–{{ app.settings.risk?.max_leverage ?? '-' }}x</span></div>

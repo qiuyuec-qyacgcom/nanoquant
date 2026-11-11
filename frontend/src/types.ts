@@ -65,6 +65,17 @@ export interface EngineStatus {
     used_weight: number
     capacity: number
   }
+  /** 交易模式体检（双向持仓 + 逐仓） */
+  trade_mode?: {
+    hedge_mode?: boolean
+    need_hedge?: boolean
+    need_isolated?: string[]
+    margin_known?: number
+    with_positions?: string[]
+    can_switch?: boolean
+    margin?: Record<string, string>
+    hint?: string
+  }
   stats: {
     trades: number
     win_rate: number
