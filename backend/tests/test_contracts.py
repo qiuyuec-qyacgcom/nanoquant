@@ -2166,6 +2166,36 @@ def test_weight_limiter_fails_fast_instead_of_queueing(monkeypatch):
     asyncio.run(run())
 
 
+def test_weight_limiter_exposes_declared_ban_time():
+    """长封禁：本地只认 3 分钟试探，但必须保留并说明交易所声明的真实解封时间."""
+    import asyncio
+    import time
+
+    from nanoquant.exchange import ratelimit
+
+    limiter = ratelimit.WeightLimiter(capacity=2400)
+    declared_ms = int((time.time() + 7200) * 1000)
+    assert limiter.observe_ban(f"Too many requests; banned until {declared_ms}") is True
+    assert limiter.banned is True
+    assert 0 < limiter.ban_remaining() <= ratelimit.MAX_BAN_HONOR_SEC + 1
+    assert limiter.ban_declared_until > time.time() + 3600
+    assert limiter.ban_declared_remaining() > 3600
+
+    # 同一轮封禁反复试探：解封时间不变，且不会把本地倒计时改成长封禁
+    limiter.observe_ban(f"Too many requests; banned until {declared_ms}")
+    assert limiter.ban_remaining() <= ratelimit.MAX_BAN_HONOR_SEC + 1
+
+    async def run() -> str:
+        try:
+            await limiter.acquire(1)
+        except ratelimit.RateLimited as exc:
+            return str(exc)
+        return ""
+
+    msg = asyncio.run(run())
+    assert "封禁至" in msg and "试探" in msg  # 不再只显示「剩余 Ns」误导用户
+
+
 def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeypatch):
     """决策上下文显式给出全局区间，不再把心法规则原文塞给模型，同时注入适用策略."""
     from types import SimpleNamespace

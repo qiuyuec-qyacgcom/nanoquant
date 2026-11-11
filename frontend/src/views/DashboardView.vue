@@ -256,7 +256,15 @@ onBeforeUnmount(() => window.clearInterval(timer))
             · 心跳 {{ (status?.heartbeat_age ?? -1) >= 0 ? status?.heartbeat_age + 's 前' : '无' }}
             · 数据延迟 {{ status?.last_cycle_ms }}ms
             <template v-if="status?.rate_limit?.banned">
-              · <span class="down">交易所限频冷却 {{ status.rate_limit.ban_remaining }}s（权重 {{ status.rate_limit.used_weight }}/{{ status.rate_limit.capacity }}）</span>
+              · <span class="down">
+                <template v-if="(status.rate_limit.declared_remaining ?? 0) > 0">
+                  交易所封禁至 {{ status.rate_limit.declared_label }}（还需约
+                  {{ Math.ceil((status.rate_limit.declared_remaining ?? 0) / 60) }} 分钟），
+                  本地 {{ status.rate_limit.ban_remaining }}s 后试探
+                </template>
+                <template v-else>交易所限频冷却 {{ status.rate_limit.ban_remaining }}s</template>
+                （权重 {{ status.rate_limit.used_weight }}/{{ status.rate_limit.capacity }}）
+              </span>
             </template>
           </div>
           <div v-if="status?.trade_mode?.need_hedge" class="note warn" style="margin: 0">
@@ -489,7 +497,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <tr v-if="!protection.length">
               <td colspan="8" class="empty">
                 {{ status?.rate_limit?.banned
-                  ? `交易所限频冷却中（剩余 ${status.rate_limit.ban_remaining}s），保护单列表暂不可用；冷却结束后自动恢复`
+                  ? ((status.rate_limit.declared_remaining ?? 0) > 0
+                      ? `交易所封禁至 ${status.rate_limit.declared_label}，保护单列表暂不可用；解封后自动恢复`
+                      : `交易所限频冷却中（剩余 ${status.rate_limit.ban_remaining}s），保护单列表暂不可用；冷却结束后自动恢复`)
                   : '当前没有挂着保护单 · 开仓成功后会自动挂止损与止盈' }}
               </td>
             </tr>

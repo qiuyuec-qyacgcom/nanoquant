@@ -1611,7 +1611,15 @@ class TradingEngine:
             # 交易所限频观测: 前端据此提示「冷却剩余 Ns」，而不是反复弹 -1003 错误
             "rate_limit": {
                 "banned": binance_client.weight.banned,
+                # 本地试探倒计时；交易所声明的长封禁单独给出，避免误导为「还有 Ns 就恢复」
                 "ban_remaining": int(binance_client.weight.ban_remaining()),
+                "declared_until": int(binance_client.weight.ban_declared_until),
+                "declared_remaining": int(binance_client.weight.ban_declared_remaining()),
+                "declared_label": (
+                    time.strftime("%H:%M", time.localtime(binance_client.weight.ban_declared_until))
+                    if binance_client.weight.ban_declared_until > 0
+                    else ""
+                ),
                 "used_weight": binance_client.weight.used_weight,
                 "capacity": binance_client.weight.capacity,
             },

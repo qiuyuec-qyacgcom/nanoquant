@@ -61,7 +61,12 @@ export interface EngineStatus {
   /** 交易所限频观测（后端 WeightLimiter 状态） */
   rate_limit?: {
     banned: boolean
+    /** 本地试探倒计时（秒），不是交易所解封时间 */
     ban_remaining: number
+    /** 交易所声明的真实解封信息；长封禁时才有 */
+    declared_until?: number
+    declared_remaining?: number
+    declared_label?: string
     used_weight: number
     capacity: number
   }

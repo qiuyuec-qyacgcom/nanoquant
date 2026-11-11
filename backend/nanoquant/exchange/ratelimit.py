@@ -37,6 +37,9 @@ class WeightLimiter:
         self._last = time.monotonic()
         self._used_header = 0
         self._ban_until = 0.0
+        #: 交易所声明的真实解封时间（可能长达数小时），仅用于展示与提示，不按它熔断
+        self._ban_declared_until = 0.0
+        self._ban_logged_until = 0.0
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------ internal
@@ -55,17 +58,30 @@ class WeightLimiter:
     def ban_remaining(self) -> float:
         return max(0.0, self._ban_until - time.time())
 
+    @property
+    def ban_declared_until(self) -> float:
+        """交易所声明的解封时间戳；0 表示没有长封禁信息."""
+        return self._ban_declared_until
+
+    def ban_declared_remaining(self) -> float:
+        return max(0.0, self._ban_declared_until - time.time())
+
     def observe_ban(self, message: str) -> bool:
         m = _BAN_RE.search(message or "")
         if not m:
             return False
         declared = int(m.group(1)) / 1000.0
+        self._ban_declared_until = max(self._ban_declared_until, declared)
         self._ban_until = max(self._ban_until, min(declared, time.time() + MAX_BAN_HONOR_SEC))
-        log.error(
-            "币安返回封禁 (声明至 %s), 本地熔断至 %s",
-            time.strftime("%H:%M:%S", time.localtime(declared)),
-            time.strftime("%H:%M:%S", time.localtime(self._ban_until)),
-        )
+        # 同一轮封禁每 3 分钟会试探一次，声明时间不变时不要刷 ERROR
+        if declared > self._ban_logged_until + 1:
+            self._ban_logged_until = declared
+            log.warning(
+                "币安返回封禁 (声明至 %s), 本地每 %.0f 分钟试探一次, 下次 %s",
+                time.strftime("%H:%M:%S", time.localtime(declared)),
+                MAX_BAN_HONOR_SEC / 60,
+                time.strftime("%H:%M:%S", time.localtime(self._ban_until)),
+            )
         return True
 
     def observe_weight(self, used: int) -> None:
@@ -87,6 +103,13 @@ class WeightLimiter:
                 self._refill()
                 if self.banned:
                     # 熔断期内直接失败: 挂起会让 HTTP 请求超时, 面板看起来像卡死
+                    declared_left = self.ban_declared_remaining()
+                    if declared_left > MAX_BAN_HONOR_SEC:
+                        when = time.strftime("%H:%M", time.localtime(self._ban_declared_until))
+                        raise RateLimited(
+                            f"币安封禁至 {when}（还需约 {int(declared_left // 60)} 分钟）；"
+                            f"本地 {int(self.ban_remaining())}s 后试探，并非解封时间"
+                        )
                     raise RateLimited(f"币安限频冷却中, 剩余 {int(self.ban_remaining())}s")
                 if self._tokens >= weight:
                     self._tokens -= weight

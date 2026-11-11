@@ -1249,6 +1249,17 @@
   - 新增 `.roi-editor / .roi-head / .roi-row` 样式与 560px 窄屏适配。
 - **验证**：`vue-tsc --noEmit` 0 error、`npm run build` 通过；Playwright 实测：5 档正确渲染、无 JSON textarea、添加 `180 / 0.15` 档并保存回读成功、删除后保存恢复原值（配置未污染）。后端零改动，无需重启。
 
+### 88. -1003 长封禁信息透明化
+- **状态**：✅ 已完成
+- **现象**：总览显示「账户不可用：[-1003] 币安限频冷却中，剩余 133s」，但倒计时归零后并未恢复；本地权重只有 55/2400。
+- **根因**：日志 `币安返回封禁 (声明至 16:27:57), 本地熔断至 13:58:33` —— 交易所按 IP 声明封禁约 2.5 小时（测试网共享出口 IP 连坐），而 `MAX_BAN_HONOR_SEC=180` 让本地每 3 分钟试探一次、失败再续 3 分钟；面板把**本地试探倒计时**误展示成**解封倒计时**。`-1003` 与本地权重桶无关，是交易所侧 IP 级封禁。
+- **修复**：
+  - `WeightLimiter` 新增 `ban_declared_until` / `ban_declared_remaining()`，保留交易所声明的真实解封时间；`observe_ban` 改 WARNING 且同一轮封禁只记一次日志，避免每 3 分钟刷一条 ERROR。
+  - `acquire()` 长封禁时抛出「币安封禁至 HH:MM（还需约 N 分钟）；本地 Ns 后试探，并非解封时间」。
+  - `/engine/status.rate_limit` 增加 `declared_until` / `declared_remaining` / `declared_label`；总览与保护单空态在长封禁时展示真实解封时间与「本地试探」字样，短冷却仍显示倒计时。
+- **验证**：`pytest tests -q` → **120 passed**（新增长封禁声明时间与提示文案契约）；`compileall`、`vue-tsc --noEmit` 0 error、`npm run build` 通过；重启后实测 `declared_label=16:27`、`declared_remaining=8781s`，`account.error` 已给出「封禁至 16:27（还需约 146 分钟）；本地 175s 后试探，并非解封时间」。
+- **边界**：本地无法解除交易所封禁，重置 `ban_until` 只会立刻再撞 -1003（可能延长封禁）；需等待、切换出口 IP（代理 / 备用线路）或降低请求频率。
+
 ---
 
 ## 二、未开始
