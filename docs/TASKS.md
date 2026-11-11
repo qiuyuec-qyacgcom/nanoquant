@@ -1239,6 +1239,16 @@
   - 汇总文案不再臆断「有持仓需先平仓」，改由逐项明细说明。
 - **验证**：`pytest tests -q` → **119 passed**（新增「超时快速失败且不再发后续请求」「逐仓并发」2 条契约）；`compileall`、`vue-tsc --noEmit` 0 error、`npm run build` 通过；重启后实测 `POST /engine/trade-mode` **1.8s** 返回（原近 1 分钟），`hedge_mode` 由 `false` 变 `true`；1 个标的（ARIAUSDT）因存在挂单未切逐仓，已在结果区列出具体原因。
 
+### 87. 时间阶梯止盈改为可视化档位编辑器
+- **状态**：✅ 已完成
+- **背景**：`roi_table` 原先是 JSON textarea（`[[持仓分钟, 收益率%]]`），需手写 JSON；且「常用/全部」视图把它折叠进高级项，用户连续两轮找不到「单仓盈利百分比自动平仓」。代码与 git 历史中从来没有名为「盈利上限」/ `max_profit` 的字段，实际对应 `roi_table`（`detect_exit` 中 `profit_pct >= roi_target(...)` 触发 `exit_reason=roi`）。
+- **过程要点**：
+  - `StrategyView.vue` 新增 `roi` widget：**两列输入框**（持仓分钟 / 盈利达 % 自动平仓），支持逐档修改、添加（自动按上一档 +15 分钟、收益率 ×0.75 预填）、删除、清空（关闭阶梯止盈），最多 12 档；保存数据仍是 `[[分钟, 收益率%]]`，后端 `field_validator` 负责升序与范围校验，功能不变。
+  - 输入时只替换当前行，避免整表重建导致输入框失焦；`syncJsonText` 不再为 `roi_table` 生成 JSON 草稿。
+  - 把 `breakeven_at_r` / `partial_tp_at_r` / `partial_tp_ratio` / `roi_table` 放回「常用参数」视图，hint 改为白话（点明「按盈利百分比自动平仓」「自行配比」）。
+  - 新增 `.roi-editor / .roi-head / .roi-row` 样式与 560px 窄屏适配。
+- **验证**：`vue-tsc --noEmit` 0 error、`npm run build` 通过；Playwright 实测：5 档正确渲染、无 JSON textarea、添加 `180 / 0.15` 档并保存回读成功、删除后保存恢复原值（配置未污染）。后端零改动，无需重启。
+
 ---
 
 ## 二、未开始

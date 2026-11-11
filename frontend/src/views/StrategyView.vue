@@ -15,7 +15,7 @@ import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 
-type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json'
+type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
 
 interface FieldMeta {
   label: string
@@ -62,6 +62,7 @@ const BASIC_FIELDS: Record<string, string[]> = {
   strategy: [
     'timeframe', 'entry_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max',
     'sl_atr_mult', 'tp_atr_mult', 'trailing_pct', 'max_hold_minutes',
+    'breakeven_at_r', 'partial_tp_at_r', 'partial_tp_ratio', 'roi_table',
   ],
   data: ['max_pool_size', 'demo_base_url', 'live_base_url', 'proxy'],
   news: ['enabled', 'refresh_minutes', 'keep_days'],
@@ -92,6 +93,10 @@ const PLAIN_HINTS: Record<string, string> = {
   tp_atr_mult: '止盈距离 = ATR 的几倍',
   trailing_pct: '从浮盈高点回撤这么多就离场；0=关闭',
   max_hold_minutes: '持仓超过这个时间强制离场',
+  breakeven_at_r: '浮盈达到初始止损距离的几倍时，把止损移到开仓价',
+  partial_tp_at_r: '浮盈达到初始止损距离的几倍时，先平掉一部分仓位；0=关闭',
+  partial_tp_ratio: '部分止盈先平掉几成仓位（0.5 = 平一半）',
+  roi_table: '按盈利百分比自动平仓：每档填「持仓分钟 + 价格涨到百分之几就全平」，可增删档位自行配比；清空=关闭',
   max_spread_bps: '买卖价差超过该值就放弃；短线建议 5–12bps',
   min_notional_buffer: '交易所最小下单额的倍数，防止下单被拒',
   fee_rate_taker: '吃单手续费率，0.0005 = 0.05%',
@@ -191,8 +196,8 @@ const BASE_META: Record<string, FieldMeta> = {
   max_spread_bps: { label: '盘口点差上限', unit: 'bps', hint: '买一卖一价差超过该值就放弃开仓；0=关闭。短线建议 5–12bps' },
   roi_table: {
     label: '时间阶梯止盈',
-    widget: 'json',
-    hint: '[[持仓分钟, 收益率%]]: 持仓越久要求越低；空数组=关闭。例 [[0,0.55],[2,0.4],[5,0.28]]',
+    widget: 'roi',
+    hint: '按盈利百分比自动平仓：每档填「持仓分钟 + 价格涨到百分之几就全平」，可增删档位自行配比',
   },
   weight_trend: { label: '权重 · 趋势' },
   weight_momentum: { label: '权重 · 动能' },
@@ -502,7 +507,7 @@ const currentSections = computed(() => {
 function syncJsonText() {
   for (const key of Object.keys(jsonText)) delete jsonText[key]
   for (const [key, value] of Object.entries(draft.value || {})) {
-    if (value && typeof value === 'object') {
+    if (value && typeof value === 'object' && metaOf(current.value, key).widget !== 'roi') {
       jsonText[key] = JSON.stringify(value, null, 2)
       jsonError[key] = ''
     }
@@ -655,6 +660,42 @@ function applyJson(key: string) {
   } catch {
     jsonError[key] = 'JSON 格式有误，保存前请修正'
   }
+}
+
+/** 阶梯止盈：两列档位编辑器，保存时仍是 [[分钟, 收益率%], ...] */
+function roiRows(key: string): number[][] {
+  const raw = draft.value[key]
+  return Array.isArray(raw) ? raw.map((r: any) => [Number(r?.[0] ?? 0), Number(r?.[1] ?? 0)]) : []
+}
+
+function setRoiCell(key: string, idx: number, col: 0 | 1, event: Event) {
+  const rows = draft.value[key]
+  if (!Array.isArray(rows) || !rows[idx]) return
+  const num = Number((event.target as HTMLInputElement).value)
+  const next = Array.isArray(rows[idx]) ? [...rows[idx]] : [0, 0]
+  next[col] = Number.isFinite(num) ? num : 0
+  rows[idx] = next // 只替换当前行，输入过程中不重建整表，避免输入框失焦
+}
+
+function addRoiTier(key: string) {
+  const rows = roiRows(key)
+  if (rows.length >= 12) return
+  const last = rows[rows.length - 1]
+  rows.push([
+    last ? Math.min(2880, Number(last[0]) + 15) : 0,
+    last ? Number(Math.max(0.05, Number(last[1]) * 0.75).toFixed(2)) : 0.8,
+  ])
+  draft.value[key] = rows
+}
+
+function removeRoiTier(key: string, idx: number) {
+  const rows = roiRows(key)
+  rows.splice(idx, 1)
+  draft.value[key] = rows
+}
+
+function clearRoiTiers(key: string) {
+  draft.value[key] = []
 }
 
 async function loadCredentials() {
@@ -1006,6 +1047,45 @@ onMounted(async () => {
                     <span v-if="jsonError[f.key]" class="down" style="font-size: 11px">{{ jsonError[f.key] }}</span>
                   </div>
 
+                  <div v-else-if="f.widget === 'roi'" class="roi-editor">
+                    <div class="roi-head">
+                      <span>持仓分钟</span>
+                      <span>盈利达 % 自动平仓</span>
+                      <span></span>
+                    </div>
+                    <div v-for="(tier, idx) in draft[f.key] || []" :key="idx" class="roi-row">
+                      <input
+                        type="number" min="0" max="2880" step="1" class="input mono"
+                        :value="tier[0]"
+                        @input="setRoiCell(f.key, idx, 0, $event)"
+                      />
+                      <input
+                        type="number" min="0" max="50" step="0.05" class="input mono"
+                        :value="tier[1]"
+                        @input="setRoiCell(f.key, idx, 1, $event)"
+                      />
+                      <button class="btn btn-xs btn-danger" title="删除该档" @click="removeRoiTier(f.key, idx)">✕</button>
+                    </div>
+                    <div v-if="!(draft[f.key] || []).length" class="hint">没有档位 = 关闭按盈利百分比自动平仓</div>
+                    <div class="row" style="gap: 8px; margin-top: 6px; flex-wrap: wrap">
+                      <button
+                        class="btn btn-xs"
+                        :disabled="(draft[f.key] || []).length >= 12"
+                        @click="addRoiTier(f.key)"
+                      >
+                        + 添加一档
+                      </button>
+                      <button
+                        class="btn btn-xs btn-ghost"
+                        :disabled="!(draft[f.key] || []).length"
+                        @click="clearRoiTiers(f.key)"
+                      >
+                        清空（关闭）
+                      </button>
+                      <span class="hint">最多 12 档；保存后自动按分钟升序生效</span>
+                    </div>
+                  </div>
+
                   <input
                     v-else
                     v-model="draft[f.key]"
@@ -1280,5 +1360,34 @@ onMounted(async () => {
   font-size: 11.5px;
   color: var(--muted);
   line-height: 1.6;
+}
+
+/* ------------------------------------------------ 阶梯止盈档位编辑器 */
+.roi-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.roi-head,
+.roi-row {
+  display: grid;
+  grid-template-columns: minmax(88px, 1fr) minmax(110px, 1fr) 28px;
+  gap: 8px;
+  align-items: center;
+}
+.roi-head {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.roi-row .input {
+  padding: 5px 8px;
+}
+@media (max-width: 560px) {
+  .roi-head,
+  .roi-row {
+    grid-template-columns: minmax(70px, 1fr) minmax(88px, 1fr) 26px;
+    gap: 5px;
+  }
 }
 </style>
