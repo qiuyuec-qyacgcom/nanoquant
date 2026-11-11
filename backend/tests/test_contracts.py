@@ -1782,6 +1782,80 @@ def test_switch_trade_mode_isolates_symbols_concurrently(monkeypatch):
     assert elapsed < 1.0, elapsed  # 串行需要 1.2s
 
 
+# ------------------------------------------- 交易所降载：缓存与按标的兜底
+def test_positions_cache_reuses_snapshot(monkeypatch):
+    """positionRisk 3s 内复用；关键路径 fresh / 带 symbol 仍强制实时."""
+    import asyncio
+
+    from nanoquant.exchange import client as client_mod
+
+    calls: list[str] = []
+
+    async def fake_request(_method, path, _params=None, **_kwargs):  # noqa: ANN001
+        calls.append(path)
+        return [{"symbol": "BTCUSDT", "positionAmt": "0.1"}]
+
+    monkeypatch.setattr(client_mod.client, "_request", fake_request)
+    c = client_mod.client
+    c._positions_cache = None
+    c._positions_ts = 0.0
+    try:
+        async def run():
+            first = await c.positions()
+            cached = await c.positions()
+            fresh = await c.positions(fresh=True)
+            scoped = await c.positions("BTCUSDT")
+            return first, cached, fresh, scoped
+
+        first, cached, fresh, scoped = asyncio.run(run())
+        assert first == cached and fresh and scoped
+        assert calls == ["/fapi/v3/positionRisk"] * 3  # 首次 + fresh + 带 symbol
+    finally:
+        c._positions_cache = None
+        c._positions_ts = 0.0
+
+
+def test_tickers_rest_fallback_scopes_symbols(monkeypatch):
+    """WS 快照缺失时按标的查 ticker，权重 2，不再拉全市场 (40)."""
+    import asyncio
+    import json
+
+    from nanoquant.exchange import client as client_mod
+    from nanoquant.exchange import ticker_stream
+
+    calls: list[tuple[dict, int]] = []
+
+    async def fake_ensure(_symbols):  # noqa: ANN001
+        return None
+
+    def make(symbol):
+        return {
+            "symbol": symbol, "lastPrice": "100", "priceChangePercent": "1",
+            "highPrice": "101", "lowPrice": "99", "quoteVolume": "1000",
+        }
+
+    async def fake_request(_method, _path, params=None, **kwargs):  # noqa: ANN001
+        calls.append((params or {}, kwargs.get("weight")))
+        return [make("BTCUSDT"), make("ETHUSDT")]
+
+    monkeypatch.setattr(ticker_stream.ticker_hub, "ensure_subscribed", fake_ensure)
+    monkeypatch.setattr(ticker_stream.ticker_hub, "snapshot", lambda: {})
+    monkeypatch.setattr(client_mod.client, "_request", fake_request)
+    c = client_mod.client
+    c._tickers = {}
+    c._tickers_ts = 0.0
+    try:
+        out = asyncio.run(c.tickers(["BTCUSDT", "ETHUSDT"]))
+        assert set(out) == {"BTCUSDT", "ETHUSDT"}
+        assert calls[0][0]["symbols"] == json.dumps(["BTCUSDT", "ETHUSDT"])
+        assert calls[0][1] == 2
+        asyncio.run(c.tickers(["BTCUSDT", "ETHUSDT"]))  # 命中缓存，不再请求
+        assert len(calls) == 1
+    finally:
+        c._tickers = {}
+        c._tickers_ts = 0.0
+
+
 # ------------------------------------------- 熔断状态回写
 def test_normalize_halted_strips_compounded_prefix():
     """旧 bug 会把「引擎已熔断: 」逐轮拼回去，读侧必须能还原成单条原因."""

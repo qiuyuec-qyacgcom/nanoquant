@@ -248,6 +248,32 @@ def test_trade_mode_endpoints(client, monkeypatch):
     assert posted.json()["ok"] is True
 
 
+def test_engine_status_cache_avoids_duplicate_exchange_reads(client, monkeypatch):
+    """多标签页 2s 内轮询 status 只向交易所取一次，控制操作后立即失效."""
+    from nanoquant.api.routes import trade as trade_routes
+
+    calls = {"n": 0}
+
+    async def fake_status():
+        calls["n"] += 1
+        return {"ok": True, "stamp": calls["n"]}
+
+    monkeypatch.setattr(trade_routes.engine, "status", fake_status)
+    trade_routes.invalidate_status_cache()
+    headers = _token(client)
+    try:
+        a = client.get(f"{API}/engine/status", headers=headers).json()
+        b = client.get(f"{API}/engine/status", headers=headers).json()
+        assert a["stamp"] == b["stamp"] == 1
+        assert calls["n"] == 1
+
+        trade_routes.invalidate_status_cache()
+        c = client.get(f"{API}/engine/status", headers=headers).json()
+        assert c["stamp"] == 2 and calls["n"] == 2
+    finally:
+        trade_routes.invalidate_status_cache()
+
+
 def test_strategy_crud_and_preview(client):
     """策略 CRUD + 停用后回落到默认分析 + 适用范围预览只做本地匹配."""
     from nanoquant.db import init_db, session_scope

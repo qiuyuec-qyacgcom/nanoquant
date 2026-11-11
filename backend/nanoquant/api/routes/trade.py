@@ -1,6 +1,7 @@
 """交易: 引擎控制 / 持仓 / 订单 / 成交 / 信号 / 权益曲线."""
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -20,10 +21,37 @@ from ..schemas import ClosePositionIn, EngineControl, TradeModeIn
 
 router = APIRouter(tags=["trade"])
 
+#: 状态聚合缓存：顶栏 5s + 总览 8s + 跟单 5s 轮询、多标签页叠加时，
+#: 2 秒内只向交易所取一次 account/positionRisk（单飞锁防并发击穿）。
+_status_cache: dict | None = None
+_status_ts = 0.0
+_status_lock = asyncio.Lock()
+
+
+def invalidate_status_cache() -> None:
+    """控制/平仓/立即执行一轮后，让下一次 status 立即取新快照."""
+    global _status_cache, _status_ts
+    _status_cache = None
+    _status_ts = 0.0
+
+
+async def _status_snapshot() -> dict:
+    global _status_cache, _status_ts
+    now = time.time()
+    if _status_cache is not None and now - _status_ts < 2.0:
+        return dict(_status_cache)
+    async with _status_lock:
+        if _status_cache is not None and time.time() - _status_ts < 2.0:
+            return dict(_status_cache)
+        result = await engine.status()
+        _status_cache = result
+        _status_ts = time.time()
+        return dict(result)
+
 
 @router.get("/engine/status")
 async def status(user: str = Depends(current_user)) -> dict:
-    return await engine.status()
+    return await _status_snapshot()
 
 
 @router.get("/engine/admission")
@@ -54,6 +82,7 @@ async def switch_trade_mode(payload: TradeModeIn, user: str = Depends(current_us
         f"{user} 切换交易模式: 双向={'开' if payload.hedge else '不变'}，逐仓={'开' if payload.isolated else '不变'}",
         result,
     )
+    invalidate_status_cache()
     return result
 
 
@@ -117,7 +146,9 @@ async def control(payload: EngineControl, user: str = Depends(current_user)) -> 
                 reachable = False
             if not reachable:
                 warning = "已切换交易环境, 但该环境的币安接口暂时不可达; 恢复前引擎不会开新仓"
-    return {"ok": True, "warning": warning, "status": await engine.status()}
+    if patch:
+        invalidate_status_cache()
+    return {"ok": True, "warning": warning, "status": await _status_snapshot()}
 
 
 @router.get("/engine/execution")
@@ -197,6 +228,7 @@ async def chart_klines(
 @router.post("/engine/cycle-now")
 async def cycle_now(user: str = Depends(current_user)) -> dict:
     result = await engine.cycle()
+    invalidate_status_cache()
     return {"ok": True, "result": result}
 
 
@@ -260,6 +292,7 @@ async def close_position(position_id: int, payload: ClosePositionIn, user: str =
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.message)
     events.record("warn", "trade", f"{user} 手动平仓 {pos.symbol} {pos.side}", {"position_id": position_id})
+    invalidate_status_cache()
     return {"ok": True, "price": result.price, "qty": result.qty, "message": result.message}
 
 

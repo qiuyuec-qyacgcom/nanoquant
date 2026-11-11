@@ -361,14 +361,12 @@ function onVisible() {
 onMounted(() => {
   bootstrap()
   clockTimer = window.setInterval(tickCountdown, 1000)
-  // 轻量安全刷新 (每 5 秒一次, 权重 2): 对标 astra 的 3 秒轮询。
-  // WS 负责秒级更新最后一根蜡烛, 这里负责兜底——即使切标的/切周期时
-  // 单次请求偶发失败, 也能在 5 秒内收敛到正确数据, 而不是等到
-  // 下一根 5m 蜡烛 (最长 5 分钟) 才更新。
+  // 轻量安全兜底 (每 20 秒一次, 权重 2)：WS 已负责秒级更新最后一根蜡烛,
+  // REST 只用于切标的/切周期或偶发失败后收敛；5s 轮询在限频期间纯属浪费权重。
   refreshTimer = window.setInterval(() => {
     if (document.hidden || !selected.value) return
     reloadChart()
-  }, 5000)
+  }, 20000)
   // 24h 快照权重 40, 60 秒一次足够
   quoteTimer = window.setInterval(() => {
     if (document.hidden) return

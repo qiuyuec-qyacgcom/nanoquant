@@ -16,6 +16,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import re
 import time
 from contextvars import ContextVar
@@ -183,6 +184,9 @@ class BinanceClient:
         self._funding: dict[str, float] = {}
         self._funding_ts = 0.0
         self._oi: dict[str, tuple[float, float]] = {}
+        #: positionRisk 快照短缓存: status()/对账/模式体检并发时只打一次 REST
+        self._positions_cache: list[dict] | None = None
+        self._positions_ts = 0.0
         #: 账户快照短缓存: 多个前端面板/引擎在同一时刻读取时, 只打一次 /fapi/v3/account
         self._account_cache: dict[str, Any] | None = None
         self._account_ts = 0.0
@@ -213,6 +217,8 @@ class BinanceClient:
             self._funding = {}
             self._funding_ts = 0.0
             self._oi = {}
+            self._positions_cache = None
+            self._positions_ts = 0.0
             self._account_cache = None
             self._account_ts = 0.0
             self._algo_cache = None
@@ -451,12 +457,26 @@ class BinanceClient:
             if all(s in snap for s in wanted):
                 return {s: snap[s] for s in wanted}
 
-        # REST 兜底 (WS 尚未就绪 / 快照陈旧)
+        # REST 兜底 (WS 尚未就绪 / 快照陈旧)：按所需标的查询，避免拉全市场 (权重 40)
         now = time.time()
-        if not self._tickers or now - self._tickers_ts >= cfg.ticker_ttl_sec:
+        cached = self._tickers or {}
+        missing = [s for s in wanted if s not in cached] if wanted else []
+        stale = now - self._tickers_ts >= cfg.ticker_ttl_sec
+        if stale or missing:
             async with self._lock:
-                if not self._tickers or now - self._tickers_ts >= cfg.ticker_ttl_sec:
-                    rows = await self._request("GET", "/fapi/v1/ticker/24hr", signed=False, weight=40)
+                cached = self._tickers or {}
+                missing = [s for s in wanted if s not in cached] if wanted else []
+                stale = now - self._tickers_ts >= cfg.ticker_ttl_sec
+                if stale or missing:
+                    # 缓存过期只刷新本轮要用的标的；否则只补缺失项
+                    need = list(wanted) if (stale and wanted) else missing
+                    params: dict[str, Any] = {}
+                    if need:
+                        params["symbols"] = json.dumps(sorted(set(need)))
+                    weight = 2 if len(need) > 1 else (1 if need else 40)
+                    rows = await self._request(
+                        "GET", "/fapi/v1/ticker/24hr", params, signed=False, weight=weight
+                    )
                     out: dict[str, Ticker] = {}
                     for row in rows if isinstance(rows, list) else []:
                         if not isinstance(row, dict):
@@ -481,7 +501,7 @@ class BinanceClient:
                             continue
                         out[t.symbol] = t
                     if out:
-                        self._tickers = out
+                        self._tickers = {**cached, **out}
                         self._tickers_ts = now
         if wanted:
             return {s: self._tickers[s] for s in wanted if s in self._tickers}
@@ -623,9 +643,25 @@ class BinanceClient:
     async def balance(self) -> list[dict]:
         return await self._request("GET", "/fapi/v3/balance", weight=5)
 
-    async def positions(self, symbol: str | None = None) -> list[dict]:
+    async def positions(self, symbol: str | None = None, *, fresh: bool = False) -> list[dict]:
+        """交易所持仓快照；不带 symbol 时 3s 内复用，避免多面板轮询重复打点.
+
+        带 symbol 或 ``fresh=True`` 时强制实时（删标的确认、下单前校验等关键路径）。
+        """
+        now = time.time()
+        if (
+            symbol is None
+            and not fresh
+            and self._positions_cache is not None
+            and now - self._positions_ts < 3.0
+        ):
+            return [dict(r) for r in self._positions_cache]
         data = await self._request("GET", "/fapi/v3/positionRisk", {"symbol": symbol}, weight=5)
-        return data if isinstance(data, list) else []
+        rows = data if isinstance(data, list) else []
+        if symbol is None:
+            self._positions_cache = [dict(r) for r in rows if isinstance(r, dict)]
+            self._positions_ts = now
+        return rows
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         return await self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)})

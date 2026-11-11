@@ -142,7 +142,7 @@ class TickerStreamHub:
                     self._ws = ws
                     self._env = env
                     self._connected = True
-                    self._backoff = 1.0
+                    # 不在连接成功时立刻重置退避：网络抖动时 1s 重连会自己触发 -1003
                     streams = [f"{s.lower()}@ticker" for s in sorted(self._subs)]
                     await self._send(ws, streams, "SUBSCRIBE")
                     log.info("Ticker 流已连接 %s (%d 个订阅)", url, len(streams))
@@ -159,6 +159,7 @@ class TickerStreamHub:
                         now = time.time()
                         if now - last_prune > 60:
                             last_prune = now
+                            self._backoff = 1.0  # 稳定连接满 1 分钟才允许回到 1s 退避
                             stale = self._prune(now)
                             if stale:
                                 async with self._lock:
