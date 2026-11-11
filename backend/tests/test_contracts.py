@@ -78,10 +78,27 @@ def test_detect_exit_take_profit_long():
 
 
 def test_detect_exit_roi_tier():
+    """时间阶梯止盈：够 R 才落袋，不够 R 不落袋（赢小输大比不落袋更伤期望）。"""
     cfg = _cfg(roi_table=[[0, 0.5], [10, 0.2]])
+    # 止损 90 → risk 10%；浮盈 0.6% 只有 0.06R，属于"在止损前落袋"，必须放过
     hit, reason = detect_exit(
         side="long", entry_price=100, mark_price=100.6, peak_price=100.6,
         sl_price=90, tp_price=120, opened_at=0, now_ts=60, cfg=cfg, score=0.0,
+    )
+    assert not hit
+
+    # 浮盈 10.6% ≥ 1R，且已过 0.5% 门槛 → 应该止盈
+    hit, reason = detect_exit(
+        side="long", entry_price=100, mark_price=110.6, peak_price=110.6,
+        sl_price=90, tp_price=120, opened_at=0, now_ts=60, cfg=cfg, score=0.0,
+    )
+    assert hit and reason == "roi"
+
+    # 关掉 R 下限则恢复旧行为（可回退）
+    loose = _cfg(roi_table=[[0, 0.5], [10, 0.2]], roi_min_r=0.0)
+    hit, reason = detect_exit(
+        side="long", entry_price=100, mark_price=100.6, peak_price=100.6,
+        sl_price=90, tp_price=120, opened_at=0, now_ts=60, cfg=loose, score=0.0,
     )
     assert hit and reason == "roi"
 

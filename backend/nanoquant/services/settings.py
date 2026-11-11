@@ -96,8 +96,15 @@ class RiskSettings(BaseModel):
 
 
 class StrategySettings(BaseModel):
+    #: 信号模型。`trend` = 均线/动量趋势跟随；`meanrev` = 布林极值回归。
+    #: 两者共用准入闸门与出场规则，只有打分与止损/止盈的定位方式不同。
+    mode: Literal["trend", "meanrev"] = "trend"
+    #: 是否允许策略自主开仓。默认关闭——2026-11 的 walk-forward 实测里
+    #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/STRATEGY_REVIEW.md），
+    #: 没有正期望的配置就不该默认拿真钱去试。信号照常落库供观察。
+    auto_entry: bool = False
     #: 5–30 分钟短线系统: 主周期限定为 5m/15m/30m/1h
-    timeframe: Literal["5m", "15m", "30m", "1h"] = "5m"
+    timeframe: Literal["5m", "15m", "30m", "1h"] = "30m"
     ema_fast: int = Field(default=9, ge=2, le=200)
     ema_slow: int = Field(default=21, ge=3, le=400)
     rsi_period: int = Field(default=14, ge=2, le=100)
@@ -110,9 +117,37 @@ class StrategySettings(BaseModel):
     min_24h_quote_volume: float = Field(default=3_000_000, ge=0)
     sl_atr_mult: float = Field(default=1.2, ge=0.2, le=10)
     tp_atr_mult: float = Field(default=2.0, ge=0.2, le=20)
+    #: 盈亏比硬底线: 止盈至少是止损的 N 倍。
+    #: 正期望推导 E = p·R - (1-p), R:R=2 时只需 33% 胜率即可盈利;
+    #: R:R 只有 1.1 时要求 48% 以上胜率, 再扣手续费基本是负期望。
+    min_risk_reward: float = Field(default=2.0, ge=0.5, le=10)
+    #: 时间阶梯止盈的最小 R 倍数。低于这个倍数不落袋 ——
+    #: 静态收益率表遇上宽止损时会出现"首批止盈在止损之前落袋"，
+    #: 锁定的 R 小于 1，正是"赢小输大"的来源。
+    roi_min_r: float = Field(default=1.0, ge=0.0, le=10)
     trailing_pct: float = Field(default=0.8, ge=0.0, le=20, description="0 表示关闭移动止损")
     breakeven_at_r: float = Field(default=1.0, ge=0.1, le=10)
     max_hold_minutes: int = Field(default=180, ge=1, le=2880)
+    #: 震荡市入场的时间止损(分钟)。震荡市里 3 小时不突破就该释放资金，
+    #: 空耗到 max_hold_minutes 只会让资金占着不动。0=沿用 max_hold_minutes
+    max_hold_minutes_chop: int = Field(default=90, ge=0, le=2880)
+    #: 判定"震荡市"的均线间距阈值(%), |EMA 间距| 小于它即视为无趋势
+    chop_ema_gap_pct: float = Field(default=0.08, ge=0.0, le=5.0)
+    #: RSI 是否按趋势体制分区间解读(静态 30/70 在单边趋势里必然失效)
+    rsi_adaptive: bool = True
+
+    # ---- 均值回归模式专用（mode="meanrev"）----
+    #: 布林/标准分窗口
+    mr_window: int = Field(default=20, ge=5, le=200)
+    #: 触发回归的 |z| 阈值
+    mr_z_entry: float = Field(default=2.0, ge=0.5, le=6)
+    #: 均值回归允许的最低盈亏比。回归模型胜率高但 R 小（目标回中轨），
+    #: 用趋势那套 2R 会把全部信号拦掉，所以单独给一个更低的底线。
+    mr_min_risk_reward: float = Field(default=0.8, ge=0.2, le=5)
+    #: 趋势体制里禁止做回归（顺势方向的极值通常是继续走，不是回归）
+    mr_block_in_trend: bool = True
+    #: 判定"强趋势"的 |EMA 间距| 阈值(%)，超过则不做逆势回归
+    mr_trend_gap_pct: float = Field(default=0.35, ge=0.0, le=5.0)
     min_signal_gap: float = Field(default=0.05, ge=0.0, le=1.0)
     #: 部分止盈: 浮盈达到 N 倍初始风险 (R) 时先平掉一部分, 剩余交给移动止损; 0=关闭
     partial_tp_at_r: float = Field(default=1.0, ge=0, le=10)

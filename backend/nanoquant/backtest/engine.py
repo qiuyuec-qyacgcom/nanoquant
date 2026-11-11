@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..engine.strategy import build_features, score_signal
+from ..engine.strategy import build_features, entry_regime, score_signal
 from ..services.settings import StrategySettings
 
 WARMUP = 60
@@ -261,12 +261,23 @@ def run_backtest(
                 target = _roi_target(cfg.roi_table, held_bars * bar_minutes)
                 if target is not None and target > 0:
                     profit_pct = (bar.close - pos.entry) * direction / pos.entry * 100
-                    if profit_pct >= target:
+                    # 与实盘 detect_exit 保持同一条规则：低于 roi_min_r 倍风险的
+                    # 收益不主动了结。回测少了这一条会把"赢小输大"的单子算成盈利。
+                    risk_pct = pos.sl_pct
+                    if profit_pct >= target and (
+                        cfg.roi_min_r <= 0 or risk_pct <= 0
+                        or profit_pct + 1e-9 >= risk_pct * cfg.roi_min_r
+                    ):
                         close_pos(bar.close, i, "roi")
                         continue
 
             # 7) 超时
-            if cfg.max_hold_minutes > 0 and held_bars * bar_minutes >= min(hold_limit, cfg.max_hold_minutes):
+            chop_limit = cfg.max_hold_minutes_chop if state.get("chop") else 0
+            if chop_limit > 0:
+                hold_limit_eff = min(hold_limit, cfg.max_hold_minutes, chop_limit)
+            else:
+                hold_limit_eff = min(hold_limit, cfg.max_hold_minutes)
+            if cfg.max_hold_minutes > 0 and held_bars * bar_minutes >= hold_limit_eff:
                 close_pos(bar.close, i, "timeout")
                 continue
             continue
@@ -318,6 +329,8 @@ def run_backtest(
             "realized": 0.0,
             "funding": 0.0,
             "partial": False,
+            # 入场时的体制：震荡市提前释放资金，与实盘同一条规则
+            "chop": entry_regime(features, cfg) == "chop",
         }
         pos.stop_price = entry * (1 - direction * sl_pct / 100)
         entry_idx = i + 1

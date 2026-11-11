@@ -105,6 +105,21 @@ const PLAIN_HINTS: Record<string, string> = {
 }
 
 const BASE_META: Record<string, FieldMeta> = {
+  mode: {
+    label: '信号模型',
+    widget: 'select',
+    options: [
+      ['trend', 'trend 趋势跟随'],
+      ['meanrev', 'meanrev 均值回归'],
+    ],
+    hint: '实测两者样本外均为负收益（见 docs/STRATEGY_REVIEW.md），切换前先跑 walk-forward',
+  },
+  auto_entry: { label: '自动开仓', hint: '关闭后只落库信号供观察，不下单；跟单不受此开关影响' },
+  mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
+  mr_min_risk_reward: { label: '回归盈亏比', unit: 'R', hint: '回归模型胜率高但 R 小，用比趋势更低的底线' },
+  mr_block_in_trend: { label: '趋势中禁止逆势', hint: '顺势的极值通常是继续走，不是回归' },
+  mr_trend_gap_pct: { label: '强趋势判定', unit: '%', hint: '|EMA 间距| 超过该值视为趋势，不做逆势回归' },
+  mr_window: { label: '回归窗口', unit: '根', hint: '计算中轨与标准差所用的 K 线根数' },
   enabled: { label: '启用', hint: '关闭后该模块不参与运行' },
   cycle_interval_sec: {
     label: '轮询间隔',
@@ -336,16 +351,35 @@ const SECTIONS: Record<string, SectionDef[]> = {
     { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },
   ],
   strategy: [
-    { title: '周期与指标', fields: ['timeframe', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
+    {
+      title: '信号模型',
+      hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。auto_entry 关闭时只落库信号、不下单（与引擎总闸不同，跟单不受影响）',
+      fields: ['mode', 'auto_entry', 'timeframe'],
+    },
+    { title: '周期与指标', fields: ['ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
     { title: '开仓过滤', hint: '任一项不达标都不开仓', fields: ['entry_threshold', 'exit_threshold', 'min_signal_gap', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume'] },
-    { title: '出场规则', fields: ['sl_atr_mult', 'tp_atr_mult', 'trailing_pct', 'breakeven_at_r', 'max_hold_minutes'] },
+    {
+      title: '出场规则',
+      hint: 'min_risk_reward 是止盈/止损的硬底线：2.0 意味着只需 33% 胜率即可正期望；1.1 则要 48% 以上，扣手续费基本是负期望',
+      fields: ['sl_atr_mult', 'tp_atr_mult', 'min_risk_reward', 'trailing_pct', 'breakeven_at_r', 'max_hold_minutes'],
+    },
+    {
+      title: '体制自适应',
+      hint: '震荡市入场时提前释放资金；RSI 按趋势体制分区解读（上涨趋势里 65 是健康、80 才是过热）',
+      fields: ['max_hold_minutes_chop', 'chop_ema_gap_pct', 'rsi_adaptive'],
+    },
     { title: '部分止盈', hint: '先落袋一部分，剩余仓位用移动止损奔跑', fields: ['partial_tp_at_r', 'partial_tp_ratio'] },
     {
       title: '短线执行',
       hint: '进场先扣点差，出场按持仓时长阶梯止盈：这两项决定 5–30 分钟级别的净收益',
-      fields: ['max_spread_bps', 'roi_table'],
+      fields: ['max_spread_bps', 'roi_table', 'roi_min_r'],
     },
-    { title: '因子权重', hint: '加权求和后映射到 [-1, 1]', fields: ['weight_trend', 'weight_momentum', 'weight_volume', 'weight_funding', 'weight_oi'] },
+    { title: '因子权重', hint: '加权求和后映射到 [-1, 1]；缺失因子会被剔除并把权重重新归一', fields: ['weight_trend', 'weight_momentum', 'weight_volume', 'weight_funding', 'weight_oi'] },
+    {
+      title: '均值回归（mode=meanrev 时生效）',
+      hint: '|z| 不到阈值不做；强趋势里禁止逆势；放量突破打折。回归模型胜率高但 R 小，所以用更低的盈亏比底线',
+      fields: ['mr_window', 'mr_z_entry', 'mr_min_risk_reward', 'mr_block_in_trend', 'mr_trend_gap_pct'],
+    },
   ],
   data: [
     { title: '标的池规则', hint: '添加标的时用币安在线合约表校验；池内规格随添加落库', fields: ['max_pool_size'] },

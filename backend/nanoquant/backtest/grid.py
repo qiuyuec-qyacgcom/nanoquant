@@ -15,8 +15,28 @@ from ..services.settings import StrategySettings
 from .engine import run_backtest
 
 #: 可扫描的参数 (其余参数沿用当前配置)
-GRID_KEYS = ("entry_threshold", "sl_atr_mult", "tp_atr_mult", "trailing_pct")
+GRID_KEYS = (
+    "entry_threshold", "sl_atr_mult", "tp_atr_mult", "trailing_pct",
+    # 模型选择与均值回归参数也要能扫，否则"换假设"这件事无法验证
+    "mode", "mr_z_entry", "mr_min_risk_reward", "min_risk_reward",
+    "roi_min_r", "max_hold_minutes_chop",
+)
 MAX_RUNS = 48
+
+#: 少于此笔数的组合不参与"最优"评选。
+#: 3 笔单赚 50% 就能在按收益率排序时夺冠 —— 这是过拟合最廉价的入口，
+#: 所以排序前先按笔数筛一道，样本薄的只保留在明细里供参考。
+MIN_TRADES = 8
+
+
+def _round_param(value: Any) -> Any:
+    """数值参数取 4 位小数；字符串参数（如 mode="meanrev"）原样保留。"""
+    if isinstance(value, bool) or isinstance(value, str):
+        return value
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return value
 
 
 def run_grid(
@@ -60,7 +80,7 @@ def run_grid(
         )
         items.append(
             {
-                "params": {key: round(float(value), 4) for key, value in params.items()},
+                "params": {key: _round_param(value) for key, value in params.items()},
                 "summary": {
                     "trades": result.summary.get("trades", 0),
                     "win_rate": result.summary.get("win_rate", 0.0),
@@ -73,17 +93,25 @@ def run_grid(
             }
         )
 
+    # 按期望 R 排序：它是尺度无关的"每笔平均收益"，不会被复利放大干扰；
+    # 收益率排序容易被少数大单主导，挑出来的参数更不稳。
     items.sort(
-        key=lambda row: (row["summary"]["total_return_pct"], row["summary"]["profit_factor"]),
+        key=lambda row: (row["summary"]["expectancy"], row["summary"]["profit_factor"]),
         reverse=True,
     )
+    eligible = [row for row in items if row["summary"]["trades"] >= MIN_TRADES]
     return {
         "runs": len(items),
         "truncated": truncated,
         "max_runs": MAX_RUNS,
+        "min_trades": MIN_TRADES,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
         "grid": {key: grid[key] for key in keys},
-        "best": items[0] if items else None,
+        # 样本太薄的组合一律不进 best，避免"3 笔夺冠"
+        "best": eligible[0] if eligible else None,
         "items": items,
-        "disclaimer": "样本内排序, 过拟合风险自负; 不含 AI 复核与盘口点差闸门",
+        "disclaimer": (
+            f"样本内排序（期望 R，笔数≥{MIN_TRADES}）；"
+            "过拟合风险自负；不含 AI 复核与盘口点差闸门"
+        ),
     }

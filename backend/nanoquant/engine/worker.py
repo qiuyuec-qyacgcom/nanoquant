@@ -50,7 +50,15 @@ from ..evolution import mantra as mantra_store
 from ..evolution import review as evolution_review
 from . import risk as risk_mod
 from .margin import MarginLedger
-from .strategy import build_features, detect_exit, partial_close_qty, partial_tp_r, score_signal
+from .strategy import (
+    build_features,
+    detect_exit,
+    entry_regime,
+    partial_close_qty,
+    partial_tp_r,
+    score_signal,
+    strategy_fingerprint,
+)
 
 log = get_logger("engine")
 
@@ -65,6 +73,9 @@ class TradingEngine:
         self._stop = asyncio.Event()
         self._entry_tasks: dict[str, asyncio.Task] = {}
         self._signal_dedup: dict[tuple, int] = {}
+        #: 上一轮各标的持仓量快照。OI 接口只给单点值，不自己存上一轮就算不出 ΔOI，
+        #: 而 ΔOI 因子没有值时会以 0 分隐身（旧实现就是这样白占 12% 权重）
+        self._oi_prev: dict[str, float] = {}
         self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
         self._last_equity = 0.0
@@ -368,6 +379,7 @@ class TradingEngine:
                 initial_sl = row.initial_sl_price or 0.0
                 partial_at = row.partial_taken_at or 0
                 live_qty = row.qty
+                entry_feats = dict(row.features or {})
 
             # ---- 部分止盈: 浮盈达到 N 倍初始风险时先平掉一部分 ----
             # 放在硬止损/止盈判断之前, 触发后本轮直接 continue, 避免同轮重复平仓。
@@ -399,6 +411,8 @@ class TradingEngine:
             exit_now, reason = detect_exit(
                 side=side, entry_price=entry, mark_price=mark, peak_price=peak,
                 sl_price=sl, tp_price=tp, opened_at=opened, now_ts=now, cfg=cfg, score=score,
+                # 用**入场时**的体制判断震荡：震荡市里资金不该空耗在不会突破的仓位上
+                entry_regime=entry_regime(entry_feats, cfg),
             )
             if exit_now:
                 await self._close(broker, pos.id, reason, mark)
@@ -409,7 +423,11 @@ class TradingEngine:
             if sl and cfg.breakeven_at_r > 0 and r_multiple >= cfg.breakeven_at_r:
                 new_sl = entry * (1 + 0.0004 * direction)
                 if (direction == 1 and new_sl > sl) or (direction == -1 and new_sl < sl):
-                    res = await broker.amend_stop(pos.symbol, side, new_sl, pos.qty)
+                    # 必须把止盈一起传下去：amend_stop 内部会 cancel_all，
+                    # 只挂止损等于把止盈单撤掉不再补 —— 仓位变成"有止损、没止盈"
+                    res = await broker.amend_stop(
+                        pos.symbol, side, new_sl, pos.qty, tp_price=float(tp or 0)
+                    )
                     if res.ok:
                         events.record("info", "engine", f"{pos.symbol} 止损上移至保本 {new_sl:.8g}")
 
@@ -586,6 +604,15 @@ class TradingEngine:
         except (BinanceError, NoCredentials) as exc:
             events.record("warn", "engine", f"行情取数失败, 本轮跳过扫描: {str(exc)[:160]}")
             return []
+        # OI 变化自己算：接口只返回当前快照。第一轮没有上一轮基线 -> 该因子标记缺失，
+        # 由打分逻辑把它的权重剔出分母，而不是当成"变化 0"参与加权。
+        oi_change: dict[str, float] = {}
+        for _sym, _val in oi.items():
+            _prev = self._oi_prev.get(_sym)
+            if _prev and _prev > 0 and _val > 0:
+                oi_change[_sym] = round((_val / _prev - 1) * 100, 4)
+            self._oi_prev[_sym] = _val
+        strat_fp = strategy_fingerprint(strat_cfg)
         prices = {s: t.last for s, t in tickers.items()}
         results: list[dict[str, Any]] = []
 
@@ -602,11 +629,16 @@ class TradingEngine:
                 continue
             features = build_features(
                 candles, strat_cfg,
-                funding=funding.get(symbol, 0.0),
+                # 取不到就是 None（缺失），不能塞 0.0 冒充"费率中性 / OI 没变"
+                funding=funding.get(symbol),
                 open_interest=oi.get(symbol, 0.0),
+                oi_change_pct=oi_change.get(symbol),
                 change_24h=ticker.change_pct,
                 quote_volume=ticker.quote_volume,
             )
+            # 策略版本指纹：随信号落库并写进持仓 features，复盘时能回答
+            # "这笔亏损是策略版本问题还是执行问题"
+            features["strategy_fp"] = strat_fp
             features["_bars"] = [
                 {"o": c.open, "h": c.high, "l": c.low, "c": c.close} for c in candles[-14:]
             ]
@@ -618,6 +650,11 @@ class TradingEngine:
             rec = self._record_signal(sig, ticker, "scan")
             results.append(rec)
             if sig.direction == "flat":
+                continue
+            # 只观察不交易：信号照常落库供人眼对照，但不下单。
+            # 与 engine.enabled 的区别是那个连跟单一起停，这个是"只看不做"。
+            if not strat_cfg.auto_entry:
+                self._update_signal_reject(rec["signal_id"], "自动开仓已关闭(仅观察)")
                 continue
             if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
                 continue

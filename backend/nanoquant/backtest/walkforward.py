@@ -148,3 +148,78 @@ def run_walkforward(
         },
         "disclaimer": "每折参数在训练段选出、测试段冻结; 仍不含 AI 复核与点差闸门, 结论只用于判断参数稳健性",
     }
+
+
+# ------------------------------------------------------------------ 命令行
+
+def _load_klines(symbol: str, interval: str, limit: int) -> list[Any]:
+    """走公共接口取 K 线，不需要 API 凭证，方便离线复盘。"""
+    import httpx
+
+    from ..exchange.client import Candle
+
+    resp = httpx.get(
+        "https://fapi.binance.com/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return [
+        Candle(
+            open_time=int(k[0]), open=float(k[1]), high=float(k[2]),
+            low=float(k[3]), close=float(k[4]), volume=float(k[5]),
+        )
+        for k in resp.json()
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m nanoquant.backtest.walkforward --symbols BTCUSDT --interval 30m`"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="walk-forward 验证：样本外还能不能站住")
+    parser.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT")
+    parser.add_argument("--interval", default="30m")
+    parser.add_argument("--limit", type=int, default=3000, help="每标的 K 线根数（越大越可信）")
+    parser.add_argument("--folds", type=int, default=3)
+    parser.add_argument("--train-bars", type=int, default=600)
+    args = parser.parse_args(argv)
+
+    # 与项目默认一致的粗网格：阈值 × 止损 × 止盈
+    grid = {
+        "entry_threshold": [0.30, 0.45],
+        "sl_atr_mult": [1.0, 1.5],
+        "tp_atr_mult": [2.0, 3.0],
+    }
+
+    header = f"{'标的':10} {'折':>3} {'OOS笔':>7} {'OOS收益%':>10} {'最差折%':>9} {'正折':>7} {'过拟合缺口%':>12}"
+    print(header)
+    print("-" * len(header.encode("gbk", errors="ignore")) or "-" * 70)
+    for raw in [s.strip() for s in args.symbols.split(",") if s.strip()]:
+        try:
+            candles = _load_klines(raw, args.interval, args.limit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{raw:10} 取数失败: {str(exc)[:60]}")
+            continue
+        result = run_walkforward(
+            candles,
+            StrategySettings(timeframe=args.interval),
+            symbol=raw,
+            grid=grid,
+            folds=args.folds,
+            train_bars=args.train_bars,
+        )
+        if result.get("error"):
+            print(f"{raw:10} {result['error']}")
+            continue
+        agg = result["aggregate"]
+        print(
+            f"{raw:10} {result['folds']:>3} {agg['oos_trades']:>7} "
+            f"{agg['oos_return_pct']:>10.2f} {agg['oos_worst_fold_pct']:>9.2f} "
+            f"{agg['positive_folds']}/{result['folds']:<5} {agg['overfit_gap_pct']:>12.2f}"
+        )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - 手工运行入口
+    raise SystemExit(main())

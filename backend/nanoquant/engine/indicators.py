@@ -74,6 +74,22 @@ def stdev(values: list[float]) -> float:
     return math.sqrt(max(0.0, var))
 
 
+def zscore_last(values: list[float], period: int) -> tuple[float, float, float]:
+    """最后一根相对近 period 根的标准分：(z, 均值, 标准差)。
+
+    z 用**样本标准差**，并在标准差为 0（横盘到没有波动）时返回 z=0 ——
+    否则会出现除零或"无穷大的偏离"，那是数据退化不是信号。
+    """
+    if len(values) < max(3, period) or period <= 1:
+        return 0.0, 0.0, 0.0
+    window = values[-period:]
+    mean = sum(window) / len(window)
+    sd = stdev(window)
+    if sd <= 0:
+        return 0.0, mean, 0.0
+    return (window[-1] - mean) / sd, mean, sd
+
+
 def pct_change(values: list[float], bars: int) -> float:
     if len(values) <= bars or values[-bars - 1] == 0:
         return 0.0

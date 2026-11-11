@@ -226,7 +226,7 @@ async def analyze_symbol(payload: AnalyzeIn, user: str = Depends(current_user)) 
     try:
         candles = await binance_client.klines(symbol, payload.interval or strat.timeframe, 120)
         tickers = await binance_client.tickers([symbol])
-        funding = (await binance_client.funding_rates([symbol])).get(symbol, 0.0)
+        funding = (await binance_client.funding_rates([symbol])).get(symbol)
     except (BinanceError, NoCredentials) as exc:
         raise HTTPException(status_code=503, detail=f"币安行情不可用: {exc}") from exc
     if len(candles) < 30:
@@ -273,9 +273,10 @@ async def decision_preview(payload: AnalyzeIn, user: str = Depends(current_user)
     if ticker is None:
         raise HTTPException(status_code=400, detail="行情不可用")
     try:
-        funding = (await binance_client.funding_rates([symbol])).get(symbol, 0.0)
+        # 取不到就保持 None（缺失），不能塞 0 冒充"费率为零"
+        funding = (await binance_client.funding_rates([symbol])).get(symbol)
     except BinanceError:
-        funding = 0.0
+        funding = None
     features = build_features(candles, strat, funding=funding, change_24h=ticker.change_pct, quote_volume=ticker.quote_volume)
     from ...evolution import mantra as mantra_store
 
