@@ -48,6 +48,7 @@ interface FollowStatus {
   engine_enabled: boolean
   path: string
   path_exists: boolean
+  source_kind: string
   offset: number
   inflight_margin: number
   last_poll: number
@@ -225,8 +226,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <span v-else class="tag tag-dim">状态接口不可用</span>
         </div>
         <div class="hint" style="margin-top: 8px">
-          上游把信号写入 <code>data/&lt;slug&gt;/signals.jsonl</code>，本模块每 {{ form.poll_sec }} 秒增量读本地文件，
-          收到开仓信号即刻跟仓；也可 <code>POST /api/v1/signal-follow/ingest</code> 直推，零轮询延迟。
+          信号源填本地 <code>signals.jsonl</code> 路径，或直接填 <code>http(s)</code> 频道链接（后端每 {{ form.poll_sec }} 秒拉取）。
+          也可 <code>POST /api/v1/signal-follow/ingest</code> 直推，零轮询延迟。
           开仓走本系统风控与资金，和引擎轮询开仓共用同标的互斥与保证金账本。
         </div>
       </div>
@@ -244,12 +245,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <div class="kpi-foot">含过期、风控闸门、非开仓事件</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">信号文件</div>
+        <div class="kpi-label">信号源</div>
         <div class="kpi-value" :class="!ready ? 'flat' : status?.path_exists ? 'up' : 'down'" style="font-size: 17px">
           {{ !ready ? '--' : status?.path_exists ? '已接入' : '未接入' }}
         </div>
         <div class="kpi-foot ellipsis" :title="status?.path || ''">
-          {{ !ready ? '等待状态接口' : (status?.path || '请配置 jsonl_path') }}
+          {{ !ready ? '等待状态接口' : (status?.path || '请配置信号源路径 / 频道链接') }}
         </div>
       </div>
       <div class="kpi">
@@ -322,14 +323,14 @@ onBeforeUnmount(() => window.clearInterval(timer))
 
           <div>
             <div class="section-hd">
-              <span class="section-title">接入路径与直推</span>
+              <span class="section-title">信号源与直推</span>
               <span class="section-hint">频道不写死在代码里</span>
             </div>
             <div class="stack" style="gap: 10px">
               <div class="field">
-                <span class="label">signals.jsonl 路径 / 频道目录</span>
-                <input v-model="form.jsonl_path" class="input mono" placeholder="留空自动发现 ao-monitor/data/*/signals.jsonl" />
-                <span class="hint">也可用环境变量 <code>SIGNAL_FOLLOW_JSONL</code> / <code>AO_MONITOR_DATA</code> 指定；首次接入从文件尾部开始，不回放历史。</span>
+                <span class="label">信号源路径 / 频道链接</span>
+                <input v-model="form.jsonl_path" class="input mono" placeholder="本地 signals.jsonl 路径，或 http(s) 频道链接" />
+                <span class="hint">本地路径支持文件或频道目录；填 <code>http(s)</code> 链接则后端定时拉取（支持 JSON 数组 / 含 signals 字段的对象 / JSONL 文本）；首次接入不回放历史。</span>
               </div>
               <div class="field">
                 <span class="label">直推共享密钥</span>
@@ -350,7 +351,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <span class="panel-title">链路状态</span>
           <div class="right">
             <span class="tag" :class="!ready ? 'tag-dim' : status?.path_exists ? 'tag-long' : 'tag-warn'">
-              {{ !ready ? '状态未读取' : status?.path_exists ? '文件已接入' : '等待上游写入' }}
+              {{ !ready ? '状态未读取' : status?.path_exists ? (status?.source_kind === 'url' ? '链接已接入' : '文件已接入') : '等待上游写入' }}
             </span>
           </div>
         </div>
@@ -384,7 +385,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <div class="divider" />
 
           <div class="field">
-            <span class="label">信号文件</span>
+            <span class="label">信号源</span>
             <div class="code" style="font-size: 10.5px; max-height: 84px">
               {{ !ready ? '状态接口不可用' : (status?.path || '未发现 signals.jsonl') }}
             </div>
@@ -402,7 +403,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <button class="btn btn-sm" :disabled="busy" @click="runOp('/signal-follow/reset-cursor', '重置游标')">重置游标</button>
             <button class="btn btn-sm" :disabled="loading" @click="load">刷新</button>
           </div>
-          <div class="hint">切换频道或清理积压旧信号时用「重置游标」，它只把当前文件游标移到尾部，不删除任何数据。</div>
+          <div class="hint">切换频道或清理积压旧信号时用「重置游标」：本地文件移到尾部、频道链接清空去重索引，均不回放历史、不删数据。</div>
         </div>
       </aside>
     </div>

@@ -84,6 +84,10 @@ class TradingEngine:
         self._follow_cursor_key = ""
         self._follow_last_poll = 0.0
         self._follow_last_error = ""
+        #: 频道链接(http/https)模式：首次接入只建去重索引、不回放历史
+        self._follow_url_primed = False
+        self._follow_url_primed_for = ""
+        self._follow_url_seen: set[str] = set()
         #: 交易模式体检（双向持仓 + 逐仓）节流：5 分钟查一次，提示 1 小时一次
         self._trade_mode_ts = 0.0
         self._trade_mode_warn_ts = 0.0
@@ -737,10 +741,10 @@ class TradingEngine:
             log.warning("跟单中断记录恢复失败: %s", exc)
 
     async def _poll_signal_feed_once(self) -> int:
-        """读一轮 signals.jsonl，返回本次处理的行数.
+        """读一轮信号源，返回本次处理的行数.
 
-        首次接入某个文件从**文件尾部**开始（RUNBOOK 非目标: 历史回填）；上游
-        `--reset` 截断文件时 `read_new_lines` 会自动从 0 重读新文件。
+        支持两类信号源：本地 ``signals.jsonl`` 文件（增量字节游标）与 http(s) 频道链接
+        （去重索引）。两者首次接入都**不回放历史**：文件从尾部、链接只建索引。
         """
         cfg = get_signal_follow()
         if not cfg.enabled:
@@ -748,19 +752,25 @@ class TradingEngine:
             return 0
         from ..config import paths
 
+        raw = (cfg.jsonl_path or "").strip()
+        if signal_feed.is_url(raw):
+            return await self._poll_url(raw)
+
         path = signal_feed.resolve_path(cfg.jsonl_path, str(paths.HOME))
         if not path:
             self._follow_last_error = "未找到 signals.jsonl（请配置 jsonl_path 或 AO_MONITOR_DATA）"
             return 0
         if path != self._follow_path:
             self._follow_path = path
+            self._follow_cursor_key = self._follow_offset_key(path)
+            self._follow_url_primed = False
+            self._follow_url_seen = set()
             state.set("signal_follow_path", path)
-        self._follow_cursor_key = self._follow_offset_key(path)
         if not os.path.isfile(path):
             self._follow_last_error = f"等待信号文件: {path}"
             return 0
-        raw = state.get(self._follow_cursor_key, "")
-        if raw == "":
+        raw_off = state.get(self._follow_cursor_key, "")
+        if raw_off == "":
             offset = os.path.getsize(path)
             state.set(self._follow_cursor_key, str(offset))
             events.record(
@@ -778,9 +788,55 @@ class TradingEngine:
             await self._handle_signal_row(row)
         return len(rows)
 
+    async def _poll_url(self, url: str) -> int:
+        """拉取频道链接（http/https）信号；首次接入只建去重索引、不回放历史.
+
+        链接没有「尾部」，故首次轮询把当前返回的所有信号标识写入
+        ``_follow_url_seen`` 而不跟单；之后只跟「新出现」的信号，与文件尾部语义一致。
+        """
+        if url != self._follow_path:
+            self._follow_path = url
+            self._follow_cursor_key = ""
+            self._follow_url_primed = False
+            self._follow_url_seen = set()
+            state.set("signal_follow_path", url)
+            events.record("info", "signal_follow", f"接入频道链接 {url}")
+        try:
+            rows = await signal_feed.fetch_url_signals(url, timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            self._follow_last_error = f"拉取频道链接失败: {exc}"[:200]
+            return 0
+        self._follow_last_poll = time.time()
+        self._follow_last_error = ""
+        if not self._follow_url_primed or self._follow_url_primed_for != url:
+            self._follow_url_primed_for = url
+            self._follow_url_primed = True
+            for r in rows:
+                parsed = signal_feed.parse_signal(r)
+                if parsed:
+                    self._follow_url_seen.add(signal_feed.signal_identity(parsed))
+            return 0
+        new_rows: list[dict[str, Any]] = []
+        for r in rows:
+            parsed = signal_feed.parse_signal(r)
+            if not parsed:
+                continue
+            key = signal_feed.signal_identity(parsed)
+            if key in self._follow_url_seen:
+                continue
+            self._follow_url_seen.add(key)
+            new_rows.append(r)
+        for row in new_rows:
+            await self._handle_signal_row(row)
+        return len(new_rows)
+
     def reset_follow_cursor(self) -> dict[str, Any]:
-        """手动把游标移到当前文件尾部（切换频道 / 清掉积压旧信号时用）."""
+        """手动把游标移到当前源尾部：本地文件移字节游标；频道链接清空去重索引（不回放历史）."""
         path = self._follow_path
+        if signal_feed.is_url(path):
+            self._follow_url_primed = False
+            self._follow_url_seen = set()
+            return {"ok": True, "path": path, "offset": 0, "mode": "url"}
         if not path or not os.path.isfile(path):
             return {"ok": False, "reason": "信号文件尚不可用"}
         key = self._follow_offset_key(path)
@@ -1110,7 +1166,11 @@ class TradingEngine:
             "running": bool(self._follow_task and not self._follow_task.done()),
             "engine_enabled": get_engine().enabled,
             "path": self._follow_path,
-            "path_exists": bool(self._follow_path and os.path.isfile(self._follow_path)),
+            "path_exists": bool(
+                self._follow_path
+                and (os.path.isfile(self._follow_path) or signal_feed.is_url(self._follow_path))
+            ),
+            "source_kind": "url" if signal_feed.is_url(self._follow_path) else "file",
             "offset": state.get_int(key, 0) if key else 0,
             "inflight_margin": round(self._margin.inflight, 6),
             "last_poll": int(self._follow_last_poll),

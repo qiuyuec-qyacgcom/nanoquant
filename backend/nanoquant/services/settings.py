@@ -334,8 +334,8 @@ class SignalFollowSettings(BaseModel):
     """
 
     enabled: bool = Field(default=False, description="开启后才会读取或接收外部信号")
-    jsonl_path: str = Field(default="", description="signals.jsonl 绝对路径（或频道目录）; 留空自动找 ao-monitor/data/*/signals.jsonl")
-    poll_sec: int = Field(default=1, ge=1, le=60, description="本地 jsonl 增量轮询间隔秒（非 Telegram 轮询）")
+    jsonl_path: str = Field(default="", description="信号源：本地 signals.jsonl 绝对路径（或频道目录），或 http(s) 频道链接（后端定时拉取）；留空自动找 ao-monitor/data/*/signals.jsonl")
+    poll_sec: int = Field(default=1, ge=1, le=60, description="信号源轮询间隔秒（本地文件增量读 / 频道链接拉取共用）")
     ingest_token: str = Field(default="", description="HTTP 直推共享密钥; 留空则直推接口只接受登录态")
     leverage_bonus: int = Field(default=10, ge=0, le=100, description="在原信号杠杆基础上增加的倍数（默认 +10x）")
     max_age_sec: int = Field(default=180, ge=5, le=3600, description="信号超过该秒数不再跟单（防重启补开旧信号）")

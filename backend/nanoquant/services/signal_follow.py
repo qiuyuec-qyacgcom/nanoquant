@@ -259,3 +259,59 @@ def read_new_lines(path: str, offset: int, *, max_bytes: int = 1 << 20) -> tuple
         if isinstance(item, dict):
             rows.append(item)
     return rows, offset + consumed
+
+
+# -------------------------------------------------------------------- 频道链接(http/https)
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def is_url(source: str) -> bool:
+    """配置项既可以是本地文件路径，也可以是 http(s) 频道链接."""
+    return bool(_URL_RE.match((source or "").strip()))
+
+
+def _coerce_rows(payload: Any) -> list[dict[str, Any]]:
+    """从 URL 响应体提取信号行：JSON 数组 / 含列表字段的对象 / 纯 JSONL 文本.
+
+    返回 dict 列表；空或非预期结构返回空列表（调用方据此跳过本轮）。
+    """
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("signals", "items", "data", "messages", "rows", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [r for r in value if isinstance(r, dict)]
+        return []
+    if isinstance(payload, str):
+        out: list[dict[str, Any]] = []
+        for line in payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+    return []
+
+
+async def fetch_url_signals(url: str, *, timeout: float = 10.0) -> list[dict[str, Any]]:
+    """拉取频道链接并把响应体解析成统一信号行列表.
+
+    兼容三种上游格式：JSON 数组、含 ``signals/items/data`` 等键的对象、纯 JSONL 文本。
+    失败直接抛异常，由轮询方记录后跳过本轮（不阻塞）。
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"Accept": "application/json, text/plain"})
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = resp.text
+        return _coerce_rows(payload)

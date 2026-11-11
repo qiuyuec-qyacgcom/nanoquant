@@ -2270,6 +2270,77 @@ def test_weight_limiter_exposes_declared_ban_time():
     assert "封禁至" in msg and "试探" in msg  # 不再只显示「剩余 Ns」误导用户
 
 
+def test_is_url_detects_http_links():
+    """信号源支持 http(s) 频道链接，本地路径/空串仍按文件处理."""
+    from nanoquant.services import signal_follow as signal_feed
+
+    assert signal_feed.is_url("https://example.com/signals")
+    assert signal_feed.is_url("http://example.com/signals")
+    assert not signal_feed.is_url("")
+    assert not signal_feed.is_url("/tmp/signals.jsonl")
+    assert not signal_feed.is_url("f:/cb/data/signals.jsonl")
+
+
+def test_coerce_rows_supports_array_object_and_jsonl():
+    """频道链接响应体兼容 JSON 数组 / 含 signals 字段的对象 / 纯 JSONL 文本."""
+    from nanoquant.services import signal_follow as signal_feed
+
+    assert signal_feed._coerce_rows([{"symbol": "BTCUSDT"}])[0]["symbol"] == "BTCUSDT"
+    assert signal_feed._coerce_rows({"signals": [{"symbol": "ETHUSDT"}]})[0]["symbol"] == "ETHUSDT"
+    assert signal_feed._coerce_rows({"data": [{"symbol": "SOLUSDT"}]})[0]["symbol"] == "SOLUSDT"
+    assert [r["symbol"] for r in signal_feed._coerce_rows('{"symbol":"X"}\n{"symbol":"Y"}\n')] == ["X", "Y"]
+    assert signal_feed._coerce_rows("not json") == []
+    assert signal_feed._coerce_rows(123) == []
+
+
+def test_signal_follow_url_no_replay_then_follows_only_new(monkeypatch):
+    """频道链接首次接入只建去重索引、不回放历史；之后只跟新出现的信号."""
+    import asyncio
+
+    from nanoquant.engine import worker
+    from nanoquant.engine.worker import engine as eng
+
+    captured: list[dict] = []
+
+    async def fake_handle(row):
+        captured.append(row)
+        return {"ok": True}
+
+    monkeypatch.setattr(eng, "_handle_signal_row", fake_handle)
+
+    rows_a = [
+        {"id": "1", "event": "开仓", "symbol": "BTCUSDT", "side": "long"},
+        {"id": "2", "event": "开仓", "symbol": "ETHUSDT", "side": "short"},
+    ]
+    rows_b = [
+        {"id": "2", "event": "开仓", "symbol": "ETHUSDT", "side": "short"},
+        {"id": "3", "event": "开仓", "symbol": "SOLUSDT", "side": "long"},
+    ]
+    calls = {"i": 0}
+
+    async def fake_fetch(url, *, timeout=10.0):
+        calls["i"] += 1
+        return rows_a if calls["i"] == 1 else rows_b
+
+    monkeypatch.setattr(worker.signal_feed, "fetch_url_signals", fake_fetch)
+
+    eng._follow_path = ""
+    eng._follow_url_primed = False
+    eng._follow_url_primed_for = ""
+    eng._follow_url_seen = set()
+    eng._follow_last_error = ""
+
+    async def run():
+        n1 = await eng._poll_url("https://example.com/signals")
+        n2 = await eng._poll_url("https://example.com/signals")
+        return n1, n2
+
+    n1, n2 = asyncio.run(run())
+    assert n1 == 0  # 首次接入只建索引，不跟单
+    assert n2 == 1  # 只跟新出现的 id=3
+    assert {r["id"] for r in captured} == {"3"}
+
+
 def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeypatch):
     """决策上下文显式给出全局区间，不再把心法规则原文塞给模型，同时注入适用策略."""
     from types import SimpleNamespace

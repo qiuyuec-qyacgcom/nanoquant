@@ -1,6 +1,6 @@
 # NanoQuant 任务跟踪
 
-> 更新日期：2026-11-06
+> 更新日期：2026-11-11
 > 说明：本文件区分「已完成 / 进行中」与「未开始」两部分，记录任务名称、状态、执行过程要点、结果或待办，便于后续跟踪。
 > 状态标记：`✅ 已完成` / `🟡 进行中` / `⬜ 未开始`
 
@@ -1271,6 +1271,16 @@
   5. `ticker_stream` 重连退避：连接成功不再立即重置为 1s，稳定连接满 60s 才重置，避免网络抖动时高频重连自己触发 -1003。
 - **验证**：`pytest tests -q` → **123 passed**（新增持仓缓存、ticker 按标的兜底、status 聚合缓存 3 条用例）；`compileall` 通过；`vue-tsc --noEmit` 0 error；`npm run build` 通过；重启后连续两次 `/engine/status` 响应完全一致（缓存生效），账户与 8 个标的行情恢复正常、无封禁日志。
 - **边界**：仍无法规避测试网共享出口 IP 连坐；独立出口 IP / 代理需在「参数配置 → 数据源」自行配置。
+
+### 90. 信号跟单「接入路径」支持频道链接（http/https）
+- **状态**：✅ 已完成
+- **背景**：信号跟单原只支持本地 `signals.jsonl` 文件或 HTTP 直推接口，页面「接入路径」只能填本地文件路径。用户希望直接粘贴信号源 **频道链接**。
+- **过程要点**：
+  - `services/signal_follow.py` 新增 `is_url()` 识别 `http(s)`、`_coerce_rows()`（兼容 JSON 数组 / 含 `signals|items|data|messages|rows|result` 字段的对象 / 纯 JSONL 文本）、`fetch_url_signals()`（用 `httpx.AsyncClient` 拉取，超时 10s）。
+  - 引擎 `_poll_signal_feed_once` 增加 URL 分支，转调 `_poll_url`；链接**首次接入只建去重索引、不回放历史**（与文件尾部语义一致），之后只跟「新出现」的信号；拉取失败优雅记录 `last_error` 不阻塞。
+  - `signal_follow_status` 增加 `source_kind`（`url`/`file`）与链接接入态；`reset_follow_cursor` 支持链接模式（清空去重索引、不回放）；设置项 `jsonl_path` 描述改为「信号源：本地路径或 http(s) 频道链接」。
+  - 前端 `SignalFollowView.vue`：输入框改「信号源路径 / 频道链接」、占位与说明覆盖 URL 三种格式；KPI 与链路状态标签从「文件已接入」改为「链接已接入」；重置游标说明覆盖两种模式；类型补 `source_kind`。
+- **验证**：`pytest tests -q` → **126 passed**（新增 `is_url`、URL 三种格式解析、链接首次不回放/之后只跟新信号 3 条用例）；`compileall`、`vue-tsc --noEmit` 0 error、`npm run build` 通过；重启后实测 `PUT /settings/signal_follow` 写入 `https://example.invalid/signals` 并启用，引擎一轮后 `path_exists=True`、`source_kind=url`、拉取失败优雅记录（无效域名），配置已恢复默认。
 
 ---
 
