@@ -261,8 +261,8 @@ async def decision_preview(payload: AnalyzeIn, user: str = Depends(current_user)
     symbol = payload.symbol.upper()
     strat = get_strategy()
     try:
-        # AnalyzeIn 默认 interval=1m（AI 分析用），但策略是 5m；演练必须跟实盘同周期
-        interval = payload.interval if payload.interval in {"5m", "15m", "30m", "1h"} else strat.timeframe
+        # AnalyzeIn 默认 interval=1m（AI 分析用），但策略是 15m；演练必须跟实盘同周期
+        interval = payload.interval if payload.interval in {"15m", "30m", "1h"} else strat.timeframe
         candles = await binance_client.klines(symbol, interval, 120)
         tickers = await binance_client.tickers([symbol])
     except (BinanceError, NoCredentials) as exc:

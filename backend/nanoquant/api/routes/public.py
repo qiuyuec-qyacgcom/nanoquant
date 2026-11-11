@@ -105,7 +105,7 @@ def _kline_payload(symbol: str, interval: str, candles: list[Any]) -> dict[str, 
 @router.get("/klines")
 async def public_klines(
     symbol: str = Query(..., description="合约, 必须在标的池中"),
-    interval: str = Query(default="5m"),
+    interval: str = Query(default="15m"),
     limit: int = Query(default=600, ge=20, le=1000),
     fresh: bool = Query(default=True, description="绕过服务端缓存, 取最新一根未收盘蜡烛"),
 ) -> dict[str, Any]:
@@ -154,7 +154,7 @@ async def public_quotes() -> dict[str, Any]:
 
 @router.get("/klines/batch")
 async def public_klines_batch(
-    interval: str = Query(default="5m"),
+    interval: str = Query(default="15m"),
     limit: int = Query(default=120, ge=20, le=300),
     max_symbols: int = Query(default=12, ge=1, le=20),
     fresh: bool = Query(default=False, description="绕过缓存"),

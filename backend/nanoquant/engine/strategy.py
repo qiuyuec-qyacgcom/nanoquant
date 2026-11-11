@@ -32,14 +32,15 @@ from . import indicators as ta
 
 #: 影响信号语义的配置项。任何一项变化都应改变策略指纹（可追溯"这笔单是哪个版本开的"）
 _FP_KEYS = (
-    "mode", "timeframe", "ema_fast", "ema_slow", "rsi_period", "atr_period",
+    "mode", "timeframe", "htf_timeframe", "ema_fast", "ema_slow", "rsi_period", "atr_period",
     "entry_threshold", "exit_threshold", "volume_ratio_min",
     "atr_pct_min", "atr_pct_max", "min_24h_quote_volume",
     "sl_atr_mult", "tp_atr_mult", "min_risk_reward", "roi_min_r",
-    "trailing_pct", "breakeven_at_r", "max_hold_minutes", "max_hold_minutes_chop",
+    "trailing_pct", "trailing_arm_r", "breakeven_at_r", "max_hold_minutes", "max_hold_minutes_chop",
     "chop_ema_gap_pct", "rsi_adaptive", "partial_tp_at_r", "partial_tp_ratio",
-    "roi_table",
+    "roi_table", "adx_filter", "adx_period", "adx_min",
     "mr_window", "mr_z_entry", "mr_min_risk_reward", "mr_block_in_trend", "mr_trend_gap_pct",
+    "mr_exhaustion_confirm",
     "weight_trend", "weight_momentum", "weight_volume", "weight_funding", "weight_oi",
 )
 
@@ -118,6 +119,8 @@ def build_features(
     oi_change_pct: float | None = None,
     change_24h: float = 0.0,
     quote_volume: float = 0.0,
+    data_degraded: bool = False,
+    htf_trend: str = "",
 ) -> dict[str, Any]:
     """构造因子字典。
 
@@ -151,6 +154,11 @@ def build_features(
         "oi_change_pct": float(oi_change_pct) if oi_change_pct is not None else None,
         "change_24h": change_24h,
         "quote_volume": quote_volume,
+        #: 行情走 REST 兜底（WS 断线）时置真。此时没有盘口，点差闸门失效，
+        #: 信号层必须知道自己在用降级数据，而不是静默拿一个没有 bid/ask 的快照。
+        "data_degraded": bool(data_degraded),
+        #: 高周期趋势方向：up/down/flat，""=未启用 HTF
+        "htf_trend": htf_trend,
     }
 
     # ---- 可用性判定：缺失写成缺失，不写中性 ----
@@ -190,6 +198,13 @@ def build_features(
     f["band_z"] = round(z, 4)
     f["band_mid"] = round(mid, 8)
     f["band_sd_pct"] = round(sd / price * 100, 4)
+    # ADX 趋势强度：需要 2×period+1 根
+    adx_val = ta.adx(candles, cfg.adx_period)
+    f["adx"] = round(adx_val, 4)
+    if "adx" not in ok:
+        ok["adx"] = bars >= cfg.adx_period * 2 + 1
+        if not ok["adx"]:
+            missing.append(f"ADX:K线{bars}<{cfg.adx_period*2+1}")
     for key in ("close", "ema_fast", "ema_slow", "atr"):
         f[key] = round(f[key], 8)
     return f
@@ -329,9 +344,10 @@ def _score_trend(
         f"EMA 结构 {features['ema_gap_pct']:+.3f}%",
         f"RSI {features['rsi']:.1f}"
         + (f"→{rsi_term:+.2f}(体制自适应)" if cfg.rsi_adaptive else ""),
-        f"1/5 分钟收益 {features['ret_1']:+.3f}% / {features['ret_5']:+.3f}%",
+        f"1/5 根收益 {features['ret_1']:+.3f}% / {features['ret_5']:+.3f}%",
         f"量比 {features['vol_ratio']:.2f}",
         f"ATR {features['atr_pct']:.3f}%",
+        f"ADX {features['adx']:.1f}",
     ]
     if avail("funding"):
         res.reasons.append(f"资金费率 {features['funding'] * 100:+.4f}%")
@@ -340,6 +356,8 @@ def _score_trend(
     if missing:
         # 把"缺什么"写进 reasons，而不是让它以 0 分隐身
         res.reasons.append("缺失因子(未计入打分): " + "、".join(missing))
+    if features.get("data_degraded"):
+        res.reasons.append("⚠ 行情走 REST 兜底(WS 断线, 无盘口)")
 
     # ---- 准入过滤 (可解释的拒绝原因)
     if not _pass_gates(res, features, cfg, avail("volume")):
@@ -367,6 +385,14 @@ def _score_trend(
     else:
         res.direction = "flat"
 
+    # 趋势强度过滤: 方向分再高，没有趋势支撑就是震荡里的假突破。
+    # 短线趋势跟随的亏损绝大多数来自这里（模拟盘 24 笔 trailing 全亏的深一层原因）。
+    if res.direction != "flat" and cfg.adx_filter and avail("adx"):
+        if features["adx"] < cfg.adx_min:
+            res.blocked = f"趋势强度不足 ADX {features['adx']:.1f} < {cfg.adx_min}"
+            res.direction = "flat"
+            return res
+
     # 结构确认: 趋势方向必须与分数一致, 避免逆势抄底
     if res.direction == "long" and features["ema_fast"] <= features["ema_slow"]:
         res.blocked = "多头信号缺少均线结构确认"
@@ -374,6 +400,12 @@ def _score_trend(
     if res.direction == "short" and features["ema_fast"] >= features["ema_slow"]:
         res.blocked = "空头信号缺少均线结构确认"
         res.direction = "flat"
+    # 高周期过滤：只做与 HTF 趋势同向的信号
+    htf = features.get("htf_trend") or ""
+    if htf in ("up", "down") and res.direction != "flat":
+        if (htf == "up" and res.direction == "short") or (htf == "down" and res.direction == "long"):
+            res.blocked = f"逆高周期趋势(HTF {htf})"
+            res.direction = "flat"
     return res
 
 
@@ -382,7 +414,7 @@ def _score_meanrev(
 ) -> SignalResult:
     """均值回归：价格偏离中轨到极值、且没有跟随量时，赌它回到中轨。
 
-    为什么值得单独做一套：5m 级别的趋势跟随在加密永续上长期是负期望
+    为什么值得单独做一套：短周期趋势跟随在加密永续上长期是负期望
     （实测 BTC/ETH/SOL 全周期为负，见 docs/STRATEGY_REVIEW.md），
     原因是大量时间在震荡。回归模型赚的正是那段震荡，而它的代价是
     胜率高但单笔 R 小 —— 所以用单独的更低的盈亏比底线，而不是趋势那套 2R。
@@ -442,15 +474,22 @@ def _score_meanrev(
         res.blocked = "带宽为 0（横盘无波动），无法定位回归空间"
         return res
 
+    # 动能衰竭二次确认：放量仍在把极值往外推，回归条件不成立
+    if cfg.mr_exhaustion_confirm and vol_ratio >= 1.0:
+        res.blocked = f"动能未衰竭 量比 {vol_ratio:.2f} ≥ 1.0，放量可能继续而非回归"
+        res.direction = "flat"
+        return res
+
     # 放量突破不算超买超卖：置信度打折，但不停用（有些放量确实是衰竭）
     follow_through = 1.0 if vol_ratio <= 1.2 else 0.6
     strength = ta.clamp(-ta.tanh_norm(z, cfg.mr_z_entry) * follow_through)
     res.score = round(strength, 4)
     res.direction = "long" if z < 0 else "short"
 
-    # 止损放在极值之外，止盈回到中轨附近
+    # 止损放在极值之外，止盈回到中轨。|z|·σ 就是"当前价到中轨"的精确距离，
+    # 所以这里直接用 full 距离（不再打 0.9 折），让止盈落在真实中轨上。
     sl_pct = round(min(3.0, max(0.18, (abs(z) + 0.5) * sd_pct)), 4)
-    tp_pct = round(min(8.0, max(abs(z) * sd_pct * 0.9, sl_pct * cfg.mr_min_risk_reward)), 4)
+    tp_pct = round(min(8.0, max(abs(z) * sd_pct, sl_pct * cfg.mr_min_risk_reward)), 4)
     res.sl_pct = sl_pct
     res.tp_pct = tp_pct
     res.rr = round(tp_pct / sl_pct, 3) if sl_pct > 0 else 0.0
@@ -566,11 +605,17 @@ def detect_exit(
             )
             if cfg.roi_min_r <= 0 or risk_pct <= 0 or profit_pct + 1e-9 >= risk_pct * cfg.roi_min_r:
                 return True, "roi"
-    if cfg.trailing_pct > 0 and peak_price > 0:
-        if direction == 1 and mark_price <= peak_price * (1 - cfg.trailing_pct / 100):
-            return True, "trailing_stop"
-        if direction == -1 and mark_price >= peak_price * (1 + cfg.trailing_pct / 100):
-            return True, "trailing_stop"
+    # 移动止损：只在浮盈先走到激活门槛之后才接管。
+    # 旧实现从开仓就 arm（peak 起始于 entry），任何没先涨够、回撤 trailing_pct 的单
+    # 都会在 ATR 止损之前被噪声扫掉 —— 模拟盘 24 笔 trailing_stop 全亏，全因这个。
+    if cfg.trailing_pct > 0 and peak_price > 0 and entry_price > 0:
+        risk = abs(entry_price - sl_price) if sl_price and sl_price > 0 else abs(entry_price) * 0.005
+        favor = (peak_price - entry_price) * direction
+        if favor >= risk * cfg.trailing_arm_r:
+            if direction == 1 and mark_price <= peak_price * (1 - cfg.trailing_pct / 100):
+                return True, "trailing_stop"
+            if direction == -1 and mark_price >= peak_price * (1 + cfg.trailing_pct / 100):
+                return True, "trailing_stop"
     hold_limit = cfg.max_hold_minutes
     if entry_regime == "chop" and cfg.max_hold_minutes_chop > 0:
         hold_limit = min(hold_limit, cfg.max_hold_minutes_chop)

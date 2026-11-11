@@ -243,14 +243,17 @@ def run_backtest(
                     take_partial(trigger)
                     continue
 
-            # 5) 移动止损
+            # 5) 移动止损：与实盘同一条规则——浮盈先走到 trailing_arm_r 倍风险才 arm
             if cfg.trailing_pct > 0:
-                if direction == 1:
+                risk_pct = pos.sl_pct or 0.0
+                favor_pct = (trail_peak - pos.entry) * direction / pos.entry * 100 if pos.entry else 0.0
+                armed = favor_pct >= risk_pct * cfg.trailing_arm_r
+                if armed and direction == 1:
                     trail_peak = max(trail_peak, bar.high)
                     if bar.close <= trail_peak * (1 - cfg.trailing_pct / 100):
                         close_pos(bar.close, i, "trailing_stop")
                         continue
-                else:
+                elif armed and direction == -1:
                     trail_peak = min(trail_peak if trail_peak else bar.low, bar.low)
                     if bar.close >= trail_peak * (1 + cfg.trailing_pct / 100):
                         close_pos(bar.close, i, "trailing_stop")

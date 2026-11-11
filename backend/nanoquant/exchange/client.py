@@ -149,6 +149,9 @@ class Ticker:
     bid: float = 0.0
     ask: float = 0.0
     ts: int = 0
+    #: 数据来源。ws=WebSocket 快照（含 bid/ask），rest=REST 兜底（无盘口）。
+    #: 下游据此知道"现在走的是降级通道"，而不是静默拿一个没有盘口的快照。
+    source: str = "ws"
 
 
 @dataclass
@@ -494,6 +497,7 @@ class BinanceClient:
                                 bid=float(row.get("bidPrice") or 0),
                                 ask=float(row.get("askPrice") or 0),
                                 ts=int(now),
+                                source="rest",
                             )
                         except (TypeError, ValueError):
                             continue

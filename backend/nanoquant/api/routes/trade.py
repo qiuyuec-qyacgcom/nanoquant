@@ -184,7 +184,7 @@ async def quotes(user: str = Depends(current_user)) -> dict:
 @router.get("/chart/klines")
 async def chart_klines(
     symbol: str = Query(..., description="合约, 必须在标的池中"),
-    interval: str = Query(default="5m"),
+    interval: str = Query(default="15m"),
     limit: int = Query(default=600, ge=20, le=1000),
     user: str = Depends(current_user),
 ) -> dict:

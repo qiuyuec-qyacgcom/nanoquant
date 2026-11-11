@@ -20,7 +20,7 @@ from .prompts import clean_features, decision_messages as v1_messages
 #: 中文数值名，用于拼「指标：...」这一段，保证 reason 仍引用具体数值
 NUMBER_LABELS = {
     "rsi": "RSI", "atr": "ATR%", "atr_pct": "ATR%", "chg": "24h%", "change_24h": "24h%",
-    "r5": "5m%", "r15": "15m%", "v": "量比", "vol_ratio": "量比", "eg": "EMA差%",
+    "r5": "5根%", "r15": "15根%", "v": "量比", "vol_ratio": "量比", "eg": "EMA差%",
     "ema_gap_pct": "EMA差%", "fund": "资金费率%", "funding": "资金费率%",
     "oi": "持仓量", "spread": "点差bps", "price": "价格", "score": "评分",
 }

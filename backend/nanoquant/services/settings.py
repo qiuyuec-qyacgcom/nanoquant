@@ -29,7 +29,7 @@ class SettingsValidationError(ValueError):
 # 交易环境: demo=币安模拟盘(测试网真实下单) / live=币安实盘
 MODE_DEMO = "demo"
 MODE_LIVE = "live"
-#: 引擎轮询下限: 策略是 5m K 线, 低于 15s 只是徒增 REST 权重与信号行, 没有信息增量
+#: 引擎轮询下限: 策略是 15m K 线, 低于 15s 只是徒增 REST 权重与信号行, 没有信息增量
 MIN_CYCLE_INTERVAL_SEC = 15
 _LEGACY_MODES = {"paper": MODE_DEMO, "sim": MODE_DEMO, "demo": MODE_DEMO, "live": MODE_LIVE}
 
@@ -76,6 +76,9 @@ class RiskSettings(BaseModel):
     max_same_direction: int = Field(
         default=0, ge=0, le=20, description="同方向最多持仓数, 0=不限制（币种高度相关, 建议小资金设 1）"
     )
+    #: 单一相关性组（BTC类/ETH类/主流/山寨）的总名义额占权益上限%，0=关闭。
+    #: 山寨币彼此高度相关，N 个山寨多仓本质是一笔放大杠杆的多仓，同向计数管不住这个。
+    category_exposure_limit_pct: float = Field(default=500.0, ge=0, le=20000)
     vol_target_atr_pct: float = Field(
         default=0.0, ge=0.0, le=20.0, description="波动率目标(ATR%), 0=关闭；ATR 高则自动缩仓"
     )
@@ -93,18 +96,25 @@ class RiskSettings(BaseModel):
     min_equity_usdt: float = Field(default=0.5, ge=0.1, le=100)
     fee_rate_taker: float = Field(default=0.0005, ge=0, le=0.01)
     fee_rate_maker: float = Field(default=0.0002, ge=0, le=0.01)
+    #: 强平价监控：标记价距强平价小于该百分比(%)时告警，0=关闭。
+    #: 高杠杆短线最致命的尾部风险是爆仓，必须事前预警而非事后记录。
+    liquidation_warn_pct: float = Field(default=20.0, ge=0, le=50)
 
 
 class StrategySettings(BaseModel):
     #: 信号模型。`trend` = 均线/动量趋势跟随；`meanrev` = 布林极值回归。
     #: 两者共用准入闸门与出场规则，只有打分与止损/止盈的定位方式不同。
-    mode: Literal["trend", "meanrev"] = "trend"
+    mode: Literal["trend", "meanrev"] = "meanrev"
     #: 是否允许策略自主开仓。默认关闭——2026-11 的 walk-forward 实测里
     #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/STRATEGY_REVIEW.md），
     #: 没有正期望的配置就不该默认拿真钱去试。信号照常落库供观察。
     auto_entry: bool = False
-    #: 5–30 分钟短线系统: 主周期限定为 5m/15m/30m/1h
-    timeframe: Literal["5m", "15m", "30m", "1h"] = "30m"
+    #: 主周期。15–60 分钟短线系统，4h 为波段（全局策略转向波段后默认 4h）
+    timeframe: Literal["15m", "30m", "1h", "4h"] = "4h"
+    #: 高周期过滤（HTF）。非空时，只做与 HTF 趋势同向的信号；""=关闭。
+    #: 短线趋势跟随输在震荡与逆势，HTF 用来定大方向、LTF 择时。
+    #: 默认关闭：开启会每标的每轮多一次 REST，先用 auto_entry=false 观察再开。
+    htf_timeframe: Literal["", "15m", "30m", "1h", "2h", "4h"] = ""
     ema_fast: int = Field(default=9, ge=2, le=200)
     ema_slow: int = Field(default=21, ge=3, le=400)
     rsi_period: int = Field(default=14, ge=2, le=100)
@@ -126,6 +136,10 @@ class StrategySettings(BaseModel):
     #: 锁定的 R 小于 1，正是"赢小输大"的来源。
     roi_min_r: float = Field(default=1.0, ge=0.0, le=10)
     trailing_pct: float = Field(default=0.8, ge=0.0, le=20, description="0 表示关闭移动止损")
+    #: 移动止损的激活门槛（倍初始风险）。只有浮盈先走到 N 倍风险，移动止损才接管，
+    #: 否则它会从开仓那一刻就 arm（peak 起始于 entry），任何没先涨够、回撤 0.8% 的单
+    #: 都会在 ATR 止损之前被噪声扫掉 —— 实盘 24 笔 trailing_stop 全亏，这是元凶。
+    trailing_arm_r: float = Field(default=1.0, ge=0.0, le=20)
     breakeven_at_r: float = Field(default=1.0, ge=0.1, le=10)
     max_hold_minutes: int = Field(default=180, ge=1, le=2880)
     #: 震荡市入场的时间止损(分钟)。震荡市里 3 小时不突破就该释放资金，
@@ -135,6 +149,13 @@ class StrategySettings(BaseModel):
     chop_ema_gap_pct: float = Field(default=0.08, ge=0.0, le=5.0)
     #: RSI 是否按趋势体制分区间解读(静态 30/70 在单边趋势里必然失效)
     rsi_adaptive: bool = True
+
+    # ---- 趋势体制过滤（trend 模式）----
+    #: 用 ADX 过滤"无趋势"时段。短线趋势跟随输就输在震荡市的假突破，
+    #: ADX 低于阈值时只有"方向分"没有"趋势支撑"，宁可放过。
+    adx_filter: bool = True
+    adx_period: int = Field(default=14, ge=5, le=100)
+    adx_min: float = Field(default=20.0, ge=0, le=100)
 
     # ---- 均值回归模式专用（mode="meanrev"）----
     #: 布林/标准分窗口
@@ -148,6 +169,9 @@ class StrategySettings(BaseModel):
     mr_block_in_trend: bool = True
     #: 判定"强趋势"的 |EMA 间距| 阈值(%)，超过则不做逆势回归
     mr_trend_gap_pct: float = Field(default=0.35, ge=0.0, le=5.0)
+    #: 动能衰竭二次确认：量比 >= 1.0 说明放量还在推动极值，回归条件不成立。
+    #: 开启后更保守（更少但更稳），默认关闭。
+    mr_exhaustion_confirm: bool = False
     min_signal_gap: float = Field(default=0.05, ge=0.0, le=1.0)
     #: 部分止盈: 浮盈达到 N 倍初始风险 (R) 时先平掉一部分, 剩余交给移动止损; 0=关闭
     partial_tp_at_r: float = Field(default=1.0, ge=0, le=10)
@@ -465,9 +489,9 @@ def _migrate_legacy_group(name: str, data: dict[str, Any]) -> dict[str, Any]:
         for legacy in ("mode", "allow_synthetic_fallback", "synthetic_seed", "testnet"):
             out.pop(legacy, None)
     elif name == "strategy":
-        # 由 1 分钟级升级为 5–30 分钟短线: 旧主周期 1m/3m 统一迁到 5m
-        if out.get("timeframe") in {"1m", "3m"}:
-            out["timeframe"] = "5m"
+        # 由 1 分钟级升级为 15–60 分钟短线: 旧主周期 1m/3m/5m 统一迁到 15m
+        if out.get("timeframe") in {"1m", "3m", "5m"}:
+            out["timeframe"] = "15m"
     return out
 
 

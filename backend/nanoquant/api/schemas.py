@@ -24,7 +24,7 @@ class BacktestIn(BaseModel):
     """回测入参: 只覆盖纯量化部分, 费率与滑点显式传入."""
 
     symbol: str
-    interval: str = "5m"
+    interval: str = "15m"
     limit: int = Field(default=1000, ge=200, le=1500)
     fee_bps: float = Field(default=5.0, ge=0, le=100)
     slippage_bps: float = Field(default=2.0, ge=0, le=100)

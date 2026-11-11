@@ -130,6 +130,35 @@ def total_notional(prices: dict[str, float]) -> float:
     return total
 
 
+_MAJOR = ("SOL", "BNB", "XRP", "ADA", "DOGE", "LTC", "AVAX", "LINK", "DOT", "TRX", "TON", "SUI", "MATIC", "POL")
+
+
+def categorize(symbol: str) -> str:
+    """把标的分进相关性组。山寨彼此高度相关（对 BTC 的 beta≈1 但波动放大），
+    同向 N 个山寨多仓本质是一笔放大杠杆的多仓，必须单独限制。"""
+    s = (symbol or "").upper()
+    if "BTC" in s:
+        return "btc"
+    if "ETH" in s:
+        return "eth"
+    for m in _MAJOR:
+        if m in s:
+            return "major"
+    return "alt"
+
+
+def category_exposure_pct(prices: dict[str, float], account) -> dict[str, float]:
+    """各相关性组当前名义额占权益百分比。"""
+    out = {"btc": 0.0, "eth": 0.0, "major": 0.0, "alt": 0.0}
+    for p in open_positions():
+        px = prices.get(p.symbol, p.mark_price or p.entry_price) or 0.0
+        out[categorize(p.symbol)] += p.qty * px
+    if getattr(account, "equity", 0) > 0:
+        for k in out:
+            out[k] = round(out[k] / account.equity * 100, 2)
+    return out
+
+
 def global_gates(account: Account, cfg_engine: EngineSettings, cfg_risk: RiskSettings) -> GateDecision:
     if account.equity <= 0:
         return GateDecision(False, "账户权益为 0")
@@ -197,6 +226,16 @@ def symbol_gates(
     exposure_pct = notional / account.equity * 100 if account.equity > 0 else 0.0
     if exposure_pct >= cfg_risk.max_exposure_pct:
         return GateDecision(False, f"总敞口 {exposure_pct:.1f}% 已达上限 {cfg_risk.max_exposure_pct}%")
+    # 相关性组敞口：山寨多仓本质是加杠杆，同向计数管不住这个
+    if cfg_risk.category_exposure_limit_pct > 0:
+        cat = categorize(symbol)
+        cat_exp = category_exposure_pct(prices, account)
+        cur = cat_exp.get(cat, 0.0)
+        if cur >= cfg_risk.category_exposure_limit_pct:
+            return GateDecision(
+                False,
+                f"{cat} 类敞口 {cur:.1f}% 已达上限 {cfg_risk.category_exposure_limit_pct}%（相关性组）",
+            )
     return GateDecision(True)
 
 

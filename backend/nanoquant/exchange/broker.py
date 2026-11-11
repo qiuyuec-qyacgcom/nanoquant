@@ -203,6 +203,8 @@ class ExchangePosition:
     margin: float
     unrealized: float
     source: str = "local"
+    #: 交易所给的强平价。0 = 无强平价信息（模拟盘/未取到），用于尾部风险监控
+    liquidation_price: float = 0.0
 
 
 @dataclass
@@ -331,6 +333,7 @@ class BinanceBroker:
                     leverage=lev,
                     margin=notional / max(1.0, lev),
                     unrealized=float(row.get("unRealizedProfit", 0) or 0),
+                    liquidation_price=float(row.get("liquidationPrice", 0) or 0),
                     source="binance",
                 )
             )
@@ -376,6 +379,26 @@ class BinanceBroker:
                     params["type"] = "LIMIT"
                     params["timeInForce"] = "GTX"
                     params["price"] = filters.format_price(px)
+            else:
+                # 下单前盘口二次确认：信号基于缓存价决策，到真正下单时盘口可能已经移动。
+                # 短线的利润空间有限，这一跳就是利润；偏离超过阈值直接放弃，比闭眼吃滑点强。
+                max_slip = risk.max_slippage_pct / 100.0
+                ref = filters.last_price or 0
+                if max_slip > 0 and ref > 0:
+                    try:
+                        book = (await binance_client.client.book_tickers([symbol])).get(symbol)
+                        if book:
+                            exec_px = book[1] if side == "long" else book[0]  # 买吃卖一、卖吃买一
+                            if exec_px and exec_px > 0 and abs(exec_px - ref) / ref > max_slip:
+                                return ExecResult(
+                                    False,
+                                    message=(
+                                        f"盘口 {exec_px:.5g} 已偏离决策价 {ref:.5g} "
+                                        f"{abs(exec_px - ref) / ref * 100:.3f}% > {max_slip * 100:.2f}%，放弃"
+                                    ),
+                                )
+                    except BinanceError:
+                        pass
             stage["plan_ms"] = (time.perf_counter() - t_call) * 1000
             t0 = time.perf_counter()
             sink_token = STAGE_SINK.set(stage)

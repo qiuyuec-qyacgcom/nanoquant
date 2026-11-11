@@ -74,6 +74,52 @@ def stdev(values: list[float]) -> float:
     return math.sqrt(max(0.0, var))
 
 
+def adx(candles: list[Candle], period: int = 14) -> float:
+    """Wilder 平均趋向指数 (ADX)。衡量趋势强度，与方向无关：>25 才有趋势。
+
+    输入不足 ``period*2+1`` 根时返回 0.0 —— 0 不表示"无趋势"，而是"算不出"，
+    调用方必须区分（见 strategy 里的缺失语义）。
+    """
+    n = len(candles)
+    if n < period * 2 + 1:
+        return 0.0
+    tr: list[float] = []
+    pdm: list[float] = []
+    ndm: list[float] = []
+    for i in range(1, n):
+        c, p = candles[i], candles[i - 1]
+        up = c.high - p.high
+        dn = p.low - c.low
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        ndm.append(dn if (dn > up and dn > 0) else 0.0)
+        tr.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
+
+    def wilder(series: list[float]) -> list[float]:
+        smoothed = sum(series[:period])
+        out = [smoothed]
+        for v in series[period:]:
+            smoothed = smoothed - smoothed / period + v
+            out.append(smoothed)
+        return out
+
+    atr_s = wilder(tr)
+    pdi_s = wilder(pdm)
+    mdi_s = wilder(ndm)
+    if not atr_s or atr_s[-1] <= 0:
+        return 0.0
+    dx: list[float] = []
+    for a, p, m in zip(atr_s, pdi_s, mdi_s):
+        s = p + m
+        dx.append(100.0 * abs(p - m) / s if s > 0 else 0.0)
+    # ADX = 对 DX 再做一次 Wilder 平滑
+    if len(dx) < period + 1:
+        return 0.0
+    adx_sm = sum(dx[:period])
+    for v in dx[period:]:
+        adx_sm = adx_sm - adx_sm / period + v
+    return adx_sm / period
+
+
 def zscore_last(values: list[float], period: int) -> tuple[float, float, float]:
     """最后一根相对近 period 根的标准分：(z, 均值, 标准差)。
 

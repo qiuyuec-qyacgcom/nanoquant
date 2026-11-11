@@ -59,12 +59,24 @@ from .strategy import (
     score_signal,
     strategy_fingerprint,
 )
+from . import indicators as ta
 
 log = get_logger("engine")
 
 MAX_TASKS = 2
 #: 同一标的、同一方向/拒绝原因的 flat 信号在这个窗口内合并成一行 (repeats 计数)
 SIGNAL_DEDUP_SEC = 60
+
+
+def _channel_of(parsed: dict[str, Any]) -> str:
+    """从解析结果里提取信号来源（频道名），用于按信号源评估质量。"""
+    raw = parsed.get("raw")
+    if isinstance(raw, dict):
+        for key in ("channel", "source", "group", "频道", "来源"):
+            value = raw.get(key)
+            if value:
+                return str(value).strip()[:64]
+    return ""
 
 
 class TradingEngine:
@@ -76,6 +88,11 @@ class TradingEngine:
         #: 上一轮各标的持仓量快照。OI 接口只给单点值，不自己存上一轮就算不出 ΔOI，
         #: 而 ΔOI 因子没有值时会以 0 分隐身（旧实现就是这样白占 12% 权重）
         self._oi_prev: dict[str, float] = {}
+        #: 强平价告警去重（symbol+side -> 上次告警时间戳）
+        self._last_liq_warn: dict[str, float] = {}
+        #: 健康检查节流与 WS 告警去重
+        self._last_health_check = 0.0
+        self._last_ws_warn = 0.0
         self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
         self._last_equity = 0.0
@@ -261,6 +278,8 @@ class TradingEngine:
         await timed("reconcile", self._reconcile_live(broker))
 
         await timed("positions", self._manage_positions(broker, strat_cfg, engine_cfg))
+        await timed("liquidation_risk", self._check_liquidation_risk(broker, risk_cfg))
+        await timed("health_check", self._health_check())
         await timed("equity_sample", self._sample_equity(account))
 
         _t_gate = time.perf_counter()
@@ -627,6 +646,17 @@ class TradingEngine:
                 continue
             if len(candles) < 30:
                 continue
+            # 高周期趋势：只做与 HTF 同向的信号（默认关闭，开启时每标的每轮多一次 REST）
+            htf_trend = ""
+            if strat_cfg.htf_timeframe:
+                try:
+                    htf_candles = await binance_client.klines(symbol, strat_cfg.htf_timeframe, 60)
+                    htf_closes = [c.close for c in htf_candles]
+                    htf_fast = ta.ema(htf_closes, strat_cfg.ema_fast)
+                    htf_slow = ta.ema(htf_closes, strat_cfg.ema_slow)
+                    htf_trend = "up" if htf_fast > htf_slow else ("down" if htf_fast < htf_slow else "flat")
+                except (BinanceError, NoCredentials):
+                    htf_trend = ""
             features = build_features(
                 candles, strat_cfg,
                 # 取不到就是 None（缺失），不能塞 0.0 冒充"费率中性 / OI 没变"
@@ -635,6 +665,8 @@ class TradingEngine:
                 oi_change_pct=oi_change.get(symbol),
                 change_24h=ticker.change_pct,
                 quote_volume=ticker.quote_volume,
+                data_degraded=getattr(ticker, "source", "ws") == "rest",
+                htf_trend=htf_trend,
             )
             # 策略版本指纹：随信号落库并写进持仓 features，复盘时能回答
             # "这笔亏损是策略版本问题还是执行问题"
@@ -920,6 +952,7 @@ class TradingEngine:
                 s.add(
                     SignalFollow(
                         signal_id=key, symbol=parsed["symbol"], side=parsed["side"],
+                        channel=_channel_of(parsed),
                         status="processing", reason="处理中", mode=mode,
                         leverage=int(parsed.get("leverage") or 0),
                         payload={"raw": parsed.get("raw"), "signal_ts": parsed.get("ts")},
@@ -952,6 +985,8 @@ class TradingEngine:
                     s.add(row)
                 row.status = status
                 row.reason = (reason or "")[:240]
+                if not row.channel:
+                    row.channel = _channel_of(parsed)
                 row.leverage = int(extra.get("leverage") or row.leverage or 0)
                 row.qty = float(extra.get("qty") or 0)
                 row.price = float(extra.get("price") or 0)
@@ -1802,6 +1837,77 @@ class TradingEngine:
             "mantras": mantras,
             "injected_mantra_ids": injected_ids,
         }
+
+    async def _health_check(self) -> None:
+        """实时健康检查（每 60s 一次）：WS 断线、引擎心跳停滞。告警去重防刷屏。"""
+        now = time.time()
+        if now - self._last_health_check < 60:
+            return
+        self._last_health_check = now
+
+        # 1) Ticker WebSocket 断线 → 行情走 REST 兜底（无盘口，点差闸门失效）
+        try:
+            from ..exchange.ticker_stream import ticker_hub
+
+            if not ticker_hub.connected:
+                if now - self._last_ws_warn > 600:
+                    self._last_ws_warn = now
+                    events.record(
+                        "warn", "health",
+                        "Ticker WebSocket 已断开，行情走 REST 兜底（无盘口，点差闸门失效）",
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2) 引擎心跳：超过 5 分钟没有新信号落库，说明扫描可能卡死
+        try:
+            with session_scope() as s:
+                row = (
+                    s.query(Signal)
+                    .order_by(Signal.ts.desc())
+                    .first()
+                )
+                last_ts = int(row.ts) if row else 0
+            if last_ts and now - last_ts > 300:
+                events.record(
+                    "warn", "health",
+                    f"引擎已 {int(now - last_ts)} 秒没有产生新信号，扫描可能停滞",
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _check_liquidation_risk(self, broker: Broker, risk_cfg: Any) -> None:
+        """强平价监控：标记价逼近强平价时告警，并写进 engine_events。
+
+        高杠杆短线的尾部风险是爆仓，而不是止损多打几笔。这个检查每轮都跑，
+        但只在距离低于阈值时才告警，用状态去重避免刷屏。
+        """
+        warn_pct = getattr(risk_cfg, "liquidation_warn_pct", 0.0)
+        if warn_pct <= 0:
+            return
+        try:
+            positions = await broker.positions()
+        except Exception:  # noqa: BLE001
+            return
+        for p in positions:
+            liq = float(getattr(p, "liquidation_price", 0) or 0)
+            mark = float(getattr(p, "mark_price", 0) or 0)
+            if liq <= 0 or mark <= 0:
+                continue
+            dist = abs(mark - liq) / mark * 100
+            if dist < warn_pct:
+                key = f"liq_{p.symbol}_{p.side}"
+                last_warn = self._last_liq_warn.get(key, 0)
+                now = time.time()
+                if now - last_warn < 300:  # 5 分钟内不重复
+                    continue
+                self._last_liq_warn[key] = now
+                events.record(
+                    "warn", "risk",
+                    f"{p.symbol} {p.side} 距强平价仅 {dist:.1f}%（强平价 {liq:.5g}）",
+                    {"symbol": p.symbol, "side": p.side, "mark": mark,
+                     "liquidation_price": liq, "distance_pct": round(dist, 2)},
+                )
 
     async def _sample_equity(self, account) -> None:
         now = int(time.time())

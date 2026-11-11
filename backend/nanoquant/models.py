@@ -237,6 +237,8 @@ class SignalFollow(Base):
     signal_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     side: Mapped[str] = mapped_column(String(8), default="")
+    #: 信号来源（频道/群组），用于按信号源评估质量；从 payload.raw.channel 提取
+    channel: Mapped[str] = mapped_column(String(64), default="", index=True)
     status: Mapped[str] = mapped_column(String(16), default="opened", index=True)
     reason: Mapped[str] = mapped_column(String(240), default="")
     leverage: Mapped[int] = mapped_column(Integer, default=0)

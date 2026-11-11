@@ -92,6 +92,12 @@ def run_walkforward(
 
         cfg = base_cfg.model_copy(update=best["params"])
         oos = run_backtest(test, cfg, symbol=symbol, **costs)
+        # 成本敏感性：手续费/滑点翻倍后，样本外结论是否翻转。
+        # 短线利润薄，一倍成本往往就是"能赚"与"必亏"的分界线。
+        stressed = run_backtest(
+            test, cfg, symbol=symbol,
+            **{**costs, "fee_bps": costs["fee_bps"] * 2, "slippage_bps": costs["slippage_bps"] * 2},
+        )
         items.append(
             {
                 "fold": k + 1,
@@ -115,6 +121,11 @@ def run_walkforward(
                     )
                 },
                 "out_sample_funding": oos.summary.get("funding_total", 0.0),
+                # 成本翻倍后的样本外收益（用于判断"结论是否脆弱"）
+                "stressed_return_pct": stressed.summary.get("total_return_pct", 0.0),
+                "stressed_expectancy": stressed.summary.get("expectancy", 0.0),
+                # 逐笔收益，用于 bootstrap
+                "trade_returns_pct": [t.pnl_pct for t in getattr(oos, "trades", []) or []],
             }
         )
 
@@ -130,6 +141,31 @@ def run_walkforward(
     trade_count = sum(int(item["out_sample"]["trades"]) for item in items)
     positive = sum(1 for value in oos_returns if value > 0)
 
+    # bootstrap：对样本外逐笔收益重采样，估计"平均单笔收益"的分布，
+    # 判断正收益是不是运气（置信区间跨 0 = 不显著）。
+    all_returns = [r for item in items for r in item.get("trade_returns_pct", [])]
+    boot = {"ci_low": 0.0, "ci_high": 0.0, "p_positive": 0.0, "n_trades": len(all_returns)}
+    if len(all_returns) >= 10:
+        import random
+
+        rng = random.Random(42)
+        means: list[float] = []
+        for _ in range(500):
+            sample = [rng.choice(all_returns) for _ in range(len(all_returns))]
+            means.append(sum(sample) / len(sample))
+        means.sort()
+        boot = {
+            "ci_low": round(means[int(len(means) * 0.025)], 3),
+            "ci_high": round(means[int(len(means) * 0.975)], 3),
+            "p_positive": round(sum(1 for m in means if m > 0) / len(means), 3),
+            "n_trades": len(all_returns),
+        }
+
+    # 成本敏感性：手续费/滑点翻倍后样本外是否转负
+    stressed_returns = [float(item["stressed_return_pct"]) for item in items]
+    stressed_avg = sum(stressed_returns) / len(stressed_returns) if stressed_returns else 0.0
+    base_avg = sum(oos_returns) / len(oos_returns) if oos_returns else 0.0
+
     return {
         "folds": len(items),
         "requested_folds": requested_folds,
@@ -138,13 +174,21 @@ def run_walkforward(
         "items": items,
         "aggregate": {
             "oos_return_pct": round((equity / initial_equity - 1) * 100, 3),
-            "oos_avg_return_pct": round(sum(oos_returns) / len(oos_returns), 3),
+            "oos_avg_return_pct": round(base_avg, 3),
             "oos_worst_fold_pct": round(min(oos_returns), 3),
             "positive_folds": positive,
             "consistency": round(positive / len(items) * 100, 1),
             "in_sample_avg_pct": round(sum(is_returns) / len(is_returns), 3),
-            "overfit_gap_pct": round(sum(is_returns) / len(is_returns) - sum(oos_returns) / len(oos_returns), 3),
+            "overfit_gap_pct": round(sum(is_returns) / len(is_returns) - base_avg, 3),
             "oos_trades": trade_count,
+        },
+        "bootstrap": boot,
+        "cost_sensitivity": {
+            "base_avg_return_pct": round(base_avg, 3),
+            "stressed_avg_return_pct": round(stressed_avg, 3),
+            # 成本翻倍后收益掉了多少（越负越脆弱）
+            "delta_pct": round(stressed_avg - base_avg, 3),
+            "flips_sign": (base_avg > 0) != (stressed_avg > 0),
         },
         "disclaimer": "每折参数在训练段选出、测试段冻结; 仍不含 AI 复核与点差闸门, 结论只用于判断参数稳健性",
     }
@@ -153,24 +197,35 @@ def run_walkforward(
 # ------------------------------------------------------------------ 命令行
 
 def _load_klines(symbol: str, interval: str, limit: int) -> list[Any]:
-    """走公共接口取 K 线，不需要 API 凭证，方便离线复盘。"""
+    """分页取 K 线（突破单次 1000 根上限），不需要 API 凭证，方便离线复盘。"""
     import httpx
 
     from ..exchange.client import Candle
 
-    resp = httpx.get(
-        "https://fapi.binance.com/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return [
-        Candle(
-            open_time=int(k[0]), open=float(k[1]), high=float(k[2]),
-            low=float(k[3]), close=float(k[4]), volume=float(k[5]),
-        )
-        for k in resp.json()
-    ]
+    out: list[Candle] = []
+    end_ms: int | None = None
+    per = 1000
+    while len(out) < limit:
+        params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": per}
+        if end_ms is not None:
+            params["endTime"] = end_ms
+        resp = httpx.get("https://fapi.binance.com/fapi/v1/klines", params=params, timeout=30)
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            break
+        batch = [
+            Candle(
+                open_time=int(k[0]), open=float(k[1]), high=float(k[2]),
+                low=float(k[3]), close=float(k[4]), volume=float(k[5]),
+            )
+            for k in rows
+        ]
+        out = batch + out
+        end_ms = int(rows[0][0]) - 1
+        if len(rows) < per:
+            break
+    return out[-limit:]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,21 +235,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="walk-forward 验证：样本外还能不能站住")
     parser.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT")
     parser.add_argument("--interval", default="30m")
-    parser.add_argument("--limit", type=int, default=3000, help="每标的 K 线根数（越大越可信）")
+    parser.add_argument("--limit", type=int, default=3000, help="每标的 K 线根数（分页取，可 >1000）")
     parser.add_argument("--folds", type=int, default=3)
     parser.add_argument("--train-bars", type=int, default=600)
     args = parser.parse_args(argv)
 
-    # 与项目默认一致的粗网格：阈值 × 止损 × 止盈
     grid = {
         "entry_threshold": [0.30, 0.45],
         "sl_atr_mult": [1.0, 1.5],
         "tp_atr_mult": [2.0, 3.0],
     }
 
-    header = f"{'标的':10} {'折':>3} {'OOS笔':>7} {'OOS收益%':>10} {'最差折%':>9} {'正折':>7} {'过拟合缺口%':>12}"
+    header = f"{'标的':10} {'折':>3} {'OOS笔':>7} {'OOS收益%':>10} {'最差折%':>9} {'正折':>7} {'过拟合缺口%':>12} {'bootstrapCI':>18} {'成本×2':>9}"
     print(header)
-    print("-" * len(header.encode("gbk", errors="ignore")) or "-" * 70)
+    print("-" * 112)
     for raw in [s.strip() for s in args.symbols.split(",") if s.strip()]:
         try:
             candles = _load_klines(raw, args.interval, args.limit)
@@ -213,10 +267,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{raw:10} {result['error']}")
             continue
         agg = result["aggregate"]
+        b = result.get("bootstrap", {})
+        cs = result.get("cost_sensitivity", {})
+        ci = f"[{b.get('ci_low', 0)},{b.get('ci_high', 0)}]" if b else "-"
         print(
             f"{raw:10} {result['folds']:>3} {agg['oos_trades']:>7} "
             f"{agg['oos_return_pct']:>10.2f} {agg['oos_worst_fold_pct']:>9.2f} "
-            f"{agg['positive_folds']}/{result['folds']:<5} {agg['overfit_gap_pct']:>12.2f}"
+            f"{agg['positive_folds']}/{result['folds']:<5} {agg['overfit_gap_pct']:>12.2f} "
+            f"{ci:>18} {cs.get('stressed_avg_return_pct', 0):>9.2f}"
         )
     return 0
 
