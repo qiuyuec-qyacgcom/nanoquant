@@ -626,13 +626,16 @@ class BinanceClient:
         return r.status_code == 200
 
     async def account(self, *, fresh: bool = False) -> dict:
-        """账户快照；默认 1.5s 内复用上一次结果，避免多面板并发重复打点.
+        """账户快照；默认 6s 内复用上一次结果，避免多面板并发重复打点.
 
-        下单/平仓等写操作不受影响（它们走独立的 order 通道）；
+        这里原来只缓存 1.5s，而前端面板默认 5s 刷新一次 /engine/status，
+        每次刷新都会穿透缓存 -> 每 5 秒实实在在打一发 weight=5 的账户接口，
+        权重全花在"把同一份余额重复读一遍"上。
+        面板展示延迟 6 秒没有实际影响；下单/平仓走独立的 order 通道，
         需要确认余额时传 ``fresh=True`` 跳过缓存。
         """
         now = time.time()
-        if not fresh and self._account_cache is not None and now - self._account_ts < 1.5:
+        if not fresh and self._account_cache is not None and now - self._account_ts < 6.0:
             return dict(self._account_cache)
         data = await self._request("GET", "/fapi/v3/account", weight=5)
         if isinstance(data, dict):
@@ -644,7 +647,7 @@ class BinanceClient:
         return await self._request("GET", "/fapi/v3/balance", weight=5)
 
     async def positions(self, symbol: str | None = None, *, fresh: bool = False) -> list[dict]:
-        """交易所持仓快照；不带 symbol 时 3s 内复用，避免多面板轮询重复打点.
+        """交易所持仓快照；不带 symbol 时 6s 内复用，避免多面板轮询重复打点.
 
         带 symbol 或 ``fresh=True`` 时强制实时（删标的确认、下单前校验等关键路径）。
         """
@@ -653,7 +656,7 @@ class BinanceClient:
             symbol is None
             and not fresh
             and self._positions_cache is not None
-            and now - self._positions_ts < 3.0
+            and now - self._positions_ts < 6.0
         ):
             return [dict(r) for r in self._positions_cache]
         data = await self._request("GET", "/fapi/v3/positionRisk", {"symbol": symbol}, weight=5)

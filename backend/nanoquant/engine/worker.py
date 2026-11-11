@@ -19,7 +19,12 @@ from sqlalchemy.exc import IntegrityError
 
 from ..ai.decision import decide
 from ..db import session_scope
-from ..exchange.broker import Broker, get_broker, record_external_position
+from ..exchange.broker import (
+    Broker,
+    get_broker,
+    qty_from_margin_pct,
+    record_external_position,
+)
 from ..exchange.client import BinanceError, NoCredentials
 from ..exchange.client import client as binance_client
 from ..logging_setup import get_logger
@@ -1045,13 +1050,26 @@ class TradingEngine:
                 abs(parsed["tp"] - ref) / ref * 100 if parsed["tp"] > 0 else max(sl_pct * 1.6, sl_pct + 0.1)
             )
 
-            # 资金完全按本系统来: 风险预算 / 保证金比例 / 可用余额，且与轮询开仓共用账本
+            # 资金完全按本系统来: 与轮询开仓共用账本
             self._margin.refresh(account.available)
-            qty, info = risk_mod.plan_position(
-                price=ticker.last, filters=filters, account=account,
-                cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage,
-                available=self._margin.remaining,
-            )
+            if cfg.sizing_mode == "margin_pct":
+                # 默认: 按后台「单仓保证金占权益%」定仓。跟单的亏损由信号自带止损承担,
+                # 不该再用"单笔风险"二次压缩 —— 否则止损给得宽的信号仓位会被压到很小
+                pct = cfg.margin_pct_override if cfg.margin_pct_override > 0 else risk_cfg.margin_pct
+                qty, info = qty_from_margin_pct(
+                    equity=account.equity,
+                    price=ticker.last,
+                    leverage=leverage,
+                    margin_pct=pct,
+                    filters=filters,
+                    available=self._margin.remaining,
+                )
+            else:
+                qty, info = risk_mod.plan_position(
+                    price=ticker.last, filters=filters, account=account,
+                    cfg_risk=risk_cfg, sl_pct=sl_pct, leverage=leverage,
+                    available=self._margin.remaining,
+                )
             if qty <= 0:
                 return self._follow_skip(key, parsed, "skipped", f"仓位不足: {info['note']}", mode)
 

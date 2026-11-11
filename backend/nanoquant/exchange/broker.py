@@ -903,6 +903,89 @@ def estimate_qty(
     return qty, "ok"
 
 
+def qty_from_margin_pct(
+    equity: float,
+    price: float,
+    leverage: float,
+    margin_pct: float,
+    filters: SymbolFilters,
+    *,
+    available: float | None = None,
+) -> tuple[float, dict[str, Any]]:
+    """按「单仓保证金占权益 %」定仓位（外部跟单专用）。
+
+    与 estimate_qty 的区别：**完全不看止损距离**。
+        notional = equity × margin_pct% × leverage
+
+    estimate_qty 取 min(风险预算, 保证金上限)，而风险预算 = equity × risk_per_trade_pct ÷ sl_pct%。
+    止损越宽这一项越小：默认参数（单笔风险 10%、单仓保证金 50%、20x、止损 2%）下
+    风险预算只给出 5 倍权益，永远够不到 50% 保证金对应的 10 倍权益 ——
+    这就是"跟单开仓只有设定占比一半"的原因。
+
+    跟单的亏损由信号自带止损承担，不需要再用风险预算二次压缩；
+    但 `available` 必须生效：交易所按 availableBalance 校验初始保证金，
+    算出的保证金超过可用余额会被 -2019 拒绝。
+    """
+    pct = max(0.0, min(float(margin_pct or 0.0), 100.0))
+    min_qty_safe = filters.effective_min_qty(price) if price > 0 else 0.0
+    info: dict[str, Any] = {
+        "qty": 0.0,
+        "notional": 0.0,
+        "margin": 0.0,
+        "leverage": leverage,
+        "margin_pct": pct,
+        "sizing": f"保证金{pct:g}%×{leverage:g}x",
+        "equity": round(equity, 6),
+        "target_notional": 0.0,
+        "note": "ok",
+        "effective_min_notional": filters.effective_min_notional(price) if price > 0 else 0.0,
+        "min_qty": min_qty_safe,
+    }
+    if equity <= 0 or price <= 0 or pct <= 0:
+        info["note"] = "权益、价格或单仓保证金占比无效"
+        return 0.0, info
+
+    target_margin = equity * pct / 100.0
+    effective_available = float(available) if available is not None else target_margin
+    # 占比算出的保证金不能超过可用余额（留安全垫）
+    usable_margin = min(target_margin, max(0.0, effective_available) * MARGIN_SAFETY)
+    notional = usable_margin * leverage
+    info["target_notional"] = round(notional, 6)
+    info["available"] = round(max(0.0, effective_available), 6)
+
+    qty = floor_to_step(notional / price, filters.qty_step)
+    min_qty = filters.effective_min_qty(price)
+    if qty <= 0 or qty < min_qty - 1e-12:
+        need = filters.effective_min_notional(price)
+        if usable_margin < target_margin - 1e-9:
+            info["note"] = (
+                f"可用保证金不足: 可用 {effective_available:.2f} USDT, "
+                f"按 {leverage:g}x 最多 {notional:.2f} USDT 名义额, "
+                f"但该标的最小名义额约 {need:.2f} USDT; 请平掉已有仓位或提高杠杆"
+            )
+        else:
+            info["note"] = (
+                f"可分配名义额 {notional:.4f} USDT 不足该标的最小可下单量 "
+                f"(需约 {need:.2f} USDT, 最小数量 {min_qty} @ {price:.6g}); "
+                f"可提高单仓保证金占比/杠杆, 或改用更小面值标的"
+            )
+        return 0.0, info
+
+    ok, why = filters.validate(qty, price)
+    if not ok:
+        need = filters.effective_min_notional(price)
+        info["note"] = f"{why} (该标的有效最小名义额约 {need:.2f} USDT)"
+        return 0.0, info
+
+    actual = qty * price
+    info.update(
+        qty=qty,
+        notional=round(actual, 6),
+        margin=round(actual / max(1.0, leverage), 6),
+    )
+    return qty, info
+
+
 def record_external_position(
     symbol: str,
     side: str,

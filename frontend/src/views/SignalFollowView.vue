@@ -20,11 +20,18 @@ interface FollowSettings {
   auto_add_symbol: boolean
   strict_events: boolean
   default_sl_pct: number
+  margin_pct_override: number
   dry_run: boolean
 }
 
 type BoolKey = 'enabled' | 'auto_add_symbol' | 'strict_events' | 'dry_run'
-type NumKey = 'poll_sec' | 'leverage_bonus' | 'max_age_sec' | 'max_per_hour' | 'default_sl_pct'
+type NumKey =
+  | 'poll_sec'
+  | 'leverage_bonus'
+  | 'max_age_sec'
+  | 'max_per_hour'
+  | 'default_sl_pct'
+  | 'margin_pct_override'
 
 interface FollowRow {
   id: number
@@ -68,7 +75,7 @@ const busy = ref(false)
 const DEFAULTS: FollowSettings = {
   enabled: false, jsonl_path: '', poll_sec: 1, ingest_token: '',
   leverage_bonus: 10, max_age_sec: 180, max_per_hour: 6,
-  auto_add_symbol: true, strict_events: false, default_sl_pct: 1.2, dry_run: true,
+  auto_add_symbol: true, strict_events: false, default_sl_pct: 1.2, margin_pct_override: 0, dry_run: true,
 }
 const form = reactive<FollowSettings>({ ...DEFAULTS })
 
@@ -93,6 +100,15 @@ const numberFields: { key: NumKey; label: string; hint: string; min: number; max
   { key: 'leverage_bonus', label: '杠杆加成', hint: '原信号杠杆 +N，仍受系统上限钳制', min: 0, max: 100, step: 1, unit: 'x' },
   { key: 'max_per_hour', label: '每小时跟单上限', hint: '按已成交笔数做频控', min: 1, max: 100, step: 1, unit: '笔' },
   { key: 'default_sl_pct', label: '缺省止损', hint: '信号未给止损时使用', min: 0.1, max: 20, step: 0.1, unit: '%' },
+  {
+    key: 'margin_pct_override',
+    label: '跟单单仓占比',
+    hint: '按「权益 × 该比例 × 杠杆」开仓；0 = 沿用风控里的单仓保证金',
+    min: 0,
+    max: 100,
+    step: 1,
+    unit: '%',
+  },
 ]
 const NUM_KEYS: NumKey[] = numberFields.map((f) => f.key)
 

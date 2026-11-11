@@ -2270,6 +2270,130 @@ def test_weight_limiter_exposes_declared_ban_time():
     assert "封禁至" in msg and "试探" in msg  # 不再只显示「剩余 Ns」误导用户
 
 
+def test_ban_backoff_escalates_and_resets():
+    """连续被封要指数退避.
+
+    固定每 3 分钟试探一次, 在 IP 被共享出口拖累而长封禁时等于每 3 分钟再撞一次墙:
+    日志刷满不说, 每次试探本身又是一次超限请求, 可能让封禁计时被续上。
+    """
+    from nanoquant.exchange import ratelimit
+    import time as _time
+
+    limiter = ratelimit.WeightLimiter(capacity=2400)
+    far = int((_time.time() + 7200) * 1000)  # 交易所声明封 2 小时
+
+    prev = 0.0
+    for expected_streak in (1, 2, 3, 4):
+        limiter.observe_ban(f"Way too many requests; banned until {far}")
+        assert limiter._ban_streak == expected_streak
+        remaining = limiter.ban_remaining()
+        # 退避时长单调递增, 但始终不超过上限 (面板不能被封死一整天)
+        assert remaining > prev
+        assert remaining <= ratelimit.BAN_BACKOFF_MAX_SEC + 1
+        prev = remaining
+
+    # 只要有一次请求成功(收到权重响应头), 退避计数立刻归零
+    limiter.observe_weight(37)
+    assert limiter._ban_streak == 0
+    limiter._ban_until = 0.0
+    limiter.observe_ban(f"banned until {far}")
+    assert limiter._ban_streak == 1
+    assert limiter.ban_remaining() <= ratelimit.BAN_BACKOFF_BASE_SEC + 1
+
+
+def _btc_filters():
+    from nanoquant.exchange.precision import SymbolFilters
+
+    return SymbolFilters(
+        symbol="BTCUSDT", price_tick=0.1, qty_step=0.001, min_qty=0.001, min_notional=100.0
+    )
+
+
+def test_qty_from_margin_pct_follows_configured_share():
+    """跟单仓位 = 权益 × 单仓保证金占比 × 杠杆."""
+    from nanoquant.exchange.broker import qty_from_margin_pct
+
+    qty, info = qty_from_margin_pct(1000.0, 65000.0, 10, 20.0, _btc_filters(), available=1000.0)
+    # 目标保证金 200 USDT -> 名义额 2000 -> 0.0307 -> 取整 0.030
+    assert qty == pytest.approx(0.030, abs=1e-6)
+    assert info["notional"] == pytest.approx(1950, abs=40)
+    assert info["margin"] == pytest.approx(195, abs=4)
+    assert info["sizing"].startswith("保证金20%")
+
+
+def test_follow_position_not_shrunk_by_wide_stop():
+    """宽止损的信号: risk_pct 算法会被风险预算压到 1/3, margin_pct 算法不受影响.
+
+    这是"跟单开仓比设定的占比小一半"的根因。
+    """
+    from types import SimpleNamespace
+
+    from nanoquant.exchange.broker import estimate_qty, qty_from_margin_pct
+
+    risk = SimpleNamespace(risk_per_trade_pct=10.0, margin_pct=50.0)
+    q_risk, _ = estimate_qty(1000.0, 65000.0, 10, risk, 0.06, _btc_filters(), available=1000.0)
+    q_margin, _ = qty_from_margin_pct(1000.0, 65000.0, 10, 50.0, _btc_filters(), available=1000.0)
+    assert q_margin > q_risk * 2
+
+
+def test_qty_from_margin_pct_capped_by_available():
+    """交易所按 availableBalance 校验保证金, 占比算出的保证金超了必须截断."""
+    from nanoquant.exchange.broker import qty_from_margin_pct
+
+    qty, info = qty_from_margin_pct(1000.0, 65000.0, 10, 50.0, _btc_filters(), available=50.0)
+    # 可用 50 -> 50 × 0.9 安全垫 × 10x = 450 名义额
+    assert info["target_notional"] == pytest.approx(450, abs=1)
+    assert qty > 0
+
+
+def test_qty_from_margin_pct_rejects_when_too_small():
+    from nanoquant.exchange.broker import qty_from_margin_pct
+
+    qty, info = qty_from_margin_pct(10.0, 65000.0, 1, 1.0, _btc_filters(), available=10.0)
+    assert qty == 0.0
+    assert info["note"]
+
+
+def test_parse_signal_accepts_gateway_payload():
+    """telegram 网关直推的扁平结构必须被 parse_signal 认出来.
+
+    两个项目字段名一旦错位, 对接会静默失败(信号被当成"无法识别"), 所以在这里锁住。
+    """
+    from nanoquant.services.signal_follow import parse_signal, signal_identity
+
+    payload = {
+        "id": "-1009876543210:777",
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "entry": 65000.0,
+        "sl": 63800.0,
+        "tp": 66500.0,
+        "leverage": 10,
+        "ts": 1762848000,
+        "event": "open",
+        "channel": "测试频道",
+        "message_link": "https://t.me/x/777",
+    }
+    parsed = parse_signal(payload)
+    assert parsed is not None
+    assert parsed["symbol"] == "BTCUSDT"
+    assert parsed["side"] == "long"
+    assert parsed["entry"] == 65000.0
+    assert parsed["stop"] == 63800.0
+    assert parsed["tp"] == 66500.0
+    assert parsed["leverage"] == 10
+    assert parsed["event"] == "open"
+    assert signal_identity(parsed).startswith("-1009876543210:777")
+
+
+def test_parse_signal_accepts_buy_sell_wording():
+    """网关早期版本发 BUY/SELL, 也要能认."""
+    from nanoquant.services.signal_follow import parse_signal
+
+    assert parse_signal({"symbol": "ETHUSDT", "side": "BUY", "entry": 3400})["side"] == "long"
+    assert parse_signal({"symbol": "ETHUSDT", "side": "SELL", "entry": 3400})["side"] == "short"
+
+
 def test_is_url_detects_http_links():
     """信号源支持 http(s) 频道链接，本地路径/空串仍按文件处理."""
     from nanoquant.services import signal_follow as signal_feed

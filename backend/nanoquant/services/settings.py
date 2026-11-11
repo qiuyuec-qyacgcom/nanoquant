@@ -343,6 +343,13 @@ class SignalFollowSettings(BaseModel):
     auto_add_symbol: bool = Field(default=True, description="标的池没有该标的时自动添加")
     strict_events: bool = Field(default=False, description="开启后未知事件一律拒绝; 关闭时只告警并按方向跟单")
     default_sl_pct: float = Field(default=1.2, gt=0, le=20, description="信号未给止损时使用的止损百分比")
+    #: 仓位算法: margin_pct=按「单仓保证金占权益%」定名义额（跟单默认，仓位听后台设置）;
+    #: risk_pct=按「单笔风险%」反推（与策略信号一致，止损越宽仓位越小）
+    sizing_mode: Literal["margin_pct", "risk_pct"] = Field(
+        default="margin_pct", description="跟单仓位算法"
+    )
+    #: 跟单专用的单仓保证金占比；0 = 沿用「风控 → 单仓保证金」的全局值
+    margin_pct_override: float = Field(default=0.0, ge=0, le=100, description="跟单单仓保证金占比覆盖值")
     dry_run: bool = Field(default=True, description="只记录意图不下单; 人工明确授权后才可关闭（RUNBOOK M4）")
 
 

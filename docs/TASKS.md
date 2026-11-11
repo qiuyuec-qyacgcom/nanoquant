@@ -1282,6 +1282,21 @@
   - 前端 `SignalFollowView.vue`：输入框改「信号源路径 / 频道链接」、占位与说明覆盖 URL 三种格式；KPI 与链路状态标签从「文件已接入」改为「链接已接入」；重置游标说明覆盖两种模式；类型补 `source_kind`。
 - **验证**：`pytest tests -q` → **126 passed**（新增 `is_url`、URL 三种格式解析、链接首次不回放/之后只跟新信号 3 条用例）；`compileall`、`vue-tsc --noEmit` 0 error、`npm run build` 通过；重启后实测 `PUT /settings/signal_follow` 写入 `https://example.invalid/signals` 并启用，引擎一轮后 `path_exists=True`、`source_kind=url`、拉取失败优雅记录（无效域名），配置已恢复默认。
 
+### 91. 信号跟单新增「按保证金占比定仓」模式
+- **状态**：✅ 已完成（本地，待推送）
+- **背景**：原信号跟单复用 `risk_mod.plan_position`，会用「单笔风险 %」二次压缩仓位；但跟单的亏损本应由信号自带止损承担，止损给得宽的信号仓位会被压到很小。
+- **过程要点**：
+  - `services/settings.py` 增加 `sizing_mode: Literal["margin_pct","risk_pct"]`（默认 `margin_pct`）与 `margin_pct_override: float`（跟单单仓保证金占权益 % 覆盖值，0=用全局 `risk_cfg.margin_pct`）。
+  - `exchange/broker.py` 新增 `qty_from_margin_pct(equity, price, leverage, margin_pct, filters, available)`：直接按权益×保证金占比算合约数量并完成下单量规整。
+  - 引擎 `_follow_signal` 在 `sizing_mode=="margin_pct"` 时走 `qty_from_margin_pct`（默认），否则退回原 `plan_position` 风险预算逻辑；前端 `SignalFollowView.vue` 增加定仓模式与覆盖值控件。
+- **验证**：`pytest tests -q` → 新增跟单定仓与覆盖值用例；`vue-tsc` 0 error、`npm run build` 通过。
+
+### 92. -1003 封禁探测改为指数退避
+- **状态**：✅ 已完成（本地，待推送）
+- **背景**：#88 让本地每 3 分钟试探一次封禁；但真封禁期间这等于每 3 分钟再撞一次墙，每次试探本身又是一次超限请求，可能让交易所把封禁计时续上——表现为「什么都没干，封禁却一直不结束」。
+- **过程要点**：`exchange/ratelimit.py` 把固定 `MAX_BAN_HONOR_SEC=180` 探测改为指数退避（基础 60s，×2 递增，封顶 1800s，最多 6 连）；新增 `ban_streak` 计数；只要任一次请求成功收到权重响应头（`observe_weight`）即把退避计数归零。仍保留交易所声明解封时间 `ban_declared_until` 用于面板展示。
+- **验证**：`pytest tests -q` → 新增封禁指数退避契约（连续封禁退避递增、成功一次即归零）；`compileall` 通过；前端构建通过。
+
 ---
 
 ## 二、未开始

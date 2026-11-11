@@ -17,9 +17,16 @@ log = get_logger("ratelimit")
 _BAN_RE = re.compile(r"banned until (\d{13})")
 
 #: 交易所返回的封禁时间可能长达数小时 (共享出口 IP 被邻居拖累时尤其长)。
-#: 直接按字面值熔断会让整个面板"假死", 所以本地最多只认 3 分钟,
-#: 到点先试探一次: 仍被封就再续 3 分钟, 已解封就立即恢复。
+#: 直接按字面值熔断会让整个面板"假死", 所以本地不照单全收。
+#: 但也不能固定每 3 分钟探测一次: 真封禁期间那等于每 3 分钟再撞一次墙,
+#: 每次试探本身又是一次超限请求, 可能让交易所把封禁计时续上 ——
+#: 表现就是"明明什么都没干, 封禁却一直不结束"。
+#: 改为指数退避: 60 -> 120 -> 240 -> 480 -> 960 -> 1800s 封顶;
+#: 只要有一次请求成功 (收到权重响应头), 退避计数立刻归零。
 MAX_BAN_HONOR_SEC = 180.0
+BAN_BACKOFF_BASE_SEC = 60.0
+BAN_BACKOFF_MAX_SEC = 1800.0
+BAN_BACKOFF_MAX_STREAK = 6
 #: 令牌不足时的最大排队时间。超过就快速失败，避免请求在网关里堆到超时（雪崩）。
 MAX_WAIT_SEC = 5.0
 
@@ -40,6 +47,8 @@ class WeightLimiter:
         #: 交易所声明的真实解封时间（可能长达数小时），仅用于展示与提示，不按它熔断
         self._ban_declared_until = 0.0
         self._ban_logged_until = 0.0
+        #: 连续被封次数, 决定退避时长; 任一请求成功即归零
+        self._ban_streak = 0
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------ internal
@@ -72,14 +81,20 @@ class WeightLimiter:
             return False
         declared = int(m.group(1)) / 1000.0
         self._ban_declared_until = max(self._ban_declared_until, declared)
-        self._ban_until = max(self._ban_until, min(declared, time.time() + MAX_BAN_HONOR_SEC))
-        # 同一轮封禁每 3 分钟会试探一次，声明时间不变时不要刷 ERROR
+        self._ban_streak = min(self._ban_streak + 1, BAN_BACKOFF_MAX_STREAK)
+        backoff = min(
+            BAN_BACKOFF_MAX_SEC,
+            BAN_BACKOFF_BASE_SEC * (2 ** (self._ban_streak - 1)),
+        )
+        self._ban_until = max(self._ban_until, min(declared, time.time() + backoff))
+        # 同一轮封禁内声明时间不变时不重复刷日志
         if declared > self._ban_logged_until + 1:
             self._ban_logged_until = declared
             log.warning(
-                "币安返回封禁 (声明至 %s), 本地每 %.0f 分钟试探一次, 下次 %s",
+                "币安返回封禁 (声明至 %s), 第 %d 次连续封禁 -> 本地退避 %ds 后试探 (%s)",
                 time.strftime("%H:%M:%S", time.localtime(declared)),
-                MAX_BAN_HONOR_SEC / 60,
+                self._ban_streak,
+                int(backoff),
                 time.strftime("%H:%M:%S", time.localtime(self._ban_until)),
             )
         return True
@@ -87,6 +102,8 @@ class WeightLimiter:
     def observe_weight(self, used: int) -> None:
         if used <= 0:
             return
+        # 能收到权重响应头 = 这次请求通了, 熔断确实解除, 退避计数归零
+        self._ban_streak = 0
         self._used_header = used
         # 交易所口径已用权重直接压缩本地令牌, 避免双算
         remaining_ratio = max(0.0, 1.0 - used / self.capacity)
