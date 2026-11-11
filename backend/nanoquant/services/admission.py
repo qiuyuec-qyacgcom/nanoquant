@@ -154,7 +154,13 @@ async def evaluate() -> dict[str, Any]:
         pass
     cooldowns = state.active_cooldowns(int(__import__("time").time()))
     consecutive = state.get_int("consecutive_losses", 0)
-    engine_ok = engine_cfg.enabled and window_ok and consecutive < risk_cfg.consecutive_loss_limit and not state.get("halted")
+    halted = state.normalize_halted(state.get("halted"))
+    engine_ok = (
+        engine_cfg.enabled
+        and window_ok
+        and consecutive < risk_cfg.consecutive_loss_limit
+        and not halted
+    )
     engine_detail = []
     if not engine_cfg.enabled:
         engine_detail.append("引擎未启动 (总览页点「启动引擎」)")
@@ -162,8 +168,8 @@ async def evaluate() -> dict[str, Any]:
         engine_detail.append(window_reason)
     if consecutive >= risk_cfg.consecutive_loss_limit:
         engine_detail.append(f"连亏 {consecutive} 笔触发冷静期")
-    if state.get("halted"):
-        engine_detail.append(f"已熔断: {state.get('halted')[:60]}")
+    if halted:
+        engine_detail.append(f"已熔断: {halted[:60]}")
     if cooldowns:
         engine_detail.append(f"{len(cooldowns)} 个标的处于冷却")
     guard_remaining = max(0, int(state.get_float("sl_guard_until", 0) - __import__("time").time()))

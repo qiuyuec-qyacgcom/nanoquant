@@ -22,6 +22,31 @@ DEFAULT_STATE: dict[str, str] = {
 }
 
 
+_HALT_PREFIX = "引擎已熔断:"
+#: 这些是定时自愈状态，不能持久化为熔断（到期后仍会被判成熔断，永久锁死）
+_SELF_HEALING_HALTS = ("止损熔断", "连亏", "冷静期")
+
+
+def normalize_halted(raw: str) -> str:
+    """清洗熔断原因：剥离历史层层拼接的「引擎已熔断: 」前缀，并丢弃自愈类状态.
+
+    修复背景：旧实现把 gate.reason（含「熔断」二字）回写 ``halted``，
+    而 ``global_gates`` 又会给已熔断状态再加一次前缀，导致每轮 +6 字符、
+    且「止损熔断中」到期后仍被当成熔断，形成永久死锁。读取侧统一归一化即可自愈。
+    """
+    text = str(raw or "").strip()
+    # 历史脏数据可能嵌套上百层前缀，循环剥到干净为止（带安全上限防死循环）
+    depth = 0
+    while text.startswith(_HALT_PREFIX) and depth < 10000:
+        text = text[len(_HALT_PREFIX) :].strip()
+        depth += 1
+    if not text:
+        return ""
+    if any(token in text for token in _SELF_HEALING_HALTS):
+        return ""
+    return text[:200]
+
+
 def get(key: str, default: str = "") -> str:
     with session_scope() as s:
         row = s.get(EngineState, key)

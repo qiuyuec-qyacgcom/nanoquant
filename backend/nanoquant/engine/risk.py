@@ -26,6 +26,9 @@ class GateDecision:
     ok: bool
     reason: str = ""
     warnings: list[str] | None = None
+    #: 需要写入 ``engine_state.halted`` 的**干净原因**；为空表示该闸门属定时自愈，
+    #: 不得持久化（旧实现把含「熔断」字样的 reason 原样回写，导致永久熔断）。
+    halt: str = ""
 
 
 def _now_local(cfg: EngineSettings) -> datetime:
@@ -137,25 +140,35 @@ def global_gates(account: Account, cfg_engine: EngineSettings, cfg_risk: RiskSet
     if day_start > 0:
         day_pnl_pct = (account.equity - day_start) / day_start * 100
         if day_pnl_pct <= -cfg_risk.daily_loss_limit_pct:
-            return GateDecision(False, f"触发日内亏损上限 {day_pnl_pct:.2f}% (限 {cfg_risk.daily_loss_limit_pct}%)")
+            return GateDecision(
+                False,
+                f"触发日内亏损上限 {day_pnl_pct:.2f}% (限 {cfg_risk.daily_loss_limit_pct}%)",
+                halt=f"日内亏损 {day_pnl_pct:.2f}% 超过上限 {cfg_risk.daily_loss_limit_pct}%",
+            )
     if peak > 0:
         dd = (peak - account.equity) / peak * 100
         if dd >= cfg_risk.max_drawdown_pct:
-            return GateDecision(False, f"触发最大回撤限制 {dd:.2f}% (限 {cfg_risk.max_drawdown_pct}%)")
+            return GateDecision(
+                False,
+                f"触发最大回撤限制 {dd:.2f}% (限 {cfg_risk.max_drawdown_pct}%)",
+                halt=f"最大回撤 {dd:.2f}% 超过上限 {cfg_risk.max_drawdown_pct}%",
+            )
     losses = state.get_int("consecutive_losses", 0)
     if losses >= cfg_risk.consecutive_loss_limit:
         halt_until = state.get_float("loss_halt_until", 0)
         if time.time() < halt_until:
             remain = int(halt_until - time.time())
+            # 冷静期到点自动解除，属定时自愈：不写 halted
             return GateDecision(False, f"连亏 {losses} 笔, 冷静期剩余 {remain}s")
         state.set("consecutive_losses", "0")
     guard_until = state.get_float("sl_guard_until", 0)
     if guard_until > time.time():
         remain = int(guard_until - time.time())
+        # 止损熔断同样会自然到期：只拦本轮，不持久化
         return GateDecision(False, f"止损熔断中, 剩余 {remain}s (窗口内多次止损)")
-    halted = state.get("halted")
+    halted = state.normalize_halted(state.get("halted"))
     if halted:
-        return GateDecision(False, f"引擎已熔断: {halted}")
+        return GateDecision(False, f"引擎已熔断: {halted}", halt=halted)
     return GateDecision(True)
 
 

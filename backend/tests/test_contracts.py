@@ -1650,6 +1650,56 @@ def test_margin_inflight_reservation_survives_engine_cycle():
     asyncio.run(run())
 
 
+# ------------------------------------------- 熔断状态回写
+def test_normalize_halted_strips_compounded_prefix():
+    """旧 bug 会把「引擎已熔断: 」逐轮拼回去，读侧必须能还原成单条原因."""
+    from nanoquant.services import state
+
+    dirty = "引擎已熔断: " * 120 + "日内亏损 -30.00% 超过上限 25%"
+    assert state.normalize_halted(dirty) == "日内亏损 -30.00% 超过上限 25%"
+    # 定时自愈状态不得被当成持久熔断
+    assert state.normalize_halted("止损熔断中, 剩余 111s (窗口内多次止损)") == ""
+    assert state.normalize_halted("引擎已熔断: 止损熔断中, 剩余 3s") == ""
+    assert state.normalize_halted("连亏 4 笔, 冷静期剩余 120s") == ""
+    assert state.normalize_halted("") == ""
+    assert state.normalize_halted("引擎已熔断: ") == ""
+
+
+def test_global_gates_does_not_persist_self_healing_halt():
+    """止损熔断/连亏冷静期只拦本轮，不写 halted；持久熔断原因保持干净且不会增长."""
+    import time
+    from types import SimpleNamespace
+
+    from nanoquant.engine import risk as risk_mod
+    from nanoquant.services import state
+    from nanoquant.services.settings import EngineSettings, RiskSettings
+
+    cfg = EngineSettings()
+    risk = RiskSettings(daily_loss_limit_pct=100, max_drawdown_pct=100)
+    account = SimpleNamespace(equity=1000.0, available=1000.0)
+    state.set("halted", "")
+    state.set("consecutive_losses", "0")
+    state.set("sl_guard_until", str(int(time.time()) + 60))
+    try:
+        guard = risk_mod.global_gates(account, cfg, risk)
+        assert not guard.ok and "止损熔断" in guard.reason
+        assert guard.halt == ""  # 自愈闸门不产生持久熔断原因
+    finally:
+        state.set("sl_guard_until", "")
+
+    # 持久熔断：读出来的原因应干净，写回后不叠加前缀
+    state.set("halted", "日内亏损 -30.00% 超过上限 25%")
+    try:
+        first = risk_mod.global_gates(account, cfg, risk)
+        assert first.reason == "引擎已熔断: 日内亏损 -30.00% 超过上限 25%"
+        assert first.halt == "日内亏损 -30.00% 超过上限 25%"
+        state.set("halted", first.halt)
+        second = risk_mod.global_gates(account, cfg, risk)
+        assert second.halt == first.halt  # 不再变长
+    finally:
+        state.set("halted", "")
+
+
 # ------------------------------------------- 标的池：股票/商品类永续（TRADIFI）
 def test_pool_accepts_tradifi_equity_contract():
     """币安股票合约是 TRADIFI_PERPETUAL（underlyingType=EQUITY），旧逻辑只认 PERPETUAL 会全拒."""

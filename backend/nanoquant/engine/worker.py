@@ -251,7 +251,10 @@ class TradingEngine:
             state.set("cycle_timings", __import__("json").dumps(timings))
             return {"skipped": why}
         if not gate.ok:
-            state.set("halted", gate.reason if "熔断" in gate.reason else "")
+            # 只有需要人工/日切解除的闸门（日亏、回撤）才写 halted；
+            # 止损熔断、连亏冷静期等定时自愈状态绝不能持久化，否则到期后仍被判熔断。
+            if gate.halt:
+                state.set("halted", state.normalize_halted(gate.halt))
             state.set("cycle_timings", __import__("json").dumps(timings))
             return {"skipped": gate.reason}
         state.set("halted", "")
@@ -1551,7 +1554,7 @@ class TradingEngine:
             "last_cycle_ts": state.get_int("last_cycle_ts", 0),
             "last_cycle_ms": state.get_int("last_cycle_ms", 0),
             "last_error": state.get("last_error"),
-            "halted": state.get("halted"),
+            "halted": state.normalize_halted(state.get("halted")),
             "halted_reason": state.get("loss_halt_until"),
             "account": account_d,
             "positions": pos_d,

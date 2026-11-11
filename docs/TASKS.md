@@ -1200,6 +1200,20 @@
   - **消除冗余**：删除 `mobile-nav` / `flatNav` 死代码；9 处内联便签颜色改语义类；3 处内联十六进制颜色改变量/语义类；`Modal` 补 `role="dialog"` / `aria-modal` / Esc 关闭。
 - **验证**：`vue-tsc --noEmit` 0 error、`npm run build` 通过；Playwright 实拍桌面 1440 与移动 390（后台总览/策略/参数配置、移动抽屉、底部抽屉弹窗、前台首页）均正常；宽表在移动端横向滚动、不再重叠。
 
+### 84. 熔断状态回写死锁修复（风控提示重复上百次）
+- **状态**：✅ 已完成
+- **现象**：总览「风控提示」显示 `引擎已熔断: ` 重复上百次，末尾才是「止损熔断中, 剩余 111s (窗口内多次止损)」。
+- **根因**（三层叠加）：
+  1. `worker.cycle` 把 `gate.reason` 中只要含「熔断」字样的内容原样写回 `engine_state.halted`；
+  2. `risk.global_gates` 对已熔断状态返回 `f"引擎已熔断: {halted}"`，该字符串下一轮又被回写 ⇒ 每轮 +6 字符、无限增长；
+  3. 更严重：`止损熔断中`（StoplossGuard）与「连亏冷静期」本是**定时自愈**状态，被写进 `halted` 后即使已到期仍会被判为熔断 ⇒ 永久锁死，只能人工改库。
+- **修复**：
+  - `GateDecision` 新增 `halt` 字段：仅日亏/回撤这类需要人工或日切解除的闸门给出**干净原因**；止损熔断、连亏冷静期 `halt=""`，只拦本轮。
+  - `worker.cycle` 改为写 `state.normalize_halted(gate.halt)`，非持久闸门不再改写 `halted`；闸门恢复时照旧清空。
+  - `risk.global_gates` 读取侧统一归一化：剥离任意层「引擎已熔断:」前缀，并丢弃自愈类原因。
+  - `state.normalize_halted()` 同时用于 `/engine/status` 与开仓体检，历史脏数据在下次读取时自动还原，无需手工改库。
+- **验证**：`pytest tests -q` → **113 passed**（新增 120 层前缀剥离、自愈闸门不持久化、熔断原因不增长 3 条断言）；重启后 `halted` 由上千字符自动还原为 `[]`，`stoploss_guard_remaining=0`、`consecutive_losses=0`，引擎恢复运行。
+
 ---
 
 ## 二、未开始
