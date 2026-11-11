@@ -1544,12 +1544,28 @@ def test_parse_signal_normalizes_templates_and_events():
     assert parsed["leverage"] == 20.0 and parsed["entry"] == 1234.5
     assert parsed["ts"] == 1730000000 and parsed["event"] == "open"
 
-    assert sf.classify_event({"event": "平仓"}) == "exit"
     assert sf.classify_event({"event": "止盈更新"}) == "exit"
     assert sf.classify_event({"action": "buy"}) == "open"
     assert sf.classify_event({"symbol": "BTCUSDT"}) == ""  # 模板变体: 无事件字段
     assert sf.classify_event({"event": "something_odd"}) == "unknown"
-    assert sf.parse_signal({"symbol": "BTCUSDT", "action": "平多"}) is None
+
+    # 生命周期事件各自可执行：以前一律归为 exit（只报告不执行），
+    # 导致"频道说全部平仓，系统一直拿着"。
+    assert sf.classify_event({"event": "平仓"}) == "close"
+    assert sf.classify_event({"event": "加仓"}) == "add"
+    assert sf.classify_event({"event": "close"}) == "close"
+    assert sf.classify_event({"event": "move_stop"}) == "move_stop"
+    assert sf.classify_event({"event": "全部平仓，盈利 180%"}) == "close"
+    # 差一个比例词就是减半而不是清仓，顺序错了会把半仓平光
+    assert sf.classify_event({"event": "平仓 50%"}) == "reduce"
+    assert sf.classify_event({"event": "减仓一半"}) == "reduce"
+
+    # 方向藏在事件词里（"平多"）也要能推出来，否则这类消息会被整条丢掉
+    closed = sf.parse_signal({"symbol": "BTCUSDT", "action": "平多"})
+    assert closed is not None
+    assert closed["event"] == "close" and closed["side"] == "long"
+    # 缺方向的开仓仍然必须拒绝
+    assert sf.parse_signal({"symbol": "BTCUSDT", "event": "开仓"}) is None
 
     from datetime import datetime
 

@@ -221,8 +221,11 @@ class Broker(Protocol):
     async def account(self) -> Account: ...
     async def positions(self) -> list[ExchangePosition]: ...
     async def open_position(self, **kwargs: Any) -> ExecResult: ...
+    async def add_to_position(self, **kwargs: Any) -> ExecResult: ...
     async def close_position(self, **kwargs: Any) -> ExecResult: ...
-    async def amend_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> ExecResult: ...
+    async def amend_stop(
+        self, symbol: str, side: str, stop_price: float, qty: float, tp_price: float = 0.0
+    ) -> ExecResult: ...
     async def health(self) -> dict[str, Any]: ...
     async def trade_mode_status(self, symbols: list[str] | None = None) -> dict[str, Any]: ...
     async def switch_trade_mode(self, *, hedge: bool = True, isolated: bool = True) -> dict[str, Any]: ...
@@ -464,6 +467,131 @@ class BinanceBroker:
                 return ExecResult(False, message=precision_hint(filters, qty))
             return ExecResult(False, message=f"下单失败 {exc.code}: {exc.message}")
 
+    async def add_to_position(
+        self,
+        *,
+        position: PositionRecord,
+        qty: float,
+        filters: SymbolFilters,
+        sl_price: float,
+        tp_price: float,
+        reason: str = "",
+    ) -> ExecResult:
+        """在已有仓位上加仓，并合并成一笔：重算加权均价 + 按新均价重挂保护单。
+
+        为什么不复用 `open_position`：它的落库是"同标的存在就整行覆盖"，
+        拿它加仓会把账本数量改成只剩新加的这笔，与交易所实际仓位脱节，
+        后续部分平仓、风控计数、止损挂单量全都会错。所以这里显式做数量累加
+        与加权均价。
+        """
+        pid = position.id
+        if pid in _CLOSING:
+            return ExecResult(False, message="该仓位正在平仓中, 请稍候")
+        old_qty = float(position.qty)
+        old_entry = float(position.entry_price or 0)
+        t_call = time.perf_counter()
+        stage: dict[str, float] = {}
+        try:
+            dual = await self._ensure_trade_mode()
+            await self._ensure_symbol(position.symbol, int(position.leverage or 1))
+            cid = new_client_order_id("na")
+            side_txt = "BUY" if position.side == "long" else "SELL"
+            params: dict[str, Any] = {
+                "symbol": position.symbol,
+                "side": side_txt,
+                "type": "MARKET",
+                "quantity": filters.format_qty(qty),
+                "newClientOrderId": cid,
+                "recvWindow": get_engine().recv_window_ms,
+                **hedge_order_params(dual, position.side),
+            }
+            stage["plan_ms"] = (time.perf_counter() - t_call) * 1000
+            t0 = time.perf_counter()
+            sink_token = STAGE_SINK.set(stage)
+            try:
+                try:
+                    resp = await binance_client.client.place_order(**params)
+                except UncertainSubmission as exc:
+                    resolved = await self._resolve_entry(position.symbol, cid)
+                    if not resolved:
+                        return ExecResult(False, message=f"加仓结果未知且查询失败: {exc.message}")
+                    resp = resolved
+            finally:
+                STAGE_SINK.reset(sink_token)
+            stage["send_ms"] = (time.perf_counter() - t0) * 1000
+            filled = float(resp.get("executedQty", 0) or 0) or qty
+            avg = float(resp.get("avgPrice", 0) or 0) or (filters.last_price or 0)
+            if avg <= 0:
+                return ExecResult(False, message="加仓成交但取不到成交价, 已放弃合并, 请手工核对")
+
+            new_qty = old_qty + filled
+            new_entry = (
+                (old_entry * old_qty + avg * filled) / new_qty
+                if new_qty > 0 and old_entry > 0
+                else avg
+            )
+            with session_scope() as s:
+                row = s.get(PositionRecord, pid)
+                if row is None or row.status != "open":
+                    return ExecResult(False, message="加仓已成交但本地仓位不存在, 请手工核对")
+                row.qty = new_qty
+                row.entry_price = new_entry
+                row.mark_price = avg
+                row.margin = new_qty * new_entry / max(1.0, float(row.leverage or 1))
+                if sl_price > 0:
+                    row.sl_price = sl_price
+                if tp_price > 0:
+                    row.tp_price = tp_price
+                row.ai_reason = f"{row.ai_reason or ''} | 加仓×{filled:g} @{avg:.8g}".strip(" |")[:800]
+                s.add(
+                    OrderRecord(
+                        symbol=position.symbol,
+                        side=side_txt,
+                        order_type="MARKET",
+                        qty=filled,
+                        price=avg,
+                        status=str(resp.get("status", "FILLED")),
+                        purpose="add",
+                        client_order_id=cid,
+                        exchange_order_id=str(resp.get("orderId", "")),
+                        mode=self.mode,
+                        latency_ms=int(stage.get("send_ms", 0)),
+                        raw=_compact_raw(resp),
+                    )
+                )
+            # 合并后必须按新均价重挂：closePosition=true 覆盖整仓数量，
+            # 但触发价仍是旧仓位的止损位，与新均价不匹配
+            try:
+                await binance_client.client.cancel_all(position.symbol)
+                await binance_client.client.cancel_all_algo(position.symbol)
+            except BinanceError:
+                pass
+            await self._place_protection(
+                position.symbol, position.side, sl_price, tp_price, filters, dual=dual
+            )
+            stage["total_ms"] = (time.perf_counter() - t_call) * 1000
+            exec_metrics.record(stage)
+            label = "实盘" if self.mode == "live" else "模拟盘"
+            return ExecResult(
+                True,
+                price=avg,
+                qty=filled,
+                order_id=str(resp.get("orderId", "")),
+                message=(
+                    f"{label}加仓 {filled:g}@{avg:.8g}, "
+                    f"合并后 {new_qty:g} 均价 {new_entry:.8g}"
+                ),
+            )
+        except NoCredentials as exc:
+            return ExecResult(False, message=str(exc))
+        except BinanceError as exc:
+            if exc.code == -2019:
+                need = qty * (filters.last_price or 0) / max(1.0, float(position.leverage or 1))
+                return ExecResult(False, message=margin_insufficient_hint(need, position.leverage or 1))
+            if exc.code == -1111:
+                return ExecResult(False, message=precision_hint(filters, qty))
+            return ExecResult(False, message=f"加仓失败 {exc.code}: {exc.message}")
+
     async def _place_protection(
         self,
         symbol: str,
@@ -629,7 +757,14 @@ class BinanceBroker:
             _CLOSING.discard(pid)
             raise
 
-    async def amend_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> ExecResult:
+    async def amend_stop(
+        self, symbol: str, side: str, stop_price: float, qty: float, tp_price: float = 0.0
+    ) -> ExecResult:
+        """改止损。传入 tp_price 时把止盈一起重挂。
+
+        `cancel_all` 会连止盈单一起撤掉，只挂止损会让仓位变成"有止损、没止盈"。
+        所以只要原仓位有止盈，调用方就必须把 tp_price 传进来。
+        """
         close_side = "SELL" if side == "long" else "BUY"
         try:
             dual = await self._ensure_trade_mode()
@@ -654,6 +789,8 @@ class BinanceBroker:
                 **(hedge_order_params(dual, side, closing=True) if dual else {}),
             }
             await binance_client.client.place_algo_order(**params)
+            if tp_price and tp_price > 0:
+                await self._place_protection(symbol, side, 0.0, tp_price, pf, dual=dual)
             with session_scope() as s:
                 row = (
                     s.query(PositionRecord)
@@ -662,9 +799,11 @@ class BinanceBroker:
                 )
                 if row:
                     row.sl_price = stop_price
-            return ExecResult(True, price=stop_price, message="交易所止损已上移")
+                    if tp_price and tp_price > 0:
+                        row.tp_price = tp_price
+            return ExecResult(True, price=stop_price, message="交易所止损已更新")
         except BinanceError as exc:
-            return ExecResult(False, message=f"止损上移失败: {exc.message}")
+            return ExecResult(False, message=f"止损更新失败: {exc.message}")
 
     async def trade_mode_status(self, symbols: list[str] | None = None) -> dict[str, Any]:
         """持仓模式与保证金模式体检（只读）.

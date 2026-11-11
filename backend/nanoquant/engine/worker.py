@@ -982,6 +982,14 @@ class TradingEngine:
                 key, parsed, "skipped", f"每小时跟单已达上限 {cfg.max_per_hour} 笔", mode
             )
 
+        # 加仓/减仓/平仓/移止损：语义不同，走独立分支，且**排在标的锁之前**。
+        # 那个锁的语义是"别对同一标的重复开仓"，开仓成功后会刻意保留 90 秒；
+        # 若把离场动作放在锁后面，开仓后一分钟内收到的平仓信号会被挡掉 ——
+        # 该止损的时候止不掉，比重复开仓严重得多。
+        business = parsed.get("event") or "open"
+        if business in ("add", "reduce", "close", "move_stop"):
+            return await self._follow_lifecycle(key, parsed, business, mode, cfg, risk_cfg)
+
         if not self._symbol_acquire(symbol):
             return self._follow_skip(key, parsed, "skipped", "同标的开仓任务在途", mode)
         rid = 0
@@ -1153,6 +1161,301 @@ class TradingEngine:
             if not follow_opened:
                 self._symbol_release(symbol)
 
+    # ------------------------------------------------------------ 生命周期事件
+
+    def _open_position(self, symbol: str, mode: str) -> PositionRecord | None:
+        """取该标的当前 open 仓位，返回脱离 session 的副本。
+
+        加仓/减仓/平仓/移止损都要先知道"现在有什么仓"，方向、均价、
+        数量一律以本地账本为准，不信信号里写的方向。
+        """
+        with session_scope() as s:
+            pos = (
+                s.query(PositionRecord)
+                .filter(
+                    PositionRecord.symbol == symbol,
+                    PositionRecord.status == "open",
+                    PositionRecord.mode == mode,
+                )
+                .order_by(PositionRecord.opened_at.desc())
+                .first()
+            )
+            if pos is not None:
+                s.expunge(pos)
+            return pos
+
+    async def _follow_lifecycle(
+        self,
+        key: str,
+        parsed: dict[str, Any],
+        event: str,
+        mode: str,
+        cfg: Any,
+        risk_cfg: Any,
+    ) -> dict[str, Any]:
+        """处理加仓 / 减仓 / 平仓 / 移止损。
+
+        共同前提：本系统必须有该标的的持仓。没有持仓时不是"出错了"，
+        而是这条频道消息对我们没有意义（我们没跟过这一单），直接跳过。
+        """
+        symbol = parsed["symbol"]
+        pos = self._open_position(symbol, mode)
+        if pos is None:
+            return self._follow_skip(
+                key, parsed, "skipped", f"本地无 {symbol} 持仓，无法执行 {event}", mode
+            )
+
+        filters = symbol_service.filters_for(symbol)
+        if filters is None:
+            return self._follow_skip(key, parsed, "skipped", "缺少交易规则(标的未就绪)", mode)
+        broker = get_broker(mode)
+
+        try:
+            tickers = await binance_client.tickers([symbol])
+        except (BinanceError, NoCredentials) as exc:
+            return self._follow_skip(key, parsed, "skipped", f"取价失败: {str(exc)[:120]}", mode)
+        ticker = tickers.get(symbol)
+        if ticker is None or ticker.last <= 0:
+            return self._follow_skip(key, parsed, "skipped", "行情暂不可用", mode)
+        filters.last_price = ticker.last
+        last = ticker.last
+
+        if event == "close":
+            return await self._lifecycle_close(key, parsed, pos, broker, mode, cfg)
+
+        if event == "reduce":
+            return await self._lifecycle_reduce(key, parsed, pos, broker, mode, cfg, filters)
+
+        if event == "move_stop":
+            return await self._lifecycle_move_stop(
+                key, parsed, pos, broker, mode, cfg, filters, last
+            )
+
+        return await self._lifecycle_add(
+            key, parsed, pos, broker, mode, cfg, risk_cfg, filters, last
+        )
+
+    async def _lifecycle_close(
+        self, key, parsed, pos: PositionRecord, broker: Broker, mode: str, cfg: Any
+    ) -> dict[str, Any]:
+        if cfg.dry_run:
+            self._finish_follow(
+                key, parsed, "dry_run", "演练模式: 只记录不平仓", mode,
+                qty=pos.qty, price=pos.mark_price, leverage=pos.leverage,
+            )
+            events.record(
+                "info", "signal_follow",
+                f"{pos.symbol} 演练: 收到平仓信号, 将平掉 {pos.qty:g}",
+            )
+            return {"ok": True, "status": "dry_run"}
+        res = await broker.close_position(position=pos, reason="signal_close")
+        if not res.ok:
+            return self._follow_skip(key, parsed, "error", f"平仓失败: {res.message}"[:200], mode)
+        self._finish_follow(
+            key, parsed, "closed", f"跟单平仓 @{res.price:.8g}", mode,
+            qty=res.qty, price=res.price, leverage=pos.leverage,
+        )
+        events.record(
+            "info", "signal_follow",
+            f"{pos.symbol} 跟单平仓 {res.qty:g} @{res.price:.8g}",
+        )
+        return {"ok": True, "status": "closed", "qty": res.qty, "price": res.price}
+
+    async def _lifecycle_reduce(
+        self, key, parsed, pos: PositionRecord, broker: Broker, mode: str, cfg: Any, filters
+    ) -> dict[str, Any]:
+        pct = float(parsed.get("reduce_pct") or 0.0)
+        if pct <= 0:
+            # 频道只说"减仓"没给比例：按一半处理，比"全平"保守，比"不动"有意义
+            pct = 50.0
+            why_pct = "未给比例, 按 50%"
+        else:
+            why_pct = f"{pct:g}%"
+        pct = max(1.0, min(100.0, pct))
+        qty = pos.qty * pct / 100.0
+        # 数量对齐交给 close_position（它内部按步进取整并校验最小量）
+        if qty <= 0:
+            return self._follow_skip(key, parsed, "skipped", "减仓数量为 0", mode)
+        if cfg.dry_run:
+            self._finish_follow(
+                key, parsed, "dry_run", f"演练模式: 只记录不平仓(减 {why_pct})", mode,
+                qty=qty, price=pos.mark_price, leverage=pos.leverage,
+            )
+            events.record(
+                "info", "signal_follow",
+                f"{pos.symbol} 演练: 减仓 {why_pct}, 将平掉 {qty:g}",
+            )
+            return {"ok": True, "status": "dry_run", "qty": qty}
+        res = await broker.close_position(
+            position=pos, reason=f"signal_reduce_{pct:g}pct", qty=qty
+        )
+        if not res.ok:
+            return self._follow_skip(key, parsed, "error", f"减仓失败: {res.message}"[:200], mode)
+        self._finish_follow(
+            key, parsed, "reduced", f"跟单减仓 {why_pct} @{res.price:.8g}", mode,
+            qty=res.qty, price=res.price, leverage=pos.leverage,
+        )
+        events.record(
+            "info", "signal_follow",
+            f"{pos.symbol} 跟单减仓 {why_pct} 平掉 {res.qty:g} @{res.price:.8g}",
+        )
+        return {"ok": True, "status": "reduced", "qty": res.qty, "price": res.price}
+
+    async def _lifecycle_move_stop(
+        self, key, parsed, pos: PositionRecord, broker: Broker, mode: str, cfg: Any, filters, last: float
+    ) -> dict[str, Any]:
+        if parsed.get("stop_to_breakeven"):
+            target = float(pos.entry_price or 0)
+            why = "移到入场价(保本)"
+        else:
+            target = float(parsed.get("stop") or 0)
+            why = f"移到 {target:g}" if target > 0 else ""
+        if target <= 0:
+            return self._follow_skip(key, parsed, "skipped", "移止损信号没有可用目标价", mode)
+
+        target = filters.align_price(target)
+        # 止损必须落在现价的安全侧，否则挂上去立刻触发市价平仓
+        if pos.side == "long" and target >= last:
+            return self._follow_skip(
+                key, parsed, "skipped",
+                f"多单止损 {target:g} 不低于现价 {last:g}, 挂上会立即触发", mode,
+            )
+        if pos.side == "short" and target <= last:
+            return self._follow_skip(
+                key, parsed, "skipped",
+                f"空单止损 {target:g} 不高于现价 {last:g}, 挂上会立即触发", mode,
+            )
+
+        if cfg.dry_run:
+            self._finish_follow(
+                key, parsed, "dry_run", f"演练模式: 只记录不移动止损({why})", mode,
+                qty=pos.qty, price=target, leverage=pos.leverage,
+            )
+            events.record(
+                "info", "signal_follow",
+                f"{pos.symbol} 演练: 止损 {why}, 当前止损 {pos.sl_price or '-'}",
+            )
+            return {"ok": True, "status": "dry_run", "price": target}
+        res = await broker.amend_stop(
+            pos.symbol, pos.side, target, float(pos.qty), tp_price=float(pos.tp_price or 0)
+        )
+        if not res.ok:
+            return self._follow_skip(key, parsed, "error", f"移止损失败: {res.message}"[:200], mode)
+        self._finish_follow(
+            key, parsed, "stop_moved", f"止损 {why}", mode,
+            qty=pos.qty, price=target, leverage=pos.leverage,
+        )
+        events.record("info", "signal_follow", f"{pos.symbol} 跟单止损 {why}")
+        return {"ok": True, "status": "stop_moved", "price": target}
+
+    async def _lifecycle_add(
+        self, key, parsed, pos: PositionRecord, broker: Broker, mode: str, cfg: Any,
+        risk_cfg: Any, filters, last: float,
+    ) -> dict[str, Any]:
+        side = parsed.get("side") or pos.side
+        if side != pos.side:
+            return self._follow_skip(
+                key, parsed, "skipped",
+                f"加仓方向 {side} 与现有持仓 {pos.side} 相反, 已忽略", mode,
+            )
+        # 只挡"引擎真的正在给同标的开仓"这一种并发：那种情况下再加一笔，
+        # 额度与均价都可能算重。这里刻意不用 _symbol_acquire —— 它的 90 秒
+        # TTL 在开仓成功后不会释放，而频道的"开仓 / 现价加仓"经常前后脚发出，
+        # 用那把锁会把正常的加仓信号全部吃掉。
+        # 跟单本身由 _follow_lock 串行，不存在两条加仓互相覆盖的可能。
+        task = self._entry_tasks.get(pos.symbol)
+        if task is not None and not task.done():
+            return self._follow_skip(
+                key, parsed, "skipped", "引擎正在同标的开仓, 加仓稍后重试", mode
+            )
+        return await self._lifecycle_add_locked(
+            key, parsed, pos, broker, mode, cfg, risk_cfg, filters, last
+        )
+
+    async def _lifecycle_add_locked(
+        self, key, parsed, pos: PositionRecord, broker: Broker, mode: str, cfg: Any,
+        risk_cfg: Any, filters, last: float,
+    ) -> dict[str, Any]:
+        try:
+            account = await broker.account()
+        except Exception as exc:  # noqa: BLE001
+            return self._follow_skip(key, parsed, "skipped", f"账户读取失败: {str(exc)[:120]}", mode)
+
+        self._margin.refresh(account.available)
+        pct = cfg.margin_pct_override if cfg.margin_pct_override > 0 else risk_cfg.margin_pct
+        if cfg.sizing_mode == "margin_pct":
+            qty, info = qty_from_margin_pct(
+                equity=account.equity,
+                price=last,
+                leverage=float(pos.leverage or 1),
+                margin_pct=pct,
+                filters=filters,
+                available=self._margin.remaining,
+            )
+        else:
+            sl_pct = cfg.default_sl_pct
+            ref = parsed["entry"] if parsed["entry"] > 0 else last
+            if parsed["stop"] > 0:
+                sl_pct = max(0.05, min(abs(ref - parsed["stop"]) / ref * 100, 20.0))
+            qty, info = risk_mod.plan_position(
+                price=last, filters=filters, account=account, cfg_risk=risk_cfg,
+                sl_pct=sl_pct, leverage=float(pos.leverage or 1),
+                available=self._margin.remaining,
+            )
+        if qty <= 0:
+            return self._follow_skip(key, parsed, "skipped", f"加仓数量不足: {info['note']}", mode)
+
+        # 止损/止盈沿用原仓位的设定，信号给了新的就用新的
+        sl_price = float(parsed["stop"]) if parsed["stop"] > 0 else float(pos.sl_price or 0)
+        tp_price = float(parsed["tp"]) if parsed["tp"] > 0 else float(pos.tp_price or 0)
+        if sl_price <= 0:
+            # 绝不留裸仓：加完之后没有止损是最危险的状态
+            sl_pct = cfg.default_sl_pct
+            sl_price = last * (1 - sl_pct / 100 if pos.side == "long" else 1 + sl_pct / 100)
+        sl_price = filters.align_price(sl_price)
+        if tp_price > 0:
+            tp_price = filters.align_price(tp_price)
+
+        reserved = float(info.get("margin") or 0)
+        rid = await self._margin.reserve_tracked(reserved)
+        if not rid:
+            return self._follow_skip(key, parsed, "skipped", "可用保证金不足, 加仓未执行", mode)
+
+        if cfg.dry_run:
+            await self._margin.settle(rid, opened=False)
+            self._finish_follow(
+                key, parsed, "dry_run", "演练模式: 只记录不加仓", mode,
+                qty=qty, price=last, margin=reserved, leverage=pos.leverage,
+            )
+            events.record(
+                "info", "signal_follow",
+                f"{pos.symbol} 演练: 加仓 {qty:g} @{last:.8g} 保证金≈{reserved:.2f}U",
+            )
+            return {"ok": True, "status": "dry_run", "qty": qty}
+
+        try:
+            res = await broker.add_to_position(
+                position=pos, qty=qty, filters=filters,
+                sl_price=sl_price, tp_price=tp_price, reason=f"外部信号加仓 {key}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("信号跟单加仓异常")
+            await self._margin.settle(rid, opened=False)
+            return self._follow_skip(key, parsed, "error", f"加仓异常: {str(exc)[:150]}", mode)
+        if not res.ok:
+            await self._margin.settle(rid, opened=False)
+            return self._follow_skip(key, parsed, "error", f"加仓失败: {res.message}"[:200], mode)
+        await self._margin.settle(rid, opened=True)
+        self._finish_follow(
+            key, parsed, "added", res.message[:200], mode,
+            qty=res.qty, price=res.price, margin=reserved, leverage=pos.leverage,
+        )
+        events.record(
+            "info", "signal_follow",
+            f"{pos.symbol} 跟单加仓 {res.qty:g} @{res.price:.8g} 保证金≈{reserved:.2f}U",
+        )
+        return {"ok": True, "status": "added", "qty": res.qty, "price": res.price}
+
     def signal_follow_status(self) -> dict[str, Any]:
         cfg = get_signal_follow()
         settings = cfg.model_dump()
@@ -1167,7 +1470,10 @@ class TradingEngine:
             )
             counts = {
                 status: s.query(SignalFollow).filter(SignalFollow.status == status).count()
-                for status in ("opened", "dry_run", "skipped", "error", "duplicate", "processing")
+                for status in (
+                    "opened", "added", "reduced", "closed", "stop_moved",
+                    "dry_run", "skipped", "error", "duplicate", "processing",
+                )
             }
             items = [
                 {

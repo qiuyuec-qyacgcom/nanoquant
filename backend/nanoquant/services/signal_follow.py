@@ -33,6 +33,15 @@ _SIDE_MAP = {
     "short": "short", "sell": "short", "空": "short", "做空": "short", "开空": "short", "看空": "short",
 }
 
+#: 事件字段里自带的方向（"平多"/"平空"/"close_long"），当 side 字段缺失时用
+_SIDE_FROM_EVENT = (
+    ("平多", "long"), ("平空", "short"),
+    ("多单", "long"), ("空单", "short"),
+    ("closelong", "long"), ("closeshort", "short"),
+    ("close_long", "long"), ("close_short", "short"),
+    ("reduce_long", "long"), ("reduce_short", "short"),
+)
+
 #: 只按「明确的事件字段」分类, 不扫 headline/正文, 避免"开仓...止盈 3%"被误判成平仓
 _EVENT_KEYS = (
     "event", "event_type", "type", "kind", "action", "stage", "op",
@@ -48,6 +57,59 @@ _OPEN_WORDS = (
     "开仓", "建仓", "入场", "进仓", "开多", "开空", "做多", "做空", "买入", "卖出", "开单",
     "open", "entry", "long", "short", "buy", "sell",
 )
+
+#: 生命周期事件：与「exit（旧口径，一律忽略）」分开，避免"止盈 50%"被当成全平。
+#: 顺序即优先级：reduce 必须排在 close 之前，因为"平仓50%"同时含"平仓"，
+#: 先判 close 会把"平一半"执行成"全平"。
+_EVENT_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "reduce",
+        (
+            "reduce", "partial", "trim", "减仓", "减持", "减半", "部分止盈",
+            "部分平仓", "分批止盈", "平仓一半", "平一半", "止盈出局",
+        ),
+    ),
+    (
+        "close",
+        (
+            "closeall", "close_all", "close-all", "close", "全平", "全部平仓",
+            "清仓", "全部出局", "全部止盈", "全部离场", "平掉", "已平仓",
+            "平多", "平空", "平多头", "平空头", "平仓",
+        ),
+    ),
+    (
+        "add",
+        (
+            "add", "加仓", "补仓", "加码", "追加仓位", "二次开仓", "二次进场",
+            "average", "scale_in", "scalein",
+        ),
+    ),
+    (
+        "move_stop",
+        (
+            "move_stop", "movestop", "move_stoploss", "breakeven", "trailing",
+            "trail", "移止损", "移动止损", "保本", "推保本", "止损上移",
+            "止损移至", "止损调整",
+        ),
+    ),
+)
+
+#: 显式事件字段的精确取值（网关会直接送这些值）
+_EVENT_EXACT = {
+    "open": "open",
+    "entry": "open",
+    "add": "add",
+    "reduce": "reduce",
+    "close": "close",
+    "move_stop": "move_stop",
+    "move": "move_stop",
+    "hold": "exit",  # 持仓提醒：明确"不动作"，落到退出分支即跳过
+}
+
+#: 明确表示"整仓离场"的说法，优先级高于比例判断
+_CLOSE_ALL_WORDS = ("全部平仓", "全平", "清仓", "全部出局", "全部止盈", "全部离场", "平掉", "closeall")
+#: 带这些量词说明是在说比例，配合平仓动词即可判为减仓
+_PCT_HINT = re.compile(r"\d{1,3}\s*%|一半|半仓|三分之一|三分之二|四分之一|三成|两成|七成|八成")
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _ENV_PATH = "SIGNAL_FOLLOW_JSONL"
@@ -94,18 +156,43 @@ def _timestamp(value: Any) -> int:
 
 
 def classify_event(row: dict[str, Any]) -> str:
-    """返回 open / exit / unknown / ""（""=没有事件字段, 按模板变体放行）.
+    """返回 open / add / reduce / close / move_stop / exit / unknown / ""。
 
-    未知事件一律 fail-closed: 只报告「需扩充规则」, 不擅自当成开仓 (RUNBOOK S6-06 / M6)。
+    - ""=没有事件字段, 按模板变体放行（老行为）
+    - exit=旧口径的"其它离场类"，一律跳过不执行（保本兼容）
+    - unknown 一律 fail-closed: 只报告「需扩充规则」, 不擅自当成开仓
+      (RUNBOOK S6-06 / M6)
+
+    之所以把加仓/减仓/平仓/移止损单列出来：它们各自对应一个真实动作，
+    混在 exit 里会导致"频道说全部平仓，系统一直拿着"。
     """
     if not isinstance(row, dict):
         return ""
     raw = _first(row, *_EVENT_KEYS)
     if raw is None:
         return ""
-    text = str(raw).strip().lower().replace(" ", "")
+    text = str(raw).strip().lower().replace(" ", "").replace("-", "")
     if not text:
         return ""
+
+    exact = _EVENT_EXACT.get(text)
+    if exact:
+        return exact
+
+    # "平仓 50%" 与 "全部平仓" 只差一个比例词，但一个是减半一个是清仓。
+    # 先认全平的明确说法，再按"带比例=减仓"兜住前者。
+    if any(word in text for word in _CLOSE_ALL_WORDS):
+        return "close"
+    if _PCT_HINT.search(text) and any(
+        word in text for word in ("平仓", "减", "清", "close", "reduce", "partial", "trim")
+    ):
+        return "reduce"
+
+    for event, words in _EVENT_MAP:
+        if any(word.replace("-", "") in text for word in words):
+            return event
+
+    # 旧口径兜底：止损/止盈/更新/取消等仍然只报告、不执行
     if any(word in text for word in _EXIT_WORDS):
         return "exit"
     if any(word in text for word in _OPEN_WORDS):
@@ -126,16 +213,31 @@ def follow_leverage(signal_leverage: float, default_leverage: float, bonus: int 
 
 
 def parse_signal(row: dict[str, Any], *, now: int | None = None) -> dict[str, Any] | None:
-    """把 jsonl / HTTP 里的一条记录转成统一结构；缺标的或缺方向返回 None."""
+    """把 jsonl / HTTP 里的一条记录转成统一结构；缺标的返回 None。
+
+    方向只在「开仓 / 加仓」时必需：平仓、减仓、移止损这类消息频道经常
+    只写币种（"BTC 全部平仓"），方向由下游按现有持仓补齐。
+    """
     if not isinstance(row, dict):
         return None
     symbol = normalize_symbol(str(_first(row, "symbol", "pair", "coin", "ticker", "标的") or ""))
+    if not symbol:
+        return None
+    event = classify_event(row)
     side = normalize_side(_first(row, "side", "direction", "action", "方向"))
-    if not symbol or not side:
+    if not side:
+        # "action":"平多" 这类写法方向藏在事件词里
+        blob = "".join(
+            str(row.get(k, "")) for k in ("event", "event_type", "action", "类型", "动作")
+        ).lower().replace(" ", "")
+        for word, mapped in _SIDE_FROM_EVENT:
+            if word in blob:
+                side = mapped
+                break
+    if not side and event not in ("close", "reduce", "move_stop", "exit"):
         return None
     ts = _timestamp(_first(row, "ts", "time", "created_at", "timestamp", "时间")) or int(now or time.time())
     signal_id = str(_first(row, "id", "signal_id", "msg_id", "message_id") or "").strip()
-    event = classify_event(row)
     return {
         "symbol": symbol,
         "side": side,
@@ -143,6 +245,10 @@ def parse_signal(row: dict[str, Any], *, now: int | None = None) -> dict[str, An
         "entry": _float(_first(row, "entry", "price", "entry_price", "入场价")),
         "stop": _float(_first(row, "sl", "stop", "stop_loss", "止损")),
         "tp": _float(_first(row, "tp", "take_profit", "止盈")),
+        "reduce_pct": _float(_first(row, "reduce_pct", "reduce", "close_pct", "减仓比例")),
+        "stop_to_breakeven": bool(
+            _first(row, "stop_to_breakeven", "breakeven", "move_to_breakeven")
+        ),
         "ts": ts,
         "signal_id": signal_id,
         "event": event,

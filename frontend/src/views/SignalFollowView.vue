@@ -81,6 +81,10 @@ const form = reactive<FollowSettings>({ ...DEFAULTS })
 
 const STATUS_LABELS: Record<string, { text: string; cls: string }> = {
   opened: { text: '已跟仓', cls: 'tag-long' },
+  added: { text: '已加仓', cls: 'tag-long' },
+  reduced: { text: '已减仓', cls: 'tag-blue' },
+  closed: { text: '已平仓', cls: 'tag-dim' },
+  stop_moved: { text: '移止损', cls: 'tag-blue' },
   dry_run: { text: '演练', cls: 'tag-blue' },
   skipped: { text: '跳过', cls: 'tag-warn' },
   error: { text: '失败', cls: 'tag-short' },
@@ -123,7 +127,9 @@ const listening = computed(() => !!(status.value?.running && status.value?.setti
 const counts = computed<Record<string, number>>(() => {
   const raw = status.value?.counts || {}
   return {
-    opened: raw.opened || 0, dry_run: raw.dry_run || 0, skipped: raw.skipped || 0,
+    opened: raw.opened || 0, added: raw.added || 0, reduced: raw.reduced || 0,
+    closed: raw.closed || 0, stop_moved: raw.stop_moved || 0,
+    dry_run: raw.dry_run || 0, skipped: raw.skipped || 0,
     error: raw.error || 0, duplicate: raw.duplicate || 0, processing: raw.processing || 0,
   }
 })
@@ -253,12 +259,16 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <div class="kpi">
         <div class="kpi-label">已跟仓</div>
         <div class="kpi-value up">{{ counts.opened }}</div>
-        <div class="kpi-foot">{{ !ready ? '等待状态接口' : '演练 ' + counts.dry_run + ' 笔 · 失败 ' + counts.error + ' 笔' }}</div>
+        <div class="kpi-foot">
+          {{ !ready ? '等待状态接口'
+            : '加仓 ' + counts.added + ' · 减仓 ' + counts.reduced + ' · 平仓 ' + counts.closed
+              + ' · 移损 ' + counts.stop_moved }}
+        </div>
       </div>
       <div class="kpi">
         <div class="kpi-label">跳过 / 重复</div>
         <div class="kpi-value">{{ counts.skipped + counts.duplicate }}</div>
-        <div class="kpi-foot">含过期、风控闸门、非开仓事件</div>
+        <div class="kpi-foot">含过期、风控闸门、无持仓可执行</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">信号源</div>

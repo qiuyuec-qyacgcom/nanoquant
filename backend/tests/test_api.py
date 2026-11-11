@@ -497,7 +497,9 @@ def test_signal_follow_ingest_auth_and_event_filter(client):
             json={"id": "unit-exit", "event": "平仓", "symbol": "BTCUSDT", "side": "long"},
         )
         assert res.status_code == 200 and res.json()["status"] == "skipped"
-        assert "非开仓" in res.json()["reason"]
+        # 平仓不再被"非开仓事件"过滤，而是正常进入执行分支；
+        # 这里引擎没开，所以在引擎闸门处被挡下
+        assert "引擎" in res.json()["reason"]
         masked = client.get(f"{API}/signal-follow/status", headers=headers).json()
         assert masked["settings"]["ingest_token"] == "******" and masked["ingest_token_set"]
     finally:
@@ -586,7 +588,9 @@ def test_follow_signal_end_to_end_uses_system_sizing(monkeypatch):
         first, again, closed = asyncio.run(run())
         assert first["status"] == "opened" and first["leverage"] == 30  # 20x + 10x
         assert again["status"] == "duplicate"  # 文件重读 / HTTP 重推只跟一次
-        assert closed["status"] == "skipped" and "非开仓" in closed["reason"]
+        assert closed["status"] == "skipped" and "持仓" in closed["reason"]
+        # 平仓现在会真的进入执行分支，只是这笔仓位不在本地账本里才跳过；
+        # 空仓时绝不能凭空下单
         assert len(calls) == 1
         kw = calls[0]
         assert kw["leverage"] == 30 and kw["qty"] > 0
