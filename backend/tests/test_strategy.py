@@ -64,7 +64,7 @@ def test_insufficient_bars_blocks_instead_of_scoring_neutral():
 
 def test_missing_funding_is_not_zero_funding():
     """没取到资金费率 ≠ 费率为 0。前者应剔除权重，后者才是中性。"""
-    cfg = StrategySettings()
+    cfg = StrategySettings(mode="trend")
     candles = _candles(60)
     f_none = build_features(candles, cfg, funding=None, oi_change_pct=1.0, quote_volume=5e7)
     f_zero = build_features(candles, cfg, funding=0.0, oi_change_pct=1.0, quote_volume=5e7)
@@ -81,7 +81,7 @@ def test_missing_funding_is_not_zero_funding():
 
 def test_oi_change_now_actually_feeds_the_score():
     """回归：ΔOI 因子曾经恒为 0，却还留着 12% 权重在分母里。"""
-    cfg = StrategySettings()
+    cfg = StrategySettings(mode="trend")
     candles = _candles(60)
     hot = build_features(candles, cfg, funding=0.0, oi_change_pct=6.0, quote_volume=5e7)
     cold = build_features(candles, cfg, funding=0.0, oi_change_pct=None, quote_volume=5e7)
@@ -96,7 +96,7 @@ def test_oi_change_now_actually_feeds_the_score():
 
 def test_weights_renormalize_over_available_factors():
     """只有趋势与动量可用时，分数必须是这两项的加权平均，不能被缺失项稀释。"""
-    cfg = StrategySettings()
+    cfg = StrategySettings(mode="trend")
     candles = _candles(60)
     f = build_features(candles, cfg, funding=None, oi_change_pct=None, quote_volume=5e7)
     sig = score_signal("X", f, cfg)
@@ -165,7 +165,7 @@ def test_closed_history_is_not_trimmed():
 # ------------------------------------------------------------------ 盈亏比
 
 def test_take_profit_respects_min_risk_reward():
-    cfg, f = _features(n=60, step=0.4)
+    cfg, f = _features(n=60, step=0.4, cfg=StrategySettings(mode="trend"))
     sig = score_signal("BTCUSDT", f, cfg)
     assert sig.sl_pct > 0 and sig.tp_pct > 0
     assert sig.tp_pct / sig.sl_pct >= cfg.min_risk_reward - 1e-6
@@ -174,7 +174,7 @@ def test_take_profit_respects_min_risk_reward():
 
 def test_rr_impossible_blocks_instead_of_taking_bad_trade():
     """止损被 3% 上限卡住、而要求 3R 时 8% 的止盈上限凑不够 —— 应该拒绝开仓。"""
-    cfg = StrategySettings(min_risk_reward=3.0)
+    cfg = StrategySettings(mode="trend", min_risk_reward=3.0)
     candles = _candles(60, step=6.0)  # ATR 很大 → sl 触到 3% 上限
     f = build_features(candles, cfg, funding=0.0, oi_change_pct=0.0, quote_volume=5e7)
     sig = score_signal("X", f, cfg)

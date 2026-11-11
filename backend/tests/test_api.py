@@ -149,6 +149,9 @@ def test_backtest_run_and_walkforward_with_stubbed_klines(client, monkeypatch):
         return candles[:limit]
 
     monkeypatch.setattr(route.binance_client, "klines", fake_klines)
+    from nanoquant.services.settings import update_group
+
+    update_group("strategy", {"mode": "trend"})
     headers = _token(client)
 
     body = {"symbol": "TESTUSDT", "interval": "5m", "limit": 600, "spread_bps": 2, "funding_bps_8h": 1}

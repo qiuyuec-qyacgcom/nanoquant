@@ -30,7 +30,7 @@ def _fed(cfg: StrategySettings, candles: list[Candle], **kw):
 
 @pytest.fixture
 def mr():
-    return StrategySettings(mode="meanrev", timeframe="5m", mr_block_in_trend=False)
+    return StrategySettings(mode="meanrev", timeframe="15m", mr_block_in_trend=False)
 
 
 def test_meanrev_fades_an_extreme_move_upward(mr):
@@ -44,9 +44,10 @@ def test_meanrev_fades_an_extreme_move_upward(mr):
     assert f["band_z"] > 2
     assert sig.direction == "short", sig.blocked
     assert sig.score < 0
-    # 止盈回到中轨附近，止损在极值之外
-    assert sig.tp_pct < abs(f["band_z"]) * f["band_sd_pct"] + 1e-6
-    assert sig.sl_pct > sig.tp_pct * 0.5
+    # 止盈回到中轨：|z|·σ 就是当前价到中轨的精确距离（不再打 0.9 折）
+    assert sig.tp_pct == pytest.approx(abs(f["band_z"]) * f["band_sd_pct"], rel=1e-3)
+    # 止损在极值之外，比止盈距离更近（保证盈亏比 > 1）
+    assert sig.sl_pct < sig.tp_pct
 
 
 def test_meanrev_stays_flat_when_deviation_is_small(mr):
@@ -131,7 +132,8 @@ def test_auto_entry_is_off_by_default():
     assert StrategySettings().auto_entry is False
 
 
-def test_default_mode_still_trend_but_longer_timeframe():
+def test_default_mode_is_meanrev_with_4h_timeframe():
+    """全局策略默认：均值回归 + 4h 波段（低杠杆波段策略信号层）。"""
     cfg = StrategySettings()
-    assert cfg.mode == "trend"
-    assert cfg.timeframe == "30m"
+    assert cfg.mode == "meanrev"
+    assert cfg.timeframe == "4h"

@@ -104,9 +104,23 @@ def test_detect_exit_roi_tier():
 
 
 def test_detect_exit_trailing_stop():
-    cfg = _cfg(roi_table=[], trailing_pct=0.8)
+    """移动止损只在浮盈先走到 trailing_arm_r 倍风险后才接管。
+
+    旧行为从开仓就 arm，导致没先涨够的单被 0.8% 回撤反复扫掉——
+    模拟盘 24 笔 trailing_stop 全亏（-2639U），根因就是这里。
+    """
+    cfg = _cfg(roi_table=[], trailing_pct=0.8)  # trailing_arm_r 默认 1.0
+
+    # 浮盈只到 0.4R（peak 104 vs 止损 90 = 风险 10），还没到 1R：trailing 不得接管
     hit, reason = detect_exit(
         side="long", entry_price=100, mark_price=103.1, peak_price=104,
+        sl_price=90, tp_price=0, opened_at=0, now_ts=60, cfg=cfg, score=0.0,
+    )
+    assert not hit, "未到 1R 就触发 trailing 会把'要发展的仓位'当噪声扫掉"
+
+    # 浮盈到了 1.2R（peak 112）再回撤 0.8%：应该锁盈离场
+    hit, reason = detect_exit(
+        side="long", entry_price=100, mark_price=111.0, peak_price=112,
         sl_price=90, tp_price=0, opened_at=0, now_ts=60, cfg=cfg, score=0.0,
     )
     assert hit and reason == "trailing_stop"
@@ -123,7 +137,7 @@ def test_detect_exit_timeout():
 
 # ------------------------------------------------------------------ 配置校验
 def test_timeframe_whitelist():
-    assert StrategySettings(timeframe="5m").timeframe == "5m"
+    assert StrategySettings(timeframe="15m").timeframe == "15m"
     with pytest.raises(ValidationError):
         StrategySettings(timeframe="1m")
 
@@ -320,7 +334,7 @@ def test_grid_runs_and_ranks():
 
     result = run_grid(
         candles,
-        StrategySettings(),
+        StrategySettings(mode="trend"),
         symbol="TESTUSDT",
         grid={"entry_threshold": [0.2, 0.4], "sl_atr_mult": [1.0, 1.5]},
         leverage=20,
@@ -1298,8 +1312,8 @@ def test_backtest_spread_is_a_round_trip_cost():
         candles.append(bar(o=price, h=price * 1.001, l=price * 0.999, c=price, v=1000.0, t=i * 300_000))
 
     common = dict(symbol="TESTUSDT", fee_bps=0.0, slippage_bps=0.0, funding_bps_8h=0.0)
-    clean = run_backtest(candles, StrategySettings(), **common)
-    costly = run_backtest(candles, StrategySettings(), spread_bps=10.0, **common)
+    clean = run_backtest(candles, StrategySettings(mode="trend"), **common)
+    costly = run_backtest(candles, StrategySettings(mode="trend"), spread_bps=10.0, **common)
     assert clean.summary["trades"] and costly.summary["trades"]
     assert costly.summary["total_return_pct"] < clean.summary["total_return_pct"]
 
@@ -1316,7 +1330,7 @@ def test_walkforward_reports_overfit_gap():
 
     result = run_walkforward(
         candles,
-        StrategySettings(),
+        StrategySettings(mode="trend"),
         symbol="TESTUSDT",
         grid={"entry_threshold": [0.2, 0.4]},
         folds=2,
