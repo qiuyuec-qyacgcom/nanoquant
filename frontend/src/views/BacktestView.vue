@@ -27,7 +27,7 @@ interface TradeRow {
 const pool = ref<any[]>([])
 const form = ref({
   symbol: '',
-  interval: '5m',
+  interval: '15m',
   limit: 1000,
   fee_bps: 5,
   slippage_bps: 2,

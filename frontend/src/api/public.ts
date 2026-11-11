@@ -38,7 +38,7 @@ export const publicPool = () =>
   pubGet<{ symbols: import('../types/candle').PoolSymbol[]; count: number; empty: boolean; updated_at: number }>('/pool')
 
 /** 单标的 K 线 (池内标的兜底, 用于池子大于批量上限时按需加载) */
-export const publicKlines = (symbol: string, interval = '5m', limit = 160) =>
+export const publicKlines = (symbol: string, interval = '15m', limit = 160) =>
   pubGet<{ symbol: string; interval: string; items: import('../types/candle').Candle[]; updated_at: number }>(
     `/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`
   )

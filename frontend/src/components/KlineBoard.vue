@@ -48,7 +48,7 @@ const BARS = 600
 
 const pool = ref<PoolSymbol[]>([])
 const selected = ref('')
-const interval = ref('5m')
+const interval = ref('15m')
 const mainIndicator = ref('MA')
 const subIndicator = ref('VOL')
 const items = ref<Candle[]>([])
