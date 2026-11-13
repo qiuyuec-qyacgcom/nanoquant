@@ -1,0 +1,21 @@
+# ruff：只开「几乎一定是错误」的规则，不做风格审查
+#
+#   ruff check .          # 本地
+#   ruff check . --fix    # 自动修未使用导入等
+#
+# 规则选择原则：
+# - F（pyflakes）：未定义名字、未使用导入/变量、重复定义、f-string 占位符错误；
+# - E9：语法/缩进级别的硬错误（其余 E/W 属风格，交给编辑器和人）。
+# 代码里已有大量中文注释与长行，所以行宽放宽，避免噪声掩盖真问题。
+
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["F", "E9"]
+# F841（赋值未使用）在测试的 fixture/桩代码里很常见，先不纳入门禁
+ignore = ["F841"]
+
+[lint.per-file-ignores]
+# 测试里允许用 import 做副作用（例如注册模型、打桩）
+"tests/*" = ["F401"]

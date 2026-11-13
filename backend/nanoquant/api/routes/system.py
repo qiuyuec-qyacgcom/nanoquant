@@ -398,7 +398,6 @@ def system_settings(user: str = Depends(current_user)) -> dict:
 @router.get("/system/archives")
 def list_archives(user: str = Depends(current_user)) -> dict:
     """历史归档文件列表 (retention 清理前写出的 gzip JSONL)."""
-    import gzip
     import re
 
     from ...services.retention import ARCHIVE_DIR
@@ -495,7 +494,6 @@ def _ops_metrics() -> list[tuple[str, str, float]]:
 
 def _account_metrics() -> list[tuple[str, str, float]]:
     """账户类指标：只在带有效 token 时输出，避免公开端点泄露资金规模."""
-    import time as _time
 
     from ...db import session_scope
     from ...models import EquityPoint, PositionRecord

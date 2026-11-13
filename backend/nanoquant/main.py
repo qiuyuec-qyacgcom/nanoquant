@@ -15,7 +15,7 @@ from .ai.client import ai_client
 from .api.routes import (
     ai, auth, backup, backtest, evolution, news, public, signal_follow, strategies, symbols, system, trade, ws
 )
-from .config import APP_NAME, DEBUG, paths
+from .config import APP_NAME, paths
 from .db import init_db, session_scope
 from .engine.worker import engine
 from .exchange import client as binance_client
@@ -27,7 +27,7 @@ from .logging_setup import get_logger, setup_logging
 from .models import TradingSymbol
 from .security import hash_password
 from .services import events
-from .services.settings import SettingsValidationError, get_engine, get_security, get_system, update_group
+from .services.settings import SettingsValidationError, get_security, get_system, update_group
 
 log = get_logger("main")
 

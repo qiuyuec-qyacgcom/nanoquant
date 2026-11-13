@@ -30,6 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: Lint (ruff)
+        # 只开 F/E9：未定义名字、未使用导入、重复定义这类"几乎一定是 bug"的规则
+        run: python -m ruff check .
+
       - name: Byte-compile
         run: python -m compileall -q nanoquant
 
