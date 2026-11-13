@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 
 from ... import __version__
 from ...config import APP_NAME, paths
@@ -15,7 +15,7 @@ from ...exchange.broker import get_broker
 from ...exchange.client import client as binance_client
 from ...logging_setup import get_logger
 from ...models import AiCallLog, AiProvider, EngineEvent, Signal, WriteFailure
-from ...services import events, state
+from ...services import audit, events, state
 from ...services import backup as backup_service
 from ...services.settings import (
     GROUPS,
@@ -293,6 +293,24 @@ def read_settings(user: str = Depends(current_user)) -> dict:
     return {"groups": get_all(), "defaults": {name: model().model_dump() for name, model in GROUPS.items()}}
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return forwarded or (request.client.host if request.client else "")
+
+
+@router.get("/settings/audit")
+def settings_audit(
+    group: str = Query(default="", description="留空=全部分组"),
+    limit: int = Query(default=50, ge=1, le=200),
+    user: str = Depends(current_user),
+) -> dict:
+    """参数变更记录（新的在前）：谁、什么时候、把哪个字段从什么改成什么.
+
+    必须定义在 `/settings/{group}` **之前**，否则 "audit" 会被当成配置组名。
+    """
+    return {"items": audit.recent(group or None, limit)}
+
+
 @router.get("/settings/{group}")
 def read_group(group: str, user: str = Depends(current_user)) -> dict:
     try:
@@ -302,7 +320,12 @@ def read_group(group: str, user: str = Depends(current_user)) -> dict:
 
 
 @router.put("/settings/{group}")
-def write_group(group: str, payload: SettingsIn, user: str = Depends(current_user)) -> dict:
+def write_group(
+    group: str,
+    payload: SettingsIn,
+    request: Request,
+    user: str = Depends(current_user),
+) -> dict:
     # 交易环境只走 /engine/control (带确认短语), 防止绕过确认直接改配置
     if group == "engine" and "mode" in payload.patch:
         if normalize_mode(payload.patch.get("mode")) != normalize_mode(get_engine().mode):
@@ -311,22 +334,27 @@ def write_group(group: str, payload: SettingsIn, user: str = Depends(current_use
                 detail="切换交易环境请使用「交易环境」开关（实盘需要输入确认短语 LIVE）",
             )
     try:
+        before = get_group(group, use_cache=False)
         data = update_group(group, payload.patch)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"未知配置组 {group}") from exc
     except SettingsValidationError as exc:
         raise HTTPException(status_code=400, detail=exc.detail) from exc
-    events.record("info", "settings", f"{user} 更新配置组 {group}", {"patch": payload.patch})
-    return {"ok": True, "group": group, "data": data}
+    # 结构化审计：只记真正变化的字段，密钥类脱敏（审计日志不能变成泄密源）
+    changes = audit.record(user, group, before, data, ip=_client_ip(request))
+    events.record("info", "settings", f"{user} 更新配置组 {group}", {"changed": list((changes or {}).keys())})
+    return {"ok": True, "group": group, "data": data, "changed": list((changes or {}).keys())}
 
 
 @router.post("/settings/{group}/reset")
-def reset(group: str, user: str = Depends(current_user)) -> dict:
+def reset(group: str, request: Request, user: str = Depends(current_user)) -> dict:
     try:
+        before = get_group(group, use_cache=False)
         data = reset_group(group)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"未知配置组 {group}") from exc
-    events.record("warn", "settings", f"{user} 重置配置组 {group} 为默认值")
+    changes = audit.record(user, group, before, data, ip=_client_ip(request))
+    events.record("warn", "settings", f"{user} 重置配置组 {group} 为默认值", {"changed": list((changes or {}).keys())})
     return {"ok": True, "group": group, "data": data}
 
 
@@ -431,12 +459,93 @@ def preview_archive(
     return {"name": name, "count": len(rows), "rows": rows}
 
 
-@router.get("/metrics", include_in_schema=False)
-def metrics() -> Response:
-    """Prometheus 文本指标（只读、无需登录、不含任何账户/密钥/持仓数据）.
+def _ops_metrics() -> list[tuple[str, str, float]]:
+    """运行态业务指标（**不含账户数据**，可公开抓取）.
 
-    只暴露进程内计数与几个状态位，便于 VPS 上用 node_exporter/Prometheus 抓：
-    引擎是否运行、写队列积压/失败、死信、sidecar 比对结果。
+    `/metrics` 是免鉴权端点，所以这里只放"跑没跑、卡没卡、产没产信号、权重够不够"。
+    权益、当日盈亏、持仓数一律放 `_account_metrics()`，需 Bearer token 才出现。
+    """
+    import time as _time
+
+    from ...db import session_scope
+    from ...models import Signal
+    from ...services import state
+
+    try:
+        now = int(_time.time())
+        with session_scope() as s:
+            signals_1h = s.query(Signal).filter(Signal.ts >= now - 3600).count()
+        last_cycle = state.get_int("last_cycle_ts", 0)
+        return [
+            ("nanoquant_signals_last_1h", "最近 1 小时信号数（长期为 0 = 策略与行情脱节）", float(signals_1h)),
+            ("nanoquant_halted", "是否处于熔断状态", float(bool(state.normalize_halted(state.get("halted"))))),
+            (
+                "nanoquant_last_cycle_age_seconds",
+                "距上一轮扫描的秒数（-1 = 从未运行）",
+                float(now - last_cycle) if last_cycle else -1.0,
+            ),
+            ("nanoquant_api_weight_used", "本分钟已用交易所权重", float(binance_client.weight.used_weight)),
+            ("nanoquant_api_banned", "是否被交易所限频封禁", float(bool(binance_client.weight.banned))),
+            ("nanoquant_business_metrics_ok", "业务指标采集是否成功", 1.0),
+        ]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("业务指标采集失败: %s", exc)
+        return [("nanoquant_business_metrics_ok", "业务指标采集是否成功", 0.0)]
+
+
+def _account_metrics() -> list[tuple[str, str, float]]:
+    """账户类指标：只在带有效 token 时输出，避免公开端点泄露资金规模."""
+    import time as _time
+
+    from ...db import session_scope
+    from ...models import EquityPoint, PositionRecord
+    from ...services import state
+    from ...services.settings import get_engine
+
+    try:
+        mode = str(get_engine().mode or "demo")
+        with session_scope() as s:
+            last = s.query(EquityPoint).order_by(EquityPoint.ts.desc()).first()
+            equity = float(last.wallet) if last else 0.0
+            open_positions = (
+                s.query(PositionRecord)
+                .filter(PositionRecord.status == "open", PositionRecord.mode == mode)
+                .count()
+            )
+        day_start = state.get_float("day_start_equity", 0.0)
+        today_pnl = (equity - day_start) / day_start * 100 if day_start > 0 and equity > 0 else 0.0
+        return [
+            ("nanoquant_account_equity_usdt", f"账户权益（{mode}，需鉴权）", round(equity, 6)),
+            ("nanoquant_account_today_pnl_pct", "当日盈亏百分比（相对日切基准）", round(today_pnl, 4)),
+            ("nanoquant_account_open_positions", "当前持仓数", float(open_positions)),
+            ("nanoquant_account_consecutive_losses", "连续亏损笔数", float(state.get_int("consecutive_losses", 0))),
+        ]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("账户指标采集失败: %s", exc)
+        return []
+
+
+def _metrics_authorized(authorization: str) -> bool:
+    """metrics 的可选鉴权：带有效 token 才追加账户类指标."""
+    from ...security import verify_token
+    from ...services.settings import get_security
+
+    cfg = get_security()
+    if not cfg.require_login:
+        return True
+    return bool(verify_token(authorization.removeprefix("Bearer ").strip()))
+
+
+@router.get("/metrics", include_in_schema=False)
+def metrics(authorization: str = Header(default="")) -> Response:
+    """Prometheus 文本指标（只读）.
+
+    默认**无需登录**，输出进程计数、写队列、死信、sidecar 比对与运行态业务位
+    （引擎是否运行、多久没扫描、近 1 小时信号数、权重占用、是否熔断）。
+
+    账户类指标（权益、当日盈亏、持仓数、连亏笔数）**只有带有效 Bearer token 才出现**：
+    这条端点通常是公开可访问的，把资金规模放进去等于对全网广播账户情况。
+    Prometheus 需要账户指标时，在 scrape config 里配 `bearer_token` 即可。
     """
     from ...engine.worker import engine
     from ...services import dead_letter
@@ -470,6 +579,13 @@ def metrics() -> Response:
         ("nanoquant_exec_shadow_skipped", "跳过比对次数", counts["skipped"]),
         ("nanoquant_exec_sidecar_connected", "sidecar 是否已连接", int(bool(shadow["connected"]))),
     ]
+
+    # ------------------------------------------------------------ 业务指标
+    # 只到进程层的指标抓不到"权益跳水 / 策略不产信号 / 权重打满"这类真正要命的状态，
+    # 这里补几个 gauge（读本地库与内存状态，不触发交易所请求，抓取成本恒定）。
+    values.extend(_ops_metrics())
+    if _metrics_authorized(authorization):
+        values.extend(_account_metrics())
     lines: list[str] = []
     for name, help_text, value in values:
         lines.append(f"# HELP {name} {help_text}")

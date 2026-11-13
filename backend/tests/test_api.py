@@ -667,3 +667,114 @@ def test_engine_reset_anchors_keeps_unrelated_halt(client, monkeypatch):
     assert res.json()["cleared_halt"] == ""
     assert "回撤" in state.get("halted")
     state.set("halted", "")
+
+
+def test_metrics_exposes_ops_gauges_publicly_without_account_data(client):
+    """运行态指标公开可抓；账户规模绝不能出现在免鉴权端点里。"""
+    from nanoquant.services.settings import get_system, update_group
+
+    old = get_system().metrics_enabled
+    update_group("system", {"metrics_enabled": True})
+    try:
+        res = client.get(f"{API}/metrics")
+        assert res.status_code == 200, res.text
+        body = res.text
+        for name in (
+            "nanoquant_signals_last_1h",
+            "nanoquant_halted",
+            "nanoquant_last_cycle_age_seconds",
+            "nanoquant_api_weight_used",
+            "nanoquant_business_metrics_ok",
+        ):
+            assert f"{name} " in body, f"缺少指标 {name}"
+        assert "nanoquant_account_equity_usdt" not in body, "公开端点不能暴露账户权益"
+        assert "nanoquant_account_open_positions" not in body
+    finally:
+        update_group("system", {"metrics_enabled": old})
+
+
+def test_metrics_account_gauges_require_token(client):
+    """带有效 token 时才追加账户类指标，供 Prometheus 配 bearer_token 抓取。"""
+    from nanoquant.services.settings import get_system, update_group
+
+    old = get_system().metrics_enabled
+    update_group("system", {"metrics_enabled": True})
+    try:
+        res = client.get(f"{API}/metrics", headers=_token(client))
+        assert res.status_code == 200, res.text
+        body = res.text
+        assert "nanoquant_account_equity_usdt" in body
+        assert "nanoquant_account_today_pnl_pct" in body
+        assert "nanoquant_account_open_positions" in body
+    finally:
+        update_group("system", {"metrics_enabled": old})
+
+
+def test_settings_changes_are_audited_with_before_after(client):
+    """改参数要能回答"谁改的、改前是多少"——engine_events 里没有 diff。"""
+    from nanoquant.services.settings import get_risk, update_group
+
+    headers = _token(client)
+    original = get_risk().max_drawdown_pct
+    try:
+        res = client.put(
+            f"{API}/settings/risk",
+            headers=headers,
+            json={"patch": {"max_drawdown_pct": 21.5}},
+        )
+        assert res.status_code == 200, res.text
+        assert "max_drawdown_pct" in res.json()["changed"]
+
+        audit = client.get(f"{API}/settings/audit", headers=headers, params={"group": "risk", "limit": 5})
+        assert audit.status_code == 200, audit.text
+        item = audit.json()["items"][0]
+        assert item["group"] == "risk"
+        assert item["user"]
+        change = item["changes"]["max_drawdown_pct"]
+        assert change["to"] == 21.5
+        assert change["from"] == original
+    finally:
+        update_group("risk", {"max_drawdown_pct": original})
+
+
+def test_settings_audit_masks_secrets(client):
+    """审计日志本身不能成为泄密源：密钥类字段只记"改过"，不记内容。"""
+    from nanoquant.services.settings import get_data, update_group
+
+    headers = _token(client)
+    original = get_data().demo_api_key_enc
+    try:
+        res = client.put(
+            f"{API}/settings/data",
+            headers=headers,
+            json={"patch": {"demo_api_key_enc": "ciphertext-should-not-appear"}},
+        )
+        assert res.status_code == 200, res.text
+
+        audit = client.get(f"{API}/settings/audit", headers=headers, params={"group": "data", "limit": 5})
+        body = audit.text
+        assert "ciphertext-should-not-appear" not in body
+        item = next(i for i in audit.json()["items"] if "demo_api_key_enc" in i["changes"])
+        assert item["changes"]["demo_api_key_enc"]["to"] == "***"
+    finally:
+        update_group("data", {"demo_api_key_enc": original})
+
+
+def test_settings_audit_skips_noop_writes(client):
+    """没有实际变化时不写审计记录，避免刷屏。"""
+    from nanoquant.services.settings import get_risk
+
+    headers = _token(client)
+    before = client.get(f"{API}/settings/audit", headers=headers, params={"group": "risk", "limit": 50})
+    count_before = len(before.json()["items"])
+
+    res = client.put(
+        f"{API}/settings/risk",
+        headers=headers,
+        json={"patch": {"max_drawdown_pct": get_risk().max_drawdown_pct}},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["changed"] == []
+
+    after = client.get(f"{API}/settings/audit", headers=headers, params={"group": "risk", "limit": 50})
+    assert len(after.json()["items"]) == count_before

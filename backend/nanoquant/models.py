@@ -26,6 +26,25 @@ class Setting(Base):
     updated_at: Mapped[int] = mapped_column(Integer, default=now_ts, onupdate=now_ts)
 
 
+class SettingsAudit(Base):
+    """参数变更审计：谁在什么时候把哪个字段从什么改成什么.
+
+    杠杆与风控参数直接决定风险敞口，出事后必须能回答"谁改的、改前是多少"。
+    engine_events 里只记了"更新配置组 X"+整个 patch，既没有 diff、也不便检索。
+    """
+
+    __tablename__ = "settings_audit"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[int] = mapped_column(Integer, default=now_ts, index=True)
+    #: 操作者（登录用户名；未开启登录时为配置里的默认用户名）
+    user: Mapped[str] = mapped_column(String(64), default="")
+    #: 配置组名（engine/risk/strategy/...）；"group" 是 SQL 关键字，列名加后缀
+    group_name: Mapped[str] = mapped_column(String(32), index=True)
+    #: {字段: {"from": 旧值, "to": 新值}}，敏感字段已脱敏
+    changes: Mapped[dict] = mapped_column(JSON, default=dict)
+    ip: Mapped[str] = mapped_column(String(64), default="")
+
+
 class EngineState(Base):
     """引擎运行态键值 (enabled / mode / halt 原因 / 模拟盘余额等)."""
 
