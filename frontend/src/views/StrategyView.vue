@@ -130,6 +130,10 @@ const BASE_META: Record<string, FieldMeta> = {
   adx_min: { label: 'ADX 下限', unit: '', hint: '低于该值视为无趋势；25 以上才有明显趋势' },
   liquidation_warn_pct: { label: '强平价告警', unit: '%', hint: '标记价距强平价小于该百分比就告警；0=关闭' },
   category_exposure_limit_pct: { label: '相关性组敞口', unit: '%', hint: 'BTC/ETH/主流/山寨 各组名义额占权益上限；山寨彼此高度相关，0=关闭' },
+  auto_protect_external: {
+    label: '自动补挂保护单',
+    hint: '发现没有止损/止盈的外部（手动）仓位时，自动按 ATR 挂保护单；默认关，先告警由人决定更稳',
+  },
   enabled: { label: '启用', hint: '关闭后该模块不参与运行' },
   cycle_interval_sec: {
     label: '轮询间隔',
@@ -366,7 +370,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
     },
     { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
     { title: '止损熔断', hint: '窗口内多次止损 = 策略与行情脱节，先暂停观察', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
-    { title: '尾部风险', hint: '强平价监控 + 相关性组敞口（山寨多仓本质是加杠杆）', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct'] },
+    { title: '尾部风险', hint: '强平价监控 + 相关性组敞口（山寨多仓本质是加杠杆）+ 手动仓保护单', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct', 'auto_protect_external'] },
     { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },
   ],
   strategy: [
@@ -786,6 +790,8 @@ function loadGroup(id: string) {
   focusKey.value = ''
   syncJsonText()
   if (id === 'engine') loadTradeMode()
+  if (id === 'risk') loadUnprotected()
+  loadAudit()
 }
 
 function onGroupClick(id: string) {
@@ -813,6 +819,7 @@ async function save() {
     onlyDirty.value = false
     app.notify('配置已保存并热生效', 'ok')
     if (current.value === 'engine' || current.value === 'data') await app.loadStatus()
+    await loadAudit()
   } catch (err: any) {
     app.notify(err.message, 'error')
   } finally {
@@ -865,6 +872,74 @@ async function resetAnchors() {
   } finally {
     anchorBusy.value = false
   }
+}
+
+/** 当前分组的最近变更（谁改的、改前改后） */
+const auditRows = ref<any[]>([])
+
+async function loadAudit() {
+  try {
+    const res = await http.get(`/settings/audit?group=${current.value}&limit=6`)
+    auditRows.value = res.items || []
+  } catch {
+    auditRows.value = []
+  }
+}
+
+function tsText(ts: number): string {
+  if (!ts) return '-'
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function fieldLabel(key: string): string {
+  return metaOf(current.value, key).label || key
+}
+
+function shortValue(v: any): string {
+  if (v === null || v === undefined || v === '') return '空'
+  if (typeof v === 'boolean') return v ? '开' : '关'
+  if (Array.isArray(v)) return v.length ? `${v.length} 项` : '空'
+  if (typeof v === 'object') return '…'
+  const s = String(v)
+  return s.length > 14 ? `${s.slice(0, 14)}…` : s
+}
+
+// ---------------------------------------------------- 无保护单仓位
+/** 手动开的仓常常没挂止损，系统只能显示 sl=0。这里列出并支持一键按 ATR 补挂。 */
+const unprotected = ref<{ id: number; symbol: string }[]>([])
+const protectBusy = ref(false)
+
+async function loadUnprotected() {
+  try {
+    const res = await http.get('/engine/positions?limit=50')
+    unprotected.value = (res.items || [])
+      .filter((p: any) => !p.sl_price && !p.tp_price)
+      .map((p: any) => ({ id: p.id, symbol: p.symbol }))
+  } catch {
+    unprotected.value = []
+  }
+}
+
+async function protectAll() {
+  if (!unprotected.value.length) return
+  if (!confirm(`按 ATR 给 ${unprotected.value.length} 个无保护单仓位补挂止损/止盈？`)) return
+  protectBusy.value = true
+  let ok = 0
+  let fail = 0
+  for (const p of unprotected.value) {
+    try {
+      await http.post(`/engine/positions/${p.id}/protect`)
+      ok += 1
+    } catch {
+      fail += 1
+    }
+  }
+  protectBusy.value = false
+  await loadUnprotected()
+  await app.loadStatus()
+  app.notify(`已补挂 ${ok} 个${fail ? `，失败 ${fail} 个` : ''}`, fail ? 'error' : 'ok')
 }
 
 async function toggleEngine() {
@@ -1326,6 +1401,15 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
                   {{ anchorBusy ? '重置中…' : '重置基准到当前权益' }}
                 </button>
               </div>
+              <div v-if="unprotected.length" class="row" style="gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 8px">
+                <span class="tag tag-warn">
+                  {{ unprotected.length }} 个仓位没有止损/止盈：{{ unprotected.map((p) => p.symbol).slice(0, 4).join('、') }}
+                </span>
+                <button class="btn btn-sm" :disabled="protectBusy" @click="protectAll">
+                  {{ protectBusy ? '补挂中…' : '按 ATR 补挂保护单' }}
+                </button>
+                <span class="muted" style="font-size: 10.5px">手动开的仓不走系统下单链路，需要补挂后才受托管</span>
+              </div>
             </div>
 
             <div v-for="sec in currentSections" :key="sec.title" class="section">
@@ -1447,6 +1531,25 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
                     :class="{ mono: f.key === 'base_url' || f.key === 'proxy' || f.key === 'rsshub_base' }"
                   />
                 </div>
+              </div>
+            </div>
+
+            <div v-if="auditRows.length" class="section">
+              <div class="section-hd">
+                <span class="section-title">最近变更</span>
+                <span class="section-hint">谁在什么时候把这一组改成了什么；密钥类字段只记录"改过"，不记录内容</span>
+              </div>
+              <div v-for="row in auditRows" :key="row.id" class="audit-row">
+                <span class="audit-time">{{ tsText(row.ts) }}</span>
+                <span class="audit-user">{{ row.user || '-' }}</span>
+                <span class="audit-diff">
+                  <span v-for="(val, key) in row.changes" :key="key" class="audit-item">
+                    {{ fieldLabel(String(key)) }}
+                    <s>{{ shortValue(val.from) }}</s>
+                    →
+                    {{ shortValue(val.to) }}
+                  </span>
+                </span>
               </div>
             </div>
 
@@ -1772,6 +1875,41 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
     grid-template-columns: minmax(70px, 1fr) minmax(88px, 1fr) 26px;
     gap: 5px;
   }
+}
+
+/* ------------------------------------------------ 参数变更记录 */
+.audit-row {
+  display: grid;
+  grid-template-columns: 84px 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+  font-size: 11px;
+}
+.audit-row:first-of-type {
+  border-top: none;
+}
+.audit-time {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.audit-user {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.audit-diff {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--text);
+}
+.audit-item s {
+  color: var(--muted);
+  text-decoration-color: rgba(240, 75, 90, 0.6);
 }
 
 /* ------------------------------------------------ 参数检索 / 常用直达 */

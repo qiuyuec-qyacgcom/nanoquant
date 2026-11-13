@@ -329,6 +329,16 @@ async def positions(
     return {"items": items}
 
 
+@router.post("/engine/positions/{position_id}/protect")
+async def protect_position(position_id: int, user: str = Depends(current_user)) -> dict:
+    """给没有保护单的仓位按 ATR 补挂止损/止盈（手动开仓接管用）."""
+    outcome = await engine.protect_position(position_id, reason=f"{user} 手动补挂")
+    if not outcome.get("ok"):
+        raise HTTPException(status_code=400, detail=outcome.get("reason") or "补挂失败")
+    invalidate_status_cache()
+    return outcome
+
+
 @router.post("/engine/positions/{position_id}/close")
 async def close_position(position_id: int, payload: ClosePositionIn, user: str = Depends(current_user)) -> dict:
     with session_scope() as s:

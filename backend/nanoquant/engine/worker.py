@@ -333,6 +333,34 @@ class TradingEngine:
                     unrealized=vp.unrealized, sl_price=sl, tp_price=tp,
                 )
                 events.record("warn", "engine", f"发现交易所外部仓位 {symbol} {vp.side} {vp.qty}", {"symbol": symbol})
+                if sl <= 0 and tp <= 0:
+                    # 裸仓：手动开仓常常没挂保护单，系统只"看到 0"不会替你挂。
+                    # 默认只告警（auto_protect_external=False），需要时一键补挂。
+                    events.record(
+                        "warn", "engine",
+                        f"{symbol} 外部仓位没有止损/止盈保护，可用「补挂保护单」按 ATR 生成",
+                        {"symbol": symbol, "position_id": None},
+                    )
+                    if get_risk().auto_protect_external:
+                        with session_scope() as s:
+                            row = (
+                                s.query(PositionRecord)
+                                .filter(
+                                    PositionRecord.symbol == symbol,
+                                    PositionRecord.status == "open",
+                                    PositionRecord.mode == mode,
+                                )
+                                .first()
+                            )
+                            pid = row.id if row else 0
+                        if pid:
+                            outcome = await self.protect_position(pid, reason="自动补挂")
+                            if not outcome.get("ok"):
+                                events.record(
+                                    "error", "engine",
+                                    f"{symbol} 自动补挂保护单失败: {outcome.get('reason')}",
+                                    {"symbol": symbol},
+                                )
             else:
                 with session_scope() as s:
                     row = s.get(PositionRecord, local_map[symbol].id)
@@ -353,6 +381,61 @@ class TradingEngine:
                         row.exit_price = lp.mark_price or lp.entry_price
                         row.exit_reason = "venue_sync"
                 events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+
+    async def protect_position(self, position_id: int, *, reason: str = "手动补挂") -> dict[str, Any]:
+        """给没有保护单的仓位按 ATR 补挂止损/止盈.
+
+        手动开的仓不走系统下单链路，交易所侧可能压根没挂止损，对账只会显示 `sl=0`。
+        这里用当前周期的 ATR 与策略倍数算保护价，复用 amend_stop（先撤旧单再重挂），
+        并在成交后把 sl/tp 写回持仓记录。
+        """
+        from . import indicators as ta
+
+        with session_scope() as s:
+            pos = s.get(PositionRecord, position_id)
+            if pos is None or pos.status != "open":
+                return {"ok": False, "reason": "仓位不存在或已平仓"}
+            info = {
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "qty": float(pos.qty),
+                "entry": float(pos.entry_price or 0.0),
+                "mode": pos.mode,
+            }
+        if info["qty"] <= 0 or info["entry"] <= 0:
+            return {"ok": False, "reason": "仓位数量或成本价无效"}
+
+        cfg = get_strategy()
+        try:
+            candles = await binance_client.klines(info["symbol"], cfg.timeframe, limit=120)
+        except (BinanceError, NoCredentials) as exc:
+            return {"ok": False, "reason": f"取 K 线失败: {str(exc)[:80]}"}
+        atr = ta.atr(candles, cfg.atr_period)
+        if atr <= 0:
+            return {"ok": False, "reason": "ATR 不可用，无法计算保护价"}
+
+        direction = 1 if info["side"] == "long" else -1
+        stop = info["entry"] - direction * atr * cfg.sl_atr_mult
+        tp = info["entry"] + direction * atr * cfg.tp_atr_mult if cfg.tp_atr_mult > 0 else 0.0
+        if stop <= 0:
+            return {"ok": False, "reason": "止损价计算为负，请检查 ATR 与倍数"}
+
+        broker = get_broker(normalize_mode(info["mode"]))
+        res = await broker.amend_stop(info["symbol"], info["side"], stop, info["qty"], tp)
+        if not res.ok:
+            return {"ok": False, "reason": res.message or "交易所拒绝挂保护单"}
+
+        with session_scope() as s:
+            row = s.get(PositionRecord, position_id)
+            if row is not None:
+                row.sl_price = stop
+                row.tp_price = tp
+        events.record(
+            "info", "engine",
+            f"{info['symbol']} 已补挂保护单 SL={stop:.8g} TP={tp:.8g}（{reason}）",
+            {"symbol": info["symbol"], "position_id": position_id},
+        )
+        return {"ok": True, "sl_price": round(stop, 8), "tp_price": round(tp, 8)}
 
     async def _algo_sl_tp(self, symbol: str) -> tuple[float, float]:
         """从交易所保护单提取该标的的止损/止盈触发价（手动开仓同步用）."""

@@ -99,6 +99,9 @@ class RiskSettings(BaseModel):
     #: 强平价监控：标记价距强平价小于该百分比(%)时告警，0=关闭。
     #: 高杠杆短线最致命的尾部风险是爆仓，必须事前预警而非事后记录。
     liquidation_warn_pct: float = Field(default=20.0, ge=0, le=50)
+    #: 发现「没有止损/止盈」的外部（手动）仓位时，是否自动按 ATR 补挂保护单。
+    #: 默认关：自动替用户挂单属于越权操作，先告警、由人决定更稳。
+    auto_protect_external: bool = False
 
 
 class StrategySettings(BaseModel):

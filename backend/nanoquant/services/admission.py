@@ -200,7 +200,17 @@ async def evaluate() -> dict[str, Any]:
         ticker = tickers.get(symbol)
         if filters is None or ticker is None:
             symbols.append(
-                {"symbol": symbol, "tradeable": False, "reason": "缺少交易规则或行情", "max_leverage": 0}
+                {
+                    "symbol": symbol,
+                    "tradeable": False,
+                    "reason": "缺少交易规则或行情",
+                    "max_leverage": 0,
+                    # 下面三项缺失时也要占位：后面的"最低门槛"提示会读它们，
+                    # 缺字段会直接 KeyError 把整个体检打成 500
+                    "min_notional": None,
+                    "leverage_used": 0,
+                    "required_margin": 0.0,
+                }
             )
             continue
         # 与真实开仓一致：杠杆下限/上限取全局风控，交易所上限更低时以交易所为准
@@ -234,7 +244,8 @@ async def evaluate() -> dict[str, Any]:
         )
 
     tradeable = [s for s in symbols if s["tradeable"]]
-    cheapest = min(symbols, key=lambda s: s.get("min_notional", 1e9)) if symbols else None
+    priced = [s for s in symbols if isinstance(s.get("min_notional"), (int, float))]
+    cheapest = min(priced, key=lambda s: s["min_notional"]) if priced else None
     tip = (
         f"；最低门槛 {cheapest['symbol']} 名义额 {cheapest['min_notional']} U、"
         f"{cheapest['leverage_used']}x 下需保证金 {cheapest['required_margin']} U"
