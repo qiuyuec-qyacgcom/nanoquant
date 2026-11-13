@@ -67,6 +67,21 @@ def _fill(price: float, bps: float, side: int, opening: bool) -> float:
     return price * (1 + sign * rate)
 
 
+def _gap_fill(bar: Any, trigger: float, direction: int, *, adverse: bool) -> float:
+    """跳空成交价：开盘已经越过触发价时按开盘价成交，否则按触发价.
+
+    止损/强平（``adverse=True``）跳空会成交得更差，止盈（``adverse=False``）会更好。
+    旧实现一律按触发价成交，等于假设"止损永远能精确成交"——这是回测最容易高估
+    收益的地方，尤其在插针行情里。
+    """
+    open_px = float(getattr(bar, "open", trigger) or trigger)
+    if direction == 1:
+        crossed = open_px <= trigger if adverse else open_px >= trigger
+    else:
+        crossed = open_px >= trigger if adverse else open_px <= trigger
+    return open_px if crossed else trigger
+
+
 def _roi_target(table: list[list[float]], minutes: float) -> float | None:
     target: float | None = None
     for row in table or []:
@@ -109,6 +124,7 @@ def run_backtest(
     margin_pct: float = 50.0,
     leverage: float = 20.0,
     max_bars_hold: int | None = None,
+    maintenance_margin_rate: float = 0.005,
 ) -> BacktestResult:
     result = BacktestResult()
     if len(candles) <= WARMUP:
@@ -133,6 +149,7 @@ def run_backtest(
     fee_total = 0.0
     funding_total = 0.0
     partial_count = 0
+    liquidations = 0
     hold_limit = max_bars_hold or cfg.max_hold_minutes
     at_r = float(cfg.partial_tp_at_r or 0.0)
     ratio = float(cfg.partial_tp_ratio or 0.0)
@@ -219,20 +236,34 @@ def run_backtest(
                 state["realized"] = float(state["realized"]) + delta
                 state["funding"] = float(state["funding"]) + delta
 
-            # 2) 硬止损 (最保守: 同一根 K 线里与部分止盈冲突时以止损为准)
+            # 2) 强平：杠杆越高越可能早于止损触发（旧实现完全没有这一步，
+            #    8–30x 下会把"爆仓"记成普通止损，系统性低估风险）
+            liq_price = float(state.get("liq_price") or 0.0)
+            if liq_price > 0:
+                hit_liq = (direction == 1 and bar.low <= liq_price) or (
+                    direction == -1 and bar.high >= liq_price
+                )
+                if hit_liq:
+                    fill = _gap_fill(bar, liq_price, direction, adverse=True)
+                    close_pos(fill, i, "liquidation")
+                    liquidations += 1
+                    continue
+
+            # 3) 硬止损 (最保守: 同一根 K 线里与部分止盈冲突时以止损为准)
             #    注意读 pos.stop_price: 部分止盈会把它上移到保本, 用副本会漏掉这次移动
             stop_price = float(pos.stop_price or 0.0)
             if stop_price > 0:
                 hit = (direction == 1 and bar.low <= stop_price) or (direction == -1 and bar.high >= stop_price)
                 if hit:
-                    close_pos(stop_price, i, "stop_loss")
+                    # 跳空穿过止损价时只能按开盘价成交；按止损价成交是回测里最经典的乐观假设
+                    close_pos(_gap_fill(bar, stop_price, direction, adverse=True), i, "stop_loss")
                     continue
 
-            # 3) 止盈
+            # 4) 止盈（跳空高开则按开盘价成交，对空头同理）
             if pos.tp_pct > 0:
                 tp_price = pos.entry * (1 + pos.tp_pct / 100) if direction == 1 else pos.entry * (1 - pos.tp_pct / 100)
                 if (direction == 1 and bar.high >= tp_price) or (direction == -1 and bar.low <= tp_price):
-                    close_pos(tp_price, i, "take_profit")
+                    close_pos(_gap_fill(bar, tp_price, direction, adverse=False), i, "take_profit")
                     continue
 
             # 4) 部分止盈: R 达标先落袋, 剩余仓位保本
@@ -336,6 +367,10 @@ def run_backtest(
             "chop": entry_regime(features, cfg) == "chop",
         }
         pos.stop_price = entry * (1 - direction * sl_pct / 100)
+        # 强平价：逐仓近似 entry × (1 ∓ (1/杠杆 − 维持保证金率))
+        lev = max(1.0, float(leverage))
+        mmr = max(0.0, float(maintenance_margin_rate))
+        state["liq_price"] = entry * (1 - direction * (1.0 / lev - mmr))
         entry_idx = i + 1
         trail_peak = next_bar.open
 
@@ -352,6 +387,9 @@ def run_backtest(
         bar_minutes,
         funding_total=funding_total,
         partial_count=partial_count,
+        liquidations=liquidations,
+        leverage=leverage,
+        maintenance_margin_rate=maintenance_margin_rate,
     )
     return result
 
@@ -422,6 +460,9 @@ def _summarize(
     *,
     funding_total: float = 0.0,
     partial_count: int = 0,
+    liquidations: int = 0,
+    leverage: float = 0.0,
+    maintenance_margin_rate: float = 0.0,
 ) -> dict[str, Any]:
     trades = result.trades
     wins = [t for t in trades if t.pnl > 0]
@@ -445,7 +486,13 @@ def _summarize(
         "fee_total": round(fee_total, 6),
         "funding_total": round(funding_total, 6),
         "partial_tp_count": partial_count,
+        "liquidations": liquidations,
+        "leverage": round(float(leverage), 2),
+        "maintenance_margin_rate": round(float(maintenance_margin_rate), 5),
         "final_equity": round(equity, 6),
-        "disclaimer": "不含 AI 复核与点差闸门; 资金费为假设费率; 仅用于参数粗筛, 不代表实盘收益",
+        "disclaimer": (
+            "不含 AI 复核与点差闸门; 资金费为假设费率; 强平按维持保证金率估算、跳空按开盘价成交; "
+            "仅用于参数粗筛, 不代表实盘收益"
+        ),
         **_segments(trades, bar_minutes),
     }
