@@ -8,7 +8,7 @@
  * - 字段按语义选择控件 (开关/分段/数字+单位/标签/文本), 并给出口径说明;
  * - 顶部保留「未保存」提示与保存/恢复默认, 避免改完不知道有没有生效。
  */
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
@@ -549,11 +549,160 @@ const hiddenCount = computed(() => {
   return Object.keys(draft.value || {}).filter((k) => !skip.has(k) && !basic.includes(k)).length
 })
 
+// ------------------------------------------------------------ 参数检索
+/**
+ * 参数分散在 10 个分组、上百个字段里，先让用户猜"在哪一组"是最大的摩擦。
+ * 这里做三件事：
+ * 1) 跨全部分组的关键词检索（同时搜中文名、字段名、说明、分区名），点击直接跳转并高亮；
+ * 2) 「常用直达」——最高频的十来个参数一键定位，不必记分组；
+ * 3) 「只看已改」——保存前确认到底动了哪几项。
+ */
+const query = ref('')
+const hitsOpen = ref(false)
+const focusKey = ref('')
+const onlyDirty = ref(false)
+const searchInput = ref<HTMLInputElement | null>(null)
+
+interface Hit {
+  group: string
+  groupLabel: string
+  section: string
+  key: string
+  label: string
+  hint: string
+  value: any
+}
+
+/** 常用直达：出现频率最高的参数，跨分组一键定位 */
+const QUICK_LINKS: { label: string; group: string; key: string }[] = [
+  { label: '扫描间隔', group: 'engine', key: 'cycle_interval_sec' },
+  { label: '下单方式', group: 'engine', key: 'order_type' },
+  { label: '最多持仓', group: 'engine', key: 'max_positions' },
+  { label: '信号模式', group: 'strategy', key: 'mode' },
+  { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
+  { label: '杠杆区间', group: 'strategy', key: 'leverage_min' },
+  { label: '止损止盈', group: 'strategy', key: 'sl_atr_mult' },
+  { label: '点差闸门', group: 'strategy', key: 'max_spread_bps' },
+  { label: '单笔风险', group: 'risk', key: 'risk_per_trade_pct' },
+  { label: '回撤熔断', group: 'risk', key: 'max_drawdown_pct' },
+  { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
+  { label: '手续费率', group: 'risk', key: 'fee_rate_taker' },
+]
+
+function sectionMapOf(group: string): Map<string, string> {
+  const m = new Map<string, string>()
+  for (const def of SECTIONS[group] || []) for (const k of def.fields) m.set(k, def.title)
+  return m
+}
+
+function skipOf(group: string): Set<string> {
+  return new Set([...PROTECTED, ...(SKIP[group] || []), 'symbols'])
+}
+
+/** 每个分组有多少可编辑参数（导航上显示，避免"点进去才知有没有"） */
+const groupCounts = computed<Record<string, number>>(() => {
+  const out: Record<string, number> = {}
+  for (const g of groups) {
+    const cfg = (app.settings as Record<string, any>)[g.id] || {}
+    const skip = skipOf(g.id)
+    out[g.id] = Object.keys(cfg).filter((k) => !skip.has(k)).length
+  }
+  return out
+})
+
+const searchHits = computed<Hit[]>(() => {
+  const q = query.value.trim().toLowerCase()
+  if (!q) return []
+  const out: Hit[] = []
+  for (const g of groups) {
+    const cfg = (app.settings as Record<string, any>)[g.id] || {}
+    const skip = skipOf(g.id)
+    const secs = sectionMapOf(g.id)
+    for (const [key, value] of Object.entries(cfg)) {
+      if (skip.has(key)) continue
+      const meta = metaOf(g.id, key)
+      const hay = [meta.label, key, meta.hint || '', PLAIN_HINTS[key] || '', secs.get(key) || '']
+        .join(' ')
+        .toLowerCase()
+      if (!hay.includes(q)) continue
+      out.push({
+        group: g.id,
+        groupLabel: g.label,
+        section: secs.get(key) || '其他参数',
+        key,
+        label: meta.label,
+        hint: meta.hint || PLAIN_HINTS[key] || '',
+        value,
+      })
+    }
+  }
+  return out.slice(0, 30)
+})
+
+function preview(v: any): string {
+  if (typeof v === 'boolean') return v ? '开' : '关'
+  if (Array.isArray(v)) return v.length ? `${v.length} 项` : '空'
+  if (v && typeof v === 'object') return '…'
+  const s = String(v ?? '')
+  return s.length > 18 ? `${s.slice(0, 18)}…` : s
+}
+
+function clearSearch() {
+  query.value = ''
+  hitsOpen.value = false
+}
+
+/** 跳到某个参数：必要时切分组、展开高级项、滚动到视野中央并闪一下 */
+async function jumpTo(group: string, key: string) {
+  if (group !== current.value) {
+    if (dirty.value && !confirm('当前分组有未保存的修改，切换后会被丢弃，继续？')) return
+    loadGroup(group)
+  }
+  showAll.value = true
+  onlyDirty.value = false
+  clearSearch()
+  focusKey.value = key
+  await nextTick()
+  const el = document.getElementById(`fld-${group}-${key}`)
+  if (!el) return
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  window.setTimeout(() => {
+    if (focusKey.value === key) focusKey.value = ''
+  }, 2200)
+}
+
+/** 当前分组里相对"已保存值"有哪些改动 */
+const changedKeys = computed(() => {
+  const skip = skippedKeys()
+  return Object.keys(draft.value || {}).filter(
+    (k) => !skip.has(k) && JSON.stringify(draft.value[k]) !== JSON.stringify((baseline.value as any)[k]),
+  )
+})
+
+function onHotkey(e: KeyboardEvent) {
+  const tag = (e.target as HTMLElement)?.tagName
+  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+  if ((e.key === '/' && !typing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) {
+    e.preventDefault()
+    searchInput.value?.focus()
+    hitsOpen.value = true
+  }
+  if (e.key === 'Escape') clearSearch()
+}
+
+/** 只看改动：长表单保存前核对到底动了哪几项（顺手展开高级项，避免改动项被折叠看不见） */
+function toggleOnlyDirty() {
+  onlyDirty.value = !onlyDirty.value
+  if (onlyDirty.value) showAll.value = true
+}
+
 const currentSections = computed(() => {
   const skip = skippedKeys()
+  const keep = onlyDirty.value ? new Set(changedKeys.value) : null
   const rows = new Map<string, Row>()
   for (const [key, value] of Object.entries(draft.value || {})) {
     if (skip.has(key) || !allowField(key)) continue
+    if (keep && !keep.has(key)) continue
     rows.set(key, rowOf(current.value, key, value))
   }
   const out: { title: string; hint: string; rows: Row[] }[] = []
@@ -633,6 +782,8 @@ function loadGroup(id: string) {
   current.value = id
   draft.value = clone(app.settings[id] || {})
   baseline.value = clone(app.settings[id] || {})
+  onlyDirty.value = false
+  focusKey.value = ''
   syncJsonText()
   if (id === 'engine') loadTradeMode()
 }
@@ -659,6 +810,7 @@ async function save() {
     draft.value = clone(data)
     baseline.value = clone(data)
     syncJsonText()
+    onlyDirty.value = false
     app.notify('配置已保存并热生效', 'ok')
     if (current.value === 'engine' || current.value === 'data') await app.loadStatus()
   } catch (err: any) {
@@ -675,11 +827,20 @@ async function reset() {
     draft.value = clone(data)
     baseline.value = clone(data)
     syncJsonText()
+    onlyDirty.value = false
     if (current.value === 'engine' || current.value === 'data') await app.loadStatus()
     app.notify('已恢复默认值', 'ok')
   } catch (err: any) {
     app.notify(err.message, 'error')
   }
+}
+
+/** 放弃本次改动：退回上次保存的值，不用重新加载页面 */
+function discard() {
+  draft.value = clone(baseline.value)
+  syncJsonText()
+  onlyDirty.value = false
+  app.notify('已放弃未保存的修改', 'ok')
 }
 
 async function toggleEngine() {
@@ -829,12 +990,19 @@ watch(current, (id) => {
 })
 
 onMounted(async () => {
+  window.addEventListener('keydown', onHotkey)
   if (!Object.keys(app.settings).length) await app.loadSettings()
   await app.loadStatus()
   const wanted = String(route.query.group || '')
-  loadGroup(groups.some((g) => g.id === wanted) ? wanted : 'engine')
+  const group = groups.some((g) => g.id === wanted) ? wanted : 'engine'
+  loadGroup(group)
   await loadCredentials()
+  // 支持 ?group=risk&key=max_drawdown_pct 直达某个参数（文档与提示可以精确指路）
+  const key = String(route.query.key || '')
+  if (key) await jumpTo(group, key)
 })
+
+onUnmounted(() => window.removeEventListener('keydown', onHotkey))
 </script>
 
 <template>
@@ -860,6 +1028,59 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- 参数检索：跨分组搜索 + 常用直达。参数上百个，先解决"找不到" -->
+    <div class="panel">
+      <div class="panel-body stack" style="gap: 10px">
+        <div class="search-row">
+          <input
+            ref="searchInput"
+            v-model="query"
+            class="input search-input"
+            placeholder="搜索参数：杠杆 / 止损 / 周期 / 手续费 / 熔断 …"
+            @focus="hitsOpen = true"
+            @input="hitsOpen = true"
+            @keyup.enter="searchHits.length && jumpTo(searchHits[0].group, searchHits[0].key)"
+          />
+          <span class="search-kbd" title="按 / 或 Ctrl+K 聚焦搜索">/</span>
+          <button v-if="query" class="btn btn-sm btn-ghost" @click="clearSearch">清空</button>
+        </div>
+
+        <div class="quick-row">
+          <span class="quick-label">常用直达</span>
+          <button
+            v-for="q in QUICK_LINKS"
+            :key="q.group + q.key"
+            type="button"
+            class="chip-btn"
+            @click="jumpTo(q.group, q.key)"
+          >
+            {{ q.label }}
+          </button>
+        </div>
+
+        <div v-if="query && hitsOpen" class="search-results">
+          <div v-if="!searchHits.length" class="search-empty">
+            没有匹配「{{ query }}」的参数。试试：杠杆 / 止损 / 周期 / 手续费 / 熔断
+          </div>
+          <button
+            v-for="h in searchHits"
+            :key="h.group + h.key"
+            type="button"
+            class="search-hit"
+            @click="jumpTo(h.group, h.key)"
+          >
+            <span class="hit-where">{{ h.groupLabel }} · {{ h.section }}</span>
+            <span class="hit-label">{{ h.label }}</span>
+            <span class="hit-hint">{{ h.hint }}</span>
+            <span class="hit-value">{{ preview(h.value) }}</span>
+          </button>
+          <div v-if="searchHits.length" class="search-foot">
+            {{ searchHits.length }} 个结果 · 点击跳到该参数并高亮（Esc 关闭）
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="settings-layout">
       <aside class="settings-nav">
         <button
@@ -870,7 +1091,10 @@ onMounted(async () => {
           :class="{ on: current === g.id }"
           @click="onGroupClick(g.id)"
         >
-          <span class="nav-name">{{ g.label }}</span>
+          <span class="nav-name">
+            {{ g.label }}
+            <span class="nav-count">{{ groupCounts[g.id] ?? 0 }}</span>
+          </span>
           <span class="nav-hint">{{ g.hint }}</span>
         </button>
       </aside>
@@ -886,6 +1110,15 @@ onMounted(async () => {
               <span v-if="!showAll && hiddenCount" class="tag tag-dim">已隐藏 {{ hiddenCount }} 项高级参数</span>
               <button class="btn btn-sm btn-ghost" @click="showAll = !showAll">
                 {{ showAll ? '只看常用' : '显示全部参数' }}
+              </button>
+              <button
+                v-if="changedKeys.length"
+                class="btn btn-sm btn-ghost"
+                :class="{ 'btn-primary': onlyDirty }"
+                :title="onlyDirty ? '显示本组全部参数' : '只显示本组改动过的参数'"
+                @click="toggleOnlyDirty"
+              >
+                {{ onlyDirty ? '显示全部' : `只看改动 ${changedKeys.length}` }}
               </button>
               <span v-if="dirty" class="tag tag-warn">未保存</span>
               <button class="btn btn-sm" @click="reset">恢复默认</button>
@@ -1055,7 +1288,13 @@ onMounted(async () => {
                 <span v-if="sec.hint" class="section-hint">{{ sec.hint }}</span>
               </div>
 
-              <div v-for="f in sec.rows" :key="f.key" class="field-row">
+              <div
+                v-for="f in sec.rows"
+                :key="f.key"
+                :id="`fld-${current}-${f.key}`"
+                class="field-row"
+                :class="{ focus: focusKey === f.key, changed: changedKeys.includes(f.key) }"
+              >
                 <div class="field-meta">
                   <div class="field-name" :title="f.key">
                     {{ f.label }}
@@ -1166,11 +1405,23 @@ onMounted(async () => {
             </div>
 
             <div v-if="!currentSections.length && current !== 'engine' && current !== 'data' && current !== 'security'" class="empty">
-              该分组暂无可编辑字段
+               该分组暂无可编辑字段
             </div>
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- 有未保存改动时才出现的悬浮保存条：长表单滚到下面也能直接保存 -->
+    <div v-if="dirty" class="save-bar">
+      <span class="save-bar-text">
+        {{ currentGroup?.label }} · {{ changedKeys.length }} 项未保存
+      </span>
+      <button class="btn btn-sm btn-ghost" @click="discard">放弃修改</button>
+      <button class="btn btn-sm" @click="reset">恢复默认</button>
+      <button class="btn btn-sm btn-primary" :disabled="saving" @click="save">
+        {{ saving ? '保存中…' : '保存并生效' }}
+      </button>
     </div>
   </div>
 </template>
@@ -1257,6 +1508,23 @@ onMounted(async () => {
   align-items: center;
   padding: 9px 0;
   border-top: 1px dashed rgba(26, 41, 66, 0.6);
+}
+
+/* 改过但还没保存的字段：左边一条黄线 + "已改"角标，滚动时也能一眼看到 */
+.field-row.changed {
+  box-shadow: inset 2px 0 0 var(--warn);
+  padding-left: 8px;
+}
+.field-row.changed .field-name::after {
+  content: '已改';
+  margin-left: 6px;
+  padding: 0 3px;
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--warn);
+  border: 1px solid rgba(240, 169, 42, 0.35);
+  border-radius: 4px;
+  vertical-align: middle;
 }
 .field-row:first-of-type {
   border-top: none;
@@ -1457,6 +1725,184 @@ onMounted(async () => {
   .roi-row {
     grid-template-columns: minmax(70px, 1fr) minmax(88px, 1fr) 26px;
     gap: 5px;
+  }
+}
+
+/* ------------------------------------------------ 参数检索 / 常用直达 */
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+}
+.search-kbd {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-2);
+}
+
+.quick-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.quick-label {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-right: 2px;
+}
+.chip-btn {
+  padding: 3px 9px;
+  font-size: 11px;
+  font-family: var(--sans);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.chip-btn:hover {
+  color: var(--text);
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 300px;
+  overflow: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.search-empty {
+  padding: 12px 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.search-hit {
+  display: grid;
+  grid-template-columns: 132px 140px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 8px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+.search-hit:hover {
+  background: rgba(59, 130, 246, 0.1);
+}
+.hit-where {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.hit-label {
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+}
+.hit-hint {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hit-value {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--accent);
+}
+.search-foot {
+  padding: 7px 8px 2px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+/* 导航上的字段数：点进去之前就知道这一组有多少项 */
+.nav-count {
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 9.5px;
+  font-family: var(--mono);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.nav-item.on .nav-count {
+  color: var(--accent);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+/* 搜索跳转后闪一下，解决"点完不知道跳到哪了" */
+.field-row.focus {
+  animation: field-flash 2s ease;
+}@keyframes field-flash {
+  0%,
+  55% {
+    background: rgba(59, 130, 246, 0.16);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  100% {
+    background: transparent;
+    box-shadow: inset 2px 0 0 transparent;
+  }
+}
+
+/* 未保存时悬浮的保存条：长表单滚到最下面也不用回去找按钮 */
+.save-bar {
+  position: fixed;
+  right: 22px;
+  bottom: 18px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  background: var(--panel-3);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+.save-bar-text {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .search-hit {
+    grid-template-columns: 1fr auto;
+    row-gap: 2px;
+  }
+  .hit-where,
+  .hit-hint {
+    display: none;
+  }
+  .save-bar {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    justify-content: space-between;
   }
 }
 </style>
