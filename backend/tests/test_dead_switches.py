@@ -215,3 +215,62 @@ def test_auto_disable_negative_mantra(monkeypatch):
         assert "auto_disable_negative" in (row.evidence or {}).get("disabled_reason", "")
         s.delete(row)
     update_group("evolution", {"auto_disable_negative": False})
+
+
+# ------------------------------------------------- 防回归：不允许再出现死开关
+#: 只在前端消费的字段（后端读不到是正常的），新增时必须在这里登记并写清原因，
+#: 否则测试会红——这道闸门存在的意义就是"加了设置就必须有人读"。
+FRONTEND_ONLY = {
+    "ui_refresh_sec": "前端轮询间隔，后端不参与",
+    "risk_disclaimer_accepted": "前端风险提示勾选状态",
+    "max_position_leverage": "已停用：开仓杠杆统一由风控上下限钳制，保留字段兼容老配置",
+}
+
+
+def test_no_settings_field_is_defined_but_unread():
+    """扫描 settings.py 的每个字段，在后端代码里必须至少被读一次.
+
+    这条不是洁癖：`min_notional_buffer` / `close_on_halt` / `require_agreement`
+    就是这样在设置页躺了几个月，而引擎从来没读过它们。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "nanoquant"
+    src = (root / "services" / "settings.py").read_text(encoding="utf-8")
+
+    classes: dict[str, list[str]] = {}
+    cur: str | None = None
+    for line in src.splitlines():
+        head = re.match(r"class (\w+)\(BaseModel\):", line)
+        if head:
+            cur = head.group(1)
+            classes[cur] = []
+            continue
+        if cur and line.startswith("    ") and not line.startswith("        "):
+            field = re.match(r"    (\w+):\s*[\w\[\]|. ]+=", line)
+            if field:
+                classes[cur].append(field.group(1))
+        elif line and not line.startswith(" "):
+            cur = None
+
+    assert classes, "没有解析到任何设置类，说明解析规则已失效"
+
+    body = "\n".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in root.rglob("*.py")
+        if p.name != "settings.py" and "__pycache__" not in p.parts
+    )
+
+    unread = [
+        f"{cls}.{name}"
+        for cls, names in classes.items()
+        for name in names
+        if re.search(rf"\b{re.escape(name)}\b", body) is None
+        and name not in FRONTEND_ONLY
+    ]
+
+    assert not unread, (
+        "这些设置项在界面上可调、后端从不读取："
+        f"{sorted(unread)}；要么接上，要么删掉，要么登记进 FRONTEND_ONLY 并写清原因"
+    )

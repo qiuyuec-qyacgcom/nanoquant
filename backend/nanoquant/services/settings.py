@@ -84,6 +84,9 @@ class RiskSettings(BaseModel):
     )
     daily_loss_limit_pct: float = Field(default=25.0, gt=0, le=100)
     max_drawdown_pct: float = Field(default=50.0, gt=0, le=100)
+    #: 回撤峰值取样窗口(天): 0=历史最高(默认); >0 只取最近 N 天权益曲线的最高点.
+    #: 小资金腰斩后会被历史最高永久顶在熔断线上, 滚动窗口让基准随时间下移.
+    drawdown_peak_window_days: int = Field(default=0, ge=0, le=365)
     consecutive_loss_limit: int = Field(default=4, ge=1, le=20)
     cooldown_minutes: int = Field(default=10, ge=0, le=1440)
     symbol_cooldown_minutes: int = Field(default=5, ge=0, le=1440)

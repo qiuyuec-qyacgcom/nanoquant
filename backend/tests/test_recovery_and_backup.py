@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +18,7 @@ from nanoquant.engine import risk
 from nanoquant.models import BackupJob
 from nanoquant.services import backup as backup_service
 from nanoquant.services import state
-from nanoquant.services.settings import get_engine, update_group
+from nanoquant.services.settings import get_engine, get_risk, update_group
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -245,3 +246,60 @@ def test_backup_restore_rebuilds_tables():
             synchronize_session=False
         )
         s.query(TradeRecord).filter(TradeRecord.symbol == "BKPTA").delete(synchronize_session=False)
+
+
+# ------------------------------------------------------- 回撤峰值口径
+def test_rolling_peak_ignores_old_highs():
+    """`drawdown_peak_window_days>0` 时，窗口外的历史高点不再压着当前权益."""
+    from nanoquant.models import EquityPoint
+
+    now = int(time.time())
+    state.set_many({"equity_peak": "", "peak_anchor_ts": "0"})
+    with session_scope() as s:
+        s.add(EquityPoint(ts=now - 60 * 86400, mode="demo", wallet=100.0, unrealized=0.0))
+        s.add(EquityPoint(ts=now - 3 * 86400, mode="demo", wallet=50.0, unrealized=0.0))
+
+    # 60 天前的 100 在 30 天窗口外 → 峰值取窗口内的 50
+    assert risk.update_peak(45.0, 30) == pytest.approx(50.0)
+
+    # 窗口 0 = 历史最高：直接用持久化的峰值（不查库），所以这里手工写回 100
+    state.set_many({"equity_peak": "100", "peak_anchor_ts": "0"})
+    assert risk.update_peak(45.0, 0) == pytest.approx(100.0)
+
+
+def test_rolling_peak_never_crosses_reset_anchor():
+    """人工重置基准后，窗口内更早的高点不能再触发回撤熔断."""
+    from nanoquant.models import EquityPoint
+
+    now = int(time.time())
+    with session_scope() as s:
+        s.add(EquityPoint(ts=now - 2 * 86400, mode="demo", wallet=100.0, unrealized=0.0))
+    state.set_many({"equity_peak": "40", "peak_anchor_ts": str(now - 3600)})
+
+    assert risk.update_peak(40.0, 30) == pytest.approx(40.0)
+
+
+def test_drawdown_window_unblocks_gates_where_all_time_peak_would_halt():
+    """同一条权益：全历史峰值下熔断，30 天窗口下放行."""
+    from nanoquant.models import EquityPoint
+
+    now = int(time.time())
+    with session_scope() as s:
+        s.add(EquityPoint(ts=now - 60 * 86400, mode="demo", wallet=100.0, unrealized=0.0))
+        s.add(EquityPoint(ts=now - 2 * 86400, mode="demo", wallet=50.0, unrealized=0.0))
+
+    account = SimpleNamespace(equity=45.0, available=45.0, unrealized=0.0)
+    state.set_many({"day_anchor": "2099-01-01", "day_start_equity": "45", "equity_peak": "100", "halted": ""})
+
+    update_group("risk", {"max_drawdown_pct": 50.0, "drawdown_peak_window_days": 0})
+    halted = risk.global_gates(account, get_engine(), get_risk())
+
+    state.set_many({"equity_peak": "", "halted": ""})
+    update_group("risk", {"drawdown_peak_window_days": 30})
+    try:
+        passed = risk.global_gates(account, get_engine(), get_risk())
+    finally:
+        update_group("risk", {"drawdown_peak_window_days": 0})
+
+    assert halted.ok is False and "回撤" in (halted.halt or "")
+    assert passed.ok is True, passed.reason

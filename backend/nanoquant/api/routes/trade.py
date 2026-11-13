@@ -275,6 +275,8 @@ async def reset_anchors(user: str = Depends(current_user)) -> dict:
         {
             "day_start_equity": f"{equity:.8f}",
             "equity_peak": f"{equity:.8f}",
+            # 滚动峰值窗口以这个时刻为下界：不写的话，按窗口取历史高点会立刻把回撤算回来
+            "peak_anchor_ts": str(int(time.time())),
         }
     )
     cleared = ""

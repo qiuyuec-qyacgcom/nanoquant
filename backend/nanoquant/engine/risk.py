@@ -87,9 +87,36 @@ def ensure_day_anchor(equity: float, cfg: EngineSettings) -> float:
     return state.get_float("day_start_equity", equity)
 
 
-def update_peak(equity: float) -> float:
-    peak = max(equity, state.get_float("equity_peak", equity))
-    if abs(peak - state.get_float("equity_peak", equity)) > 1e-12:
+def update_peak(equity: float, window_days: int = 0) -> float:
+    """更新回撤基准峰值.
+
+    ``window_days=0``（默认）：历史最高，永不遗忘。
+    ``window_days>0``：只取最近 N 天权益曲线的最高点（外加当前权益）。
+    小资金账户腰斩后会被"历史最高"永久顶死在熔断线上，滚动窗口让基准随时间下移，
+    这属于风控口径的选择，所以默认关、由配置显式打开。
+
+    人工「重置基准」会把 ``peak_anchor_ts`` 推到当时，窗口查询不会越过这个锚点——
+    否则重置完立刻又按旧高点触发回撤熔断。
+    """
+    stored = state.get_float("equity_peak", equity)
+    if window_days <= 0:
+        peak = max(equity, stored)
+    else:
+        from ..models import EquityPoint
+
+        since = int(time.time()) - int(window_days) * 86400
+        anchor = state.get_int("peak_anchor_ts", 0)
+        if anchor:
+            since = max(since, anchor)
+        with session_scope() as s:
+            rows = (
+                s.query(EquityPoint.wallet, EquityPoint.unrealized)
+                .filter(EquityPoint.ts >= since)
+                .all()
+            )
+        points = [(float(w or 0.0) + float(u or 0.0)) for w, u in rows]
+        peak = max([equity, *points])
+    if abs(peak - stored) > 1e-12:
         state.set("equity_peak", f"{peak:.8f}")
     return peak
 
@@ -175,7 +202,7 @@ def global_gates(account: Account, cfg_engine: EngineSettings, cfg_risk: RiskSet
     if account.equity < cfg_risk.min_equity_usdt:
         return GateDecision(False, f"权益 {account.equity:.4f} USDT 低于下限 {cfg_risk.min_equity_usdt} USDT")
     day_start = ensure_day_anchor(account.equity, cfg_engine)
-    peak = update_peak(account.equity)
+    peak = update_peak(account.equity, cfg_risk.drawdown_peak_window_days)
     if day_start > 0:
         day_pnl_pct = (account.equity - day_start) / day_start * 100
         if day_pnl_pct <= -cfg_risk.daily_loss_limit_pct:

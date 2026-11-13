@@ -57,7 +57,7 @@ const BASIC_FIELDS: Record<string, string[]> = {
   engine: ['cycle_interval_sec', 'max_positions', 'trading_windows', 'order_type', 'close_on_halt'],
   risk: [
     'risk_per_trade_pct', 'margin_pct', 'default_leverage', 'max_leverage',
-    'daily_loss_limit_pct', 'max_drawdown_pct', 'consecutive_loss_limit', 'max_spread_bps',
+    'daily_loss_limit_pct', 'max_drawdown_pct', 'drawdown_peak_window_days', 'consecutive_loss_limit', 'max_spread_bps',
   ],
   strategy: [
     'timeframe', 'entry_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max',
@@ -84,6 +84,7 @@ const PLAIN_HINTS: Record<string, string> = {
   max_same_direction: '同一方向最多同时持有几个仓；0=不限制',
   daily_loss_limit_pct: '当天亏到这个比例就停止开新仓',
   max_drawdown_pct: '权益从最高点回撤到这个比例就停机',
+  drawdown_peak_window_days: '回撤基准只看最近几天的最高权益；0=用历史最高',
   entry_threshold: '信号分超过多少才开仓；越高越保守',
   volume_ratio_min: '成交量低于该倍数时不参与',
   atr_pct_min: '波动太小（赚不回手续费）时不做',
@@ -188,6 +189,7 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
+  drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
   cooldown_minutes: { label: '熔断冷静期', unit: '分钟' },
   symbol_cooldown_minutes: { label: '单标的冷却', unit: '分钟', hint: '亏损后该标的的冷却时间' },
@@ -365,7 +367,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
         'vol_target_atr_pct',
       ],
     },
-    { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
+    { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'drawdown_peak_window_days', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
     { title: '止损熔断', hint: '窗口内多次止损 = 策略与行情脱节，先暂停观察', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
     { title: '尾部风险', hint: '强平价监控 + 相关性组敞口（山寨多仓本质是加杠杆）+ 手动仓保护单', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct', 'auto_protect_external'] },
     { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },

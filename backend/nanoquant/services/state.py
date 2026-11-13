@@ -12,6 +12,8 @@ DEFAULT_STATE: dict[str, str] = {
     "halted": "",
     "day_anchor": "",
     "day_start_equity": "",
+    #: 人工重置回撤基准的时刻；滚动峰值窗口不会越过它（否则重置形同虚设）
+    "peak_anchor_ts": "0",
     "consecutive_losses": "0",
     "last_cycle_ts": "0",
     "last_cycle_ms": "0",
