@@ -843,6 +843,30 @@ function discard() {
   app.notify('已放弃未保存的修改', 'ok')
 }
 
+// ---------------------------------------------------- 日亏基准重置
+/**
+ * 充值 / 重置模拟盘资金 / 换账户之后必须做一次：旧基准还在的时候，系统会拿新
+ * 资金和旧基准比，算出 -99% 的假日内亏损并熔断（这个坑已经踩过两次）。
+ */
+const anchorBusy = ref(false)
+
+async function resetAnchors() {
+  if (!confirm('把日亏基准与回撤峰值重置为当前权益？\n只在充值、重置模拟盘资金或换账户后使用。')) return
+  anchorBusy.value = true
+  try {
+    const res = await http.post('/engine/reset-anchors')
+    await app.loadStatus()
+    app.notify(
+      res.cleared_halt ? `基准已对齐到 ${res.equity}；已解除「${res.cleared_halt}」` : `基准已对齐到 ${res.equity}`,
+      'ok',
+    )
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    anchorBusy.value = false
+  }
+}
+
 async function toggleEngine() {
   if (engineBusy.value) return
   const target = !engineRunning.value
@@ -1280,6 +1304,28 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
               这里是<b>机器真正执行的策略参数</b>：模式、周期、杠杆区间、准入闸门、止损止盈，改完直接影响下单。
               想改「AI 怎么分析」的文本指令，去
               <router-link to="/admin/strategies">AI 策略</router-link>。
+            </div>
+
+            <!-- 风控: 日亏基准（充值/重置资金后必须对齐，否则会算出假 -99%） -->
+            <div v-if="current === 'risk'" class="section">
+              <div class="section-hd">
+                <span class="section-title">日亏基准</span>
+                <span class="section-hint">
+                  日亏与回撤都相对「当日初始权益」计算；充值、重置模拟盘资金、换账户后必须对齐一次
+                </span>
+              </div>
+              <div class="row" style="gap: 10px; flex-wrap: wrap; align-items: center">
+                <span class="tag tag-dim">
+                  当前权益 {{ (app.status?.account?.equity ?? 0).toFixed(2) }}
+                </span>
+                <span v-if="app.status?.halted" class="tag tag-warn" :title="app.status.halted">
+                  熔断中 · {{ app.status.halted.slice(0, 24) }}
+                </span>
+                <span v-else class="tag tag-long">未熔断</span>
+                <button class="btn btn-sm" :disabled="anchorBusy" @click="resetAnchors">
+                  {{ anchorBusy ? '重置中…' : '重置基准到当前权益' }}
+                </button>
+              </div>
             </div>
 
             <div v-for="sec in currentSections" :key="sec.title" class="section">

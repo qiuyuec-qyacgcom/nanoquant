@@ -610,3 +610,60 @@ def test_follow_signal_end_to_end_uses_system_sizing(monkeypatch):
         with session_scope() as s:
             s.query(SignalFollow).filter(SignalFollow.symbol == symbol).delete()
             s.query(TradingSymbol).filter(TradingSymbol.symbol == symbol).delete()
+
+
+def test_engine_reset_anchors_aligns_stale_baseline(client, monkeypatch):
+    """资金重置后日亏基准没跟着重置 → 假日内亏损 -99% 熔断.
+
+    这个坑真实发生过两次：账户从 2850 改成 10，基准还留在 2850，
+    系统算出 -99.65% 直接停机。接口把基准对齐到当前权益并清掉这条熔断。
+    """
+    from types import SimpleNamespace
+
+    from nanoquant.api.routes import trade as route
+    from nanoquant.services import state
+
+    class _FakeBroker:
+        async def account(self):
+            return SimpleNamespace(equity=10.0)
+
+    monkeypatch.setattr(route, "get_broker", lambda mode: _FakeBroker())
+    state.set_many(
+        {
+            "day_start_equity": "2850.23",
+            "equity_peak": "2905.38",
+            "halted": "日内亏损 -99.65% 超过上限 30.0%",
+        }
+    )
+
+    res = client.post(f"{API}/engine/reset-anchors", headers=_token(client))
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["ok"] is True
+    assert abs(data["equity"] - 10.0) < 1e-9
+    assert "日内亏损" in data["cleared_halt"]
+
+    assert float(state.get("day_start_equity")) == pytest.approx(10.0)
+    assert float(state.get("equity_peak")) == pytest.approx(10.0)
+    assert state.get("halted") == ""
+
+
+def test_engine_reset_anchors_keeps_unrelated_halt(client, monkeypatch):
+    """回撤/连亏类熔断是真实风控状态，重置基准时不该顺手解除."""
+    from types import SimpleNamespace
+
+    from nanoquant.api.routes import trade as route
+    from nanoquant.services import state
+
+    class _FakeBroker:
+        async def account(self):
+            return SimpleNamespace(equity=100.0)
+
+    monkeypatch.setattr(route, "get_broker", lambda mode: _FakeBroker())
+    state.set_many({"halted": "权益回撤 22.0% 超过上限 20.0%"})
+
+    res = client.post(f"{API}/engine/reset-anchors", headers=_token(client))
+    assert res.status_code == 200, res.text
+    assert res.json()["cleared_halt"] == ""
+    assert "回撤" in state.get("halted")
+    state.set("halted", "")

@@ -232,6 +232,55 @@ async def cycle_now(user: str = Depends(current_user)) -> dict:
     return {"ok": True, "result": result}
 
 
+@router.post("/engine/reset-anchors")
+async def reset_anchors(user: str = Depends(current_user)) -> dict:
+    """把「日亏基准 / 回撤峰值」对齐到当前权益.
+
+    什么时候需要：给模拟盘充值、重置资金、换账户之后。旧基准留着的话，系统会拿
+    新资金和旧基准相比，算出 -99% 的假日内亏损并直接熔断（这个坑真实发生过两次）。
+
+    只清理「日内亏损」类熔断——日亏基准本身被重置了，那条判定已经失效；
+    回撤、连亏、止损熔断属于真实风控状态，这里不碰。
+    """
+    mode = normalize_mode(get_engine().mode)
+    try:
+        account = await get_broker(mode).account()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"读取账户权益失败: {str(exc)[:120]}") from exc
+    equity = float(getattr(account, "equity", 0.0) or 0.0)
+    if equity <= 0:
+        raise HTTPException(400, "当前权益为 0，不能作为日亏基准")
+
+    before = {
+        "day_start_equity": state.get("day_start_equity"),
+        "equity_peak": state.get("equity_peak"),
+        "halted": state.get("halted"),
+    }
+    state.set_many(
+        {
+            "day_start_equity": f"{equity:.8f}",
+            "equity_peak": f"{equity:.8f}",
+        }
+    )
+    cleared = ""
+    if "日内亏损" in (before["halted"] or ""):
+        cleared = before["halted"]
+        state.set("halted", "")
+    invalidate_status_cache()
+    events.record(
+        "warn",
+        "risk",
+        f"日亏基准与回撤峰值已重置为 {equity:.4f}",
+        {"equity": equity, "cleared_halt": cleared},
+    )
+    return {
+        "ok": True,
+        "equity": round(equity, 8),
+        "before": before,
+        "cleared_halt": cleared,
+    }
+
+
 @router.get("/engine/positions")
 async def positions(
     include_closed: bool = False,
