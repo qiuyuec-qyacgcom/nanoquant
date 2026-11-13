@@ -137,7 +137,10 @@ def test_admission_reports_symbol_level_tradeability(monkeypatch):
     row = next(item for item in out["symbols"] if item["symbol"] == symbol)
     assert row["tradeable"] is True
     assert row["max_leverage"] == 50
-    assert row["min_notional"] == 5.0
+    # 体检门槛与引擎下单门槛一致：交易所下限 5 U × 默认 1.05 缓冲
+    from nanoquant.services.settings import get_risk
+
+    assert row["min_notional"] == pytest.approx(5.0 * get_risk().min_notional_buffer)
     assert out["tradeable_count"] >= 1
 
 

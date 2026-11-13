@@ -507,6 +507,7 @@ def refresh_health_from_evidence(limit: int = 500) -> dict[str, Any]:
             by_id = {int(x["id"]): x for x in updated}
 
             # 观察性对照反馈：注入组明显更差的逐条心法标记为 underperform（影响注入排序）
+            underperform: set[int] = set()
             try:
                 eff = effectiveness.evaluate(limit=limit)
                 control = eff.get("control") or {}
@@ -516,6 +517,7 @@ def refresh_health_from_evidence(limit: int = 500) -> dict[str, Any]:
                     if mid not in by_id or int(item.get("trades") or 0) < effectiveness.MIN_SAMPLE:
                         continue
                     if float(item.get("avg_pnl") or 0) < control_avg:
+                        underperform.add(mid)
                         for row in rows:
                             if row.id == mid:
                                 ev = dict(row.evidence or {})
@@ -537,6 +539,20 @@ def refresh_health_from_evidence(limit: int = 500) -> dict[str, Any]:
                 if (fresh.get("evidence") or {}).get("archived_reason"):
                     ev["archived_reason"] = fresh["evidence"]["archived_reason"]
                 row.evidence = ev
+
+            # 「负向心法自动降权」：实测显著弱于对照组的条目直接停用。
+            # 以前这个开关只存在设置页，心法再差也照样被注入到 AI 的提示词里。
+            disabled = 0
+            if cfg.auto_disable_negative and underperform:
+                for row in rows:
+                    if row.id in underperform and row.enabled:
+                        row.enabled = False
+                        row.updated_at = int(time.time())
+                        ev = dict(row.evidence or {})
+                        ev["disabled_reason"] = "实测弱于对照组 (auto_disable_negative)"
+                        row.evidence = ev
+                        changes.append({"id": row.id, "action": "disable", "reason": ev["disabled_reason"]})
+                        disabled += 1
             if changes:
                 vrow = s.get(EngineState, "mantra_version")
                 token = str(int(time.time() * 1000))
@@ -548,6 +564,7 @@ def refresh_health_from_evidence(limit: int = 500) -> dict[str, Any]:
             "status": "ok" if changes else "unchanged",
             "rescored": sum(1 for c in changes if c["action"] == "rescore"),
             "archived": sum(1 for c in changes if c["action"] == "archive"),
+            "disabled": sum(1 for c in changes if c["action"] == "disable"),
             "changes": changes[:50],
         }
     except Exception as exc:  # noqa: BLE001

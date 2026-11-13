@@ -162,13 +162,13 @@ def create_backup(
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
     raw = buffer.getvalue()
-    digest = hashlib.sha256(raw).hexdigest()
     suffix = ".zip.enc" if encrypt else ".zip"
     out_path = paths.BACKUPS / f"nanoquant-{safe_label}-{ts}{suffix}"
-    if encrypt:
-        out_path.write_bytes(_fernet().encrypt(raw))
-    else:
-        out_path.write_bytes(raw)
+    blob = _fernet().encrypt(raw) if encrypt else raw
+    out_path.write_bytes(blob)
+    # 摘要必须取**落盘字节**：以前算的是加密前的 zip，于是所有加密备份在列表里
+    # 都显示 sha256 校验失败（默认就是加密），把真正的文件损坏淹掉了。
+    digest = hashlib.sha256(blob).hexdigest()
 
     with session_scope() as s:
         job = BackupJob(
@@ -293,11 +293,27 @@ def restore(job_id: int, *, restore_settings: bool = True, restore_tables: bool 
     if not path.exists():
         return {"ok": False, "error": "备份文件已丢失"}
     raw = path.read_bytes()
+    # 完整性校验：坏包还原会把半截数据写进库，比不还原更糟。
+    # 先按落盘字节比；老版本存的是明文 zip 摘要，解密后再比一次（保持旧包可还原）。
+    disk_digest = hashlib.sha256(raw).hexdigest()
+    digest_ok = not job.sha256 or disk_digest == job.sha256
     if job.encrypted:
         try:
             raw = _fernet().decrypt(raw)
         except Exception as exc:  # noqa: BLE001
+            if not digest_ok:
+                return {
+                    "ok": False,
+                    "error": f"备份文件校验失败（sha256 不符，密文可能被截断或改动）: {path.name}",
+                }
             return {"ok": False, "error": f"解密失败: {exc}"}
+        if not digest_ok and hashlib.sha256(raw).hexdigest() == job.sha256:
+            digest_ok = True  # 旧版本备份：摘要算的是明文 zip
+    if not digest_ok:
+        return {
+            "ok": False,
+            "error": f"备份文件校验失败（sha256 不符，可能被截断或改动）: {path.name}",
+        }
 
     # 还原前自保
     create_backup(name=f"pre-restore-{job_id}", created_by="system")

@@ -306,21 +306,46 @@ def source_catalog() -> list[dict[str, Any]]:
     return out
 
 
+def _sentiment_threshold() -> float:
+    """「显著情绪」的分界值（`news.sentiment_threshold`）.
+
+    这个字段以前只存在于设置页；摘要与情绪面板都写死 0.15，
+    于是把阈值调到 0.5 也不会有任何变化。
+    """
+    try:
+        return max(0.0, min(1.0, float(get_news().sentiment_threshold)))
+    except Exception:  # noqa: BLE001
+        return 0.35
+
+
 def digest(limit: int = 8) -> list[dict[str, Any]]:
-    items = list_items(limit=limit)
+    """给 AI 的新闻摘要：显著情绪优先，其余按时间补足.
+
+    AI 每次只看到 6~8 条，把最能改变判断的（大额多空消息面）排前面，
+    比单纯按时间取最新更值钱。
+    """
+    thr = _sentiment_threshold()
+    items = list_items(limit=max(limit * 2, limit))
+    items.sort(key=lambda i: 0 if abs(i["sentiment"]) >= thr else 1)  # 稳定排序，组内仍按时间倒序
     return [
-        {"title": i["title"], "sentiment": i["sentiment"], "symbols": i["symbols"]}
-        for i in items
+        {
+            "title": i["title"],
+            "sentiment": i["sentiment"],
+            "symbols": i["symbols"],
+            "significant": abs(i["sentiment"]) >= thr,
+        }
+        for i in items[:limit]
     ]
 
 
 def overview() -> dict[str, Any]:
     now = int(time.time())
     since = now - 86400
+    thr = _sentiment_threshold()
     with session_scope() as s:
         rows = s.query(NewsItem).filter(NewsItem.ts >= since).all()
-        positive = sum(1 for r in rows if r.sentiment > 0.15)
-        negative = sum(1 for r in rows if r.sentiment < -0.15)
+        positive = sum(1 for r in rows if r.sentiment > thr)
+        negative = sum(1 for r in rows if r.sentiment < -thr)
         neutral = len(rows) - positive - negative
         avg = sum(r.sentiment for r in rows) / len(rows) if rows else 0.0
         by_source: dict[str, int] = {}
@@ -332,6 +357,7 @@ def overview() -> dict[str, Any]:
             "negative": negative,
             "neutral": neutral,
             "sentiment_index": round(avg, 4),
+            "sentiment_threshold": round(thr, 3),
             "by_source": by_source,
             "last_refresh": _LAST.get("ts", 0),
             "source_status": _LAST.get("status", {}),

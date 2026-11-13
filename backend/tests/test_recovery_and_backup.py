@@ -155,6 +155,39 @@ def test_backup_retention_prunes_old_files():
         assert Path(job.file_path).exists()
 
 
+def test_encrypted_backup_sha256_matches_file_on_disk():
+    """加密备份的摘要必须取落盘字节.
+
+    以前算的是加密前的 zip，于是**默认配置下每一个备份**在列表里都显示校验失败，
+    真的文件损坏反而分辨不出来。
+    """
+    job = backup_service.create_backup(
+        name="sha-check", settings_groups=["risk"], tables=[], encrypt=True, created_by="test"
+    )
+    listed = next(j for j in backup_service.list_jobs() if j["id"] == job["job_id"])
+
+    assert listed["encrypted"] is True
+    assert listed["sha256_ok"] is True
+
+
+def test_restore_refuses_tampered_backup():
+    """坏包还原会把半截数据写进库，必须在校验这一关就拒绝."""
+    job = backup_service.create_backup(
+        name="tamper", settings_groups=["risk"], tables=[], encrypt=True, created_by="test"
+    )
+    from pathlib import Path
+
+    path = Path(job["path"])
+    original = path.read_bytes()
+    path.write_bytes(original[:-8] + b"tampered")
+
+    result = backup_service.restore(job["job_id"], restore_settings=True, restore_tables=False)
+
+    assert result["ok"] is False
+    assert "校验失败" in result["error"]
+    path.write_bytes(original)
+
+
 def test_backup_restore_roundtrip():
     """备份 → 改坏配置 → 还原，值必须回到备份时刻."""
     from nanoquant.services.settings import get_group

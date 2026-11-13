@@ -194,7 +194,6 @@ class StrategySettings(BaseModel):
     #: 动能衰竭二次确认：量比 >= 1.0 说明放量还在推动极值，回归条件不成立。
     #: 开启后更保守（更少但更稳），默认关闭。
     mr_exhaustion_confirm: bool = False
-    min_signal_gap: float = Field(default=0.05, ge=0.0, le=1.0)
     #: 部分止盈: 浮盈达到 N 倍初始风险 (R) 时先平掉一部分, 剩余交给移动止损; 0=关闭
     partial_tp_at_r: float = Field(default=1.0, ge=0, le=10)
     #: 部分止盈比例 (0,1]; 0.5 = 平一半
@@ -370,7 +369,6 @@ class SecuritySettings(BaseModel):
 
 class SystemSettings(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    heartbeat_sec: int = Field(default=5, ge=1, le=60)
     event_retention_days: int = Field(default=14, ge=1, le=365)
     #: 信号审计保留天数: 过期先归档到 data/archive/ 再删除
     signal_retention_days: int = Field(default=14, ge=1, le=365)

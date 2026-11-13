@@ -5,8 +5,11 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
+import { useAppStore } from '../stores/app'
 import EChart from '../components/EChart.vue'
 import { EXIT_LABELS, numClass, timeStr } from '../utils/format'
+
+const app = useAppStore()
 
 interface TradeRow {
   side: string
@@ -70,6 +73,19 @@ async function loadPool() {
     if (!form.value.symbol && pool.value.length) form.value.symbol = pool.value[0].symbol
   } catch {
     pool.value = []
+  }
+}
+
+/** 费率默认跟随「参数配置 → 风控 → 吃单费率」，否则这个设置项对回测毫无影响 */
+async function syncCostsFromSettings() {
+  try {
+    if (!Object.keys(app.settings).length) await app.loadSettings()
+    const taker = Number(app.settings?.risk?.fee_rate_taker)
+    if (Number.isFinite(taker) && taker > 0) {
+      form.value.fee_bps = Math.round(taker * 10000 * 100) / 100
+    }
+  } catch {
+    /* 取不到设置就保留默认值，不阻断回测 */
   }
 }
 
@@ -253,7 +269,9 @@ function exportGrid() {
   downloadCsv(`backtest-grid-${form.value.symbol}-${form.value.interval}.csv`, [head, ...rows])
 }
 
-onMounted(loadPool)
+onMounted(async () => {
+  await Promise.all([loadPool(), syncCostsFromSettings()])
+})
 </script>
 
 <template>

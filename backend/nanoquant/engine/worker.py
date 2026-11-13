@@ -38,6 +38,7 @@ from ..services.settings import (
     RiskSettings,
     StrategySettings,
     get_ai,
+    get_data,
     get_engine,
     get_evolution,
     get_news,
@@ -67,6 +68,33 @@ log = get_logger("engine")
 MAX_TASKS = 2
 #: 同一标的、同一方向/拒绝原因的 flat 信号在这个窗口内合并成一行 (repeats 计数)
 SIGNAL_DEDUP_SEC = 60
+#: AI 议会一致度下限：低于该值视为分歧，`ai.require_agreement` 打开时直接观望
+AGREEMENT_MIN = 0.6
+
+
+def ai_agreement_reject(require_agreement: bool, agreement: float) -> str:
+    """AI 议会的分歧闸门：返回拒绝原因，空字符串表示放行.
+
+    单席位模式下 agreement 恒为 1.0，不受影响；多席位时低于 ``AGREEMENT_MIN`` 视为吵成一团。
+    """
+    if not require_agreement:
+        return ""
+    if agreement >= AGREEMENT_MIN:
+        return ""
+    return f"AI 议会分歧: 一致度 {agreement:.2f} < {AGREEMENT_MIN:.2f}，按观望处理"
+
+
+def _scan_bars() -> int:
+    """引擎扫描取的 K 线条数，跟随「参数配置 → 数据源 → K 线长度」.
+
+    下限 60：EMA21/RSI14/ATR14/布林标准分至少要这么多根才不至于开头全是空值。
+    上限 500：再多只是白吃权重，策略用不到。
+    """
+    try:
+        limit = int(get_data().kline_limit)
+    except Exception:  # noqa: BLE001  配置读失败不该阻断扫描
+        return 60
+    return max(60, min(500, limit))
 
 
 def _channel_of(parsed: dict[str, Any]) -> str:
@@ -93,6 +121,7 @@ class TradingEngine:
         self._last_liq_warn: dict[str, float] = {}
         #: 健康检查节流与 WS 告警去重
         self._last_health_check = 0.0
+        self._last_halt_flatten = 0.0
         self._last_ws_warn = 0.0
         self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
@@ -298,6 +327,8 @@ class TradingEngine:
             # 止损熔断、连亏冷静期等定时自愈状态绝不能持久化，否则到期后仍被判熔断。
             if gate.halt:
                 state.set("halted", state.normalize_halted(gate.halt))
+                if getattr(engine_cfg, "close_on_halt", False):
+                    await self._flatten_on_halt(gate.halt)
             state.set("cycle_timings", __import__("json").dumps(timings))
             return {"skipped": gate.reason}
         state.set("halted", "")
@@ -382,6 +413,34 @@ class TradingEngine:
                         row.exit_price = lp.mark_price or lp.entry_price
                         row.exit_reason = "venue_sync"
                 events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+
+    async def _flatten_on_halt(self, halt_reason: str) -> None:
+        """熔断即离场（`engine.close_on_halt`）.
+
+        以前这个开关只存在设置页：熔断只锁新开仓，已有仓位继续裸奔——
+        20x 的仓位在"停止开仓"之后仍会把账户打穿，等于只关了一半的闸。
+        同一原因 10 分钟内只执行一次，避免平仓失败时每轮反复重试。
+        """
+        if not halt_reason:
+            return
+        now = time.time()
+        if now - getattr(self, "_last_halt_flatten", 0.0) < 600:
+            return
+        self._last_halt_flatten = now
+        try:
+            result = await self.flatten_all(reason=f"熔断离场: {halt_reason[:80]}", stop_engine=False)
+        except Exception as exc:  # noqa: BLE001
+            events.record("error", "risk", f"熔断离场失败: {str(exc)[:180]}")
+            return
+        closed = result.get("closed") or []
+        failed = result.get("failed") or []
+        if closed or failed:
+            events.record(
+                "error" if failed else "warn",
+                "risk",
+                f"熔断离场：平掉 {len(closed)} 笔、失败 {len(failed)} 笔",
+                {"halt": halt_reason[:120], "closed": closed, "failed": failed},
+            )
 
     async def flatten_all(self, *, reason: str = "紧急全平", stop_engine: bool = True) -> dict[str, Any]:
         """紧急全平：停引擎 → 撤挂单 → 市价平掉当前环境全部仓位.
@@ -506,7 +565,7 @@ class TradingEngine:
 
         cfg = get_strategy()
         try:
-            candles = await binance_client.klines(info["symbol"], cfg.timeframe, limit=120)
+            candles = await binance_client.klines(info["symbol"], cfg.timeframe, limit=_scan_bars())
         except (BinanceError, NoCredentials) as exc:
             return {"ok": False, "reason": f"取 K 线失败: {str(exc)[:80]}"}
         atr = ta.atr(candles, cfg.atr_period)
@@ -843,7 +902,7 @@ class TradingEngine:
             if ticker is None:
                 continue
             try:
-                candles = await binance_client.klines(symbol, strat_cfg.timeframe, 60)
+                candles = await binance_client.klines(symbol, strat_cfg.timeframe, _scan_bars())
             except (BinanceError, NoCredentials) as exc:
                 log.warning("%s K线取数失败: %s", symbol, str(exc)[:120])
                 continue
@@ -1872,6 +1931,13 @@ class TradingEngine:
             if not outcome.ok:
                 self._update_signal_reject(signal_id, f"AI 不可用({outcome.error[:80]}), 按 fail-closed 跳过")
                 return
+            if ai_cfg.require_agreement:
+                # 「AI 议会」多数票权重不足时不开仓：这个开关以前只存在设置页，没有任何代码读它，
+                # 结果是三个席位吵成一团也会照着加权后的方向下单。
+                blocked = ai_agreement_reject(True, outcome.agreement)
+                if blocked:
+                    self._update_signal_reject(signal_id, blocked)
+                    return
             if d.action == "hold":
                 self._update_signal_reject(signal_id, f"AI 否决: {d.reason[:150]}")
                 return

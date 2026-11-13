@@ -11,7 +11,7 @@ from typing import Any
 
 from ..ai.client import providers_available
 from ..db import session_scope
-from ..exchange.broker import estimate_qty, get_broker
+from ..exchange.broker import estimate_qty, get_broker, min_notional_buffer
 from ..exchange.client import BinanceError, NoCredentials
 from ..exchange.client import client as binance_client
 from ..logging_setup import get_logger
@@ -221,7 +221,9 @@ async def evaluate() -> dict[str, Any]:
             # 账户接口不可用时不要把"可用 0"误判成余额不足
             available=available if account else None,
         )
-        min_notional = filters.effective_min_notional(ticker.last)
+        # 引擎按「交易所下限 × 缓冲」下单，体检必须用同一个门槛，
+        # 否则面板说"够开"、引擎却因为差几分钱拒绝，用户只能看到莫名奇妙的跳过。
+        min_notional = filters.effective_min_notional(ticker.last) * min_notional_buffer(risk_cfg)
         symbols.append(
             {
                 "symbol": symbol,

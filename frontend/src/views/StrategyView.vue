@@ -69,7 +69,7 @@ const BASIC_FIELDS: Record<string, string[]> = {
   evolution: ['enabled', 'max_injected', 'ttl_days', 'min_lesson_sample'],
   backup: ['retention', 'encrypt', 'auto_daily'],
   security: ['require_login', 'session_ttl_hours', 'login_fail_limit'],
-  system: ['log_level', 'heartbeat_sec', 'event_retention_days'],
+  system: ['log_level', 'event_retention_days'],
   public: ['site_enabled', 'show_engine_status', 'show_mantras', 'show_performance'],
 }
 
@@ -85,7 +85,6 @@ const PLAIN_HINTS: Record<string, string> = {
   daily_loss_limit_pct: '当天亏到这个比例就停止开新仓',
   max_drawdown_pct: '权益从最高点回撤到这个比例就停机',
   entry_threshold: '信号分超过多少才开仓；越高越保守',
-  min_signal_gap: '多空分数太接近时不开仓，避免来回打脸',
   volume_ratio_min: '成交量低于该倍数时不参与',
   atr_pct_min: '波动太小（赚不回手续费）时不做',
   atr_pct_max: '波动太大（容易被扫止损）时不做',
@@ -217,7 +216,6 @@ const BASE_META: Record<string, FieldMeta> = {
   atr_period: { label: 'ATR 周期' },
   entry_threshold: { label: '开仓信号阈值', hint: '综合分绝对值高于该值才考虑开仓' },
   exit_threshold: { label: '反转平仓阈值' },
-  min_signal_gap: { label: '信号分歧缓冲', hint: '多空分数接近时直接忽略，避免来回打脸' },
   volume_ratio_min: { label: '最小量比', hint: '低于该值的信号被过滤' },
   atr_pct_min: { label: 'ATR 下限', unit: '%', hint: '波动太小不足以覆盖手续费' },
   atr_pct_max: { label: 'ATR 上限', unit: '%', hint: '波动过大不参与' },
@@ -289,7 +287,6 @@ const BASE_META: Record<string, FieldMeta> = {
       ['ERROR', 'ERROR'],
     ],
   },
-  heartbeat_sec: { label: '心跳间隔', unit: '秒' },
   event_retention_days: { label: '事件保留', unit: '天' },
   signal_retention_days: { label: '信号保留', unit: '天', hint: '过期先归档到 data/archive/ 再删除' },
   equity_retention_days: { label: '权益曲线保留', unit: '天' },
@@ -390,7 +387,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
       hint: 'ADX 低于下限不放行：短线趋势跟随的亏损主要来自震荡市假突破',
       fields: ['adx_filter', 'adx_period', 'adx_min'],
     },
-    { title: '开仓过滤', hint: '任一项不达标都不开仓', fields: ['entry_threshold', 'exit_threshold', 'min_signal_gap', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume'] },
+    { title: '开仓过滤', hint: '任一项不达标都不开仓', fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume'] },
     {
       title: '出场规则',
       hint: 'min_risk_reward 是止盈/止损的硬底线：2.0 意味着只需 33% 胜率即可正期望；1.1 则要 48% 以上，扣手续费基本是负期望',
@@ -431,7 +428,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
   security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit'] }],
   system: [
-    { title: '运行与日志', fields: ['log_level', 'heartbeat_sec', 'ui_refresh_sec', 'timezone_offset'] },
+    { title: '运行与日志', fields: ['log_level', 'ui_refresh_sec', 'timezone_offset'] },
     { title: '数据保留', hint: '过期数据先写 gzip 归档到 data/archive/ 再按批删除', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days', 'risk_disclaimer_accepted'] },
     {
       title: '告警推送',

@@ -19,7 +19,7 @@ from ..services.exec_metrics import exec_metrics
 from ..services.settings import get_engine, get_risk, normalize_mode
 from . import client as binance_client
 from .client import STAGE_SINK, BinanceError, NoCredentials, UncertainSubmission
-from .precision import SymbolFilters, floor_to_step
+from .precision import SymbolFilters, ceil_to_step, floor_to_step
 
 log = get_logger("broker")
 
@@ -62,6 +62,23 @@ def _persist_entry(order_fields: dict[str, Any], position_fields: dict[str, Any]
 
 #: 正在平仓的仓位 id (互斥闸门, 写库完成后释放)
 _CLOSING: set[int] = set()
+
+
+def _entry_fee_rate(risk_cfg: Any) -> float:
+    """入场腿费率：挂单入场（limit_post_only / GTX）用 maker，市价入场用 taker.
+
+    以前无论怎么入场都按 taker 扣，`risk.fee_rate_maker` 这个字段没有任何代码读，
+    挂单策略的成本被系统性高估。按当前下单方式取近似值：
+    同一笔仓位的入场方式在持有期间不会变，配置改了也只影响之后的成交。
+    """
+    taker = float(getattr(risk_cfg, "fee_rate_taker", 0.0005) or 0.0)
+    try:
+        order_type = get_engine().order_type
+    except Exception:  # noqa: BLE001
+        return taker
+    if order_type == "limit_post_only":
+        return float(getattr(risk_cfg, "fee_rate_maker", taker) or taker)
+    return taker
 
 
 def _persist_close(payload: dict[str, Any], position_id: int) -> None:
@@ -110,7 +127,7 @@ def _persist_close(payload: dict[str, Any], position_id: int) -> None:
                 row.closed_at = closed_at
                 row.exit_price = avg
                 row.exit_reason = payload["reason"]
-                entry_fee = qty_before * row.entry_price * risk.fee_rate_taker
+                entry_fee = qty_before * row.entry_price * _entry_fee_rate(risk)
                 trade = TradeRecord(
                     **base,
                     qty=qty_before,
@@ -132,7 +149,7 @@ def _persist_close(payload: dict[str, Any], position_id: int) -> None:
                 # 否则它的盈亏只落在 positions.realized_pnl 里, 复盘统计会漏掉
                 row.qty = qty_before - close_qty
                 margin_part = (row.margin or 0) * close_qty / max(qty_before, 1e-12)
-                entry_fee = close_qty * row.entry_price * risk.fee_rate_taker
+                entry_fee = close_qty * row.entry_price * _entry_fee_rate(risk)
                 s.add(
                     TradeRecord(
                         **base,
@@ -1017,6 +1034,51 @@ def precision_hint(filters: SymbolFilters | None, qty: float) -> str:
     )
 
 
+#: 为了跨过最小名义额缓冲，允许对风险预算的最大放大倍数
+MAX_BUFFER_OVERSHOOT = 1.10
+
+
+def min_notional_buffer(risk_cfg: Any) -> float:
+    """交易所最小名义额的缓冲倍数（`risk.min_notional_buffer`，默认 1.05x）.
+
+    卡着下限算出来的量，在"计算 → 送达交易所"这几百毫秒里只要价格轻微不利，
+    名义额就会跌破下限，被 -1013 拒单。这个字段以前只存在于设置页，没有任何代码读它。
+    """
+    try:
+        return max(1.0, min(3.0, float(getattr(risk_cfg, "min_notional_buffer", 1.0) or 1.0)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _buffer_note(buffer: float) -> str:
+    """报错里说明"这个下限已经加过缓冲"——否则用户会拿交易所官网的下限来对账."""
+    return f"（已含 {buffer:g}x 最小额缓冲）" if buffer > 1.0 else ""
+
+
+def _bump_to_buffered_min(
+    qty: float,
+    notional: float,
+    min_qty_buffered: float,
+    price: float,
+    available: float | None,
+    affordable_notional: float,
+) -> float:
+    """下取整把量压到缓冲门槛以下时，抬回缓冲后的最小量.
+
+    只在两件事都成立时抬：保证金够（不会放大成买不起的单），
+    且缓冲要求没有远超风险预算（允许 10% 以内的轻微放大——缓冲本来就是买"不被打回"的保险）。
+    否则保持原值，让调用方走"资金不足"的拒绝路径。
+    """
+    if min_qty_buffered <= 0 or price <= 0 or qty >= min_qty_buffered - 1e-12:
+        return qty
+    target = min_qty_buffered * price
+    if target > notional * MAX_BUFFER_OVERSHOOT:
+        return qty
+    if available is not None and affordable_notional + 1e-9 < target:
+        return qty
+    return min_qty_buffered
+
+
 def estimate_qty(
     equity: float,
     price: float,
@@ -1047,27 +1109,33 @@ def estimate_qty(
         affordable = max(0.0, float(available)) * MARGIN_SAFETY * leverage
         notional = min(notional, affordable)
 
+    # 最小名义额缓冲: 下单到成交之间价格会动，卡着交易所下限算出来的量
+    # 经常在送达时跌破下限被 -1013 拒绝。按配置倍数抬高门槛（默认 1.05x）。
+    buffer = min_notional_buffer(risk_cfg)
+    need = filters.effective_min_notional(price) * buffer
     qty = floor_to_step(notional / price, filters.qty_step)
     min_qty = filters.effective_min_qty(price)
-    if qty <= 0 or qty < min_qty - 1e-12:
-        need = filters.effective_min_notional(price)
+    min_qty_buffered = max(min_qty, ceil_to_step(need / price, filters.qty_step))
+    qty = _bump_to_buffered_min(qty, notional, min_qty_buffered, price, available, affordable)
+    # 门槛用**缓冲后**的量：宁可拒绝，也不去贴着交易所下限下单
+    if qty <= 0 or qty < min_qty_buffered - 1e-12:
         if available is not None and affordable < need:
             return (
                 0.0,
                 f"可用保证金不足: 可用 {float(available):.2f} USDT, "
                 f"按 {leverage:g}x 最多可开 {affordable:.2f} USDT 名义额, "
-                f"但该标的最小名义额约 {need:.2f} USDT; "
+                f"但该标的最小名义额约 {need:.2f} USDT"
+                f"（含 {buffer:g}x 缓冲）; "
                 f"请平掉已有仓位、提高杠杆或降低单仓保证金占比",
             )
         return (
             0.0,
             f"可分配名义额 {notional:.4f} USDT 不足该标的最小可下单量 "
-            f"(需约 {need:.2f} USDT, 最小数量 {min_qty} @ {price:.6g}); "
+            f"(需约 {need:.2f} USDT{_buffer_note(buffer)}, 最小数量 {min_qty_buffered} @ {price:.6g}); "
             f"可提高保证金比例/杠杆或改用更小面值标的",
         )
     ok, why = filters.validate(qty, price)
     if not ok:
-        need = filters.effective_min_notional(price)
         return 0.0, f"{why} (该标的有效最小名义额约 {need:.2f} USDT)"
     return qty, "ok"
 
@@ -1124,13 +1192,19 @@ def qty_from_margin_pct(
 
     qty = floor_to_step(notional / price, filters.qty_step)
     min_qty = filters.effective_min_qty(price)
-    if qty <= 0 or qty < min_qty - 1e-12:
-        need = filters.effective_min_notional(price)
+    buffer = min_notional_buffer(get_risk())
+    need = filters.effective_min_notional(price) * buffer
+    min_qty_buffered = max(min_qty, ceil_to_step(need / price, filters.qty_step))
+    qty = _bump_to_buffered_min(
+        qty, notional, min_qty_buffered, price, effective_available, notional
+    )
+    if qty <= 0 or qty < min_qty_buffered - 1e-12:
         if usable_margin < target_margin - 1e-9:
             info["note"] = (
                 f"可用保证金不足: 可用 {effective_available:.2f} USDT, "
                 f"按 {leverage:g}x 最多 {notional:.2f} USDT 名义额, "
-                f"但该标的最小名义额约 {need:.2f} USDT; 请平掉已有仓位或提高杠杆"
+                f"但该标的最小名义额约 {need:.2f} USDT（含 {buffer:g}x 缓冲）; "
+                f"请平掉已有仓位或提高杠杆"
             )
         else:
             info["note"] = (
@@ -1142,7 +1216,6 @@ def qty_from_margin_pct(
 
     ok, why = filters.validate(qty, price)
     if not ok:
-        need = filters.effective_min_notional(price)
         info["note"] = f"{why} (该标的有效最小名义额约 {need:.2f} USDT)"
         return 0.0, info
 

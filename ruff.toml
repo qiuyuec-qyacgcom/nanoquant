@@ -1,0 +1,16 @@
+# 仓库根 lint 配置：scripts/ 与 rust/ 旁边的 Python 都用这一份
+#
+# 背景：backend/ruff.toml 只作用于 backend/ 目录。脚本目录没有配置时走 ruff 的默认规则，
+# 于是 `ruff check .` 会报一堆 noqa 失效(I001/RUF100/UP009)这类风格噪声，
+# 真正的"未定义名/语法错"反而被淹没。这里把根目录也统一成「只开几乎一定是错误的规则」。
+
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["F", "E9"]
+ignore = ["F841"]
+
+[lint.per-file-ignores]
+# 一次性脚本常用 import 做副作用或在函数内延迟导入
+"scripts/*" = ["F401"]

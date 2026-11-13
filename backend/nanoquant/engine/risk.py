@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..db import session_scope
-from ..exchange.broker import Account, estimate_qty
+from ..exchange.broker import Account, estimate_qty, min_notional_buffer
 from ..exchange.precision import SymbolFilters
 from ..logging_setup import get_logger
 from ..models import PositionRecord, TradeRecord
@@ -317,7 +317,10 @@ def plan_position(
         "available": round(effective_available, 6),
         "risk_scale": round(risk_scale, 3),
         "note": note,
-        "effective_min_notional": filters.effective_min_notional(price),
+        # 引擎真正要求的门槛 = 交易所下限 × 缓冲（否则体检说"能开"、引擎却拒绝）
+        "effective_min_notional": round(
+            filters.effective_min_notional(price) * min_notional_buffer(cfg_risk), 8
+        ),
         "min_qty": filters.effective_min_qty(price),
     }
     return qty, info
