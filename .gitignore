@@ -28,3 +28,8 @@ Thumbs.db
 
 # Rust
 rust/**/target/
+
+# 覆盖率产物（pytest-cov）
+.coverage
+.coverage.*
+htmlcov/
