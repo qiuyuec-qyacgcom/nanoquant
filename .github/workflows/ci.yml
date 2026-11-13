@@ -28,13 +28,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Byte-compile
         run: python -m compileall -q nanoquant
 
-      - name: Tests (contract + api)
-        run: python -m pytest tests -q
+      - name: Tests + coverage
+        # 门槛只防"大幅倒退"（当前基线 56%，设 52 留跨平台余量）；
+        # term-missing 会把没覆盖到的行号打出来，便于针对性补测。
+        run: python -m pytest tests -q --cov=nanoquant --cov-report=term-missing --cov-fail-under=52
 
   rust:
     name: rust (sidecar)

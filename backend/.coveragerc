@@ -1,0 +1,19 @@
+[run]
+branch = False
+source = nanoquant
+# 只统计产品代码：测试、脚本、入口包装不参与分母
+omit =
+    */tests/*
+    */scripts/*
+    */__main__.py
+
+[report]
+# 覆盖率不是越高越好，但不能大幅倒退：CI 用 --cov-fail-under 兜住基线。
+# 当前基线 56%，门槛设 52 是给跨平台（Linux CI vs Windows 本地）留的余量。
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+show_missing = True
+skip_covered = True
