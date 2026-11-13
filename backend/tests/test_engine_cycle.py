@@ -17,7 +17,7 @@ from nanoquant.engine import risk as risk_mod
 from nanoquant.engine import worker as worker_mod
 from nanoquant.models import EngineEvent, PositionRecord
 from nanoquant.services import state
-from nanoquant.services.settings import update_group
+from nanoquant.services.settings import get_engine, update_group
 
 MODE = "demo"
 
@@ -148,14 +148,14 @@ def test_cycle_flattens_positions_on_halt_when_enabled(monkeypatch, clean_state)
         "global_gates",
         lambda account, ec, rc: risk_mod.GateDecision(False, "日亏超限", halt="日内亏损 -30% 超过上限 25%"),
     )
-    old = update_group("engine", {"close_on_halt": True})
+    prev = get_engine().close_on_halt
+    update_group("engine", {"close_on_halt": True})
     try:
         asyncio.run(eng.cycle())
     finally:
-        update_group("engine", {"close_on_halt": False})
+        update_group("engine", {"close_on_halt": prev})
 
     assert flattened == ["日内亏损 -30% 超过上限 25%"]
-    update_group("engine", {"close_on_halt": old["close_on_halt"]})
 
 
 def test_cycle_happy_path_clears_halt(monkeypatch, clean_state):

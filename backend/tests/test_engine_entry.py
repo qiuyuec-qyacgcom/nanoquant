@@ -95,10 +95,11 @@ def _run(eng, broker, *, available: float = 100.0):
 
 @pytest.fixture(autouse=True)
 def _no_ai():
-    old = update_group("ai", {"enabled": False})
-    yield
+    """默认关闭 AI，避免用例之间互相影响；退出时恢复原值（update_group 返回的是新值，不能当旧值用）."""
+    prev = get_ai().enabled
     update_group("ai", {"enabled": False})
-    update_group("ai", old)
+    yield
+    update_group("ai", {"enabled": prev})
 
 
 def test_missing_symbol_filters_is_rejected(monkeypatch):
@@ -115,7 +116,8 @@ def test_missing_symbol_filters_is_rejected(monkeypatch):
 def test_wide_spread_is_rejected(monkeypatch):
     """超短线利润只有千分之几，点差 30bps 做一次就白干."""
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old = update_group("strategy", {"max_spread_bps": 10.0})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 10.0})
 
     async def _books(_symbols):
         return {SYMBOL: (99.9, 100.2)}  # 30bps
@@ -126,7 +128,7 @@ def test_wide_spread_is_rejected(monkeypatch):
     try:
         sid = _run(eng, broker)
     finally:
-        update_group("strategy", {"max_spread_bps": old["max_spread_bps"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
 
     assert "点差" in _reject_reason(sid)
     assert not broker.calls
@@ -134,7 +136,8 @@ def test_wide_spread_is_rejected(monkeypatch):
 
 def test_ai_hold_vetoes_entry(monkeypatch):
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old = update_group("strategy", {"max_spread_bps": 0.0})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 0.0})
     update_group("ai", {"enabled": True})
     monkeypatch.setattr(worker_mod, "providers_available", lambda: 1, raising=False)
     monkeypatch.setattr("nanoquant.ai.client.providers_available", lambda: 1)
@@ -152,7 +155,7 @@ def test_ai_hold_vetoes_entry(monkeypatch):
     try:
         sid = _run(eng, broker)
     finally:
-        update_group("strategy", {"max_spread_bps": old["max_spread_bps"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
 
     assert "AI 否决" in _reject_reason(sid)
     assert not broker.calls
@@ -161,8 +164,10 @@ def test_ai_hold_vetoes_entry(monkeypatch):
 def test_ai_low_agreement_vetoes_entry(monkeypatch):
     """`ai.require_agreement` 打开后，议会分歧必须真的拦住下单."""
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old_strategy = update_group("strategy", {"max_spread_bps": 0.0})
-    old_ai = update_group("ai", {"enabled": True, "require_agreement": True})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 0.0})
+    prev_ai = get_ai()
+    update_group("ai", {"enabled": True, "require_agreement": True})
     monkeypatch.setattr("nanoquant.ai.client.providers_available", lambda: 1)
 
     async def _decide(_ctx):
@@ -178,8 +183,10 @@ def test_ai_low_agreement_vetoes_entry(monkeypatch):
     try:
         sid = _run(eng, broker)
     finally:
-        update_group("strategy", {"max_spread_bps": old_strategy["max_spread_bps"]})
-        update_group("ai", {"require_agreement": old_ai["require_agreement"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
+        update_group(
+            "ai", {"enabled": prev_ai.enabled, "require_agreement": prev_ai.require_agreement}
+        )
 
     assert "议会分歧" in _reject_reason(sid)
     assert not broker.calls
@@ -187,7 +194,8 @@ def test_ai_low_agreement_vetoes_entry(monkeypatch):
 
 def test_insufficient_capital_is_rejected(monkeypatch):
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old = update_group("strategy", {"max_spread_bps": 0.0})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 0.0})
     eng = worker_mod.TradingEngine()
     broker = _Broker()
     eng._margin.begin_cycle(0.3)
@@ -201,7 +209,7 @@ def test_insufficient_capital_is_rejected(monkeypatch):
             )
         )
     finally:
-        update_group("strategy", {"max_spread_bps": old["max_spread_bps"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
 
     assert "仓位不足" in _reject_reason(signal_id)
     assert not broker.calls
@@ -209,13 +217,14 @@ def test_insufficient_capital_is_rejected(monkeypatch):
 
 def test_successful_entry_passes_stop_and_target(monkeypatch):
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old = update_group("strategy", {"max_spread_bps": 0.0})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 0.0})
     eng = worker_mod.TradingEngine()
     broker = _Broker()
     try:
         sid = _run(eng, broker)
     finally:
-        update_group("strategy", {"max_spread_bps": old["max_spread_bps"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
 
     assert _reject_reason(sid) == ""
     assert len(broker.calls) == 1
@@ -230,13 +239,14 @@ def test_successful_entry_passes_stop_and_target(monkeypatch):
 def test_failed_exchange_order_releases_margin(monkeypatch):
     """下单失败必须把预留额度还回去，否则后面几轮都开不出仓."""
     monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
-    old = update_group("strategy", {"max_spread_bps": 0.0})
+    prev_spread = get_strategy().max_spread_bps
+    update_group("strategy", {"max_spread_bps": 0.0})
     eng = worker_mod.TradingEngine()
     broker = _Broker(ok=False, message="-2019 保证金不足")
     try:
         sid = _run(eng, broker)
     finally:
-        update_group("strategy", {"max_spread_bps": old["max_spread_bps"]})
+        update_group("strategy", {"max_spread_bps": prev_spread})
 
     assert "保证金" in _reject_reason(sid)
     assert eng._margin.remaining >= 99.0, "失败单占用的额度没有归还"

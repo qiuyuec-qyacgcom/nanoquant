@@ -85,21 +85,27 @@ def test_agreement_gate_blocks_split_votes():
 
 # --------------------------------------------------------------- 入场腿费率
 def test_entry_fee_rate_follows_order_type():
+    from nanoquant.services.settings import get_engine
+
     risk = SimpleNamespace(fee_rate_taker=0.0005, fee_rate_maker=0.0002)
-    old = update_group("engine", {"order_type": "market"})
+    prev = get_engine().order_type
     try:
+        update_group("engine", {"order_type": "market"})
         assert broker._entry_fee_rate(risk) == pytest.approx(0.0005)  # noqa: SLF001
         update_group("engine", {"order_type": "limit_post_only"})
         assert broker._entry_fee_rate(risk) == pytest.approx(0.0002)  # noqa: SLF001
     finally:
-        update_group("engine", {"order_type": old["order_type"]})
+        update_group("engine", {"order_type": prev})
 
 
 # ------------------------------------------------------------------ 取数根数
 def test_scan_bars_follows_kline_limit():
     from nanoquant.engine.worker import _scan_bars
 
-    old = update_group("data", {"kline_limit": 200})
+    from nanoquant.services.settings import get_data
+
+    prev = get_data().kline_limit
+    update_group("data", {"kline_limit": 200})
     try:
         assert _scan_bars() == 200
         update_group("data", {"kline_limit": 50})
@@ -107,7 +113,7 @@ def test_scan_bars_follows_kline_limit():
         update_group("data", {"kline_limit": 1500})
         assert _scan_bars() == 500
     finally:
-        update_group("data", {"kline_limit": old["kline_limit"]})
+        update_group("data", {"kline_limit": prev})
 
 
 # ---------------------------------------------------------------- 情绪阈值
@@ -122,7 +128,10 @@ def _news(sentiment: float, title: str) -> NewsItem:
 def test_digest_puts_significant_news_first():
     from nanoquant.news import service as news_service
 
-    old = update_group("news", {"sentiment_threshold": 0.6})
+    from nanoquant.services.settings import get_news
+
+    prev = get_news().sentiment_threshold
+    update_group("news", {"sentiment_threshold": 0.6})
     try:
         with session_scope() as s:
             s.add(_news(0.02, "DIGEST-平淡"))
@@ -135,7 +144,7 @@ def test_digest_puts_significant_news_first():
         assert items[0]["significant"] is True
         assert any(i["significant"] is False for i in items), "低于阈值的仍要保留，只是排后面"
     finally:
-        update_group("news", {"sentiment_threshold": old["sentiment_threshold"]})
+        update_group("news", {"sentiment_threshold": prev})
 
 
 def test_overview_threshold_changes_counts():
@@ -143,13 +152,16 @@ def test_overview_threshold_changes_counts():
 
     with session_scope() as s:
         s.add(_news(0.2, "OVW-轻微正面"))
-    old = update_group("news", {"sentiment_threshold": 0.1})
+    from nanoquant.services.settings import get_news
+
+    prev = get_news().sentiment_threshold
+    update_group("news", {"sentiment_threshold": 0.1})
     try:
         loose = news_service.overview()
         update_group("news", {"sentiment_threshold": 0.9})
         tight = news_service.overview()
     finally:
-        update_group("news", {"sentiment_threshold": old["sentiment_threshold"]})
+        update_group("news", {"sentiment_threshold": prev})
 
     assert tight["positive"] < loose["positive"]
     assert tight["sentiment_threshold"] == pytest.approx(0.9)
@@ -185,6 +197,9 @@ def test_auto_disable_negative_mantra(monkeypatch):
     from nanoquant.evolution import effectiveness, health, mantra
     from nanoquant.models import Mantra
 
+    from nanoquant.services.settings import get_evolution
+
+    prev_auto = get_evolution().auto_disable_negative
     update_group("evolution", {"auto_disable_negative": True})
     with session_scope() as s:
         row = Mantra(title="DEADSWITCH-心法", rule="追高不加仓", category="risk", confidence=0.5)
@@ -214,7 +229,7 @@ def test_auto_disable_negative_mantra(monkeypatch):
         assert row.enabled is False
         assert "auto_disable_negative" in (row.evidence or {}).get("disabled_reason", "")
         s.delete(row)
-    update_group("evolution", {"auto_disable_negative": False})
+    update_group("evolution", {"auto_disable_negative": prev_auto})
 
 
 # ------------------------------------------------- 防回归：不允许再出现死开关
