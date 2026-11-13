@@ -14,7 +14,19 @@ router = APIRouter(tags=["backup"])
 
 @router.get("/backup/options")
 def options(user: str = Depends(current_user)) -> dict:
-    return {**backup_service.scope_options(), "usage": backup_service.disk_usage()}
+    cfg = backup_service.get_backup()
+    auto = {
+        "enabled": cfg.auto_daily,
+        "last_run_ts": cfg.last_run_ts,
+        "interval_sec": backup_service.AUTO_INTERVAL_SEC,
+        # 从未跑过时给出"下一次检查就会执行"，而不是 0（前端要能区分"没开"和"还没到点"）
+        "next_run_ts": (cfg.last_run_ts + backup_service.AUTO_INTERVAL_SEC) if cfg.last_run_ts else 0,
+    }
+    return {
+        **backup_service.scope_options(),
+        "usage": backup_service.disk_usage(),
+        "auto": auto,
+    }
 
 
 @router.post("/backup/create")

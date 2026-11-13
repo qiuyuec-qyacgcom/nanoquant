@@ -130,6 +130,17 @@ onMounted(load)
         <div class="kpi-foot">Fernet 对称加密, 主密钥在本机 data/.master_key</div>
       </div>
       <div class="kpi">
+        <div class="kpi-label">每日自动备份</div>
+        <div class="kpi-value" :style="{ color: options?.auto?.enabled ? 'var(--up)' : 'var(--muted)' }">
+          {{ options?.auto?.enabled ? '开启' : '关闭' }}
+        </div>
+        <div class="kpi-foot">
+          <template v-if="!options?.auto?.enabled">到「参数配置 → 备份策略」打开</template>
+          <template v-else-if="!options?.auto?.last_run_ts">尚未执行，下一轮检查（≤15 分钟）自动跑</template>
+          <template v-else>上次 {{ timeStr(options.auto.last_run_ts, false) }}</template>
+        </div>
+      </div>
+      <div class="kpi">
         <div class="kpi-label">可用空间</div>
         <div class="kpi-value">{{ ((usage?.free_bytes || 0) / 1024 ** 3).toFixed(1) }} GB</div>
         <div class="kpi-foot">数据盘剩余</div>

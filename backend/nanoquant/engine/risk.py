@@ -62,7 +62,13 @@ def trading_window_open(cfg: EngineSettings) -> tuple[bool, str]:
 
 
 def ensure_day_anchor(equity: float, cfg: EngineSettings) -> float:
-    """按交易时区做日切, 返回当日初始权益."""
+    """按交易时区做日切, 返回当日初始权益.
+
+    日切同时解除「日亏」类熔断: 基准已被重置, 那条判定不再成立。
+    不解除的话, 引擎会被昨天的亏损永久锁死——``global_gates`` 读到 halted 就直接返回,
+    根本走不到日亏判定, 于是"次日自动恢复"永远等不到。
+    「最大回撤」不在此列: 它是累计亏损事实, 必须人工确认后才重置峰值。
+    """
     today = _now_local(cfg).strftime("%Y-%m-%d")
     anchor_day = state.get("day_anchor")
     if anchor_day != today or not state.get("day_start_equity"):
@@ -73,6 +79,10 @@ def ensure_day_anchor(equity: float, cfg: EngineSettings) -> float:
                 "equity_peak": f"{max(equity, state.get_float('equity_peak', equity)):.8f}",
             }
         )
+        stale = state.normalize_halted(state.get("halted"))
+        if "日内亏损" in stale:
+            state.set("halted", "")
+            log.warning("日切 %s: 解除日亏熔断 (%s)", today, stale)
         return equity
     return state.get_float("day_start_equity", equity)
 
@@ -177,10 +187,15 @@ def global_gates(account: Account, cfg_engine: EngineSettings, cfg_risk: RiskSet
     if peak > 0:
         dd = (peak - account.equity) / peak * 100
         if dd >= cfg_risk.max_drawdown_pct:
+            # 回撤是累计事实, 不会日切自愈: 必须人工确认"以当前权益为新峰值"。
+            # 把恢复动作写进原因里, 否则面板只显示"已熔断", 操作员不知道该做什么。
             return GateDecision(
                 False,
                 f"触发最大回撤限制 {dd:.2f}% (限 {cfg_risk.max_drawdown_pct}%)",
-                halt=f"最大回撤 {dd:.2f}% 超过上限 {cfg_risk.max_drawdown_pct}%",
+                halt=(
+                    f"最大回撤 {dd:.2f}% 超过上限 {cfg_risk.max_drawdown_pct}%"
+                    f"（需人工确认恢复：参数页「重置日亏与回撤基准」）"
+                ),
             )
     losses = state.get_int("consecutive_losses", 0)
     if losses >= cfg_risk.consecutive_loss_limit:

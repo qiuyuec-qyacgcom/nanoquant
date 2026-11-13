@@ -435,19 +435,6 @@ class Cooldown(Base):
     kind: Mapped[str] = mapped_column(String(24), default="symbol")
 
 
-class PendingOrder(Base):
-    """下单前落盘的幂等台账: 结果未知时靠查询收敛, 不盲目重发."""
-
-    __tablename__ = "pending_orders"
-    client_order_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(32), index=True)
-    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    state: Mapped[str] = mapped_column(String(24), default="submitting", index=True)
-    created_at: Mapped[int] = mapped_column(Integer, default=now_ts, index=True)
-    updated_at: Mapped[int] = mapped_column(Integer, default=now_ts, onupdate=now_ts)
-    message: Mapped[str] = mapped_column(String(255), default="")
-
-
 Index("ix_positions_open", PositionRecord.status, PositionRecord.symbol)
 Index("ix_trades_mode_closed", TradeRecord.mode, TradeRecord.closed_at)
 Index("ix_news_ts_source", NewsItem.ts, NewsItem.source)

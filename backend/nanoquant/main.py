@@ -66,12 +66,17 @@ async def lifespan(app: FastAPI):
     from .services import runtime_probe
 
     runtime_probe.start()
+    # 每日自动备份：配置里的 auto_daily 之前没有任何执行者，backups/ 永远是空的
+    from .services import backup as backup_service
+
+    backup_service.start_auto()
     probe_task = asyncio.create_task(_probe())
     await engine.start()
     try:
         yield
     finally:
         runtime_probe.stop()
+        backup_service.stop_auto()
         probe_task.cancel()
         await engine.stop()
         # 停机前把队列里的订单写完, 不让已 ack 的成交丢在内存里

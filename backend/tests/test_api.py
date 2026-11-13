@@ -648,8 +648,13 @@ def test_engine_reset_anchors_aligns_stale_baseline(client, monkeypatch):
     assert state.get("halted") == ""
 
 
-def test_engine_reset_anchors_keeps_unrelated_halt(client, monkeypatch):
-    """回撤/连亏类熔断是真实风控状态，重置基准时不该顺手解除."""
+def test_engine_reset_anchors_clears_drawdown_halt(client, monkeypatch):
+    """重置峰值必须同时解除回撤熔断，否则"重置了但引擎还是不动".
+
+    判定依据（equity_peak）已经被改成当前权益，回撤归零；留着那条 halted 字符串，
+    ``global_gates`` 会在第一步就返回"引擎已熔断"，形成一个没有任何出口的死锁
+    ——调用方只能去改数据库。
+    """
     from types import SimpleNamespace
 
     from nanoquant.api.routes import trade as route
@@ -660,12 +665,32 @@ def test_engine_reset_anchors_keeps_unrelated_halt(client, monkeypatch):
             return SimpleNamespace(equity=100.0)
 
     monkeypatch.setattr(route, "get_broker", lambda mode: _FakeBroker())
-    state.set_many({"halted": "权益回撤 22.0% 超过上限 20.0%"})
+    state.set_many({"halted": "最大回撤 55.0% 超过上限 50.0%"})
+
+    res = client.post(f"{API}/engine/reset-anchors", headers=_token(client))
+    assert res.status_code == 200, res.text
+    assert "回撤" in res.json()["cleared_halt"]
+    assert state.get("halted") == ""
+
+
+def test_engine_reset_anchors_keeps_unrelated_halt(client, monkeypatch):
+    """与日亏/回撤无关的熔断（人工停机原因等）不该被顺手解除."""
+    from types import SimpleNamespace
+
+    from nanoquant.api.routes import trade as route
+    from nanoquant.services import state
+
+    class _FakeBroker:
+        async def account(self):
+            return SimpleNamespace(equity=100.0)
+
+    monkeypatch.setattr(route, "get_broker", lambda mode: _FakeBroker())
+    state.set_many({"halted": "运维手动停机：核对账单"})
 
     res = client.post(f"{API}/engine/reset-anchors", headers=_token(client))
     assert res.status_code == 200, res.text
     assert res.json()["cleared_halt"] == ""
-    assert "回撤" in state.get("halted")
+    assert "运维手动停机" in state.get("halted")
     state.set("halted", "")
 
 

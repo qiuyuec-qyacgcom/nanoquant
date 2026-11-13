@@ -253,8 +253,9 @@ async def reset_anchors(user: str = Depends(current_user)) -> dict:
     什么时候需要：给模拟盘充值、重置资金、换账户之后。旧基准留着的话，系统会拿
     新资金和旧基准相比，算出 -99% 的假日内亏损并直接熔断（这个坑真实发生过两次）。
 
-    只清理「日内亏损」类熔断——日亏基准本身被重置了，那条判定已经失效；
-    回撤、连亏、止损熔断属于真实风控状态，这里不碰。
+    会清理「日内亏损」与「最大回撤」两类熔断——两者的判定依据（日亏基准、峰值）
+    都被重置了，留着只会让引擎在"已经恢复"的状态下永久锁死。
+    连亏、止损熔断属于定时自愈状态，不写 halted，这里不碰。
     """
     mode = normalize_mode(get_engine().mode)
     try:
@@ -277,7 +278,9 @@ async def reset_anchors(user: str = Depends(current_user)) -> dict:
         }
     )
     cleared = ""
-    if "日内亏损" in (before["halted"] or ""):
+    stale = state.normalize_halted(before["halted"])
+    # 「回撤」用宽匹配：历史原因出现过"权益回撤 / 最大回撤"两种写法，峰值重置后都该失效
+    if "日内亏损" in stale or "回撤" in stale:
         cleared = before["halted"]
         state.set("halted", "")
     invalidate_status_cache()

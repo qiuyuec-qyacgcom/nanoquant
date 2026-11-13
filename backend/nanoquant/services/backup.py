@@ -2,9 +2,15 @@
 
 设计成"选择性备份": 前端可以勾选要备份的配置分组、数据表与附加文件,
 备份包内 manifest.json 记录范围与校验信息, 还原前会自动做一次 pre-restore 备份.
+
+另外提供**每日自动备份**: 配置里的 ``backup.auto_daily`` / ``backup.last_run_ts``
+曾长期是"只存不读"的死开关——面板上默认开着, 但没有任何代码去执行,
+于是 data/backups/ 一直为空。``run_if_due()`` 补上这条链路, 由 lifespan 里的
+后台任务每 15 分钟检查一次。
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -22,9 +28,17 @@ from ..logging_setup import get_logger
 from ..models import BackupJob, Setting
 from ..security import _fernet
 from . import events
-from .settings import GROUPS, get_backup, get_group, invalidate
+from .settings import GROUPS, get_backup, get_group, invalidate, update_group
 
 log = get_logger("backup")
+
+#: 自动备份的最小间隔（一天一次）
+AUTO_INTERVAL_SEC = 24 * 3600
+#: 失败后的重试间隔（别等到第二天，也别每分钟刷屏）
+AUTO_RETRY_SEC = 3600
+#: 后台检查周期
+AUTO_CHECK_SEC = 900
+_AUTO_TASK: asyncio.Task | None = None
 
 # 可备份的表 -> 模型
 def _table_map() -> dict[str, Any]:
@@ -182,6 +196,57 @@ def _apply_retention() -> None:
             except OSError:
                 pass
             s.delete(job)
+
+
+def run_if_due(now: int | None = None) -> dict[str, Any] | None:
+    """到点则跑一次自动备份；未开启或未到点返回 None.
+
+    先占位再执行: 备份大表可能要几秒, 并发检查不能各跑一遍。
+    失败时把 ``last_run_ts`` 回拨到"1 小时后再试", 而不是留给下一轮循环重试。
+    """
+    cfg = get_backup()
+    if not cfg.auto_daily:
+        return None
+    ts = int(time.time()) if now is None else int(now)
+    last = int(cfg.last_run_ts or 0)
+    if ts - last < AUTO_INTERVAL_SEC:
+        return None
+    label = time.strftime("auto-%Y%m%d", time.localtime(ts))
+    update_group("backup", {"last_run_ts": ts})
+    try:
+        result = create_backup(name=label, created_by="auto")
+    except Exception as exc:  # noqa: BLE001
+        # 回拨到 1 小时后可重试的位置
+        update_group("backup", {"last_run_ts": ts - AUTO_INTERVAL_SEC + AUTO_RETRY_SEC})
+        events.record("error", "backup", f"自动备份失败: {str(exc)[:180]}")
+        log.warning("自动备份失败: %s", exc)
+        return {"ok": False, "error": str(exc)[:200]}
+    events.record("info", "backup", f"自动备份 #{result['job_id']} 完成 ({result['size'] / 1024:.1f} KB)")
+    log.info("自动备份完成 #%s", result["job_id"])
+    return result
+
+
+async def _auto_loop(interval: int = AUTO_CHECK_SEC) -> None:
+    while True:
+        try:
+            await asyncio.to_thread(run_if_due)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("自动备份检查异常: %s", exc)
+        await asyncio.sleep(interval)
+
+
+def start_auto() -> None:
+    global _AUTO_TASK
+    if _AUTO_TASK is not None and not _AUTO_TASK.done():
+        return
+    _AUTO_TASK = asyncio.create_task(_auto_loop(), name="nq-auto-backup")
+
+
+def stop_auto() -> None:
+    global _AUTO_TASK
+    if _AUTO_TASK is not None:
+        _AUTO_TASK.cancel()
+        _AUTO_TASK = None
 
 
 def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
