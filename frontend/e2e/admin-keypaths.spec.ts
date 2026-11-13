@@ -22,6 +22,8 @@ async function login(page: import('@playwright/test').Page) {
 test('参数配置：跨分组搜索能定位并高亮字段', async ({ page }) => {
   await login(page)
   await page.goto('/#/admin/strategy')
+  // 等首屏参数渲染完再操作：配置是异步拉的，抢跑会点到空分组
+  await expect(page.locator('.field-row').first()).toBeVisible()
 
   const search = page.getByPlaceholder(/搜索参数/)
   await expect(search).toBeVisible()
@@ -40,6 +42,7 @@ test('参数配置：跨分组搜索能定位并高亮字段', async ({ page }) 
 test('参数配置：常用直达一键跳到指定参数', async ({ page }) => {
   await login(page)
   await page.goto('/#/admin/strategy')
+  await expect(page.locator('.field-row').first()).toBeVisible()
 
   await page.getByRole('button', { name: 'K 线周期' }).click()
   await expect(page.locator('#fld-strategy-timeframe')).toBeVisible()
@@ -49,6 +52,7 @@ test('参数配置：常用直达一键跳到指定参数', async ({ page }) => 
 test('参数配置：改动后出现保存条，放弃修改后消失（不落库）', async ({ page }) => {
   await login(page)
   await page.goto('/#/admin/strategy')
+  await expect(page.locator('.field-row').first()).toBeVisible()
 
   await page.getByRole('button', { name: /风控/ }).first().click()
   const field = page.locator('#fld-risk-max_drawdown_pct input')
@@ -81,4 +85,18 @@ test('信号跟单与总览：关键面板可渲染', async ({ page }) => {
 
   await page.goto('/#/admin/dashboard')
   await expect(page.locator('body')).toContainText('引擎控制')
+})
+
+test('交易环境提供紧急全平入口，取消确认不会执行', async ({ page }) => {
+  const dialogs: string[] = []
+  page.on('dialog', async (d) => {
+    dialogs.push(d.message())
+    await d.dismiss() // 点取消：绝不能真的清仓
+  })
+  await login(page)
+  await page.goto('/#/admin/strategy')
+
+  await page.getByRole('button', { name: '紧急全平' }).click()
+  await expect(page.getByRole('button', { name: '紧急全平' })).toBeVisible()
+  expect(dialogs.join(' ')).toContain('FLATTEN')
 })
