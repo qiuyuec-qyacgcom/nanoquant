@@ -1008,6 +1008,15 @@ textarea.input {
   border-radius: 0 7px 7px 0;
 }
 
+/* 说明文字里的内联跳转：让「去 XX 页调」可以点 */
+.note a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.note a:hover { opacity: 0.8; }
+.note b { color: var(--text); font-weight: 600; }
+
 .code {
   font-family: var(--mono);
   font-size: 11px;

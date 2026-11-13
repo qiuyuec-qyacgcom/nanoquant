@@ -42,7 +42,7 @@ interface Row extends FieldMeta {
 const groups = [
   { id: 'engine', label: '引擎', hint: '开关、节奏与时段' },
   { id: 'risk', label: '风控', hint: '仓位、熔断与费用' },
-  { id: 'strategy', label: '策略', hint: '信号、过滤与出场' },
+  { id: 'strategy', label: '策略', hint: '机器实际执行的信号与出场（不是 AI 策略）' },
   { id: 'data', label: '数据源', hint: '行情源、网络与密钥' },
   { id: 'news', label: '资讯', hint: '抓取与情绪' },
   { id: 'evolution', label: '自进化', hint: '复盘与心法' },
@@ -112,7 +112,7 @@ const BASE_META: Record<string, FieldMeta> = {
       ['trend', 'trend 趋势跟随'],
       ['meanrev', 'meanrev 均值回归'],
     ],
-    hint: '实测两者样本外均为负收益（见 docs/STRATEGY_REVIEW.md），切换前先跑 walk-forward',
+    hint: '实测两者样本外均为负收益（见 docs/EVIDENCE.md），切换前先跑 walk-forward',
   },
   auto_entry: { label: '自动开仓', hint: '关闭后只落库信号供观察，不下单；跟单不受此开关影响' },
   mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
@@ -163,6 +163,14 @@ const BASE_META: Record<string, FieldMeta> = {
   max_leverage: {
     label: '杠杆上限', unit: 'x', max: 100,
     hint: '最高 100x；全局硬上限，AI 开仓杠杆与单标的配置都只能收紧不能突破',
+  },
+  leverage_min: {
+    label: '策略杠杆下限', unit: 'x', min: 0,
+    hint: '策略自主开仓的目标杠杆下限，独立于风控分组的全局杠杆下限；0=沿用全局',
+  },
+  leverage_max: {
+    label: '策略杠杆上限', unit: 'x', min: 0,
+    hint: '策略自主开仓的目标杠杆上限，仍受全局硬上限与交易所上限约束；0=沿用全局',
   },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
   max_same_direction: {
@@ -366,6 +374,11 @@ const SECTIONS: Record<string, SectionDef[]> = {
       title: '信号模型',
       hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。auto_entry 关闭时只落库信号、不下单（与引擎总闸不同，跟单不受影响）',
       fields: ['mode', 'auto_entry', 'timeframe', 'htf_timeframe'],
+    },
+    {
+      title: '策略杠杆区间',
+      hint: '只约束策略自主开仓，不碰风控分组的全局杠杆上下限；0=沿用全局',
+      fields: ['leverage_min', 'leverage_max'],
     },
     { title: '周期与指标', fields: ['ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
     {
@@ -1028,6 +1041,12 @@ onMounted(async () => {
               <div class="row">
                 <button class="btn btn-sm btn-primary" @click="changePassword">更新密码</button>
               </div>
+            </div>
+
+            <div v-if="current === 'strategy'" class="note">
+              这里是<b>机器真正执行的策略参数</b>：模式、周期、杠杆区间、准入闸门、止损止盈，改完直接影响下单。
+              想改「AI 怎么分析」的文本指令，去
+              <router-link to="/admin/strategies">AI 策略</router-link>。
             </div>
 
             <div v-for="sec in currentSections" :key="sec.title" class="section">

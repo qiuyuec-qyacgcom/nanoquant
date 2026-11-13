@@ -160,7 +160,7 @@ onMounted(load)
   <div class="stack">
     <div class="kpi-grid">
       <div class="kpi">
-        <div class="kpi-label">策略总数</div>
+        <div class="kpi-label">AI 策略数</div>
         <div class="kpi-value">{{ stats?.total ?? 0 }}</div>
         <div class="kpi-foot">启用 {{ enabledCount }} 条</div>
       </div>
@@ -185,17 +185,19 @@ onMounted(load)
     </div>
 
     <div class="note">
-      策略是给 AI 的分析指令：引擎照常扫描全部标的，决策时把适用策略的正文交给模型，由它按策略判断是否开仓、方向与节奏。
-      一条策略都没启用、或标的不在适用范围时，AI 按通用铁律分析（默认行为）。策略不能覆盖杠杆上下限、止损与仓位等风控铁律。
+      本页是 <b>AI 分析指令</b>：引擎照常扫描全部标的，决策时把适用策略的正文交给模型，由它按策略判断是否开仓、方向与节奏。
+      一条策略都没启用、或标的不在适用范围时，AI 按通用铁律分析（默认行为）。<b>这里改不了杠杆、止损与仓位</b>——那些是风控铁律。
+      要调机器实际执行的模式、周期、杠杆区间、止损止盈，去
+      <router-link to="/admin/strategy?group=strategy">参数配置 → 策略</router-link>。
     </div>
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">策略列表</span>
+        <span class="panel-title">AI 策略列表</span>
         <div class="right" style="gap: 8px">
           <span class="tag tag-dim">{{ items.length }} 条</span>
           <button class="btn btn-sm" :disabled="busy" @click="runPreview">预览适用标的</button>
-          <button class="btn btn-sm btn-primary" :disabled="busy" @click="openCreate">新增策略</button>
+          <button class="btn btn-sm btn-primary" :disabled="busy" @click="openCreate">新增 AI 策略</button>
         </div>
       </div>
       <div class="panel-body flush table-scroll">
