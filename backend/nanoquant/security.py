@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -18,7 +19,11 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from .config import SECRET_SALT, paths
 
+log = logging.getLogger("NanoQuant.security")
+
 _PBKDF2_ITER = 120_000
+#: 解密失败是否已告警过（避免每个调用点刷屏）
+_decrypt_warned = False
 
 
 # ---------------------------------------------------------------- master key
@@ -47,11 +52,25 @@ def encrypt_secret(plain: str) -> str:
 
 
 def decrypt_secret(cipher: str) -> str:
+    """解密凭证；失败返回空串，但**只在进程内告警一次**。
+
+    失败几乎总是同一个原因：备份不包含 ``data/.master_key``，换机器恢复后
+    密文还在、密钥没了。旧实现静默返回 ""，表现为"凭证明明填过却提示未配置"，
+    排查成本极高，所以这里显式留一条日志。
+    """
+    global _decrypt_warned
     if not cipher:
         return ""
     try:
         return _fernet().decrypt(cipher.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError):
+        if not _decrypt_warned:
+            _decrypt_warned = True
+            log.warning(
+                "凭证解密失败：主密钥与密文不匹配。若刚恢复过备份，"
+                "请把原机的 data/.master_key（或 NANOQUANT_KEY_FILE）一起放回；"
+                "否则只能重新填写 API Key。"
+            )
         return ""
 
 

@@ -5,6 +5,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Iterator
+from typing import Any
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -70,6 +71,7 @@ def init_db() -> None:
     migrate_pool_columns()
     migrate_exec_columns()
     migrate_strategy_columns()
+    ensure_schema_columns()
 
 
 #: 标的池新增列 (CREATE TABLE 只对新库生效, 老库必须 ALTER)
@@ -160,6 +162,64 @@ def migrate_strategy_columns() -> None:
             log.info("策略表补齐字段: rule")
         except Exception as exc:  # noqa: BLE001
             log.warning("策略表字段 rule 添加失败: %s", exc)
+
+
+def ensure_schema_columns(target: Any | None = None) -> list[str]:
+    """按 ORM 元数据给老库补「缺失的列与索引」（幂等）.
+
+    为什么需要：``create_all`` 只建新表，**不会**给已存在的表加列。以前每新增
+    一个模型字段，就得手写一个 ``migrate_xxx()``；漏写一次，老库升级后第一次
+    查询就是 ``no such column``（``signal_follows.channel`` 就漏过）。
+
+    这里统一对账：缺的列按类型 ALTER 补成可空列（默认值交给 ORM 侧），
+    缺的索引用 ``CREATE INDEX IF NOT EXISTS`` 补。新库由 ``create_all`` 建好，
+    因此本函数在没有漂移时是空操作，返回补了哪些列，便于自检与日志排查。
+    """
+    from sqlalchemy import inspect
+    from sqlalchemy.schema import CreateIndex
+
+    from . import models  # noqa: F401  确保 Base.metadata 已注册全部表
+
+    eng = target or engine
+    added: list[str] = []
+    try:
+        insp = inspect(eng)
+        existing_tables = set(insp.get_table_names())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("结构对账跳过（无法读取库结构）: %s", exc)
+        return added
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # 新表已由 create_all 建好
+        try:
+            have = {col["name"] for col in insp.get_columns(table.name)}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("结构对账跳过 %s: %s", table.name, exc)
+            continue
+        for column in table.columns:
+            if column.name in have:
+                continue
+            ddl = column.type.compile(dialect=eng.dialect)
+            try:
+                with eng.begin() as conn:
+                    conn.exec_driver_sql(
+                        f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl}'
+                    )
+                added.append(f"{table.name}.{column.name}")
+                log.info("补齐字段 %s.%s (%s)", table.name, column.name, ddl)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("字段 %s.%s 补齐失败: %s", table.name, column.name, exc)
+        # 索引同理：老表不会被 create_all 补索引，缺了会让按来源筛选全表扫
+        for index in table.indexes:
+            try:
+                with eng.begin() as conn:
+                    conn.execute(CreateIndex(index, if_not_exists=True))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("索引 %s 补齐跳过: %s", index.name, exc)
+    if added:
+        log.info("结构对账补齐 %d 个字段: %s", len(added), ", ".join(added))
+    return added
 
 
 def _backfill_sort_order() -> None:
