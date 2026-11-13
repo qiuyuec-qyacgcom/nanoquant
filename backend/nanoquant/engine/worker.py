@@ -45,6 +45,7 @@ from ..services.settings import (
     get_signal_follow,
     get_strategy,
     normalize_mode,
+    update_group,
 )
 from ..evolution import mantra as mantra_store
 from ..evolution import review as evolution_review
@@ -381,6 +382,104 @@ class TradingEngine:
                         row.exit_price = lp.mark_price or lp.entry_price
                         row.exit_reason = "venue_sync"
                 events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+
+    async def flatten_all(self, *, reason: str = "紧急全平", stop_engine: bool = True) -> dict[str, Any]:
+        """紧急全平：停引擎 → 撤挂单 → 市价平掉当前环境全部仓位.
+
+        事故处置只应该有一个动作。顺序不能反：先停引擎（不再开新仓）、
+        再撤挂单（保护单占保证金，也可能与市价平仓抢同一个方向），
+        最后逐仓市价平；交易所侧若有系统还没记录的仓位，先补录再平。
+        """
+        mode = normalize_mode(get_engine().mode)
+        stopped = False
+        if stop_engine:
+            await self.stop()
+            update_group("engine", {"enabled": False})
+            state.set("enabled", "false")
+            stopped = True
+
+        broker = get_broker(mode)
+        errors: list[str] = []
+        with session_scope() as s:
+            rows = (
+                s.query(PositionRecord)
+                .filter(PositionRecord.status == "open", PositionRecord.mode == mode)
+                .all()
+            )
+            targets = [
+                {"id": r.id, "symbol": r.symbol, "side": r.side, "qty": float(r.qty)}
+                for r in rows
+            ]
+
+        # 交易所可能有系统没来得及落库的仓位（手动开仓、外部操作）：以交易所为准补录
+        try:
+            venue = await broker.positions()
+        except Exception as exc:  # noqa: BLE001
+            venue = []
+            errors.append(f"读取交易所持仓失败: {str(exc)[:100]}")
+        for vp in venue:
+            if any(t["symbol"] == vp.symbol and t["side"] == vp.side for t in targets):
+                continue
+            record_external_position(
+                vp.symbol, vp.side, vp.qty, vp.entry_price, vp.mark_price, vp.leverage, mode,
+                unrealized=vp.unrealized,
+            )
+            with session_scope() as s:
+                row = (
+                    s.query(PositionRecord)
+                    .filter(
+                        PositionRecord.symbol == vp.symbol,
+                        PositionRecord.side == vp.side,
+                        PositionRecord.status == "open",
+                        PositionRecord.mode == mode,
+                    )
+                    .first()
+                )
+                if row is not None:
+                    targets.append({"id": row.id, "symbol": row.symbol, "side": row.side, "qty": float(row.qty)})
+
+        symbols = sorted({t["symbol"] for t in targets})
+        for symbol in symbols:
+            for cancel in (binance_client.cancel_all, binance_client.cancel_all_algo):
+                try:
+                    await cancel(symbol)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{symbol} 撤单失败: {str(exc)[:60]}")
+
+        closed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for target in targets:
+            with session_scope() as s:
+                pos = s.get(PositionRecord, target["id"])
+                if pos is None or pos.status != "open":
+                    continue
+                s.expunge(pos)
+            try:
+                res = await broker.close_position(position=pos, reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"symbol": target["symbol"], "side": target["side"], "error": str(exc)[:120]})
+                continue
+            if res.ok:
+                closed.append({"symbol": target["symbol"], "side": target["side"], "qty": target["qty"]})
+            else:
+                failed.append(
+                    {"symbol": target["symbol"], "side": target["side"], "error": res.message or "平仓失败"}
+                )
+
+        events.record(
+            "error" if failed else "warn",
+            "risk",
+            f"{reason}：平仓 {len(closed)} 笔、失败 {len(failed)} 笔、撤单标的 {len(symbols)} 个",
+            {"closed": closed, "failed": failed, "engine_stopped": stopped},
+        )
+        return {
+            "ok": not failed,
+            "engine_stopped": stopped,
+            "closed": closed,
+            "failed": failed,
+            "symbols": symbols,
+            "errors": errors,
+        }
 
     async def protect_position(self, position_id: int, *, reason: str = "手动补挂") -> dict[str, Any]:
         """给没有保护单的仓位按 ATR 补挂止损/止盈.
@@ -771,6 +870,8 @@ class TradingEngine:
                 quote_volume=ticker.quote_volume,
                 data_degraded=getattr(ticker, "source", "ws") == "rest",
                 htf_trend=htf_trend,
+                # 传 now 才会做"停更"判断；回测不传，历史数据天然不触发
+                now=time.time(),
             )
             # 策略版本指纹：随信号落库并写进持仓 features，复盘时能回答
             # "这笔亏损是策略版本问题还是执行问题"

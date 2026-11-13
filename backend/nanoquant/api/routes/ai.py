@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ...ai.client import ai_client, fetch_remote_models, list_models
+from ...ai.client import ai_client, fetch_remote_models
 from ...ai.decision import analyze
 from ...ai.diagnostics import diagnose
 from ...ai.reasoning import effort_options, library, match_family

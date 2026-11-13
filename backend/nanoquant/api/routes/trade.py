@@ -17,7 +17,7 @@ from ...security import decrypt_secret
 from ...services import events, position_view, state
 from ...services.settings import get_data, get_engine, normalize_mode, update_group
 from ..deps import current_user
-from ..schemas import ClosePositionIn, EngineControl, TradeModeIn
+from ..schemas import ClosePositionIn, EngineControl, FlattenIn, TradeModeIn
 
 router = APIRouter(tags=["trade"])
 
@@ -230,6 +230,20 @@ async def cycle_now(user: str = Depends(current_user)) -> dict:
     result = await engine.cycle()
     invalidate_status_cache()
     return {"ok": True, "result": result}
+
+
+@router.post("/engine/flatten")
+async def flatten(payload: FlattenIn, user: str = Depends(current_user)) -> dict:
+    """紧急全平：停引擎 + 撤挂单 + 市价平掉当前环境全部仓位.
+
+    事故处置只该有一个动作。必须输入确认短语 FLATTEN（与切实盘的 LIVE 同款约定），
+    避免误触把仓位清光。
+    """
+    if payload.confirm.strip().upper() != "FLATTEN":
+        raise HTTPException(status_code=400, detail="紧急全平需要输入确认短语 FLATTEN")
+    result = await engine.flatten_all(reason=f"{user} 紧急全平", stop_engine=payload.stop_engine)
+    invalidate_status_cache()
+    return result
 
 
 @router.post("/engine/reset-anchors")

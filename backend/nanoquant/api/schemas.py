@@ -125,6 +125,14 @@ class EngineControl(BaseModel):
     confirm: str = ""
 
 
+class FlattenIn(BaseModel):
+    """紧急全平：必须输入确认短语 FLATTEN，避免误触清仓."""
+
+    confirm: str = ""
+    #: 是否同时停引擎（默认是：事故处置时不该边平边开新仓）
+    stop_engine: bool = True
+
+
 class TradeModeIn(BaseModel):
     """交易模式引导：双向持仓 + 逐仓（无持仓时才能切换）. """
 

@@ -163,6 +163,12 @@ class StrategySettings(BaseModel):
     max_hold_minutes_chop: int = Field(default=90, ge=0, le=2880)
     #: 判定"震荡市"的均线间距阈值(%), |EMA 间距| 小于它即视为无趋势
     chop_ema_gap_pct: float = Field(default=0.08, ge=0.0, le=5.0)
+    #: 行情完整性闸门：最近 20 根内允许的 K 线缺口次数（0 = 一根都不许断）。
+    #: 断档时指标仍会算出"看起来正常"的数值，必须在打分前拦掉。
+    max_data_gaps: int = Field(default=0, ge=0, le=20)
+    #: 最后一根已收盘 K 线超过 N 倍周期仍无更新 → 视为行情停更（只在实盘判断）
+    data_stale_mult: float = Field(default=2.0, ge=1.0, le=20)
+
     #: RSI 是否按趋势体制分区间解读(静态 30/70 在单边趋势里必然失效)
     rsi_adaptive: bool = True
 

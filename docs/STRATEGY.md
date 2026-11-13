@@ -3,6 +3,7 @@
 > **唯一权威**：系统在跑什么策略、每一层怎么设计、参数怎么调、有哪些陷阱。
 > 历史验证与证伪过程见 [EVIDENCE.md](./EVIDENCE.md)；下单/风控执行细节见
 > [EXEC_PROTOCOL.md](./EXEC_PROTOCOL.md)、[SIGNAL_EVENTS.md](./SIGNAL_EVENTS.md)。
+> **出事时看 [RUNBOOK.md](./RUNBOOK.md)**（紧急全平 / 补挂保护单 / 重置基准 / 凭证丢失）。
 >
 > 本文件合并自：`STRATEGY_GLOBAL` / `STRATEGY_AOYING_MIRROR`（旧文件已删除，git 历史可查）。
 

@@ -110,6 +110,43 @@ def _closed_only(candles: list[Candle]) -> list[Candle]:
     return candles
 
 
+def _data_quality(
+    candles: list[Candle], cfg: StrategySettings, now: float | None
+) -> dict[str, Any]:
+    """检测 K 线缺口与停更——坏数据上算出来的指标看起来完全正常。
+
+    - 缺口：相邻两根的时间差 > 1.5 倍周期，视为断档（网络/限频/标的维护）；
+    - 停更：最后一根已收盘 K 线的收盘时间距今超过 ``data_stale_mult`` 倍周期。
+      只在传入 ``now`` 时判断，回测（历史数据）天然不触发。
+    """
+    out: dict[str, Any] = {"gaps": 0, "age_sec": None, "ok": True, "note": ""}
+    if len(candles) < 3:
+        return out
+    step = int(candles[-1].open_time) - int(candles[-2].open_time)
+    if step <= 0:
+        return out
+    window = candles[-21:]
+    for prev, cur in zip(window, window[1:]):
+        if int(cur.open_time) - int(prev.open_time) > step * 1.5:
+            out["gaps"] += 1
+    # open_time 为毫秒（实盘）或秒（测试造数）都能算，与 _closed_only 的口径一致
+    last_open = int(candles[-1].open_time)
+    last_open_sec = last_open / 1000.0 if last_open > 10_000_000_000 else float(last_open)
+    close_sec = last_open_sec + step / (1000.0 if last_open > 10_000_000_000 else 1.0)
+    if now is not None:
+        out["age_sec"] = round(max(0.0, now - close_sec), 1)
+    stale_limit = float(cfg.data_stale_mult) * (step / (1000.0 if last_open > 10_000_000_000 else 1.0))
+    notes: list[str] = []
+    if out["gaps"] > cfg.max_data_gaps:
+        notes.append(f"K 线缺口 {out['gaps']} 处（上限 {cfg.max_data_gaps}）")
+    if out["age_sec"] is not None and out["age_sec"] > stale_limit:
+        notes.append(f"行情停更 {out['age_sec']:.0f}s（超过 {cfg.data_stale_mult} 倍周期）")
+    if notes:
+        out["ok"] = False
+        out["note"] = "行情数据不可信: " + "；".join(notes)
+    return out
+
+
 def build_features(
     candles: list[Candle],
     cfg: StrategySettings,
@@ -121,6 +158,7 @@ def build_features(
     quote_volume: float = 0.0,
     data_degraded: bool = False,
     htf_trend: str = "",
+    now: float | None = None,
 ) -> dict[str, Any]:
     """构造因子字典。
 
@@ -129,6 +167,7 @@ def build_features(
     末尾那根未收盘的 K 线会被剔除，避免用半根的量能判"量能不足"。
     """
     candles = _closed_only(candles)
+    quality = _data_quality(candles, cfg, now)
     closes = [c.close for c in candles]
     vols = [c.volume for c in candles]
     last = candles[-1] if candles else None
@@ -157,6 +196,12 @@ def build_features(
         #: 行情走 REST 兜底（WS 断线）时置真。此时没有盘口，点差闸门失效，
         #: 信号层必须知道自己在用降级数据，而不是静默拿一个没有 bid/ask 的快照。
         "data_degraded": bool(data_degraded),
+        #: 数据完整性：缺口次数 / 停更秒数 / 是否可用。坏数据上算出的指标看着完全正常，
+        #: 所以必须在打分之前拦掉，而不是让它生成一个"很合理"的信号。
+        "data_gaps": quality["gaps"],
+        "data_age_sec": quality["age_sec"],
+        "data_ok": quality["ok"],
+        "data_note": quality["note"],
         #: 高周期趋势方向：up/down/flat，""=未启用 HTF
         "htf_trend": htf_trend,
     }
@@ -284,6 +329,12 @@ def score_signal(
     symbol: str, features: dict[str, Any], cfg: StrategySettings
 ) -> SignalResult:
     """按 `cfg.mode` 选择信号模型。两者共用准入闸门与出场规则。"""
+    # 数据完整性闸门放在最前面：缺口/停更时指标依然会算出"合理"数值，
+    # 放到后面会让坏数据生成一个看起来完全正常的信号。
+    if not features.get("data_ok", True):
+        res = SignalResult(symbol=symbol, features=features)
+        res.blocked = str(features.get("data_note") or "行情数据不完整，已跳过")
+        return res
     if cfg.mode == "meanrev":
         return _score_meanrev(symbol, features, cfg)
     return _score_trend(symbol, features, cfg)

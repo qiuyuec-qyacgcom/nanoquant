@@ -778,3 +778,27 @@ def test_settings_audit_skips_noop_writes(client):
 
     after = client.get(f"{API}/settings/audit", headers=headers, params={"group": "risk", "limit": 50})
     assert len(after.json()["items"]) == count_before
+
+
+def test_engine_flatten_requires_confirm_phrase(client, monkeypatch):
+    """紧急全平必须带确认短语，避免前端误触把仓位清光。"""
+    from nanoquant.api.routes import trade as route
+
+    called: dict = {}
+
+    async def _fake_flatten(*, reason: str = "", stop_engine: bool = True):
+        called["hit"] = True
+        return {"ok": True, "engine_stopped": stop_engine, "closed": [], "failed": [], "symbols": [], "errors": []}
+
+    monkeypatch.setattr(route.engine, "flatten_all", _fake_flatten)
+    headers = _token(client)
+
+    bad = client.post(f"{API}/engine/flatten", headers=headers, json={"confirm": "nope"})
+    assert bad.status_code == 400
+    assert "FLATTEN" in bad.json()["detail"]
+    assert "hit" not in called
+
+    ok = client.post(f"{API}/engine/flatten", headers=headers, json={"confirm": "flatten", "stop_engine": False})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["ok"] is True
+    assert called["hit"] is True

@@ -658,6 +658,8 @@ function clearSearch() {
 
 /** 跳到某个参数：必要时切分组、展开高级项、滚动到视野中央并闪一下 */
 async function jumpTo(group: string, key: string) {
+  // 首屏还在拉配置时点「常用直达」会没有任何反应：先等配置到位再跳
+  if (!Object.keys(app.settings || {}).length) await app.loadSettings()
   if (group !== current.value) {
     if (dirty.value && !confirm('当前分组有未保存的修改，切换后会被丢弃，继续？')) return
     loadGroup(group)
@@ -942,6 +944,39 @@ async function protectAll() {
   app.notify(`已补挂 ${ok} 个${fail ? `，失败 ${fail} 个` : ''}`, fail ? 'error' : 'ok')
 }
 
+// ---------------------------------------------------- 紧急全平
+/**
+ * 事故处置只该有一个动作：停引擎 + 撤挂单 + 市价平掉当前环境全部仓位。
+ * 后端要求确认短语 FLATTEN（与切实盘的 LIVE 同款约定），避免误触清仓。
+ */
+const flattenBusy = ref(false)
+
+async function flattenAll() {
+  const phrase = prompt(
+    '紧急全平：将停止引擎、撤销全部挂单，并以市价平掉当前交易环境的全部仓位。\n\n输入 FLATTEN 确认：',
+  )
+  if (phrase === null) return
+  if (phrase.trim().toUpperCase() !== 'FLATTEN') {
+    app.notify('确认短语不正确，已取消', 'error')
+    return
+  }
+  flattenBusy.value = true
+  try {
+    const res = await http.post('/engine/flatten', { confirm: 'FLATTEN', stop_engine: true })
+    await app.loadStatus()
+    const closed = (res.closed || []).length
+    const failed = (res.failed || []).length
+    app.notify(
+      failed ? `已平 ${closed} 笔，${failed} 笔失败，请手动处理` : `已平 ${closed} 笔，引擎已停止`,
+      failed ? 'error' : 'ok',
+    )
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    flattenBusy.value = false
+  }
+}
+
 async function toggleEngine() {
   if (engineBusy.value) return
   const target = !engineRunning.value
@@ -1115,6 +1150,9 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
           <span class="muted" style="font-size: 11px">{{ engineRunning ? '引擎已启动' : '引擎未启动' }}</span>
           <button class="btn btn-sm" :disabled="engineBusy" @click="toggleEngine">
             {{ engineBusy ? '…' : engineRunning ? '停止引擎' : '启动引擎' }}
+          </button>
+          <button class="btn btn-sm btn-danger" :disabled="flattenBusy" @click="flattenAll" title="停引擎 + 撤单 + 市价平掉全部仓位">
+            {{ flattenBusy ? '全平中…' : '紧急全平' }}
           </button>
         </div>
       </div>
