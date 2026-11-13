@@ -327,9 +327,10 @@ class TradingEngine:
         now = int(time.time())
         for symbol, vp in venue_map.items():
             if symbol not in local_map:
+                sl, tp = await self._algo_sl_tp(symbol)
                 record_external_position(
                     symbol, vp.side, vp.qty, vp.entry_price, vp.mark_price, vp.leverage, mode,
-                    unrealized=vp.unrealized,
+                    unrealized=vp.unrealized, sl_price=sl, tp_price=tp,
                 )
                 events.record("warn", "engine", f"发现交易所外部仓位 {symbol} {vp.side} {vp.qty}", {"symbol": symbol})
             else:
@@ -352,6 +353,26 @@ class TradingEngine:
                         row.exit_price = lp.mark_price or lp.entry_price
                         row.exit_reason = "venue_sync"
                 events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+
+    async def _algo_sl_tp(self, symbol: str) -> tuple[float, float]:
+        """从交易所保护单提取该标的的止损/止盈触发价（手动开仓同步用）."""
+        sl = tp = 0.0
+        try:
+            rows = await binance_client.open_algo_orders(symbol, fresh=True)
+        except (BinanceError, NoCredentials):
+            return sl, tp
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            typ = str(row.get("orderType") or row.get("type") or "")
+            trig = float(row.get("triggerPrice") or row.get("stopPrice") or 0)
+            if trig <= 0:
+                continue
+            if typ == "STOP_MARKET":
+                sl = trig
+            elif typ == "TAKE_PROFIT_MARKET":
+                tp = trig
+        return sl, tp
 
     # ------------------------------------------------------------- positions
     async def _manage_positions(self, broker: Broker, cfg: StrategySettings, engine_cfg: EngineSettings) -> None:
@@ -1625,7 +1646,10 @@ class TradingEngine:
 
         ai_cfg = get_ai()
         direction = sig.direction
-        leverage = risk_mod.choose_leverage(sig.symbol, engine_cfg, risk_cfg, filters)
+        leverage = risk_mod.choose_leverage(
+            sig.symbol, engine_cfg, risk_cfg, filters,
+            strategy_range=(strat_cfg.leverage_min, strat_cfg.leverage_max),
+        )
         sl_pct, tp_pct = sig.sl_pct, sig.tp_pct
         ai_meta: dict[str, Any] = {}
         ai_used = False
@@ -1696,7 +1720,8 @@ class TradingEngine:
                 # 模型（含注入心法）给出的杠杆只是区间内建议值，
                 # 统一由风控全局「杠杆下限/上限」钳制；不再走 AI 模型页的独立上限
                 leverage = risk_mod.choose_leverage(
-                    sig.symbol, engine_cfg, risk_cfg, filters, d.leverage
+                    sig.symbol, engine_cfg, risk_cfg, filters, d.leverage,
+                    strategy_range=(strat_cfg.leverage_min, strat_cfg.leverage_max),
                 )
             if d.sl_pct > 0:
                 sl_pct = min(max(0.12, d.sl_pct), 3.0)

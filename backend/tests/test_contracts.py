@@ -2223,6 +2223,33 @@ def test_choose_leverage_clamps_ai_to_global_floor_and_cap():
     tight = RiskSettings(default_leverage=20, max_leverage=30)
     assert choose_leverage("BTCUSDT", engine, tight, f, 99) == 30
 
+
+def test_choose_leverage_strategy_range_overrides_global_floor():
+    """策略目标杠杆区间 [8,30] 独立于全局上下限 [20,100]，且仍受交易所/全局上限约束."""
+    from nanoquant.engine.risk import choose_leverage
+    from nanoquant.exchange.precision import SymbolFilters
+    from nanoquant.services.settings import EngineSettings, RiskSettings
+
+    engine = EngineSettings()
+    f = SymbolFilters(symbol="BTCUSDT", max_leverage=125, price_tick=0.01, qty_step=0.001)
+    cfg = RiskSettings(default_leverage=20, max_leverage=100)
+
+    rng = (8, 30)
+    # 策略下限 8 不被全局下限 20 抬升
+    assert choose_leverage("BTCUSDT", engine, cfg, f, strategy_range=rng) == 8
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 5, strategy_range=rng) == 8
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 25, strategy_range=rng) == 25
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 99, strategy_range=rng) == 30
+    # 仍受全局/交易所上限约束
+    assert choose_leverage("BTCUSDT", engine, cfg, f, 125, strategy_range=rng) == 30
+
+    # 0 表示沿用全局
+    assert choose_leverage("BTCUSDT", engine, cfg, f, strategy_range=(0, 0)) == 20
+
+    # 交易所上限更低时，策略上限被压回交易所上限
+    f12 = SymbolFilters(symbol="BTCUSDT", max_leverage=12, price_tick=0.01, qty_step=0.001)
+    assert choose_leverage("BTCUSDT", engine, cfg, f12, 99, strategy_range=(8, 30)) == 12
+
     # 交易所上限更低时以交易所为准，即使全局下限更高也不能突破
     f12 = SymbolFilters(symbol="BTCUSDT", max_leverage=12, price_tick=0.01, qty_step=0.001)
     assert choose_leverage("BTCUSDT", engine, cfg, f12, 80) == 12

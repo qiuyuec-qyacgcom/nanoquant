@@ -42,7 +42,7 @@ def normalize_mode(mode: str | None, default: str = MODE_DEMO) -> str:
 class EngineSettings(BaseModel):
     enabled: bool = False
     mode: Literal["demo", "live"] = MODE_DEMO
-    cycle_interval_sec: int = Field(default=MIN_CYCLE_INTERVAL_SEC, ge=MIN_CYCLE_INTERVAL_SEC, le=120)
+    cycle_interval_sec: int = Field(default=MIN_CYCLE_INTERVAL_SEC, ge=MIN_CYCLE_INTERVAL_SEC, le=3600)
     max_positions: int = Field(default=2, ge=1, le=20)
     max_symbols_per_cycle: int = Field(default=12, ge=1, le=60)
     trading_windows: list[str] = Field(default_factory=lambda: ["00:00-24:00"])
@@ -102,15 +102,28 @@ class RiskSettings(BaseModel):
 
 
 class StrategySettings(BaseModel):
+    """引擎**真正执行**的策略硬参数（界面：参数配置 → 策略）。
+
+    ⚠️ 不要和 ``services.strategy_profiles`` 混：那是交给 AI 的**文本判断指令**
+    （界面：AI 策略），只影响模型怎么分析，改不了这里的杠杆/止损/准入。
+    调「快慢、杠杆、止损、闸门」动本类；调「AI 的判断口吻与规则」动 StrategyProfile。
+    """
+
     #: 信号模型。`trend` = 均线/动量趋势跟随；`meanrev` = 布林极值回归。
     #: 两者共用准入闸门与出场规则，只有打分与止损/止盈的定位方式不同。
     mode: Literal["trend", "meanrev"] = "meanrev"
     #: 是否允许策略自主开仓。默认关闭——2026-11 的 walk-forward 实测里
-    #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/STRATEGY_REVIEW.md），
+    #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/EVIDENCE.md），
     #: 没有正期望的配置就不该默认拿真钱去试。信号照常落库供观察。
     auto_entry: bool = False
     #: 主周期。15–60 分钟短线系统，4h 为波段（全局策略转向波段后默认 4h）
     timeframe: Literal["15m", "30m", "1h", "4h"] = "4h"
+    #: 策略目标杠杆区间 [min, max]（只约束策略自主开仓）。
+    #: 与风控分组 RiskSettings 的全局杠杆上下限（default_leverage/max_leverage）解耦：
+    #: 全局是硬边界（所有开仓都不能突破），这里只是策略自己更窄的目标区间。
+    #: 0 表示沿用全局。全局策略 v1.0 指定 8-30x（用户指定）。
+    leverage_min: int = Field(default=8, ge=0, le=100)
+    leverage_max: int = Field(default=30, ge=0, le=100)
     #: 高周期过滤（HTF）。非空时，只做与 HTF 趋势同向的信号；""=关闭。
     #: 短线趋势跟随输在震荡与逆势，HTF 用来定大方向、LTF 择时。
     #: 默认关闭：开启会每标的每轮多一次 REST，先用 auto_entry=false 观察再开。
@@ -474,7 +487,7 @@ def _migrate_legacy_group(name: str, data: dict[str, Any]) -> dict[str, Any]:
             interval = int(out.get("cycle_interval_sec", MIN_CYCLE_INTERVAL_SEC))
         except (TypeError, ValueError):
             interval = MIN_CYCLE_INTERVAL_SEC
-        out["cycle_interval_sec"] = max(MIN_CYCLE_INTERVAL_SEC, min(120, interval))
+        out["cycle_interval_sec"] = max(MIN_CYCLE_INTERVAL_SEC, min(3600, interval))
         if "paper_start_balance" in out:
             out.setdefault("demo_start_balance", out.pop("paper_start_balance"))
         out.pop("demo_start_balance", None)

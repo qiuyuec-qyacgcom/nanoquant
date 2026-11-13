@@ -321,8 +321,15 @@ class BinanceBroker:
                 continue
             entry = float(row.get("entryPrice", 0) or 0)
             mark = float(row.get("markPrice", 0) or 0)
-            lev = float(row.get("leverage", 1) or 1)
-            notional = abs(amt) * (mark or entry)
+            notional = abs(float(row.get("notional", 0) or 0) or abs(amt) * (mark or entry))
+            init_margin = float(row.get("positionInitialMargin", 0) or 0)
+            # 新版 positionRisk 不再返回 leverage 字段：逐仓下 positionInitialMargin
+            # 就是该仓保证金，用 名义额/初始保证金 反推实际杠杆，否则手动开 4x 会被当成 1x。
+            lev = float(row.get("leverage", 0) or 0)
+            if lev <= 0 and init_margin > 0:
+                lev = notional / init_margin
+            if lev <= 0:
+                lev = 1.0
             out.append(
                 ExchangePosition(
                     symbol=row["symbol"],
@@ -331,7 +338,7 @@ class BinanceBroker:
                     entry_price=entry,
                     mark_price=mark,
                     leverage=lev,
-                    margin=notional / max(1.0, lev),
+                    margin=init_margin or (notional / max(1.0, lev)),
                     unrealized=float(row.get("unRealizedProfit", 0) or 0),
                     liquidation_price=float(row.get("liquidationPrice", 0) or 0),
                     source="binance",
@@ -1157,11 +1164,15 @@ def record_external_position(
     leverage: float,
     mode: str | None = None,
     unrealized: float = 0.0,
+    sl_price: float = 0.0,
+    tp_price: float = 0.0,
 ) -> None:
     """记录交易所已有仓位 (外部下单/崩溃恢复).
 
     以前这里用了 `self.mode`（模块级函数里没有 self，会 NameError），
     导致恢复出来的仓位根本写不进库。
+    ``sl_price``/``tp_price`` 来自交易所保护单（止损/止盈条件单触发价）：
+    手动开的仓若不回填，引擎会以 0 止损管理，等于没接管保护。
     """
     resolved = normalize_mode(mode)
     now = int(time.time())
@@ -1178,6 +1189,10 @@ def record_external_position(
             exists.leverage = leverage
             exists.venue_unrealized = float(unrealized or 0.0)
             exists.venue_ts = now
+            if sl_price > 0:
+                exists.sl_price = sl_price
+            if tp_price > 0:
+                exists.tp_price = tp_price
             return
         s.add(
             PositionRecord(
@@ -1191,6 +1206,8 @@ def record_external_position(
                 opened_at=now,
                 mode=resolved,
                 status="open",
+                sl_price=sl_price,
+                tp_price=tp_price,
                 venue_unrealized=float(unrealized or 0.0),
                 venue_ts=now,
                 ai_reason="交易所已有仓位(外部/恢复)",

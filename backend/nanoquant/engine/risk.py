@@ -239,7 +239,14 @@ def symbol_gates(
     return GateDecision(True)
 
 
-def choose_leverage(symbol: str, cfg_engine: EngineSettings, cfg_risk: RiskSettings, filters: SymbolFilters, ai_leverage: float = 0.0) -> int:
+def choose_leverage(
+    symbol: str,
+    cfg_engine: EngineSettings,
+    cfg_risk: RiskSettings,
+    filters: SymbolFilters,
+    ai_leverage: float = 0.0,
+    strategy_range: tuple[int, int] | None = None,
+) -> int:
     """开仓杠杆统一由「参数配置 → 风控」的**全局杠杆下限/上限**决定.
 
     - 上限 = min(全局杠杆上限, 该标的交易所上限, 100)；
@@ -248,10 +255,23 @@ def choose_leverage(symbol: str, cfg_engine: EngineSettings, cfg_risk: RiskSetti
       低于下限抬到下限、高于上限压到上限；心法文本里的杠杆数值不参与决策；
     - 没有建议值时直接用下限（原「默认杠杆」语义）。
 
+    ``strategy_range=(low, high)`` 是**策略自己的目标杠杆区间**（StrategySettings
+    leverage_min/leverage_max），只把区间的上下界进一步收紧，仍然不能突破全局硬上限
+    与交易所上限：策略下限低于全局下限时按策略下限走（例如全局 20、策略 8 时用 8），
+    策略上限高于全局/交易所上限时被压回。为 0 的项表示沿用对应方向的全局值。
+    只约束策略自主开仓，跟单开仓走 follow_leverage 不受影响。
+
     ``cfg_engine`` 保留在签名中以兼容既有调用，杠杆不受引擎分组参数干预。
     """
     upper = max(1, min(int(cfg_risk.max_leverage), int(filters.max_leverage or 100), 100))
     lower = max(1, min(int(cfg_risk.default_leverage), upper))
+    if strategy_range:
+        s_low, s_high = int(strategy_range[0]), int(strategy_range[1])
+        if s_high > 0:
+            upper = max(1, min(upper, s_high))
+        if s_low > 0:
+            lower = max(1, min(s_low, upper))
+        lower = min(lower, upper)
     desired = float(ai_leverage) if ai_leverage and ai_leverage > 0 else float(lower)
     return int(max(lower, min(round(desired), upper)))
 
