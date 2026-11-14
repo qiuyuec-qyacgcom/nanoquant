@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -347,3 +348,50 @@ def test_lifecycle_close_actually_closes_position(monkeypatch):
     assert broker.closes and broker.closes[0]["reason"].startswith("signal")
     with session_scope() as s:
         assert s.get(PositionRecord, pid) is not None
+
+
+# ------------------------------------------------------------ 文件游标（不回放历史）
+def test_jsonl_file_is_tailed_from_the_end(monkeypatch, tmp_path):
+    """首次接入只从文件**尾部**开始：重启补读历史会把半小时前的信号当新单开出去."""
+    path = tmp_path / "signals.jsonl"
+    path.write_text('{"symbol": "OLDUSDT"}\n', encoding="utf-8")
+    _enable(jsonl_path=str(path))
+    handles: list[dict] = []
+    eng = worker_mod.TradingEngine()
+
+    async def _handle(row):
+        handles.append(row)
+        return {"ok": True}
+
+    eng._handle_signal_row = _handle
+
+    first = asyncio.run(eng._poll_signal_feed_once())
+    assert first == 0 and handles == [], "接入前的历史行不能被当成本轮信号"
+
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"symbol": "NEWUSDT"}\n')
+    second = asyncio.run(eng._poll_signal_feed_once())
+    assert second == 1 and len(handles) == 1
+    assert json.dumps(handles[0]).find("NEWUSDT") >= 0
+
+    # 没有新内容时不再重复处理
+    third = asyncio.run(eng._poll_signal_feed_once())
+    assert third == 0 and len(handles) == 1
+
+
+def test_poll_clears_error_when_disabled():
+    update_group("signal_follow", {"enabled": False})
+    eng = worker_mod.TradingEngine()
+    eng._follow_last_error = "上次的错误"
+
+    assert asyncio.run(eng._poll_signal_feed_once()) == 0
+    assert eng._follow_last_error == ""
+
+
+def test_poll_reports_missing_file(monkeypatch, tmp_path):
+    missing = tmp_path / "nope" / "signals.jsonl"
+    _enable(jsonl_path=str(missing))
+    eng = worker_mod.TradingEngine()
+
+    assert asyncio.run(eng._poll_signal_feed_once()) == 0
+    assert "等待信号文件" in eng._follow_last_error
