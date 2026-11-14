@@ -217,12 +217,24 @@ foreach ($d in @('data', 'logs', 'data\backups')) {
 # 端口持久化：-Port 要真的被 start.ps1 沿用，否则只是个"提示里好看"的参数
 Set-Content -Path (Join-Path $Root 'data\.port') -Value $Port -Encoding ascii
 # 初始密码：安装阶段还没有数据库，只能留成文件让首次启动读取并哈希入库，
-# 启动成功后该文件会被删掉（明文不留在盘上）
+# 启动成功后该文件会被删掉（明文不留在盘上）。
+# 未指定 -Password 时，脚本自己生成随机密码并留一个空标记文件，
+# 让首次启动知道「这是随机生成的，登录后仍需强制改密」。
+$passwordGenerated = $false
 if ($Password) {
-  $secretFile = Join-Path $Root 'data\.admin_password'
-  [System.IO.File]::WriteAllText($secretFile, $Password, (New-Object System.Text.UTF8Encoding($false)))
-  Write-Ok "已暂存初始密码（首次启动写入数据库后自动删除）"
+  $genPassword = $Password
+} else {
+  $alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'.ToCharArray()
+  $genPassword = -join ((1..16) | ForEach-Object { $alphabet | Get-Random })
+  $passwordGenerated = $true
 }
+$secretFile = Join-Path $Root 'data\.admin_password'
+[System.IO.File]::WriteAllText($secretFile, $genPassword, (New-Object System.Text.UTF8Encoding($false)))
+if ($passwordGenerated) {
+  $markFile = Join-Path $Root 'data\.admin_password_generated'
+  [System.IO.File]::WriteAllText($markFile, '', (New-Object System.Text.UTF8Encoding($false)))
+}
+Write-Ok "已暂存初始密码（首次启动写入数据库后自动删除）"
 Write-Ok "运行目录就绪（data、logs、data\backups）"
 
 Write-Host ""
@@ -232,14 +244,14 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  访问地址 : http://127.0.0.1:$Port"
 Write-Host "  默认账号 : admin"
-if ($Password) {
-  Write-Host "  初始密码 : 你安装时指定的值"
+if ($passwordGenerated) {
+  Write-Host "  初始密码 : $genPassword"
+  Write-Host ""
+  Write-Host "  该密码由安装脚本随机生成，仅本次显示；登录后必须先改密。" -ForegroundColor Yellow
+} else {
+  Write-Host "  初始密码 : $genPassword"
   Write-Host ""
   Write-Host "  登录后建议改成新的强口令（首次登录不强制）。" -ForegroundColor Yellow
-} else {
-  Write-Host "  初始密码 : 随机生成，见启动日志"
-  Write-Host ""
-  Write-Host "  启动时会在控制台与 logs\nanoquant.log 打印密码，登录后必须改密。" -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "  改密前后台除登录/改密/健康检查外的接口一律 403。" -ForegroundColor Yellow

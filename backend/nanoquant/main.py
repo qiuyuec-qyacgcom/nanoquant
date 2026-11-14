@@ -46,42 +46,56 @@ _PASSWORD_CHANGE_ALLOWED = {
 _PUBLIC_API_PREFIX = "/api/v1/public/"
 
 
-def _initial_admin_password() -> str | None:
+def _initial_admin_password() -> tuple[str | None, bool]:
     """首次创建管理员时，密码从哪来：环境变量 > 安装脚本留下的文件。
 
-    两处都没有就返回 None（由调用方随机生成）。
+    返回 (password, is_generated)：
+    - password 为 None 表示两处都没有，由调用方随机生成；
+    - is_generated=True 表示密码是安装脚本随机生成的，仍需首次登录后改密；
+    - is_generated=False 表示用户/运维显式指定（环境变量或 --password），不强制改密。
     安装脚本先于首次启动运行、还没建库，所以它只能留文件，不能直接写库。
     """
     from_env = (os.getenv("NANOQUANT_ADMIN_PASSWORD") or "").strip()
     if from_env:
-        return from_env
+        return from_env, False
     secret_file = paths.DATA / ".admin_password"
     if not secret_file.is_file():
-        return None
+        return None, False
+    # 安装脚本随机生成的密码会额外留一个空标记文件，用于区分「需强制改密」
+    generated_mark = paths.DATA / ".admin_password_generated"
+    is_generated = generated_mark.is_file()
     try:
         value = secret_file.read_text(encoding="utf-8").strip()
     except OSError as exc:
         log.warning("读取初始密码文件失败，将改用随机密码: %s", exc)
-        return None
+        return None, False
     try:
         # 用完即删：这是明文凭据，不该在盘上多留一秒
         secret_file.unlink()
     except OSError as exc:
         log.warning("初始密码文件删除失败（请手动删除 %s）: %s", secret_file, exc)
-    return value or None
+    if is_generated:
+        try:
+            generated_mark.unlink()
+        except OSError as exc:
+            log.warning("初始密码标记删除失败（请手动删除 %s）: %s", generated_mark, exc)
+    return (value or None), is_generated
 
 
 def bootstrap() -> None:
     init_db()
     sec = get_security()
     if not sec.password_hash:
-        chosen = _initial_admin_password()
+        chosen, is_generated = _initial_admin_password()
         if chosen:
             update_group(
                 "security",
-                {"password_hash": hash_password(chosen), "password_is_default": False},
+                {"password_hash": hash_password(chosen), "password_is_default": is_generated},
             )
-            events.record("warn", "system", "已按安装参数创建管理员 admin（密码由安装时指定）")
+            if is_generated:
+                events.record("warn", "system", "已按安装脚本随机生成的密码创建管理员 admin（首次登录后需修改）")
+            else:
+                events.record("warn", "system", "已按安装参数创建管理员 admin（密码由安装时指定）")
         else:
             generated = generate_password()
             update_group(

@@ -208,3 +208,31 @@ def test_bootstrap_file_beats_random(monkeypatch):
         if secret.exists():
             secret.unlink()
         _reset_security()
+
+
+def test_bootstrap_file_generated_mark_forces_change(monkeypatch):
+    """安装脚本随机生成的密码会留标记文件：密码照用，但仍要求首次登录后改密."""
+    from nanoquant.config import paths
+    from nanoquant.main import bootstrap
+    from nanoquant.security import verify_password
+    from nanoquant.services.settings import get_security, update_group
+
+    monkeypatch.delenv("NANOQUANT_ADMIN_PASSWORD", raising=False)
+    secret = paths.DATA / ".admin_password"
+    mark = paths.DATA / ".admin_password_generated"
+    secret.write_text("Installer-Gen-Pass-9", encoding="utf-8")
+    mark.write_text("", encoding="utf-8")
+    update_group("security", {"password_hash": "", "password_is_default": False})
+    try:
+        bootstrap()
+        cfg = get_security()
+        assert verify_password("Installer-Gen-Pass-9", cfg.password_hash) is True
+        assert cfg.password_is_default is True, "脚本随机生成的密码仍要求首次登录后改密"
+        assert not secret.exists(), "明文密码文件用完必须删掉"
+        assert not mark.exists(), "标记文件用完也必须删掉"
+    finally:
+        if secret.exists():
+            secret.unlink()
+        if mark.exists():
+            mark.unlink()
+        _reset_security()

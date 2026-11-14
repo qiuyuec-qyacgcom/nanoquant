@@ -76,9 +76,9 @@ info "安装目录: $ROOT"
 info "监听端口: $PORT"
 if [[ -n "$ADMIN_PASSWORD" ]]; then
   [[ ${#ADMIN_PASSWORD} -ge 8 ]] || die "--password 至少 8 位（这是唯一能进后台的凭据）"
-  info "初始管理员密码: 使用你指定的值（不回显）"
+  info "初始管理员密码: 使用你指定的值（不回显，装完会打印）"
 else
-  info "初始管理员密码: 首次启动随机生成，打印在启动日志里"
+  info "初始管理员密码: 由安装脚本随机生成，装完打印"
 fi
 
 # Git Bash / Cygwin 不是真 Linux：venv 是 Scripts\ 布局、也没有 systemd/chmod，
@@ -244,13 +244,24 @@ chmod 700 "$ROOT/data" 2>/dev/null || true
 # 端口持久化：--port 要真的被 start.sh 沿用，否则只是个"提示里好看"的参数
 printf '%s\n' "$PORT" > "$ROOT/data/.port" 2>/dev/null || true
 # 初始密码：安装阶段还没有数据库，只能留成文件让首次启动时读取并哈希入库，
-# 启动成功后该文件会被删掉（明文不留在盘上）
+# 启动成功后该文件会被删掉（明文不留在盘上）。
+# 未指定 --password 时，脚本自己生成随机密码并留一个空标记文件，
+# 让首次启动知道「这是随机生成的，登录后仍需强制改密」。
+PASSWORD_GENERATED=0
 if [[ -n "$ADMIN_PASSWORD" ]]; then
-  umask 077
-  printf '%s' "$ADMIN_PASSWORD" > "$ROOT/data/.admin_password"
-  chmod 600 "$ROOT/data/.admin_password" 2>/dev/null || true
-  ok "已暂存初始密码（首次启动写入数据库后自动删除）"
+  GEN_PASSWORD="$ADMIN_PASSWORD"
+else
+  GEN_PASSWORD="$("$PY" -c "import secrets; a='abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; print(''.join(secrets.choice(a) for _ in range(16)))")"
+  PASSWORD_GENERATED=1
 fi
+umask 077
+printf '%s' "$GEN_PASSWORD" > "$ROOT/data/.admin_password"
+chmod 600 "$ROOT/data/.admin_password" 2>/dev/null || true
+if [[ "$PASSWORD_GENERATED" == "1" ]]; then
+  : > "$ROOT/data/.admin_password_generated"
+  chmod 600 "$ROOT/data/.admin_password_generated" 2>/dev/null || true
+fi
+ok "已暂存初始密码（首次启动写入数据库后自动删除）"
 ok "运行目录就绪（data/ logs/ data/backups/）"
 
 # ---------------------------------------------------------------- systemd
@@ -301,12 +312,12 @@ fi
 IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 IP="${IP:-127.0.0.1}"
 
-if [[ -n "$ADMIN_PASSWORD" ]]; then
-  PASS_LINE="初始密码 : 你安装时指定的值"
-  PASS_HINT="登录后建议改成新的强口令（首次登录不强制）。"
+if [[ "$PASSWORD_GENERATED" == "1" ]]; then
+  PASS_LINE="初始密码 : $GEN_PASSWORD"
+  PASS_HINT="该密码由安装脚本随机生成，仅本次显示；登录后必须先改密。"
 else
-  PASS_LINE="初始密码 : 随机生成，见启动日志"
-  PASS_HINT="密码在首次启动时打印（控制台 / logs/nanoquant.log），登录后必须改密。"
+  PASS_LINE="初始密码 : $GEN_PASSWORD"
+  PASS_HINT="登录后建议改成新的强口令（首次登录不强制）。"
 fi
 
 cat <<EOF
