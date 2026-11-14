@@ -1,0 +1,35 @@
+# 构建上下文只发真正需要的文件给 daemon。
+# 之前没有这个文件，上下文约 400MB：.venv 181M、data 62M（含 57MB 库与加密 API Key）、
+# frontend/node_modules 151M —— 等于把整个数据库和密钥打包发给 docker daemon。
+
+# 运行时数据与凭证（绝不能进镜像层）
+data
+logs
+.venv
+**/.master_key
+**/*.db
+**/*.sqlite*
+
+# 依赖目录（在镜像里重新装）
+frontend/node_modules
+frontend/dist
+
+# 版本控制与 CI
+.git
+.github
+.gitignore
+
+# Python 缓存
+**/__pycache__
+**/*.pyc
+**/*.pyo
+backend/.pytest_cache
+backend/.mypy_cache
+backend/.ruff_cache
+backend/tests
+
+# 文档与部署脚本（不需要进运行时镜像）
+docs
+deploy
+*.md
+LICENSE

@@ -65,6 +65,17 @@ jobs:
       - name: Cargo test
         run: cargo test --release
 
+  docker:
+    name: docker (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        # 校验 Dockerfile 与 .dockerignore 没被改坏：能构建出来就算过，不推送。
+        # .dockerignore 挡住了 .venv/data/node_modules，构建上下文不再拖数据库与密钥。
+        run: docker build -t nanoquant:ci .
+
   audit:
     name: deps (pip-audit)
     runs-on: ubuntu-latest
