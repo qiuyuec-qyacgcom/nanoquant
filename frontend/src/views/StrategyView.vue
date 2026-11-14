@@ -77,6 +77,7 @@ const BASIC_FIELDS: Record<string, string[]> = {
 const PLAIN_HINTS: Record<string, string> = {
   cycle_interval_sec: '多久扫描一次行情；15 秒以上，间隔越短越耗交易所额度',
   max_symbols_per_cycle: '每轮最多检查几个标的（按标的池顺序）',
+  scan_concurrency: '同时拉几路 K 线；只影响信号新旧，不增加请求数',
   max_positions: '最多同时持有几个仓位',
   risk_per_trade_pct: '每笔交易最多亏掉权益的百分之几；越大仓位越重',
   margin_pct: '单个仓位最多占用多少权益作保证金',
@@ -142,6 +143,7 @@ const BASE_META: Record<string, FieldMeta> = {
     min: 15,
   },
   max_symbols_per_cycle: { label: '每轮扫描标的', unit: '个', hint: '按信号分从标的池取前 N 个' },
+  scan_concurrency: { label: '扫描并发', unit: '路', hint: '串行时 12 个标的约 2.2s；并发只降延迟，不增加权重' },
   max_positions: { label: '最大同时持仓', unit: '个' },
   trading_windows: { label: '交易时段', widget: 'tags', hint: 'HH:MM-HH:MM，可多个；00:00-24:00 表示全天' },
   timezone_offset: { label: '时区偏移', unit: '小时', hint: '交易时段所用时区，中国为 +8' },
@@ -349,7 +351,7 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {}
 
 const SECTIONS: Record<string, SectionDef[]> = {
   engine: [
-    { title: '运行与节奏', hint: '引擎每轮扫描标的池，节奏决定灵敏度', fields: ['cycle_interval_sec', 'max_symbols_per_cycle', 'max_positions'] },
+    { title: '运行与节奏', hint: '引擎每轮扫描标的池，节奏决定灵敏度', fields: ['cycle_interval_sec', 'max_symbols_per_cycle', 'scan_concurrency', 'max_positions'] },
     { title: '交易时段', hint: '只在窗口内开新仓，持仓管理不受限', fields: ['trading_windows', 'timezone_offset'] },
     { title: '模拟盘与下单', fields: ['demo_start_balance', 'order_type', 'recv_window_ms', 'close_on_halt'] },
   ],

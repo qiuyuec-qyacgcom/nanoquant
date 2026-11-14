@@ -934,28 +934,34 @@ class TradingEngine:
         prices = {s: t.last for s, t in tickers.items()}
         results: list[dict[str, Any]] = []
 
-        for symbol in symbols:
+        # 第一阶段（并发）：只做网络 + 指标计算，不碰数据库。
+        # 串行时每个标的要等一个 RTT，12 个标的就多出 2 秒"信号延迟"；
+        # 并发只改延迟、不改每轮请求数（权重不变），所以默认开到 3。
+        sem = asyncio.Semaphore(max(1, min(8, int(getattr(engine_cfg, "scan_concurrency", 3) or 3))))
+
+        async def _analyze(symbol: str) -> dict[str, Any] | None:
             ticker = tickers.get(symbol)
             if ticker is None:
-                continue
-            try:
-                candles = await binance_client.klines(symbol, strat_cfg.timeframe, _scan_bars())
-            except (BinanceError, NoCredentials) as exc:
-                log.warning("%s K线取数失败: %s", symbol, str(exc)[:120])
-                continue
-            if len(candles) < 30:
-                continue
-            # 高周期趋势：只做与 HTF 同向的信号（默认关闭，开启时每标的每轮多一次 REST）
-            htf_trend = ""
-            if strat_cfg.htf_timeframe:
+                return None
+            async with sem:
                 try:
-                    htf_candles = await binance_client.klines(symbol, strat_cfg.htf_timeframe, 60)
-                    htf_closes = [c.close for c in htf_candles]
-                    htf_fast = ta.ema(htf_closes, strat_cfg.ema_fast)
-                    htf_slow = ta.ema(htf_closes, strat_cfg.ema_slow)
-                    htf_trend = "up" if htf_fast > htf_slow else ("down" if htf_fast < htf_slow else "flat")
-                except (BinanceError, NoCredentials):
-                    htf_trend = ""
+                    candles = await binance_client.klines(symbol, strat_cfg.timeframe, _scan_bars())
+                except (BinanceError, NoCredentials) as exc:
+                    log.warning("%s K线取数失败: %s", symbol, str(exc)[:120])
+                    return None
+                # 高周期趋势：只做与 HTF 同向的信号（默认关闭，开启时每标的每轮多一次 REST）
+                htf_trend = ""
+                if strat_cfg.htf_timeframe:
+                    try:
+                        htf_candles = await binance_client.klines(symbol, strat_cfg.htf_timeframe, 60)
+                        htf_closes = [c.close for c in htf_candles]
+                        htf_fast = ta.ema(htf_closes, strat_cfg.ema_fast)
+                        htf_slow = ta.ema(htf_closes, strat_cfg.ema_slow)
+                        htf_trend = "up" if htf_fast > htf_slow else ("down" if htf_fast < htf_slow else "flat")
+                    except (BinanceError, NoCredentials):
+                        htf_trend = ""
+            if len(candles) < 30:
+                return None
             features = build_features(
                 candles, strat_cfg,
                 # 取不到就是 None（缺失），不能塞 0.0 冒充"费率中性 / OI 没变"
@@ -975,6 +981,18 @@ class TradingEngine:
             features["_bars"] = [
                 {"o": c.open, "h": c.high, "l": c.low, "c": c.close} for c in candles[-14:]
             ]
+            return {"symbol": symbol, "ticker": ticker, "features": features}
+
+        analyzed = await asyncio.gather(*(_analyze(s) for s in symbols))
+
+        # 第二阶段（串行）：落库 + 闸门 + 起任务。写库留在单线程里，避免 SQLite 写竞争；
+        # gather 保序，所以信号顺序与标的池顺序一致，排查时好对照。
+        for item in analyzed:
+            if item is None:
+                continue
+            symbol = item["symbol"]
+            ticker = item["ticker"]
+            features = item["features"]
             sig = score_signal(symbol, features, strat_cfg)
             per_symbol_min = min_scores.get(symbol, 0.0)
             if sig.direction != "flat" and per_symbol_min > 0 and abs(sig.score) < per_symbol_min:

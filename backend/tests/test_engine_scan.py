@@ -20,6 +20,7 @@ from nanoquant.services import state
 from nanoquant.services.settings import (
     EngineSettings,
     RiskSettings,
+    get_risk,
     get_strategy,
     update_group,
 )
@@ -244,3 +245,91 @@ def _reset_engine_state():
     for key, value in (("halted", ""), ("consecutive_losses", "0"), ("sl_guard_until", "0"), ("loss_halt_until", "0")):
         state.set(key, value)
     yield
+
+
+def _account():
+    """扫描只用 equity/available 做闸门与定仓，其余字段不会被读到."""
+    return SimpleNamespace(equity=100.0, available=100.0, unrealized=0.0, margin_used=0.0, mode="demo")
+
+
+# ------------------------------------------------------------ 扫描并发
+def test_scan_respects_configured_concurrency(monkeypatch):
+    """并发只改延迟不改请求数；峰值在途必须等于配置值（默认 3）."""
+    symbols = ["PARA1USDT", "PARA2USDT", "PARA3USDT", "PARA4USDT"]
+    for symbol in symbols:
+        with session_scope() as s:
+            if s.get(TradingSymbol, symbol) is None:
+                s.add(
+                    TradingSymbol(symbol=symbol, enabled=True, max_leverage=20, precision=3,
+                                  tick_sz="0.01", min_sz="0.001", min_notional=5.0, sort_order=950)
+                )
+
+    inflight = {"now": 0, "peak": 0}
+
+    async def _klines(symbol, interval, limit=500):
+        inflight["now"] += 1
+        inflight["peak"] = max(inflight["peak"], inflight["now"])
+        await asyncio.sleep(0.02)
+        inflight["now"] -= 1
+        return _candles()
+
+    async def _tickers(_symbols):
+        return {s: SimpleNamespace(last=100.0, change_pct=0.5, quote_volume=1e8, source="ws") for s in symbols}
+
+    async def _funding(_symbols):
+        return {}
+
+    async def _oi(_symbols):
+        return {}
+
+    monkeypatch.setattr(worker_mod.binance_client, "klines", _klines)
+    monkeypatch.setattr(worker_mod.binance_client, "tickers", _tickers)
+    monkeypatch.setattr(worker_mod.binance_client, "funding_rates", _funding)
+    monkeypatch.setattr(worker_mod.binance_client, "open_interest", _oi)
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: SimpleNamespace(mode="demo"))
+
+    update_group("engine", {"scan_concurrency": 3})
+    try:
+        eng = worker_mod.TradingEngine()
+        cfg = EngineSettings(enabled=True, max_symbols_per_cycle=60, scan_concurrency=3)
+        asyncio.run(eng._scan(SimpleNamespace(mode="demo"), _account(), cfg, get_risk(), get_strategy()))
+    finally:
+        update_group("engine", {"scan_concurrency": 3})
+
+    assert inflight["peak"] == 3, f"期望并发 3，实际峰值 {inflight['peak']}"
+
+
+def test_scan_survives_one_symbol_failing(monkeypatch):
+    symbols = ["PARA5USDT", "PARA6USDT"]
+    for symbol in symbols:
+        with session_scope() as s:
+            if s.get(TradingSymbol, symbol) is None:
+                s.add(
+                    TradingSymbol(symbol=symbol, enabled=True, max_leverage=20, precision=3,
+                                  tick_sz="0.01", min_sz="0.001", min_notional=5.0, sort_order=951)
+                )
+
+    async def _klines(symbol, interval, limit=500):
+        if symbol == "PARA5USDT":
+            raise BinanceError(-1001, "连接断开")
+        return _candles()
+
+    async def _tickers(_symbols):
+        return {s: SimpleNamespace(last=100.0, change_pct=0.5, quote_volume=1e8, source="ws") for s in symbols}
+
+    async def _empty(_symbols):
+        return {}
+
+    monkeypatch.setattr(worker_mod.binance_client, "klines", _klines)
+    monkeypatch.setattr(worker_mod.binance_client, "tickers", _tickers)
+    monkeypatch.setattr(worker_mod.binance_client, "funding_rates", _empty)
+    monkeypatch.setattr(worker_mod.binance_client, "open_interest", _empty)
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: SimpleNamespace(mode="demo"))
+
+    eng = worker_mod.TradingEngine()
+    cfg = EngineSettings(enabled=True, max_symbols_per_cycle=60)
+    out = asyncio.run(eng._scan(SimpleNamespace(mode="demo"), _account(), cfg, get_risk(), get_strategy()))
+
+    scanned = [r["symbol"] for r in out]
+    assert "PARA6USDT" in scanned, "一个标的取数失败不该拖垮整轮扫描"
+    assert "PARA5USDT" not in scanned

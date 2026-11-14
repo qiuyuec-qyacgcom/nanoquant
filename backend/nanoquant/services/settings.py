@@ -45,6 +45,9 @@ class EngineSettings(BaseModel):
     cycle_interval_sec: int = Field(default=MIN_CYCLE_INTERVAL_SEC, ge=MIN_CYCLE_INTERVAL_SEC, le=3600)
     max_positions: int = Field(default=2, ge=1, le=20)
     max_symbols_per_cycle: int = Field(default=12, ge=1, le=60)
+    #: 扫描并发：同时拉几路 K 线。串行时 12 个标的约 2.2s，只影响信号有多新，
+    #: 不改变权重（每轮请求数相同），所以可以放心开 3~5。
+    scan_concurrency: int = Field(default=3, ge=1, le=8)
     trading_windows: list[str] = Field(default_factory=lambda: ["00:00-24:00"])
     timezone_offset: int = Field(default=8, ge=-12, le=14, description="交易时段所用时区偏移")
     close_on_halt: bool = False

@@ -31,6 +31,10 @@ log = get_logger("retention")
 
 ARCHIVE_DIR = paths.DATA / "archive"
 BATCH = 400
+#: 权益曲线降采样：48 小时内保留每分钟一点（看细节），更早的每 10 分钟一点（看趋势）。
+#: 采样是一分钟一条，30 天就是 4.3 万行；降采样后约 3 千行，曲线外观几乎无差别。
+EQUITY_RECENT_HOURS = 48
+EQUITY_BUCKET_SEC = 600
 
 
 def _archive(name: str, rows: list[dict[str, Any]]) -> Path | None:
@@ -65,11 +69,41 @@ def _purge(
     return removed
 
 
+def _downsample_equity(now: int, *, recent_hours: int = EQUITY_RECENT_HOURS,
+                       bucket_sec: int = EQUITY_BUCKET_SEC) -> int:
+    """把近期之外的权益采样压成每 bucket 一个点，返回删除行数.
+
+    保留每个桶里**最早**的那条：曲线的拐点通常出现在桶首，取均值会抹平尖峰。
+    """
+    boundary = now - recent_hours * 3600
+    with session_scope() as s:
+        rows = s.execute(
+            select(EquityPoint.id, EquityPoint.mode, EquityPoint.ts)
+            .where(EquityPoint.ts < boundary)
+            .order_by(EquityPoint.ts)
+        ).all()
+    kept: set[tuple[str, int]] = set()
+    drop: list[int] = []
+    for row_id, mode, ts in rows:
+        key = (str(mode), int(ts) // bucket_sec)
+        if key in kept:
+            drop.append(int(row_id))
+        else:
+            kept.add(key)
+    removed = 0
+    for i in range(0, len(drop), BATCH):
+        chunk = drop[i : i + BATCH]
+        with session_scope() as s:
+            removed += s.execute(delete(EquityPoint).where(EquityPoint.id.in_(chunk))).rowcount or 0
+        time.sleep(0.02)
+    return removed
+
+
 def purge_expired(now: int | None = None) -> dict[str, int]:
     """按配置清理过期数据, 返回每类删除条数."""
     cfg = get_system()
     now = now or int(time.time())
-    stats = {"signals": 0, "events": 0, "alerts": 0, "equity": 0, "cooldowns": 0}
+    stats = {"signals": 0, "events": 0, "alerts": 0, "equity": 0, "equity_downsampled": 0, "cooldowns": 0}
 
     stats["signals"] = _purge(
         Signal,
@@ -120,6 +154,7 @@ def purge_expired(now: int | None = None) -> dict[str, int]:
         "alerts",
     )
 
+    stats["equity_downsampled"] = _downsample_equity(now)
     with session_scope() as s:
         stats["equity"] = (
             s.execute(delete(EquityPoint).where(EquityPoint.ts < now - cfg.equity_retention_days * 86400)).rowcount or 0

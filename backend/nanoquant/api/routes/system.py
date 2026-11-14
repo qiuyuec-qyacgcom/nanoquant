@@ -280,6 +280,28 @@ async def diagnostics(user: str = Depends(current_user)) -> dict:
     except Exception as exc:  # noqa: BLE001
         checks.append({"name": "执行内核", "ok": False, "detail": str(exc)[:160], "latency_ms": 0})
 
+    # 10. 告警通道：不配置就没人知道出事（过去回撤打到 -99% 也没人收到通知）
+    cfg_alert = get_system()
+    channels = []
+    if (cfg_alert.alert_webhook_url or "").strip():
+        channels.append("Webhook")
+    if (cfg_alert.alert_telegram_token or "").strip() and (cfg_alert.alert_telegram_chat_id or "").strip():
+        channels.append("Telegram")
+    checks.append(
+        {
+            "name": "告警通道",
+            "ok": bool(channels),
+            "detail": (
+                f"已配置 {' + '.join(channels)}"
+                if channels
+                else "未配置：熔断/下单失败/爆仓风险只会写进页面，没人会收到通知。"
+                "在「参数配置 → 系统 → 告警」填入 Webhook 或 Telegram 后可点“发送测试告警”验证"
+            ),
+            "latency_ms": 0,
+            "extra": {"channels": channels},
+        }
+    )
+
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,

@@ -105,3 +105,53 @@
 - [ ] 总览「委托流水」里没有长期停在 `NEW/PARTIALLY_FILLED` 的单（有 = 状态回查没跑通，台账不可信）
 - [ ] 备份页 KPI「每日自动备份」显示的是**最近一天内**的时间戳（长期不更新 = 自动备份又哑了）
 - [ ] **恢复演练**：`python scripts/backup_drill.py`（在运行库副本上跑：备份 → 删数据 → 还原 → 逐项比对；退出码非 0 就是有问题）
+
+## 八、进程守护与数据库维护
+
+### 8.1 防止"进程挂了没人知道"
+
+症状（真实发生过）：页面还能打开，但引擎从某刻起再没写过心跳，停了两天半。
+
+```text
+# 前台守护（Ctrl+C 结束）：健康检查失败就重启，日志按 20MB 轮转
+scripts\supervise.ps1
+
+# 只体检一次（放进计划任务或手工排查）
+scripts\supervise.ps1 -Once
+```
+
+放进计划任务（登录即启动，崩了由脚本自己拉起）：用 `scripts/supervise.ps1` 作为
+`schtasks` 的 `/TR` 目标，或直接在「任务计划程序」里新建"登录时"触发、程序填
+`powershell.exe`、参数填 `-WindowStyle Hidden -ExecutionPolicy Bypass -File <仓库>\scripts\supervise.ps1`。
+
+Linux 用 `deploy/nanoquant.service`（systemd 自带重启策略）。
+
+注意：守护脚本启动的进程会把标准输出写到 `logs/app.out.log`，超过 20MB 自动轮转保留 3 份；
+手工 `python -m nanoquant > app.out.log` 这种写法不会轮转，长期会把磁盘写满。
+
+### 8.2 数据库瘦身
+
+现状（2026-11 实测）：库 56.8MB，其中 34MB 是 2.7 万条 flat 信号的完整指标快照。
+新数据已经改成精简快照（见 `engine/worker.py` 的 `FLAT_FEATURE_KEYS`），
+**存量**用脚本压：
+
+```bash
+python scripts/cleanup_history.py                  # 演练：只报告能省多少
+python scripts/cleanup_history.py --apply           # 压缩旧 flat 快照 + 删除废弃表
+python scripts/cleanup_history.py --apply --vacuum  # 再重建库回收磁盘（必须先停服务）
+```
+
+实测结果：56.8MB → 16.0MB（flat 特征 34.1MB → 5.0MB），行数与 `integrity_check` 均无误。
+`--vacuum` 会先做一次一致性备份（SQLite 在线备份 API，包含未 checkpoint 的 WAL），
+再原子替换；磁盘可用不足时会拒绝执行而不是写到一半。
+
+### 8.3 扫描并发
+
+`引擎 → 每轮扫描标的 / 扫描并发`：串行时 12 个标的约 2.2s，改成 3 路并发约 0.8s。
+并发**不增加**每轮请求数（权重不变），只是把 RTT 叠起来；标的池很大或网络抖动时再降到 2。
+
+### 8.4 告警通道
+
+系统诊断里有一项「告警通道」：未配置时是红色。在 `参数配置 → 系统` 填
+Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「发送测试告警」验证。
+不配的话，熔断、下单失败、爆仓预警只会写进页面——没人会看。

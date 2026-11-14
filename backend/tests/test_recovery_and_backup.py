@@ -303,3 +303,49 @@ def test_drawdown_window_unblocks_gates_where_all_time_peak_would_halt():
 
     assert halted.ok is False and "回撤" in (halted.halt or "")
     assert passed.ok is True, passed.reason
+
+
+# ------------------------------------------------------- 权益曲线降采样
+def test_equity_downsample_keeps_recent_and_thins_old():
+    """48h 内每分钟一点保真；更早的压成每 10 分钟一点。"""
+    from nanoquant.models import EquityPoint
+    from nanoquant.services import retention
+
+    now = int(time.time())
+    with session_scope() as s:
+        s.query(EquityPoint).delete(synchronize_session=False)
+        # 3 小时前的一段"老数据"：每分钟一条，共 180 条
+        base = now - 72 * 3600
+        for i in range(180):
+            s.add(EquityPoint(ts=base + i * 60, mode="demo", wallet=10.0, unrealized=0.0))
+        # 最近 1 小时：每分钟一条，共 60 条
+        for i in range(60):
+            s.add(EquityPoint(ts=now - 3600 + i * 60, mode="demo", wallet=10.0, unrealized=0.0))
+
+    removed = retention._downsample_equity(now)  # noqa: SLF001
+
+    with session_scope() as s:
+        old_kept = s.query(EquityPoint).filter(EquityPoint.ts < now - 48 * 3600).count()
+        recent_kept = s.query(EquityPoint).filter(EquityPoint.ts >= now - 48 * 3600).count()
+        s.query(EquityPoint).delete(synchronize_session=False)
+
+    # 180 分钟 / 10 分钟桶 = 18 个点（±1 取决于桶边界）
+    assert 17 <= old_kept <= 19, old_kept
+    assert recent_kept == 60, "48 小时内不做降采样"
+    assert removed == 180 - old_kept
+
+
+def test_equity_downsample_is_noop_for_small_tables():
+    from nanoquant.models import EquityPoint
+    from nanoquant.services import retention
+
+    now = int(time.time())
+    with session_scope() as s:
+        s.query(EquityPoint).delete(synchronize_session=False)
+        # 两条落在不同的 10 分钟桶里 → 都该保留
+        s.add(EquityPoint(ts=now - 72 * 3600, mode="demo", wallet=10.0))
+        s.add(EquityPoint(ts=now - 72 * 3600 - 900, mode="demo", wallet=11.0))
+
+    assert retention._downsample_equity(now) == 0  # noqa: SLF001
+    with session_scope() as s:
+        s.query(EquityPoint).delete(synchronize_session=False)
