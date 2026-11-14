@@ -1,6 +1,6 @@
 # 直接依赖（唯一手改的地方）
 # 生成锁定文件：
-#   uv pip compile requirements.in --python-version 3.12 --python-platform linux -o requirements.txt
+#   uv pip compile requirements.in --python-version 3.11 --python-platform linux -o requirements.txt
 #   （生成后给 uvloop 补 `; sys_platform != "win32"`，Windows 没有该 wheel）
 fastapi>=0.115
 uvicorn[standard]>=0.30

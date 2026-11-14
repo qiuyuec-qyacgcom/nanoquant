@@ -92,7 +92,7 @@
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Python | **3.12+** | 必需。`backend/requirements.txt` 是按 3.12 编译的锁文件，CI 覆盖 3.12 / 3.13 |
+| Python | **3.11+** | 必需。`backend/requirements.txt` 是按 3.11 编译的锁文件，CI 覆盖 3.11 / 3.12 / 3.13 |
 | Node.js | 18+ | 可选，仅构建前端时需要；不装则没有面板，API 与引擎照常工作 |
 | 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下 |
 | 系统 | Linux（可选 systemd）/ Windows 10+ / macOS | 常驻运行建议 Linux + systemd |
@@ -109,6 +109,7 @@ if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec
 > 再转交 `scripts/install.sh` 完成依赖安装；`--dir <目录>` 可指定安装位置（默认 `./nanoquant`），
 > 其余参数（`--systemd` / `--mirror` / `--port` 等）全部透传，见下表。
 >
+> 装完会**自动在后台启动**，无需再手动 `start.sh --daemon`（想自己控制启动时机加 `--no-start`）。
 > 生产部署想顺便注册开机自启：把命令尾部换成
 > `bash install.sh --password '你的密码' --systemd`。
 
@@ -125,10 +126,10 @@ cd nanoquant
 
 ```bash
 # Linux / macOS
-bash scripts/install.sh        # 装依赖 + 建前端产物 + 准备目录
-bash scripts/start.sh          # 前台启动，默认 http://127.0.0.1:8899（--daemon 后台）
+bash scripts/install.sh        # 装依赖 + 建前端产物 + 准备目录 + 装完自动后台启动
 bash scripts/status.sh         # 查看状态
 bash scripts/stop.sh           # 停止
+bash scripts/start.sh --daemon # 手动重新后台启动（机器重启后，或装时加了 --no-start）
 ```
 
 ```powershell
@@ -146,18 +147,21 @@ powershell -ExecutionPolicy Bypass -File scripts\stop.ps1   # 按命令行匹配
 | `--systemd` | — | 注册开机自启，并等 `/api/v1/health` 通过才报完成 |
 | `--no-frontend` | `-SkipFrontend` | 跳过前端构建（已有 `dist` 或只跑后端） |
 | `--mirror cn` | `-Mirror cn` | pip 换清华源（`aliyun` / 完整 URL 亦可） |
-| `--password 'xxx'` | `-Password 'xxx'` | 指定初始管理员密码（≥ 8 位）；不传则首次启动随机生成 |
+| `--password 'xxx'` | `-Password 'xxx'` | 指定初始管理员密码（≥ 8 位）；不传则安装脚本随机生成、装完打印 |
 | `--force` | `-Force` | 忽略 `requirements.txt` 哈希，强制重装依赖 |
+| `--no-pyenv` | — | 不自动用 pyenv 编译 Python（自己管理解释器时用） |
+| `--no-start` | — | 装完不自动后台启动（默认装完即后台运行） |
 | — | `-Python <路径>` | PATH 里没有 `python` 时指定解释器 |
 
 安装脚本做了什么（**可反复执行**，已完成的步骤自动跳过）：
 
-1. 校验 Python 3.12+、Node 18+（缺 Node 只警告，不中止）
+1. 校验 Python 3.11+、Node 18+（缺 Node 只警告，不中止）
 2. 创建或复用 `.venv`；按 `requirements.txt` 的 SHA256 判断要不要重装依赖
 3. 装完跑 `import nanoquant.main` 自检 —— 只有 import 通过才算装好
 4. `npm ci` + `npm run build` 生成 `frontend/dist`
 5. 建 `data/`、`logs/`、`data/backups/`，把端口写进 `data/.port`
 6. `--systemd` 时注册服务并轮询健康检查（30s 超时，失败会打印 `journalctl` 命令）
+7. 装完自动后台启动：`--systemd` 走 systemd 接管；否则等价 `start.sh --daemon` 并轮询健康检查（`--no-start` 跳过）
 
 > Git Bash / Cygwin 下 `install.sh` 会直接拒绝并提示改用 `install.ps1`：那里没有 systemd、
 > venv 是 `Scripts\` 布局，"装成功了"只会在启动时才炸。
@@ -536,9 +540,9 @@ A：这是初始密码保护：初始密码（随机的或安装时指定的）�
 登录后前端会把你送到「参数配置 → 安全」，改一次密码即全部恢复（标记自动清除）。
 忘记密码用 `python scripts/reset_password.py`。
 
-**Q：安装脚本说找不到 Python 3.12+，但机器上明明装了？**
-A：多半是没加进 PATH。Windows 上用 `-Python C:\Python312\python.exe` 指定路径；Linux 上确认
-`python3.12 -V` 能跑。脚本也会依次尝试 `py -3.13` / `py -3.12` / `python` / `python3` 以及
+**Q：安装脚本说找不到 Python 3.11+，但机器上明明装了？**
+A：多半是没加进 PATH。Windows 上用 `-Python C:\Python311\python.exe` 指定路径；Linux 上确认
+`python3.11 -V` 能跑。脚本也会依次尝试 `py -3.13` / `py -3.12` / `py -3.11` / `python` / `python3` 以及
 常见安装目录，实在找不到才报错。
 
 **Q：`pip install` 卡住或超时？**

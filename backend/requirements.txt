@@ -1,6 +1,6 @@
 # 依赖锁定（勿手改）—— 源文件是同目录的 requirements.in
 #   重新生成：
-#     uv pip compile requirements.in --python-version 3.12 --python-platform linux -o requirements.txt
+#     uv pip compile requirements.in --python-version 3.11 --python-platform linux -o requirements.txt
 #   生成后唯一需要手工补的：给 uvloop 加 sys_platform 标记（Linux 专属，Windows 无 wheel）
 annotated-doc==0.0.5
     # via fastapi

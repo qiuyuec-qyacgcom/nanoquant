@@ -2,7 +2,7 @@
 .SYNOPSIS
   NanoQuant Windows 一键安装脚本
 .DESCRIPTION
-  检查 Python 3.12+ / Node 18+，创建虚拟环境，安装后端依赖（按哈希跳过重复安装）并构建前端。
+  检查 Python 3.11+ / Node 18+，创建虚拟环境，安装后端依赖（按哈希跳过重复安装）并构建前端。
   端口会写进 data\.port，start.ps1 会沿用，不必每次手动传 -Port。
 .PARAMETER Python
   指定 python.exe 路径（PATH 里没有 python 时用）
@@ -75,11 +75,11 @@ try {
   }
 } catch { }
 
-# ---------------------------------------------------------------- Python 3.12+
+# ---------------------------------------------------------------- Python 3.11+
 # 探测顺序：-Python → 已有 .venv → py/py -3.x → PATH 上的 python → 常见安装目录
 # 之所以要看 .venv：机器上可能根本没把 python 加进 PATH，但虚拟环境里那个是真 Python，
 # 重复执行安装脚本时不该因为"找不到 python 命令"就失败。
-$probe = 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)'
+$probe = 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)'
 $Venv = Join-Path $Root '.venv'
 $VenvPy = Join-Path $Venv 'Scripts\python.exe'
 
@@ -104,7 +104,7 @@ if ($Python -and (Test-Py $Python)) {
   $pyExe = $VenvPy
   $pyFromVenv = $true
 } else {
-  foreach ($cand in @(@('py', @('-3.13')), @('py', @('-3.12')), @('python', @()), @('python3', @()))) {
+  foreach ($cand in @(@('py', @('-3.13')), @('py', @('-3.12')), @('py', @('-3.11')), @('python', @()), @('python3', @()))) {
     if (Test-Py $cand[0] $cand[1]) { $pyExe = $cand[0]; $pyPre = $cand[1]; break }
   }
 }
@@ -129,7 +129,7 @@ if (-not $pyExe) {
 }
 
 if (-not $pyExe) {
-  Fail "未找到 Python 3.12+。请安装 https://www.python.org/downloads/（勾选 Add to PATH），或 winget install Python.Python.3.12，装好后可用 -Python 指定路径"
+  Fail "未找到 Python 3.11+。请安装 https://www.python.org/downloads/（勾选 Add to PATH），或 winget install Python.Python.3.11，装好后可用 -Python 指定路径"
 }
 
 $pyVersion = (& $pyExe @pyPre --version 2>&1)

@@ -764,7 +764,7 @@
   - 新增 `tests/test_api.py`（9 条）：健康检查、未授权/伪造 token、登录失败、配置越界 400、
     `engine.mode` 不能绕过确认短语、执行内核/死信/写库健康字段、回测 404/422、
     桩 K 线跑通回测与 walk-forward（不依赖交易所）。
-  - 依赖锁定：`requirements.in`（直接依赖）→ `requirements.txt`（uv pip compile，Python 3.12 + linux 平台；
+  - 依赖锁定：`requirements.in`（直接依赖）→ `requirements.txt`（uv pip compile，Python 3.11 + linux 平台；
     `uvloop` 手工补 `sys_platform != "win32"`，否则 Windows 装不上）。
   - CI：后端改跑 `pytest tests -q`；新增 `rust` job（`cargo test --release`）。
 - **验证**：`pytest tests -q` → **45 passed**（约 2.1s）；运行后真实 `data/nanoquant.db` 无测试写入。
