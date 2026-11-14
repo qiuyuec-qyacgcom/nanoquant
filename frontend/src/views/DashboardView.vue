@@ -16,6 +16,7 @@ const signals = ref<any[]>([])
 const usage = ref<any>(null)
 const stages = ref<any>(null)
 const protection = ref<any[]>([])
+const orders = ref<any[]>([])
 const cancelingId = ref('')
 const busy = ref(false)
 const showPosHelp = ref(false)
@@ -122,7 +123,7 @@ const equityOption = computed(() => {
 
 async function load() {
   await app.loadStatus()
-  const [eq, tr, sg, us, ev, ex, pr] = await Promise.allSettled([
+  const [eq, tr, sg, us, ev, ex, pr, od] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),
@@ -130,6 +131,7 @@ async function load() {
     app.loadEvents(40),
     http.get('/engine/execution'),
     http.get('/engine/protection'),
+    http.get('/engine/orders?limit=15'),
   ])
   if (eq.status === 'fulfilled') equity.value = eq.value.items
   if (tr.status === 'fulfilled') trades.value = tr.value.items
@@ -137,6 +139,7 @@ async function load() {
   if (us.status === 'fulfilled') usage.value = us.value
   if (ex.status === 'fulfilled') stages.value = ex.value
   if (pr.status === 'fulfilled') protection.value = pr.value.items || []
+  if (od.status === 'fulfilled') orders.value = od.value.items || []
 }
 
 async function cycleNow() {
@@ -540,6 +543,45 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <div class="right"><span class="tag tag-dim">{{ app.events.length }}</span></div>
         </div>
         <div class="panel-body"><EventFeed :events="app.events" height="260px" /></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">委托流水</span>
+        <div class="right">
+          <span class="tag tag-dim">最近 {{ orders.length }} 条</span>
+          <span class="tag tag-dim" title="挂单回执只有 NEW，成交/撤销由后台每 60s 回查交易所补齐">状态由交易所回查收敛</span>
+        </div>
+      </div>
+      <div class="panel-body flush table-scroll" style="max-height: 260px">
+        <table class="table">
+          <thead>
+            <tr><th>时间</th><th>标的</th><th>方向</th><th>类型</th><th>用途</th><th>数量</th><th>价格</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="o in orders" :key="o.id">
+              <td class="mono muted">{{ timeStr(o.ts, false) }}</td>
+              <td><b>{{ o.symbol }}</b></td>
+              <td><span class="tag" :class="o.side === 'BUY' ? 'tag-long' : 'tag-short'">{{ o.side === 'BUY' ? '买' : '卖' }}</span></td>
+              <td class="muted">{{ o.order_type }}</td>
+              <td class="muted">{{ o.purpose }}</td>
+              <td class="mono">{{ o.qty || '--' }}</td>
+              <td class="mono">{{ o.price ? px(o.price) : '--' }}</td>
+              <td>
+                <span
+                  class="tag"
+                  :class="{
+                    'tag-long': o.status === 'FILLED',
+                    'tag-short': ['CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'].includes(o.status),
+                    'tag-dim': !['FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'].includes(o.status),
+                  }"
+                >{{ o.status || '--' }}</span>
+              </td>
+            </tr>
+            <tr v-if="!orders.length"><td colspan="8" class="empty">暂无委托记录</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
 

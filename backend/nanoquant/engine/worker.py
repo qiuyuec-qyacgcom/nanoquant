@@ -31,6 +31,7 @@ from ..logging_setup import get_logger
 from ..models import EquityPoint, OrderRecord, PositionRecord, Signal, SignalFollow, TradeRecord
 from ..news import service as news_service
 from ..services import events, position_view, state
+from ..services import order_sync
 from ..services import signal_follow as signal_feed
 from ..services import symbols as symbol_service
 from ..services.settings import (
@@ -122,6 +123,7 @@ class TradingEngine:
         #: 健康检查节流与 WS 告警去重
         self._last_health_check = 0.0
         self._last_halt_flatten = 0.0
+        self._last_order_sync = 0.0
         self._last_ws_warn = 0.0
         self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
@@ -306,6 +308,8 @@ class TradingEngine:
 
         # 模拟盘与实盘都是交易所账户, 都需要与交易所对账
         await timed("reconcile", self._reconcile_live(broker))
+        # 委托状态收敛: 挂单回执只会返回 NEW, 成交/撤销要回查才知道（60s 节流，无待查单时零请求）
+        await timed("orders_sync", self._sync_orders_if_due())
 
         await timed("positions", self._manage_positions(broker, strat_cfg, engine_cfg))
         await timed("liquidation_risk", self._check_liquidation_risk(broker, risk_cfg))
@@ -413,6 +417,27 @@ class TradingEngine:
                         row.exit_price = lp.mark_price or lp.entry_price
                         row.exit_reason = "venue_sync"
                 events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+
+    async def _sync_orders_if_due(self) -> None:
+        """把非终态委托与交易所对齐（60s 一次）.
+
+        只有存在待确认委托时才会产生 REST 请求：市价单回执即 FILLED，
+        正常情况下这里每轮只做一次本地 DB 查询、零网络请求。
+        """
+        now = time.time()
+        if now - self._last_order_sync < 60:
+            return
+        self._last_order_sync = now
+        try:
+            result = await order_sync.sync()
+        except Exception as exc:  # noqa: BLE001  台账同步失败不能打断交易循环
+            log.debug("委托状态同步跳过: %s", exc)
+            return
+        if result.get("updated"):
+            log.info(
+                "委托状态同步: 查 %d 条 / 更新 %d 条 / 失败 %d 条",
+                result["checked"], result["updated"], result["errors"],
+            )
 
     async def _flatten_on_halt(self, halt_reason: str) -> None:
         """熔断即离场（`engine.close_on_halt`）.

@@ -66,6 +66,7 @@ def _engine(*, stub_reconcile: bool = True, **stubs):
         return None
 
     for name in (
+        "_sync_orders_if_due",
         "_manage_positions",
         "_check_liquidation_risk",
         "_health_check",
