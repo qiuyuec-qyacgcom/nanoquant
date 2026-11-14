@@ -190,7 +190,7 @@ onBeforeUnmount(() => {
 
       <main class="content">
         <div v-if="auth.mustChangePassword" class="note error" style="margin-bottom: 12px">
-          当前仍是初始密码 <b>admin123</b>，后台除改密外的操作都已被拒绝。
+          当前仍是初始密码，后台除改密外的操作都已被拒绝。
           <router-link to="/admin/strategy" style="text-decoration: underline">去「参数配置 → 安全」修改密码</router-link>
         </div>
         <div v-if="status?.last_error" class="note error" style="margin-bottom: 12px">

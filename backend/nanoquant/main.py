@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -25,7 +26,7 @@ from .services.db_writer import db_writer
 from .exchange.ticker_stream import ticker_hub
 from .logging_setup import get_logger, setup_logging
 from .models import TradingSymbol
-from .security import hash_password, verify_password
+from .security import generate_password, hash_password, verify_password
 from .services import events
 from .services.settings import (
     SettingsValidationError, get_security, get_system, has_explicit_key, update_group,
@@ -45,12 +46,58 @@ _PASSWORD_CHANGE_ALLOWED = {
 _PUBLIC_API_PREFIX = "/api/v1/public/"
 
 
+def _initial_admin_password() -> str | None:
+    """首次创建管理员时，密码从哪来：环境变量 > 安装脚本留下的文件。
+
+    两处都没有就返回 None（由调用方随机生成）。
+    安装脚本先于首次启动运行、还没建库，所以它只能留文件，不能直接写库。
+    """
+    from_env = (os.getenv("NANOQUANT_ADMIN_PASSWORD") or "").strip()
+    if from_env:
+        return from_env
+    secret_file = paths.DATA / ".admin_password"
+    if not secret_file.is_file():
+        return None
+    try:
+        value = secret_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        log.warning("读取初始密码文件失败，将改用随机密码: %s", exc)
+        return None
+    try:
+        # 用完即删：这是明文凭据，不该在盘上多留一秒
+        secret_file.unlink()
+    except OSError as exc:
+        log.warning("初始密码文件删除失败（请手动删除 %s）: %s", secret_file, exc)
+    return value or None
+
+
 def bootstrap() -> None:
     init_db()
     sec = get_security()
     if not sec.password_hash:
-        update_group("security", {"password_hash": hash_password("admin123"), "password_is_default": True})
-        events.record("warn", "system", "已生成默认管理员 admin / admin123, 请登录后立即修改密码")
+        chosen = _initial_admin_password()
+        if chosen:
+            update_group(
+                "security",
+                {"password_hash": hash_password(chosen), "password_is_default": False},
+            )
+            events.record("warn", "system", "已按安装参数创建管理员 admin（密码由安装时指定）")
+        else:
+            generated = generate_password()
+            update_group(
+                "security",
+                {"password_hash": hash_password(generated), "password_is_default": True},
+            )
+            # 只打印一次、只写进本次启动日志：不落独立的明文文件，也不再是 admin123 这种通用口令
+            log.warning(
+                "\n%s\n  首次启动：管理员账号 admin 的密码已随机生成\n"
+                "      密码: %s\n"
+                "  这条只出现在本次启动日志里，登录后必须先改密（改密前后台其余接口会被拒绝）\n%s",
+                "=" * 60,
+                generated,
+                "=" * 60,
+            )
+            events.record("warn", "system", "已生成随机初始密码（见启动日志），首次登录后需修改")
     elif not has_explicit_key("security", "password_is_default"):
         # 老库升级路径: 之前没有这个标记, 这里补一次判定 —— 密码仍是 admin123 的
         # 老实例同样必须被拦下, 否则"新装才有防护"等于没修
@@ -126,10 +173,10 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def _force_password_change(request: Request, call_next):
-        """出厂密码未修改前，除改密外的后台接口一律 403.
+        """初始密码未修改前，除改密外的后台接口一律 403.
 
-        只写一条"请修改密码"的事件不构成防护：面板一旦映射到公网，
-        admin123 就是一个现成的后门。这里的判定放在中间件而不是各路由上，
+        只写一条"请修改密码"的事件不构成防护：初始密码会随日志出现在机器上，
+        面板一旦映射到公网就是现成的后门。这里的判定放在中间件而不是各路由上，
         是因为路由有几十个，漏一个就等于没做。
         """
         cfg = get_security()
@@ -142,7 +189,7 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 status_code=403,
                 content={
-                    "detail": "当前仍是初始密码 admin123，请先修改密码后再操作",
+                    "detail": "当前仍是初始密码，请先修改密码后再操作",
                     "code": "password_change_required",
                 },
             )

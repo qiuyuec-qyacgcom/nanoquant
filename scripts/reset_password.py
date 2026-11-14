@@ -16,14 +16,13 @@
 from __future__ import annotations
 
 import argparse
-import secrets
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from nanoquant.db import init_db  # noqa: E402
-from nanoquant.security import hash_password  # noqa: E402
+from nanoquant.security import generate_password, hash_password  # noqa: E402
 from nanoquant.services import state  # noqa: E402
 from nanoquant.services.settings import get_security, update_group  # noqa: E402
 
@@ -38,9 +37,7 @@ def main() -> int:
         print("新密码至少 8 位", file=sys.stderr)
         return 2
     if not password:
-        # 去掉容易看错的字符，方便从终端抄到手
-        alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        password = "".join(secrets.choice(alphabet) for _ in range(16))
+        password = generate_password()
 
     init_db()
     cfg = get_security()

@@ -103,3 +103,108 @@ def test_change_password_unlocks_everything(app_client):
     headers = {"Authorization": f"Bearer {fresh}"}
     assert app_client.get(GUARDED, headers=headers).status_code != 403
     assert app_client.get(f"{API}/auth/me", headers=headers).json()["must_change_password"] is False
+
+
+# ------------------------------------------------------------ 初始密码来源
+# 首次启动的密码不再写死 admin123：
+#   环境变量 > 安装脚本留下的 data/.admin_password > 随机生成（打印在启动日志）
+def _reset_security():
+    """把 security 恢复成"已配置好密码"的稳定状态，避免污染同进程的其它用例."""
+    from nanoquant.security import hash_password
+    from nanoquant.services.settings import update_group
+
+    update_group(
+        "security",
+        {"password_hash": hash_password("admin123"), "password_is_default": False},
+    )
+
+
+def test_generate_password_shape():
+    from nanoquant.security import generate_password
+
+    pwd = generate_password()
+    assert len(pwd) == 16
+    # 去掉了 0/O、1/l/I 这类看不清的字符
+    assert not set(pwd) & set("0O1lI")
+    assert generate_password(8) and len(generate_password(8)) == 12, "长度下限是 12"
+    assert len({generate_password() for _ in range(50)}) == 50, "不能退化成可预测的序列"
+
+
+def test_bootstrap_generates_random_password(monkeypatch):
+    from nanoquant.main import bootstrap
+    from nanoquant.services.settings import get_security, update_group
+
+    monkeypatch.delenv("NANOQUANT_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr("nanoquant.main.generate_password", lambda *a, **k: "Rand0mPassw0rd12")
+    update_group("security", {"password_hash": "", "password_is_default": False})
+    try:
+        bootstrap()
+        cfg = get_security()
+        assert cfg.password_is_default is True, "随机初始密码仍要求首次登录后改掉"
+        from nanoquant.security import verify_password
+
+        assert verify_password("Rand0mPassw0rd12", cfg.password_hash) is True
+        assert verify_password("admin123", cfg.password_hash) is False
+    finally:
+        _reset_security()
+
+
+def test_bootstrap_uses_env_password(monkeypatch):
+    from nanoquant.main import bootstrap
+    from nanoquant.security import verify_password
+    from nanoquant.services.settings import get_security, update_group
+
+    monkeypatch.setenv("NANOQUANT_ADMIN_PASSWORD", "Env-Chosen-Pass-9")
+    update_group("security", {"password_hash": "", "password_is_default": False})
+    try:
+        bootstrap()
+        cfg = get_security()
+        assert verify_password("Env-Chosen-Pass-9", cfg.password_hash) is True
+        assert cfg.password_is_default is False, "运维自己选的密码不该被强制再改一次"
+    finally:
+        monkeypatch.delenv("NANOQUANT_ADMIN_PASSWORD", raising=False)
+        _reset_security()
+
+
+def test_bootstrap_reads_and_removes_password_file(monkeypatch):
+    from nanoquant.config import paths
+    from nanoquant.main import bootstrap
+    from nanoquant.security import verify_password
+    from nanoquant.services.settings import get_security, update_group
+
+    monkeypatch.delenv("NANOQUANT_ADMIN_PASSWORD", raising=False)
+    secret = paths.DATA / ".admin_password"
+    secret.write_text("Installer-Set-Pass-7", encoding="utf-8")
+    update_group("security", {"password_hash": "", "password_is_default": False})
+    try:
+        bootstrap()
+        cfg = get_security()
+        assert verify_password("Installer-Set-Pass-7", cfg.password_hash) is True
+        assert cfg.password_is_default is False
+        assert not secret.exists(), "明文密码文件用完必须删掉"
+    finally:
+        if secret.exists():
+            secret.unlink()
+        _reset_security()
+
+
+def test_bootstrap_file_beats_random(monkeypatch):
+    """文件与环境变量都没料时才随机，这里确认优先级：有文件就不走随机分支."""
+    from nanoquant.config import paths
+    from nanoquant.main import bootstrap
+    from nanoquant.services.settings import get_security, update_group
+
+    monkeypatch.delenv("NANOQUANT_ADMIN_PASSWORD", raising=False)
+    calls = []
+    monkeypatch.setattr("nanoquant.main.generate_password", lambda *a, **k: calls.append(1) or "x")
+    secret = paths.DATA / ".admin_password"
+    secret.write_text("From-File-Pass-123", encoding="utf-8")
+    update_group("security", {"password_hash": "", "password_is_default": False})
+    try:
+        bootstrap()
+        assert calls == []
+        assert get_security().password_is_default is False
+    finally:
+        if secret.exists():
+            secret.unlink()
+        _reset_security()

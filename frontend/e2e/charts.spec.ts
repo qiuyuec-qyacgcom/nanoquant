@@ -5,9 +5,11 @@ import { expect, test } from '@playwright/test'
  *  同时顺带确认总览的「委托流水」面板存在（订单状态收敛之后新增的）。 */
 
 const USER = process.env.E2E_USER || 'admin'
-const PASS = process.env.E2E_PASS || 'admin123'
+// 初始密码不再固定（首次启动随机生成）：先登录改密，再 export E2E_PASS=<你的密码> 后运行
+const PASS = process.env.E2E_PASS || ''
 
 async function login(page: import('@playwright/test').Page) {
+  if (!PASS) throw new Error('请先设置 E2E_PASS（管理员密码）再运行 e2e')
   await page.goto('/#/login')
   await page.locator('input[autocomplete="username"]').fill(USER)
   await page.locator('input[type="password"]').fill(PASS)

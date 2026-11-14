@@ -83,6 +83,16 @@ def mask_secret(plain: str) -> str:
 
 
 # ------------------------------------------------------------------ password
+def generate_password(length: int = 16) -> str:
+    """生成随机管理员密码.
+
+    - 长度下限 12：这是唯一能登录后台的凭据，短密码等于把面板交出去；
+    - 去掉容易看错的字符（0/O、1/l/I）：密码要能从终端或日志里手抄进登录框。
+    """
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(max(12, length)))
+
+
 def hash_password(password: str, *, salt: str | None = None) -> str:
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITER)

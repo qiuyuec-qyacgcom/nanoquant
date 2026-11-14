@@ -120,6 +120,7 @@ powershell -ExecutionPolicy Bypass -File scripts\stop.ps1   # 按命令行匹配
 | `--systemd` | — | 注册开机自启，并等 `/api/v1/health` 通过才报完成 |
 | `--no-frontend` | `-SkipFrontend` | 跳过前端构建（已有 `dist` 或只跑后端） |
 | `--mirror cn` | `-Mirror cn` | pip 换清华源（`aliyun` / 完整 URL 亦可） |
+| `--password 'xxx'` | `-Password 'xxx'` | 指定初始管理员密码（≥ 8 位）；不传则首次启动随机生成 |
 | `--force` | `-Force` | 忽略 `requirements.txt` 哈希，强制重装依赖 |
 | — | `-Python <路径>` | PATH 里没有 `python` 时指定解释器 |
 
@@ -143,9 +144,25 @@ curl http://127.0.0.1:8899/api/v1/health    # {"ok": true, "app": "NanoQuant", .
 
 打开 `http://127.0.0.1:8899` 即是面板。
 
-**首次登录：`admin / admin123`。初始密码只够登录**：改密前，后台除登录/改密/健康检查外的
-接口一律返回 `403`（`code=password_change_required`），前端会直接把你送到「参数配置 → 安全」。
-忘记密码时用 `python scripts/reset_password.py` 重置（重置后仍需改密）。
+**首次登录：账号 `admin`，密码按下面的顺序确定**：
+
+1. 安装时指定过：`install.sh --password '...'` / `install.ps1 -Password '...'`（≥ 8 位）—— 用你指定的；
+2. 设了环境变量 `NANOQUANT_ADMIN_PASSWORD` —— 用它；
+3. 都没有 —— **首次启动随机生成 16 位密码**，打印在控制台与 `logs/nanoquant.log`：
+
+   ```
+   ============================================================
+     首次启动：管理员账号 admin 的密码已随机生成
+         密码: mMTErg2qujqNXhqg
+   ============================================================
+   ```
+
+随机密码登录后**必须先改密**：改密前，后台除登录/改密/健康检查外的接口一律返回 `403`
+（`code=password_change_required`），前端会把你送到「参数配置 → 安全」。
+忘记密码用 `python scripts/reset_password.py` 重置（重置后仍需改密）。
+
+> 安装脚本指定的密码只以明文暂存在 `data/.admin_password`（权限 600），首次启动写入数据库后
+> 立即删除；日志里的随机密码同样只出现一次，不落独立文件。
 
 ### 方式二：Docker
 
@@ -182,6 +199,7 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 | `NANOQUANT_LOG_DIR` | `$HOME/logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 主密钥；**丢失后已加密的 API 密钥无法解密** |
 | `NANOQUANT_BACKUP_MIRROR` | 空（不启用） | 备份异盘副本目录，如 `F:/nanoquant-backups`。主库/日志/备份都在 `data/` 下，同一块盘写满就一起没；指向另一块盘后每次备份会多抄一份（镜像失败不影响本地备份） |
+| `NANOQUANT_ADMIN_PASSWORD` | 空（随机生成） | **仅首次启动建管理员时生效**：指定初始密码，不设则随机 16 位并打印在日志里。之后改密请走面板或 `scripts/reset_password.py` |
 | `NANOQUANT_FRONTEND` | `$HOME/frontend/dist` | 前端产物目录 |
 | `NANOQUANT_VENV` | 空 | Windows 启动脚本的虚拟环境目录（迁移场景） |
 | `EXEC_SOCKET` | 空 → `/run/nanoquant/exec.sock` | sidecar 地址，如 `unix:/run/nanoquant/exec.sock` / `tcp:127.0.0.1:9101`；参数页 `exec_socket` 优先 |
@@ -480,9 +498,9 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 ## ❓ FAQ
 
 **Q：装完打开面板到处报"请求失败"，或者接口返回 `403 password_change_required`？**
-A：这是出厂密码保护：`admin123` 只允许登录和改密，其它后台接口一律拒绝。登录后前端会把你送到
-「参数配置 → 安全」，改一次密码即全部恢复（标记自动清除）。要确认当前状态，看「系统诊断」的
-安全项；忘记密码用 `python scripts/reset_password.py`。
+A：这是初始密码保护：初始密码（随机的或安装时指定的）只允许登录和改密，其它后台接口一律拒绝。
+登录后前端会把你送到「参数配置 → 安全」，改一次密码即全部恢复（标记自动清除）。
+忘记密码用 `python scripts/reset_password.py`。
 
 **Q：安装脚本说找不到 Python 3.12+，但机器上明明装了？**
 A：多半是没加进 PATH。Windows 上用 `-Python C:\Python312\python.exe` 指定路径；Linux 上确认

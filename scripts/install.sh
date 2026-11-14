@@ -6,7 +6,10 @@
 #   sudo bash scripts/install.sh --systemd       # 注册 systemd 自启，并等健康检查通过
 #   sudo bash scripts/install.sh --no-frontend   # 跳过前端构建（已有 dist 或只跑后端）
 #   sudo bash scripts/install.sh --mirror cn     # 用国内 pip 镜像（清华源）
+#   sudo bash scripts/install.sh --password 'xxx' # 指定初始管理员密码
 #   sudo bash scripts/install.sh --force         # 强制重装依赖（默认按 requirements 哈希跳过）
+#
+# 密码：不指定时首次启动会随机生成（打印在启动日志里），登录后必须改密。
 #
 # 设计取舍：
 # - 幂等：重复执行不会每次重装依赖/重建 venv，改完 requirements 再跑一次即可；
@@ -20,6 +23,7 @@ WITH_SYSTEMD=0
 WITH_FRONTEND=1
 FORCE=0
 MIRROR="${PIP_INDEX_URL:-}"
+ADMIN_PASSWORD="${NANOQUANT_ADMIN_PASSWORD:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,8 +40,11 @@ while [[ $# -gt 0 ]]; do
         *) MIRROR="${2:-}" ;;
       esac
       shift 2 ;;
+    --password)
+      ADMIN_PASSWORD="${2:-}"
+      shift 2 ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（用 --help 查看用法）"; exit 1 ;;
   esac
 done
@@ -63,6 +70,12 @@ EOF
 banner
 info "安装目录: $ROOT"
 info "监听端口: $PORT"
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  [[ ${#ADMIN_PASSWORD} -ge 8 ]] || die "--password 至少 8 位（这是唯一能进后台的凭据）"
+  info "初始管理员密码: 使用你指定的值（不回显）"
+else
+  info "初始管理员密码: 首次启动随机生成，打印在启动日志里"
+fi
 
 # Git Bash / Cygwin 不是真 Linux：venv 是 Scripts\ 布局、也没有 systemd/chmod，
 # 在这里"装成功了"只会在后面启动时炸；直接把 Windows 用户送到正确脚本
@@ -209,6 +222,14 @@ mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
 chmod 700 "$ROOT/data" 2>/dev/null || true
 # 端口持久化：--port 要真的被 start.sh 沿用，否则只是个"提示里好看"的参数
 printf '%s\n' "$PORT" > "$ROOT/data/.port" 2>/dev/null || true
+# 初始密码：安装阶段还没有数据库，只能留成文件让首次启动时读取并哈希入库，
+# 启动成功后该文件会被删掉（明文不留在盘上）
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  umask 077
+  printf '%s' "$ADMIN_PASSWORD" > "$ROOT/data/.admin_password"
+  chmod 600 "$ROOT/data/.admin_password" 2>/dev/null || true
+  ok "已暂存初始密码（首次启动写入数据库后自动删除）"
+fi
 ok "运行目录就绪（data/ logs/ data/backups/）"
 
 # ---------------------------------------------------------------- systemd
@@ -259,6 +280,14 @@ fi
 IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 IP="${IP:-127.0.0.1}"
 
+if [[ -n "$ADMIN_PASSWORD" ]]; then
+  PASS_LINE="初始密码 : 你安装时指定的值"
+  PASS_HINT="登录后建议改成新的强口令（首次登录不强制）。"
+else
+  PASS_LINE="初始密码 : 随机生成，见启动日志"
+  PASS_HINT="密码在首次启动时打印（控制台 / logs/nanoquant.log），登录后必须改密。"
+fi
+
 cat <<EOF
 
 $(printf "${C_OK}========================================${C_RESET}")
@@ -267,10 +296,10 @@ $(printf "${C_OK}========================================${C_RESET}")
 
   访问地址 : http://$IP:$PORT
   默认账号 : admin
-  初始密码 : admin123
+  $PASS_LINE
 
-  $(printf "${C_WARN}初始密码只够登录：改密前后台其它接口一律 403${C_RESET}")
-  登录后会被直接送到「参数配置 → 安全」，改完立即恢复。
+  $(printf "${C_WARN}$PASS_HINT${C_RESET}")
+  改密前后台除登录/改密/健康检查外的接口一律 403。
 
   启动     : bash scripts/start.sh          （加 --daemon 后台运行）
   停止     : bash scripts/stop.sh
@@ -282,7 +311,7 @@ $(printf "${C_OK}========================================${C_RESET}")
   参数配置 : 全部在面板里，存于数据库，改完即时生效
 
   首次使用建议顺序:
-   1. 改掉初始密码（系统会强制）
+   1. 用初始密码登录，立即改成自己的强口令（随机密码首次登录会被强制）
    2. 「参数配置 → 数据源」填币安 API Key（只开合约交易，关闭提币）
    3. 「参数配置 → 系统 → 告警」配 Webhook / Telegram，否则出事只能在页面里看
    4. 「AI 模型」接入 DeepSeek / Qwen / GPT 等 OpenAI 兼容模型并点「诊断」

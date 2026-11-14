@@ -12,6 +12,8 @@
   跳过前端构建（已有 frontend\dist 或只需要后端 API）
 .PARAMETER Mirror
   pip 镜像：cn / tsinghua / aliyun，或完整 URL
+.PARAMETER Password
+  指定初始管理员密码（至少 8 位）。不传则首次启动随机生成，并打印在启动日志里
 .PARAMETER Force
   忽略 requirements 哈希，强制重装依赖
 .EXAMPLE
@@ -26,6 +28,7 @@ param(
   [switch]$SkipFrontend,
   [string]$Python = '',
   [string]$Mirror = $env:PIP_INDEX_URL,
+  [string]$Password = $env:NANOQUANT_ADMIN_PASSWORD,
   [switch]$Force
 )
 
@@ -55,6 +58,12 @@ Write-Host @'
 
 Write-Step "安装目录: $Root"
 Write-Step "监听端口: $Port"
+if ($Password) {
+  if ($Password.Length -lt 8) { Fail "-Password 至少 8 位（这是唯一能进后台的凭据）" }
+  Write-Step "初始管理员密码: 使用你指定的值（不回显）"
+} else {
+  Write-Step "初始管理员密码: 首次启动随机生成，打印在启动日志里"
+}
 
 # ---------------------------------------------------------------- 磁盘空间
 # SQLite / 备份 / 日志都写在同一块盘，空间不足会变成"盘中写入失败"，比启动失败更难查
@@ -207,6 +216,13 @@ foreach ($d in @('data', 'logs', 'data\backups')) {
 }
 # 端口持久化：-Port 要真的被 start.ps1 沿用，否则只是个"提示里好看"的参数
 Set-Content -Path (Join-Path $Root 'data\.port') -Value $Port -Encoding ascii
+# 初始密码：安装阶段还没有数据库，只能留成文件让首次启动读取并哈希入库，
+# 启动成功后该文件会被删掉（明文不留在盘上）
+if ($Password) {
+  $secretFile = Join-Path $Root 'data\.admin_password'
+  [System.IO.File]::WriteAllText($secretFile, $Password, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Ok "已暂存初始密码（首次启动写入数据库后自动删除）"
+}
 Write-Ok "运行目录就绪（data、logs、data\backups）"
 
 Write-Host ""
@@ -216,10 +232,17 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  访问地址 : http://127.0.0.1:$Port"
 Write-Host "  默认账号 : admin"
-Write-Host "  初始密码 : admin123"
+if ($Password) {
+  Write-Host "  初始密码 : 你安装时指定的值"
+  Write-Host ""
+  Write-Host "  登录后建议改成新的强口令（首次登录不强制）。" -ForegroundColor Yellow
+} else {
+  Write-Host "  初始密码 : 随机生成，见启动日志"
+  Write-Host ""
+  Write-Host "  启动时会在控制台与 logs\nanoquant.log 打印密码，登录后必须改密。" -ForegroundColor Yellow
+}
 Write-Host ""
-Write-Host "  初始密码只够登录：改密前后台其它接口一律 403" -ForegroundColor Yellow
-Write-Host "  登录后会被直接送到「参数配置 → 安全」，改完立即恢复。" -ForegroundColor Yellow
+Write-Host "  改密前后台除登录/改密/健康检查外的接口一律 403。" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  启动     : powershell -ExecutionPolicy Bypass -File scripts\start.ps1"
 Write-Host "  停止     : powershell -ExecutionPolicy Bypass -File scripts\stop.ps1"
@@ -229,7 +252,7 @@ Write-Host "  数据目录 : $Root\data     (SQLite / 备份 / 缓存)"
 Write-Host "  日志目录 : $Root\logs"
 Write-Host ""
 Write-Host "  首次使用建议顺序:"
-Write-Host "   1. 改掉初始密码（系统会强制）"
+Write-Host "   1. 用初始密码登录，立即改成自己的强口令（随机密码首次登录会被强制）"
 Write-Host "   2. 「参数配置 → 数据源」填币安 API Key（只开合约交易，关闭提币）"
 Write-Host "   3. 「参数配置 → 系统 → 告警」配 Webhook / Telegram，否则出事只能在页面里看"
 Write-Host "   4. 「AI 模型」接入 DeepSeek / Qwen / GPT 等 OpenAI 兼容模型并点「诊断」"

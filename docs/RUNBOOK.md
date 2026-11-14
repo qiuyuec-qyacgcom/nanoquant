@@ -156,18 +156,25 @@ python scripts/cleanup_history.py --apply --vacuum  # 再重建库回收磁盘�
 Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「发送测试告警」验证。
 不配的话，熔断、下单失败、爆仓预警只会写进页面——没人会看。
 
-### 8.5 出厂密码会把后台锁住（这是故意的）
+### 8.5 初始密码会把后台锁住（这是故意的）
 
-首次启动会用 `admin123` 建管理员，并且 `security.password_is_default = true`。
-在这个状态下，**除登录/改密/健康检查外，所有 `/api/v1/*` 都返回 403**
-（`code: password_change_required`），前端会把你送到「参数配置 → 安全」。
+首次启动创建管理员时，密码来源按优先级取：
 
-改完密码该标记自动置 false，一切恢复。为什么不做成"只提示"：面板一旦映射到公网，
-`admin123` 就是现成的后门，提示等于没防护。
+1. `NANOQUANT_ADMIN_PASSWORD` 环境变量；
+2. 安装脚本留下的 `data/.admin_password`（`install.sh --password` / `install.ps1 -Password`）；
+3. 都没有 → **随机生成 16 位**，只打印在首次启动日志里（控制台 + `logs/nanoquant.log`）。
 
-- 老库升级也会被拦：启动时若发现密码仍是 `admin123` 但没有这个标记，会补标一次
-- 测试/CI 需要绕过时：预置 `password_hash` + `password_is_default=false`（见 `tests/conftest.py`）
-- 忘记密码：`python scripts/reset_password.py`（无此脚本时删 `security` 配置组重启即可重置）
+随机生成的那种会同时置 `security.password_is_default = true`，此时**除登录/改密/健康检查外，
+所有 `/api/v1/*` 都返回 403**（`code: password_change_required`），前端会把你送到
+「参数配置 → 安全」。改完密码标记自动置 false，一切恢复。
+
+为什么不做成"只提示"：面板一旦映射到公网，一个能被猜到或从别处泄露的口令就是现成的后门。
+
+- 安装时指定密码 → 不强制改密（是你自己设的）；随机生成 → 首次登录必须改
+- 安装时指定的密码只以明文暂存 `data/.admin_password`（600），入库后立即删除
+- 老库升级：密码仍是 `admin123` 且没有该标记时，启动会补标并强制改密
+- 测试/CI 绕过：预置 `password_hash` + `password_is_default=false`（见 `tests/conftest.py`）
+- 忘记密码：`python scripts/reset_password.py`（随机生成新密码，并重新要求改密）
 
 ### 8.6 备份要有第二块盘
 

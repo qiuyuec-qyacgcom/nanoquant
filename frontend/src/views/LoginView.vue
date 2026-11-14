@@ -48,7 +48,7 @@ async function submit() {
         </div>
         <div class="field">
           <span class="label">密码</span>
-          <input v-model="password" type="password" class="input" autocomplete="current-password" placeholder="首次登录: admin123" />
+          <input v-model="password" type="password" class="input" autocomplete="current-password" placeholder="首次登录密码见启动日志" />
         </div>
         <div v-if="error" class="note error">{{ error }}</div>
         <button class="btn btn-primary" type="submit" :disabled="loading" style="justify-content: center; padding: 10px">
@@ -61,7 +61,9 @@ async function submit() {
       </div>
 
       <div class="hint" style="margin-top: 18px; line-height: 1.8">
-        默认管理员 <span class="mono">admin / admin123</span>，首次登录后请立即在「参数配置 → 安全」中修改。<br />
+        管理员账号 <span class="mono">admin</span>，初始密码在首次启动时随机生成，
+        见控制台或 <span class="mono">logs/nanoquant.log</span>（安装时也可指定）。<br />
+        首次登录后必须改密；忘记密码用 <span class="mono">python scripts/reset_password.py</span> 重置。<br />
         系统默认以模拟盘模式运行，接入交易所密钥并显式切换后才会真实下单。
       </div>
     </div>
