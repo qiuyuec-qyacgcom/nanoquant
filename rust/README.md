@@ -57,7 +57,7 @@ systemd 片段：
 [Service]
 Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
 EnvironmentFile=/etc/nanoquant/exec.env   # EXEC_SECRET=...
-ExecStart=/opt/nanoquant/exec-service
+ExecStart=<REPO_ROOT>/exec-service        # 就地部署：仓库根目录（clone 目录），由 scripts/setup_sidecar.sh 自动生成
 Restart=always
 RuntimeDirectory=nanoquant                # 顺便保证 /run/nanoquant 存在且属主正确
 ```

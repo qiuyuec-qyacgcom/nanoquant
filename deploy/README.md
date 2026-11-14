@@ -1,36 +1,39 @@
 # 生产部署（systemd）
 
-单位文件是**模板**：默认按 `/opt/nanoquant` + `nanoquant` 用户写死，路径不同请先改。
+> **就地部署，不依赖 /opt**：主服务与 sidecar 都直接放在 `git clone` 出来的仓库根目录下，
+> 用仓库自带的脚本自动生成 systemd unit。本目录里的两个 `.service` 仅是**模板参考**，
+> 正常部署请勿手抄。
 
-## 一次性准备
+## 主服务
 
 ```bash
-sudo useradd --system --home /opt/nanoquant --shell /usr/sbin/nologin nanoquant
-sudo mkdir -p /opt/nanoquant /etc/nanoquant
-# 代码 + venv + 前端 dist（任选 git clone 或上传）
-sudo rsync -a --exclude data --exclude logs ./ /opt/nanoquant/
-sudo -u nanoquant python3 -m venv /opt/nanoquant/.venv
-sudo -u nanoquant /opt/nanoquant/.venv/bin/pip install -r /opt/nanoquant/backend/requirements.txt
-sudo chown -R nanoquant:nanoquant /opt/nanoquant
+git clone https://github.com/qiuyuec-qyacgcom/nanoquant.git
+cd nanoquant
+sudo bash scripts/install.sh --systemd --password '你的密码'
 ```
+
+`install.sh --systemd` 会在 clone 目录里建 venv、编译前端，并动态生成
+`/etc/systemd/system/nanoquant.service`（`WorkingDirectory`/`ExecStart` 都指向 clone 目录）。
 
 ## 执行内核 sidecar（可选）
 
 ```bash
-sudo install -m 0755 rust/exec-service/target/release/exec-service /opt/nanoquant/exec-service
-# Secret 只写进环境文件，权限 0600；值用单引号包住，避免 shell 解释
-sudo sh -c 'umask 077; printf "EXEC_SECRET=%s\n" "<base64 PKCS#8 或 HMAC secret>" > /etc/nanoquant/exec.env'
-sudo chown root:root /etc/nanoquant/exec.env
+# Secret 用单引号包住，避免 shell 解释；与 Python 侧交易所 API secret 是同一把密钥
+sudo bash scripts/setup_sidecar.sh --secret '<base64 PKCS#8 或 HMAC secret>'
 ```
 
-## 安装 unit
+脚本会检测/安装 Rust、`cargo build --release`，把二进制装到 clone 目录 `exec-service`，
+写 `/etc/nanoquant/exec.env`（0600），并动态生成 `/etc/systemd/system/nanoquant-exec.service`
+（`ExecStart` 指向 clone 目录的 `exec-service`）。
+
+## 验证
 
 ```bash
-sudo cp deploy/nanoquant-exec.service deploy/nanoquant.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now nanoquant-exec nanoquant
 systemctl status nanoquant --no-pager
 curl -s localhost:8899/api/v1/health
+# sidecar：
+ls -l /run/nanoquant/exec.sock
+EXEC_SECRET='<密钥>' .venv/bin/python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock
 ```
 
 ## 启用 sidecar 参与签名

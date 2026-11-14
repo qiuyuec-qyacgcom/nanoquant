@@ -1,3 +1,6 @@
+# 参考模板：与 scripts/install.sh --systemd 动态生成的内容一致。
+# 就地部署：把 <REPO_ROOT> 换成 git clone 的仓库根目录（如 /root/nanoquant）。
+# 正常部署请直接运行 scripts/install.sh --systemd，勿手抄本文件。
 [Unit]
 Description=NanoQuant (FastAPI + trading engine)
 Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant
@@ -8,26 +11,15 @@ After=nanoquant-exec.service
 
 [Service]
 Type=simple
-User=nanoquant
-Group=nanoquant
-WorkingDirectory=/opt/nanoquant/backend
-Environment=NANOQUANT_HOME=/opt/nanoquant
+WorkingDirectory=<REPO_ROOT>/backend
+Environment=NANOQUANT_HOME=<REPO_ROOT>
 Environment=NANOQUANT_PORT=8899
-ExecStart=/opt/nanoquant/.venv/bin/python -m nanoquant
+ExecStart=<REPO_ROOT>/.venv/bin/python -m nanoquant
 
 # 崩溃自动拉起；停机时先 SIGINT 让 lifespan 排空写队列
 Restart=always
-RestartSec=3
-KillSignal=SIGINT
-TimeoutStopSec=30
-
-# 最小权限
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/nanoquant/data /opt/nanoquant/logs /run/nanoquant
-UMask=0077
+RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
