@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   停止 NanoQuant (Windows)
 .DESCRIPTION

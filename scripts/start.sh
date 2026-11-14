@@ -3,7 +3,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${NANOQUANT_PORT:-8899}"
+# 端口优先级：显式环境变量 > install 时写入的 data/.port > 默认 8899
+PORT_FILE="$ROOT/data/.port"
+INSTALLED_PORT="$(tr -dc '0-9' < "$PORT_FILE" 2>/dev/null || true)"
+PORT="${NANOQUANT_PORT:-${INSTALLED_PORT:-8899}}"
 VENV="$ROOT/.venv"
 
 if [[ ! -x "$VENV/bin/python" ]]; then

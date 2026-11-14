@@ -86,29 +86,66 @@
 
 ## 🚀 快速开始
 
+### 前置要求
+
+| 依赖 | 版本 | 说明 |
+|---|---|---|
+| Python | **3.12+** | 必需。`backend/requirements.txt` 是按 3.12 编译的锁文件，CI 覆盖 3.12 / 3.13 |
+| Node.js | 18+ | 可选，仅构建前端时需要；不装则没有面板，API 与引擎照常工作 |
+| 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下 |
+| 系统 | Linux（可选 systemd）/ Windows 10+ / macOS | 常驻运行建议 Linux + systemd |
+
 ### 方式一：一键脚本（推荐）
 
 ```bash
 # Linux / macOS
-bash scripts/install.sh     # 创建 venv、装依赖、构建前端、初始化数据库
-bash scripts/start.sh       # 前台启动，默认 http://127.0.0.1:8899（--daemon 后台运行）
-bash scripts/status.sh      # 查看状态
-bash scripts/stop.sh        # 停止
+bash scripts/install.sh        # 装依赖 + 建前端产物 + 准备目录
+bash scripts/start.sh          # 前台启动，默认 http://127.0.0.1:8899（--daemon 后台）
+bash scripts/status.sh         # 查看状态
+bash scripts/stop.sh           # 停止
 ```
 
 ```powershell
 # Windows PowerShell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-powershell -File scripts\start.ps1
-powershell -File scripts\stop.ps1        # 按命令行匹配停止，不误杀其它 Python 进程
-
-# venv 不在仓库内时（如迁移后共用上级目录的解释器）
-$env:NANOQUANT_VENV = 'F:\cb\.venvtest'
-powershell -File scripts\start.ps1       # 也支持 -Python / -Port / -Debug
+powershell -ExecutionPolicy Bypass -File scripts\start.ps1
+powershell -ExecutionPolicy Bypass -File scripts\stop.ps1   # 按命令行匹配停止，不误杀其它 Python
 ```
 
-`start.ps1` 按 `-Python` → `NANOQUANT_VENV` → 仓库 `.venv` → 上级 `.venvtest` 顺序探测解释器，
-迁移目录后不会因找不到虚拟环境而启动失败。
+参数（`install.sh` 与 `install.ps1` 一一对应）：
+
+| Linux | Windows | 作用 |
+|---|---|---|
+| `--port 9000` | `-Port 9000` | 改端口；写入 `data/.port`，之后 `start` 不用再传 |
+| `--systemd` | — | 注册开机自启，并等 `/api/v1/health` 通过才报完成 |
+| `--no-frontend` | `-SkipFrontend` | 跳过前端构建（已有 `dist` 或只跑后端） |
+| `--mirror cn` | `-Mirror cn` | pip 换清华源（`aliyun` / 完整 URL 亦可） |
+| `--force` | `-Force` | 忽略 `requirements.txt` 哈希，强制重装依赖 |
+| — | `-Python <路径>` | PATH 里没有 `python` 时指定解释器 |
+
+安装脚本做了什么（**可反复执行**，已完成的步骤自动跳过）：
+
+1. 校验 Python 3.12+、Node 18+（缺 Node 只警告，不中止）
+2. 创建或复用 `.venv`；按 `requirements.txt` 的 SHA256 判断要不要重装依赖
+3. 装完跑 `import nanoquant.main` 自检 —— 只有 import 通过才算装好
+4. `npm ci` + `npm run build` 生成 `frontend/dist`
+5. 建 `data/`、`logs/`、`data/backups/`，把端口写进 `data/.port`
+6. `--systemd` 时注册服务并轮询健康检查（30s 超时，失败会打印 `journalctl` 命令）
+
+> Git Bash / Cygwin 下 `install.sh` 会直接拒绝并提示改用 `install.ps1`：那里没有 systemd、
+> venv 是 `Scripts\` 布局，"装成功了"只会在启动时才炸。
+
+验证安装：
+
+```bash
+curl http://127.0.0.1:8899/api/v1/health    # {"ok": true, "app": "NanoQuant", ...}
+```
+
+打开 `http://127.0.0.1:8899` 即是面板。
+
+**首次登录：`admin / admin123`。初始密码只够登录**：改密前，后台除登录/改密/健康检查外的
+接口一律返回 `403`（`code=password_change_required`），前端会直接把你送到「参数配置 → 安全」。
+忘记密码时用 `python scripts/reset_password.py` 重置（重置后仍需改密）。
 
 ### 方式二：Docker
 
@@ -122,13 +159,14 @@ docker compose up -d
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r backend/requirements.txt             # 锁定版本；源头是 backend/requirements.in
-cd frontend && npm install && npm run build && cd ..
+cd frontend && npm ci && npm run build && cd ..
 
 cd backend
 python -m nanoquant        # 首次启动自动建库并创建 admin
 ```
 
-首次登录：`admin / admin123`（登录后会被要求立即改密）。
+`start.ps1` 按 `-Python` → 无 `-Port` 时的 `data/.port` → `NANOQUANT_VENV` → 仓库 `.venv` →
+上级 `.venvtest` 顺序探测解释器，迁移目录后不会因找不到虚拟环境而启动失败。
 
 > 生产守护（systemd）：主服务与 sidecar 的 unit 文件见 [`deploy/`](deploy/README.md)，含最小权限硬化与 UDS `0600` 权限设置。
 > 上主网前请先读 [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md)（三段演练、判据、回滚），并跑一次
@@ -440,6 +478,24 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 ---
 
 ## ❓ FAQ
+
+**Q：装完打开面板到处报"请求失败"，或者接口返回 `403 password_change_required`？**
+A：这是出厂密码保护：`admin123` 只允许登录和改密，其它后台接口一律拒绝。登录后前端会把你送到
+「参数配置 → 安全」，改一次密码即全部恢复（标记自动清除）。要确认当前状态，看「系统诊断」的
+安全项；忘记密码用 `python scripts/reset_password.py`。
+
+**Q：安装脚本说找不到 Python 3.12+，但机器上明明装了？**
+A：多半是没加进 PATH。Windows 上用 `-Python C:\Python312\python.exe` 指定路径；Linux 上确认
+`python3.12 -V` 能跑。脚本也会依次尝试 `py -3.13` / `py -3.12` / `python` / `python3` 以及
+常见安装目录，实在找不到才报错。
+
+**Q：`pip install` 卡住或超时？**
+A：换源：`bash scripts/install.sh --mirror cn`（Windows 用 `-Mirror cn`），或先 `export PIP_INDEX_URL=...`。
+依赖装完后脚本会跑一次 `import nanoquant.main` 自检，装不全会立刻失败而不是等到启动才发现。
+
+**Q：在 Git Bash 里跑 `install.sh` 报错退出？**
+A：这是有意为之：Git Bash 不是真 Linux（没有 systemd、venv 是 `Scripts\` 布局）。Windows 请用
+`powershell -ExecutionPolicy Bypass -File scripts\install.ps1`。
 
 **Q：引擎启动了但没有交易？**
 A：按优先级检查「开仓检查」页——标的池是否为空（当前设计：空池不交易）、是否在交易时段、

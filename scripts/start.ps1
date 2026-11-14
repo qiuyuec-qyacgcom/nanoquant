@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   启动 NanoQuant (Windows)
 .EXAMPLE
@@ -10,13 +10,27 @@
   $env:NANOQUANT_VENV='F:\cb\.venvtest'; powershell -File scripts\start.ps1
 #>
 param(
-  [int]$Port = 8899,
+  # 0 = 未指定，按 data\.port（install 时写入）→ 8899 回退
+  [int]$Port = 0,
   [switch]$Debug,
   [string]$Python = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+# 端口优先级: -Port > NANOQUANT_PORT > install 写入的 data\.port > 8899
+if (-not $PSBoundParameters.ContainsKey('Port') -and $env:NANOQUANT_PORT) {
+  $Port = [int]$env:NANOQUANT_PORT
+}
+if ($Port -le 0) {
+  $portFile = Join-Path $Root 'data\.port'
+  if (Test-Path $portFile) {
+    $saved = (Get-Content $portFile -Raw).Trim()
+    if ($saved -match '^\d+$') { $Port = [int]$saved }
+  }
+}
+if ($Port -le 0) { $Port = 8899 }
 
 # 解释器探测顺序: -Python 参数 → NANOQUANT_VENV → 仓库内 .venv → 上级目录的共享 venv
 $Candidates = @()
