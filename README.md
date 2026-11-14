@@ -55,7 +55,7 @@
 | 📊 **权威盈亏口径** | 持仓浮盈亏直接取交易所 `positionRisk.unRealizedProfit`（按 markPrice 结算，与保护单一致）；账户接口抖动时沿用上次读数而不是刷成 0 |
 | 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、抖动探针、可选 IP 限频与 `/metrics` |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
-| 🧰 **一键部署** | `install.sh` / `install.ps1` / `start.ps1` / `stop.ps1` / Docker Compose；另有 systemd unit（主服务 + sidecar，最小权限硬化） |
+| 🧰 **一键部署** | 宝塔式一条命令在线安装（`install.sh` 引导脚本，curl/wget 自动兜底）；另有 `install.ps1` / Docker Compose 与 systemd unit（主服务 + sidecar，最小权限硬化） |
 | 🩺 **主网演练手册** | [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md) 给出三段演练判据与回滚；`scripts/mainnet_preflight.py --yes` 用实盘凭证做只读预检（不碰下单） |
 
 ---
@@ -97,7 +97,22 @@
 | 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下 |
 | 系统 | Linux（可选 systemd）/ Windows 10+ / macOS | 常驻运行建议 Linux + systemd |
 
-### 获取代码
+### 方式一：一条命令在线安装（推荐，Linux）
+
+不用先 `git clone`，复制下面整行到终端回车即可（`curl` 缺失会自动改用 `wget`）：
+
+```bash
+if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;else wget -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password '你的密码'
+```
+
+> 引导脚本 `install.sh` 会先下载完整代码（git 优先，无 git 自动改用 tarball 解压），
+> 再转交 `scripts/install.sh` 完成依赖安装；`--dir <目录>` 可指定安装位置（默认 `./nanoquant`），
+> 其余参数（`--systemd` / `--mirror` / `--port` 等）全部透传，见下表。
+>
+> 生产部署想顺便注册开机自启：把命令尾部换成
+> `bash install.sh --password '你的密码' --systemd`。
+
+### 获取代码（手动，可选）
 
 ```bash
 git clone https://github.com/qiuyuec-qyacgcom/nanoquant.git
@@ -106,7 +121,7 @@ cd nanoquant
 
 > 下面所有方式都在仓库根目录下执行。
 
-### 方式一：一键脚本（推荐）
+### 方式二：本地脚本（等同引导脚本转交的那一步）
 
 ```bash
 # Linux / macOS
@@ -175,14 +190,14 @@ curl http://127.0.0.1:8899/api/v1/health    # {"ok": true, "app": "NanoQuant", .
 > 安装脚本指定的密码只以明文暂存在 `data/.admin_password`（权限 600），首次启动写入数据库后
 > 立即删除；日志里的随机密码同样只出现一次，不落独立文件。
 
-### 方式二：Docker
+### 方式三：Docker
 
 ```bash
 docker compose up -d
 # 访问 http://127.0.0.1:8899；数据与日志挂载到 ./data、./logs
 ```
 
-### 方式三：手动
+### 方式四：手动
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate

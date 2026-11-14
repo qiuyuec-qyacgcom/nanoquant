@@ -6,14 +6,14 @@
 
 ## 主服务
 
+一条命令在线安装（`curl` 缺失自动改用 `wget`），无需先 clone：
+
 ```bash
-git clone https://github.com/qiuyuec-qyacgcom/nanoquant.git
-cd nanoquant
-sudo bash scripts/install.sh --systemd --password '你的密码'
+if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;else wget -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password '你的密码' --systemd
 ```
 
-`install.sh --systemd` 会在 clone 目录里建 venv、编译前端，并动态生成
-`/etc/systemd/system/nanoquant.service`（`WorkingDirectory`/`ExecStart` 都指向 clone 目录）。
+引导脚本 `install.sh` 下载代码后转交 `scripts/install.sh --systemd`：在 clone 目录里建 venv、
+编译前端，并动态生成 `/etc/systemd/system/nanoquant.service`（`WorkingDirectory`/`ExecStart` 都指向 clone 目录）。
 
 ## 执行内核 sidecar（可选）
 

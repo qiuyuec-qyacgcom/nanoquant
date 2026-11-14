@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# NanoQuant 一键安装脚本
+# NanoQuant 一键安装脚本（依赖安装这一步）
+#
+# 免 clone 的一条命令在线安装请用仓库根目录的引导脚本 install.sh：
+#   if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;else wget -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password 'xxx'
+# 引导脚本下载代码后会转交到本脚本继续安装。
 #
 #   sudo bash scripts/install.sh                 # 默认端口 8899
 #   sudo bash scripts/install.sh --port 9000     # 指定端口（写进 data/.port，start.sh 沿用）
