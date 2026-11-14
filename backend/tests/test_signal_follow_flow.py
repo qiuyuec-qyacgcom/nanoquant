@@ -395,3 +395,140 @@ def test_poll_reports_missing_file(monkeypatch, tmp_path):
 
     assert asyncio.run(eng._poll_signal_feed_once()) == 0
     assert "等待信号文件" in eng._follow_last_error
+
+
+# ------------------------------------------------------------ 生命周期：减仓 / 移止损 / 加仓
+def _lifecycle_broker(**over):
+    broker = _Broker(**over)
+    broker.amends = []
+
+    async def _amend(symbol, side, stop, qty, tp_price=0.0):
+        broker.amends.append({"symbol": symbol, "side": side, "stop": stop, "qty": qty, "tp": tp_price})
+        return ExecResult(True, price=stop)
+
+    async def _add(*, position, qty, filters, sl_price, tp_price, reason=""):
+        broker.adds = getattr(broker, "adds", []) + [
+            {"symbol": position.symbol, "qty": qty, "sl": sl_price, "tp": tp_price}
+        ]
+        return ExecResult(True, price=filters.last_price, qty=qty)
+
+    broker.amend_stop = _amend
+    broker.add_to_position = _add
+    return broker
+
+
+def test_lifecycle_reduce_uses_signal_pct(monkeypatch):
+    _enable()
+    _patch_market(monkeypatch)
+    _open_local(qty=2.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="reduce", reduce_pct=25.0))
+
+    assert out["status"] == "reduced"
+    assert broker.closes[0]["qty"] == pytest.approx(0.5)
+    assert broker.closes[0]["reason"].startswith("signal_reduce")
+
+
+def test_lifecycle_reduce_defaults_to_half(monkeypatch):
+    """频道只说"减仓"没给比例：按一半处理（比全平保守，比不动有意义）."""
+    _enable()
+    _patch_market(monkeypatch)
+    _open_local(qty=2.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="reduce"))
+
+    assert out["status"] == "reduced"
+    assert broker.closes[0]["qty"] == pytest.approx(1.0)
+
+
+def test_lifecycle_reduce_in_dry_run_does_not_touch_broker(monkeypatch):
+    _enable(dry_run=True)
+    _patch_market(monkeypatch)
+    _open_local(qty=2.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="reduce", reduce_pct=50.0))
+
+    assert out["status"] == "dry_run"
+    assert broker.closes == []
+
+
+def test_lifecycle_move_stop_to_breakeven_keeps_take_profit(monkeypatch):
+    _enable()
+    _patch_market(monkeypatch, price=102.0)
+    _open_local(entry=100.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="move_stop", stop_to_breakeven=True))
+
+    assert out["status"] == "stop_moved"
+    call = broker.amends[0]
+    assert call["stop"] == pytest.approx(100.0)
+    assert call["tp"] == pytest.approx(104.0), "移止损必须把止盈一起重挂"
+
+
+def test_lifecycle_move_stop_on_wrong_side_is_rejected(monkeypatch):
+    """多单把止损设到现价之上，挂上去立刻市价平仓 —— 必须拒绝."""
+    _enable()
+    _patch_market(monkeypatch, price=100.0)
+    _open_local(entry=100.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="move_stop", stop=101.0))
+
+    assert out["status"] == "skipped" and "立即触发" in out["reason"]
+    assert broker.amends == []
+
+
+def test_lifecycle_move_stop_without_target_is_skipped(monkeypatch):
+    _enable()
+    _patch_market(monkeypatch)
+    _open_local()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: _lifecycle_broker())
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="move_stop", stop=0.0))
+
+    assert out["status"] == "skipped" and "目标价" in out["reason"]
+
+
+def test_lifecycle_add_uses_existing_stop_when_signal_omits_it(monkeypatch):
+    _enable()
+    _patch_market(monkeypatch, price=101.0)
+    _open_local(entry=100.0)
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="add", stop=0.0, tp=0.0))
+
+    assert out["status"] == "added"
+    call = broker.adds[0]
+    assert call["sl"] == pytest.approx(98.0), "没给新止损就沿用原仓位的，绝不留裸仓"
+    assert call["tp"] == pytest.approx(104.0)
+
+
+def test_lifecycle_add_opposite_side_is_ignored(monkeypatch):
+    _enable()
+    _patch_market(monkeypatch)
+    _open_local(side="long")
+    broker = _lifecycle_broker()
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+    eng = worker_mod.TradingEngine()
+
+    out = _run(eng, _parsed(event="add", side="short"))
+
+    assert out["status"] == "skipped" and "相反" in out["reason"]
+    assert getattr(broker, "adds", []) == []
