@@ -108,6 +108,37 @@ async function download(job: any) {
   }
 }
 
+const fileInput = ref<HTMLInputElement | null>(null)
+const uploading = ref(false)
+
+function pickUpload() {
+  fileInput.value?.click()
+}
+
+async function onFileChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  uploading.value = true
+  try {
+    // 原始 body 上传（文件字节直传，不走 JSON 封装）
+    const res = await fetch(`/api/v1/backup/upload?filename=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${getToken()}` },
+      body: file,
+    })
+    const payload = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`)
+    app.notify(`上传成功，可在记录里直接还原`, 'ok')
+    await load()
+  } catch (err: any) {
+    app.notify(`上传失败: ${err.message}`, 'error')
+  } finally {
+    uploading.value = false
+    input.value = ''
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -206,8 +237,12 @@ onMounted(load)
       <div class="panel">
         <div class="panel-hd">
           <span class="panel-title">备份记录</span>
-          <div class="right"><button class="btn btn-sm" @click="load">刷新</button></div>
+          <div class="right" style="gap: 6px">
+            <button class="btn btn-sm" :disabled="uploading" @click="pickUpload">{{ uploading ? '上传中…' : '上传备份' }}</button>
+            <button class="btn btn-sm" @click="load">刷新</button>
+          </div>
         </div>
+        <input ref="fileInput" type="file" accept=".zip,.enc" style="display: none" @change="onFileChange" />
         <div class="panel-body flush table-scroll" style="max-height: 460px">
           <table class="table">
             <thead><tr><th>#</th><th>时间</th><th>名称</th><th>大小</th><th>校验</th><th>操作</th></tr></thead>

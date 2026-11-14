@@ -1,7 +1,7 @@
-"""备份: 范围选项 / 创建 / 列表 / 下载 / 还原 / 删除."""
+"""备份: 范围选项 / 创建 / 列表 / 下载 / 上传 / 还原 / 删除."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from ...services import backup as backup_service
@@ -46,6 +46,25 @@ def create(payload: BackupIn, user: str = Depends(current_user)) -> dict:
 @router.get("/backup/jobs")
 def jobs(user: str = Depends(current_user)) -> dict:
     return {"items": backup_service.list_jobs(), "usage": backup_service.disk_usage()}
+
+
+@router.post("/backup/upload")
+async def upload(
+    request: Request,
+    filename: str = Query(default="", description="原始文件名, 仅用于命名与留痕"),
+    user: str = Depends(current_user),
+) -> dict:
+    """上传外部备份文件并登记为可还原的 job.
+
+    用原始请求体承载文件字节（单文件场景不需要 multipart），文件名走 query。
+    上传成功后会出现在备份记录里，可直接对其执行还原。
+    """
+    data = await request.body()
+    result = backup_service.upload_backup(filename=filename, data=data, created_by=user)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    events.record("info", "backup", f"{user} 上传备份 {filename or '(未命名)'}", {"job_id": result.get("job_id")})
+    return result
 
 
 @router.post("/backup/{job_id}/restore")

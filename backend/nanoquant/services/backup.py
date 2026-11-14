@@ -216,6 +216,81 @@ def create_backup(
     }
 
 
+#: 上传备份的大小上限（备份包通常几十 KB ~ 几 MB，100 MB 足够容纳含附加文件的极端情况）
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
+def _read_manifest(raw: bytes) -> dict[str, Any]:
+    """从明文 zip 里读出 manifest.json（无该成员则视为非备份包）。"""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if "manifest.json" not in zf.namelist():
+            raise ValueError("no manifest.json")
+        return json.loads(zf.read("manifest.json"))
+
+
+def upload_backup(*, filename: str, data: bytes, created_by: str) -> dict[str, Any]:
+    """接收外部上传的备份文件并登记为可还原的 job.
+
+    用途：跨机迁移 / 灾备恢复——把另一台机器下载的备份包传到本机还原。
+    自动识别加密（Fernet 密文需本机主密钥可解）与明文 zip，解析 manifest 得到
+    还原范围，sha256 按**落盘字节**计算（与 create_backup / restore 的校验口径一致）。
+    """
+    if not data:
+        return {"ok": False, "error": "空文件"}
+    if len(data) > MAX_UPLOAD_BYTES:
+        return {"ok": False, "error": f"文件过大（{len(data) / 1024 / 1024:.1f} MB，上限 100 MB）"}
+
+    encrypted = False
+    manifest: dict[str, Any] | None = None
+    # 先按明文 zip 解析；失败再尝试用本机主密钥解密（加密包是 Fernet 密文，zipfile 打不开）
+    try:
+        manifest = _read_manifest(data)
+    except Exception:
+        try:
+            manifest = _read_manifest(_fernet().decrypt(data))
+            encrypted = True
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": (
+                    "无法识别为有效备份文件：既不含 manifest.json，也无法用本机主密钥解密"
+                    f"（{exc.__class__.__name__}）。跨机加密备份请确认主密钥一致。"
+                ),
+            }
+    if not isinstance(manifest, dict) or "version" not in manifest:
+        return {"ok": False, "error": "备份包 manifest 缺少 version 字段，可能是损坏或被改动的文件"}
+
+    ts = int(time.time())
+    safe_name = "".join(c for c in filename if c.isalnum() or c in "-_.")[:60] or "upload"
+    suffix = ".zip.enc" if encrypted else ".zip"
+    out_path = paths.BACKUPS / f"upload-{safe_name}-{ts}{suffix}"
+    out_path.write_bytes(data)
+
+    digest = hashlib.sha256(data).hexdigest()
+    with session_scope() as s:
+        job = BackupJob(
+            ts=ts, name=safe_name, scope=manifest, file_path=str(out_path),
+            size=len(data), sha256=digest, encrypted=encrypted,
+            status="ok", message=f"上传 {filename}",
+            created_by=created_by,
+        )
+        s.add(job)
+        s.flush()
+        job_id = job.id
+
+    _apply_retention()
+    events.record("info", "backup", f"上传备份 #{job_id} ({filename}, {len(data) / 1024:.1f} KB)")
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "name": safe_name,
+        "size": len(data),
+        "sha256": digest,
+        "encrypted": encrypted,
+        "manifest": manifest,
+    }
+
+
 def _apply_retention() -> None:
     cfg = get_backup()
     with session_scope() as s:

@@ -395,3 +395,57 @@ def test_backup_survives_mirror_failure(monkeypatch, tmp_path):
     assert job["ok"] is True
     assert job["mirror"] is None
     assert Path(job["path"]).is_file()
+
+
+# ------------------------------------------------------------ 上传外部备份
+def test_upload_backup_plain_roundtrip():
+    """明文备份上传后自动识别、可直接还原（跨机迁移场景）."""
+    from pathlib import Path
+
+    update_group("backup", {"auto_daily": False})
+    src = backup_service.create_backup(
+        name="upload-src", settings_groups=["public"], tables=[], encrypt=False, created_by="test"
+    )
+    data = Path(src["path"]).read_bytes()
+
+    up = backup_service.upload_backup(filename="external.zip", data=data, created_by="test")
+
+    assert up["ok"] is True, up
+    assert up["encrypted"] is False
+    assert up["manifest"]["settings_groups"] == ["public"]
+    result = backup_service.restore(up["job_id"], restore_settings=True, restore_tables=False)
+    assert result["ok"] is True, result
+
+
+def test_upload_backup_encrypted_recognized():
+    """加密备份（Fernet 密文）上传后要能被正确识别为 encrypted 且可还原."""
+    from pathlib import Path
+
+    src = backup_service.create_backup(
+        name="upload-enc", settings_groups=["risk"], tables=[], encrypt=True, created_by="test"
+    )
+    data = Path(src["path"]).read_bytes()
+
+    up = backup_service.upload_backup(filename="external.zip.enc", data=data, created_by="test")
+
+    assert up["ok"] is True, up
+    assert up["encrypted"] is True
+    result = backup_service.restore(up["job_id"], restore_settings=True, restore_tables=False)
+    assert result["ok"] is True, result
+
+
+def test_upload_backup_rejects_garbage():
+    """非备份文件（既无 manifest 也无法解密）必须拒绝，而不是落盘成坏 job."""
+    up = backup_service.upload_backup(filename="not-a-backup.zip", data=b"just some bytes", created_by="test")
+
+    assert up["ok"] is False
+    assert "无法识别" in up["error"]
+
+
+def test_upload_backup_rejects_empty_and_oversized():
+    from pathlib import Path
+
+    assert backup_service.upload_backup(filename="x", data=b"", created_by="test")["ok"] is False
+    assert backup_service.upload_backup(
+        filename="big", data=b"0" * (backup_service.MAX_UPLOAD_BYTES + 1), created_by="test"
+    )["ok"] is False
