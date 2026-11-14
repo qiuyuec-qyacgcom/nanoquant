@@ -19,7 +19,6 @@ const nav = [
     { path: '/admin/signal-follow', label: '信号跟单', ico: '⇄' },
     { path: '/admin/strategies', label: 'AI 策略', ico: '⚑' },
     { path: '/admin/symbols', label: '标的池', ico: '☰' },
-    { path: '/admin/chart', label: 'K 线工作站', ico: '▤' },
     { path: '/admin/backtest', label: '回测', ico: '◇' },
   ]},
   { group: '智能', items: [

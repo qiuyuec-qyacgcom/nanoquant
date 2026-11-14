@@ -26,7 +26,6 @@ const routes: RouteRecordRaw[] = [
       { path: 'signal-follow', name: 'signal-follow', component: () => import('../views/SignalFollowView.vue'), meta: { title: '信号跟单' } },
       { path: 'strategies', name: 'strategies', component: () => import('../views/StrategiesView.vue'), meta: { title: 'AI 策略' } },
       { path: 'symbols', name: 'symbols', component: () => import('../views/SymbolsView.vue'), meta: { title: '标的池' } },
-      { path: 'chart', name: 'chart', component: () => import('../views/AdminChartView.vue'), meta: { title: 'K 线工作站' } },
       { path: 'backtest', name: 'backtest', component: () => import('../views/BacktestView.vue'), meta: { title: '回测' } },
       { path: 'news', name: 'news', component: () => import('../views/NewsView.vue'), meta: { title: '资讯情绪' } },
       { path: 'ai', name: 'ai', component: () => import('../views/AiView.vue'), meta: { title: 'AI 模型' } },

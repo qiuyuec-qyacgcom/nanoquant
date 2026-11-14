@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * K 线工作站 (前台 / 后台共用)
+ * K 线工作站 (前台)
  * ---------------------------------------------------------------
  * 数据链路 (对齐 astra-quant-agent 的 ChartWorkstation，但更省额度):
  * - **实时**: 浏览器连本服务 `/api/v1/ws/klines`，服务端复用一条币安
@@ -12,7 +12,7 @@
  * 契约: 只展示标的池内合约，顺序 = 添加顺序；空池显示"未添加标的"。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { http, getToken } from '../api/client'
+import { getToken } from '../api/client'
 import { publicKlines, publicPool, publicQuotes } from '../api/public'
 import type { Candle, PoolSymbol } from '../types/candle'
 import { fmt, numClass, pct, px, timeStr } from '../utils/format'
@@ -22,9 +22,6 @@ interface TickerBrief {
   last: number
   change_pct: number
 }
-
-const props = withDefaults(defineProps<{ variant?: 'public' | 'admin' }>(), { variant: 'public' })
-const isAdmin = computed(() => props.variant === 'admin')
 
 const INTERVALS = [
   ['5m', '5分'],
@@ -109,17 +106,6 @@ const streamLabel = computed(() => {
 let loadSeq = 0
 
 async function fetchPool(): Promise<PoolSymbol[]> {
-  if (isAdmin.value) {
-    const res = await http.get('/symbols')
-    return (res.items || []).map((row: any, index: number) => ({
-      symbol: row.symbol,
-      name: row.name || row.symbol.replace(/USDT$/, ''),
-      tier: row.tier,
-      tier_label: row.tier === 'tier_1_bluechip' ? '蓝筹主流' : '高弹性动量',
-      order: index + 1,
-      added_at: row.created_at,
-    }))
-  }
   const res = await publicPool()
   return res.symbols || []
 }
@@ -149,11 +135,7 @@ async function reloadChart(reset = false) {
   }
   chartLoading.value = true
   try {
-    const res = isAdmin.value
-      ? await http.get(
-          `/chart/klines?symbol=${encodeURIComponent(symbol)}&interval=${period}&limit=${BARS}`
-        )
-      : await publicKlines(symbol, period, BARS)
+    const res = await publicKlines(symbol, period, BARS)
     if (seq !== loadSeq || symbol !== selected.value || period !== interval.value) return
     items.value = res.items || []
     mergePendingBar()
@@ -174,18 +156,8 @@ async function reloadChart(reset = false) {
 async function fetchQuotes() {
   if (!pool.value.length) return
   try {
-    if (isAdmin.value) {
-      const res = await http.get('/engine/quotes')
-      const map: Record<string, TickerBrief> = {}
-      for (const sym of res.symbols || []) {
-        const t = res.tickers?.[sym]
-        if (t) map[sym] = { last: Number(t.last || 0), change_pct: Number(t.change_pct || 0) }
-      }
-      tickers.value = map
-    } else {
-      const res = await publicQuotes()
-      tickers.value = (res.tickers || {}) as Record<string, TickerBrief>
-    }
+    const res = await publicQuotes()
+    tickers.value = (res.tickers || {}) as Record<string, TickerBrief>
   } catch {
     /* 报价失败不影响 K 线主链路 */
   }
@@ -278,7 +250,7 @@ function connectStream() {
   socket = ws
   ws.onopen = () => {
     if (socket !== ws) return
-    // 可选鉴权：登录态下首帧带 token，site_enabled 关闭时管理员仍能看 K 线
+    // 可选鉴权：登录态下首帧带 token
     const token = getToken()
     if (token) ws.send(JSON.stringify({ type: 'auth', token }))
     wsRetry = 0
@@ -406,9 +378,9 @@ onBeforeUnmount(() => {
     <div v-if="!loading && !pool.length" class="panel kb-empty-panel">
       <div class="panel-body kb-empty">
         <div class="kb-empty-ico">▤</div>
-        <div class="kb-empty-title">{{ isAdmin ? '标的池为空' : '未添加标的' }}</div>
+        <div class="kb-empty-title">未添加标的</div>
         <div class="kb-empty-desc">
-          前台与后台的 K 线都只展示「标的池」内的合约。请先添加要跟踪的币安 USDT 永续合约，
+          K 线只展示「标的池」内的合约。请先添加要跟踪的币安 USDT 永续合约，
           保存后这里会按<b>添加顺序</b>自动展示 K 线。
         </div>
         <div class="kb-empty-tags">
@@ -426,7 +398,7 @@ onBeforeUnmount(() => {
       <div class="panel">
         <div class="panel-hd">
           <div class="stack" style="gap: 2px">
-            <span class="panel-title">{{ isAdmin ? 'K 线工作站' : '标的 K 线' }}</span>
+            <span class="panel-title">标的 K 线</span>
             <span class="muted" style="font-size: 10.5px">
               共 {{ pool.length }} 个标的 · 严格按添加顺序 · 币安 WebSocket 推送 · 600 根历史
             </span>

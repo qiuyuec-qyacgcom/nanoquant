@@ -72,7 +72,6 @@
 | 后台 | `/admin/onboarding` | 开仓检查：7 项前置条件 + 每标的最小名义额与所需保证金（按可用余额判定） |
 | 后台 | `/admin/signals` | 信号审计：评分 / AI / 裁决 / 拒绝原因 Top / 24h 密度图；`×N` 标记合并的重复扫描，`summary.scans` 还原真实次数 |
 | 后台 | `/admin/symbols` | 标的池（币安合约表校验、分层/精度/最小下单、删除确认短语） |
-| 后台 | `/admin/chart` | K 线工作站：与前台同源组件，MA/EMA/BOLL + VOL/MACD/RSI，币安推送 + 收盘倒计时 |
 | 后台 | `/admin/backtest` | 回测：净值曲线、分段统计、成交明细（含资金费/部分止盈）、参数网格、样本外验证 |
 | 后台 | `/admin/news` | 资讯情绪 + 源检测 |
 | 后台 | `/admin/ai` | 模型接入、诊断、**决策演练（原始英文输出 / 后台中文译文对照、token 估算）**、协议版本切换 |
@@ -342,7 +341,7 @@ nanoquant/
 |---|---|
 | 认证 | `POST /auth/login`、`GET /auth/me`、`POST /auth/password` |
 | 标的池 | `GET /symbols`、`GET /symbols/available`、`POST /symbols`、`POST /symbols/bulk`、`PATCH /symbols/{symbol}`、`DELETE /symbols/{symbol}?confirmation=REMOVE%20<SYMBOL>` |
-| 交易 | `GET /engine/status`、`POST /engine/control`、`POST /engine/cycle-now`、`GET /engine/admission`、`/engine/positions`、`POST /engine/positions/{id}/close`、`/engine/orders`、`/engine/protection`、`/engine/execution`、`/engine/quotes`、`/engine/signals`、`/engine/trades`、`/engine/equity`、`/engine/stats`、`GET /chart/klines` |
+| 交易 | `GET /engine/status`、`POST /engine/control`、`POST /engine/cycle-now`、`GET /engine/admission`、`/engine/positions`、`POST /engine/positions/{id}/close`、`/engine/orders`、`/engine/protection`、`/engine/execution`、`/engine/signals`、`/engine/trades`、`/engine/equity`、`/engine/stats` |
 | 回测 | `POST /backtest/run`、`POST /backtest/grid`、`POST /backtest/walkforward`（样本外验证） |
 | AI | `GET/POST /ai/providers`、`PATCH/DELETE /ai/providers/{id}`、`POST /ai/providers/fetch-models`、`POST /ai/providers/{id}/test`、`GET /ai/providers/{id}/diagnose`、`GET /ai/providers/{id}/models`、`POST /ai/analyze`、`POST /ai/decision-preview`、`GET /ai/logs`、`GET /ai/usage` |
 | 自进化 | `GET/POST /evolution/mantras`、`PATCH/DELETE /evolution/mantras/{id}`、`GET /evolution/injection`、`GET /evolution/runs`、`POST /evolution/review/{trade_id}`、`POST /evolution/global-review`、`GET /evolution/stats`、`GET /evolution/effectiveness` |

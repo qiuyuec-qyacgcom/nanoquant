@@ -561,7 +561,7 @@ class BinanceClient:
     ) -> list[Candle]:
         """K 线.
 
-        `fresh=True` 绕过缓存: 前台/后台 K 线工作站每 3 秒刷新时必须走这条路径,
+        `fresh=True` 绕过缓存: 前台 K 线工作站每 3 秒刷新时必须走这条路径,
         否则最后一根未收盘的蜡烛会被 `kline_ttl_sec` (默认 20s) 钉住, 看起来"不实时".
         """
         cfg = get_data()

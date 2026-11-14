@@ -168,69 +168,6 @@ def execution_metrics(user: str = Depends(current_user)) -> dict:
     return exec_metrics.summary()
 
 
-@router.get("/engine/quotes")
-async def quotes(user: str = Depends(current_user)) -> dict:
-    """当前交易环境标的池的 24h 快照 (后台 K 线工作站列表用)."""
-    from ...services.symbols import ordered_symbols
-
-    pool = ordered_symbols(enabled_only=True)
-    if not pool:
-        return {"symbols": [], "tickers": {}, "updated_at": int(time.time())}
-    try:
-        rows = await binance_client.tickers(pool)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"行情暂不可用: {exc}") from exc
-    return {
-        "symbols": pool,
-        "tickers": {s: {"last": t.last, "change_pct": t.change_pct} for s, t in rows.items()},
-        "updated_at": int(time.time()),
-    }
-
-
-@router.get("/chart/klines")
-async def chart_klines(
-    symbol: str = Query(..., description="合约, 必须在标的池中"),
-    interval: str = Query(default="15m"),
-    limit: int = Query(default=600, ge=20, le=1000),
-    user: str = Depends(current_user),
-) -> dict:
-    """后台 K 线工作站取数: 与前台同源 (只认标的池), 但不需要公开站点开启."""
-    from ...services.symbols import ordered_symbols
-
-    target = symbol.upper()
-    pool = ordered_symbols(enabled_only=True)
-    if target not in pool:
-        raise HTTPException(status_code=404, detail=f"{target} 不在标的池中")
-    try:
-        candles = await binance_client.klines(target, interval, limit, fresh=True)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"币安行情暂不可用: {exc}") from exc
-    step = {
-        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
-        "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
-    }.get(interval, 60_000)
-    items = [
-        {
-            "t": int(c.open_time),
-            "o": float(c.open),
-            "h": float(c.high),
-            "l": float(c.low),
-            "c": float(c.close),
-            "v": float(c.volume),
-        }
-        for c in candles
-    ]
-    last = candles[-1] if candles else None
-    return {
-        "symbol": target,
-        "interval": interval,
-        "items": items,
-        "count": len(items),
-        "next_close_at": int(last.open_time) + step if last else 0,
-        "server_time": int(time.time() * 1000),
-    }
-
-
 @router.post("/engine/cycle-now")
 async def cycle_now(user: str = Depends(current_user)) -> dict:
     result = await engine.cycle()
