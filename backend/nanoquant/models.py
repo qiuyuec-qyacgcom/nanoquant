@@ -435,6 +435,81 @@ class Cooldown(Base):
     kind: Mapped[str] = mapped_column(String(24), default="symbol")
 
 
+class DecisionJournal(Base):
+    """AI 决策快照: 每次 AI 给出方向判断时留痕, 用于 24h 后回访打标.
+
+    记录「当时看到什么 + 为什么 + 预测什么」，随后由定时任务按真实价格回访，
+    把预测与实际对齐成可统计的对错标签，喂给经验库（日志 → 打标 → 经验）。
+    与 Signal（每轮扫描信号）不同：这是「决策」级别的记录，只在 AI 参与时写，
+    且只记录方向性判断（开多/开空），hold 只留痕不参与对赌。
+    """
+
+    __tablename__ = "decision_journal"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[int] = mapped_column(Integer, default=now_ts, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    #: 预测方向 long / short / flat(hold)
+    direction: Mapped[str] = mapped_column(String(8), default="flat")
+    #: 决策时的 Conviction (0-1)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    #: 决策时的价格
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    #: 预测目标涨跌幅 %（long 为正, short 为负; 取 AI 的 tp_pct）
+    target_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    #: 决策理由
+    reason: Mapped[str] = mapped_column(Text, default="")
+    #: 市场快照: {rsi, adx, atr_pct, funding, change_24h, quote_volume, ...}
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: AI 动作: open_long / open_short / hold
+    decision: Mapped[str] = mapped_column(String(16), default="hold")
+    signal_id: Mapped[int] = mapped_column(Integer, default=0)
+    #: 本次决策注入的经验 ID（用于事后「采用/未采用」对照）
+    injected_experience_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    #: 打标状态: pending / labeled / skipped
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    #: 回访结果: correct / wrong / partial
+    outcome: Mapped[str] = mapped_column(String(16), default="")
+    #: 回访时的实际价格 / 方向校准后的涨跌幅 %
+    actual_price: Mapped[float] = mapped_column(Float, default=0.0)
+    actual_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    labeled_at: Mapped[int] = mapped_column(Integer, default=0)
+    #: 是否已归档为经验
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    mode: Mapped[str] = mapped_column(String(8), default="demo", index=True)
+
+
+class Experience(Base):
+    """经验条目: 决策回访后沉淀的场景化经验, 带标签, 下次相似场景检索注入 (RAG).
+
+    与 evolution.Mantra（心法，规则级、全局按健康度排序注入）互补：
+    这里是「场景化」经验，按 symbol + 标签 + 场景结构做相似度检索，
+    只注入 Top-k 最相关条目（来源那篇「日志 → 打标 → RAG 经验库」的闭环）。
+    """
+
+    __tablename__ = "experiences"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    #: 场景标签 (JSON list): rsi_range / adx_regime / direction / macro / 币种等
+    tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    #: 场景结构 (JSON): {rsi, adx, atr_pct, direction} 用于数值相似度
+    scenario: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: 教训/经验正文
+    lesson: Mapped[str] = mapped_column(Text, default="")
+    #: 该经验对应的结果: win / loss
+    outcome: Mapped[str] = mapped_column(String(8), default="win")
+    #: 来源决策 id
+    source_decision_id: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(24), default="journal")
+    #: 命中/胜负统计（供效果反馈与淘汰）
+    hits: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=now_ts, index=True)
+    updated_at: Mapped[int] = mapped_column(Integer, default=now_ts, onupdate=now_ts)
+
+
 Index("ix_positions_open", PositionRecord.status, PositionRecord.symbol)
 Index("ix_trades_mode_closed", TradeRecord.mode, TradeRecord.closed_at)
 Index("ix_news_ts_source", NewsItem.ts, NewsItem.source)
+Index("ix_journal_status_ts", DecisionJournal.status, DecisionJournal.ts)

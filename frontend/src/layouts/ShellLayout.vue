@@ -26,6 +26,7 @@ const nav = [
     { path: '/admin/news', label: '资讯情绪', ico: '✦' },
     { path: '/admin/ai', label: 'AI 模型', ico: '◉' },
     { path: '/admin/evolution', label: '自进化心法', ico: '✧' },
+    { path: '/admin/journal', label: '决策经验', ico: '◈' },
   ]},
   { group: '运维', items: [
     { path: '/admin/strategy', label: '参数配置', ico: '⚙' },

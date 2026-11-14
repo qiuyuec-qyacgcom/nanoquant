@@ -52,6 +52,8 @@ from ..services.settings import (
 )
 from ..evolution import mantra as mantra_store
 from ..evolution import review as evolution_review
+from ..journal import injection as journal_injection
+from ..journal import record_decision as journal_record
 from . import risk as risk_mod
 from .margin import MarginLedger
 from .strategy import (
@@ -2014,6 +2016,21 @@ class TradingEngine:
                     row.ai_action = d.action
                     row.ai_confidence = d.confidence
                     row.ai_reason = (d.reason or outcome.error)[:900]
+            if outcome.ok:
+                # 决策留痕: 记录 AI 的方向判断快照（日志 → 打标 → 经验库 闭环第一步）。
+                # 只记 open_long/open_short；hold 由 record_decision 内部忽略（不参与对赌）。
+                journal_record(
+                    symbol=sig.symbol,
+                    action=d.action,
+                    confidence=d.confidence,
+                    entry_price=ticker.last,
+                    target_pct=d.tp_pct if d.action == "open_long" else -d.tp_pct,
+                    reason=d.reason,
+                    snapshot=self._journal_snapshot(sig, ticker),
+                    signal_id=signal_id,
+                    injected_experience_ids=ctx.get("injected_experience_ids"),
+                    mode=broker.mode,
+                )
             if not outcome.ok:
                 self._update_signal_reject(signal_id, f"AI 不可用({outcome.error[:80]}), 按 fail-closed 跳过")
                 return
@@ -2135,6 +2152,22 @@ class TradingEngine:
             },
         )
 
+    @staticmethod
+    def _journal_snapshot(sig, ticker) -> dict[str, Any]:
+        """决策快照: 抽取参与场景相似度检索的数值特征 (与 strategy 特征键一致)."""
+        f = sig.features or {}
+        snap: dict[str, Any] = {
+            "rsi": f.get("rsi"),
+            "adx": f.get("adx"),
+            "atr_pct": f.get("atr_pct"),
+            "funding": f.get("funding"),
+            "vol_ratio": f.get("vol_ratio"),
+            "ema_gap_pct": f.get("ema_gap_pct"),
+            "change_24h": getattr(ticker, "change_pct", 0.0),
+            "quote_volume": getattr(ticker, "quote_volume", 0.0),
+        }
+        return {k: v for k, v in snap.items() if v is not None}
+
     def _build_ai_context(self, sig, ticker, account, engine_cfg, risk_cfg, filters) -> dict[str, Any]:
         ai_cfg = get_ai()
         mantras: list[dict[str, Any]] = []
@@ -2146,6 +2179,15 @@ class TradingEngine:
             mantras = [{"title": m["title"], "health": m["health"]} for m in lessons]
             # 只记 id，不把 id 塞进 prompt（快照用于事后「采用/未采用」对照）
             injected_ids = [int(m["id"]) for m in lessons if m.get("id")]
+        # 场景化经验 (决策日志 → 打标 → 经验库 闭环)：检索注入 top-k，失败只降级不打断
+        experiences_text = ""
+        injected_experience_ids: list[int] = []
+        try:
+            experiences_text, injected_experience_ids, _ = journal_injection(
+                sig.symbol, self._journal_snapshot(sig, ticker)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("经验检索跳过: %s", exc)
         news_items = news_service.digest(6) if ai_cfg.inject_news else []
         positions = risk_mod.open_positions()
         today_pnl = 0.0
@@ -2197,6 +2239,8 @@ class TradingEngine:
             "strategy": strategy,
             "mantras": mantras,
             "injected_mantra_ids": injected_ids,
+            "experiences": experiences_text,
+            "injected_experience_ids": injected_experience_ids,
         }
 
     async def _health_check(self) -> None:

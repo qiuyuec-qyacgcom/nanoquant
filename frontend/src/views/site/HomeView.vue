@@ -13,6 +13,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { publicOverview, publicPerformance } from '../../api/public'
 import { numClass, timeStr } from '../../utils/format'
+import KlineBoard from '../../components/KlineBoard.vue'
 
 const overview = ref<any>(null)
 const perf = ref<any>(null)
@@ -45,6 +46,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
 
 <template>
   <div class="stack" style="gap: 18px">
+    <!-- K 线工作台 (前台首页): 标的池驱动, 公开数据源, 无需登录 -->
+    <section>
+      <KlineBoard />
+    </section>
+
     <!-- Hero: 定位 + 实时状态卡 -->
     <section class="landing-hero panel">
       <div class="landing-grid">
@@ -61,9 +67,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
             每一笔“为什么没开仓”都能在信号审计里找到原因，而不是黑盒调参。
           </p>
           <div class="row" style="gap: 8px; flex-wrap: wrap">
-            <router-link to="/charts" class="btn btn-primary">查看实时 K 线</router-link>
-            <router-link to="/insights" class="btn">观点与心法</router-link>
-            <router-link to="/admin/dashboard" class="btn btn-sm">进入后台</router-link>
+            <router-link to="/insights" class="btn btn-primary">观点与心法</router-link>
+            <router-link to="/admin/dashboard" class="btn">进入后台</router-link>
           </div>
           <div class="landing-stats">
             <div class="landing-stat"><b>5m</b><span>主周期</span></div>

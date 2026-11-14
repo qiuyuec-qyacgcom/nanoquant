@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .ai.client import ai_client
 from .api.routes import (
-    ai, auth, backup, backtest, evolution, news, public, signal_follow, strategies, symbols, system, trade, ws
+    ai, auth, backup, backtest, evolution, journal, news, public, signal_follow, strategies, symbols, system, trade, ws
 )
 from .config import APP_NAME, paths
 from .db import init_db, session_scope
@@ -110,6 +110,22 @@ def bootstrap() -> None:
             log.info("标的池为空: 请在后台「标的池」页添加要交易的合约")
 
 
+async def _journal_loop() -> None:
+    """决策日志 → 打标 → 经验库 闭环后台循环 (每 15 分钟一轮)."""
+    from .journal import run_cycle
+    from .services.settings import get_journal
+
+    while True:
+        await asyncio.sleep(900)
+        try:
+            if get_journal().enabled:
+                await run_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("决策日志闭环循环异常: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 注意顺序: 配置存在数据库里, 必须先建表再读日志级别 (全新部署时尤为关键)
@@ -138,11 +154,14 @@ async def lifespan(app: FastAPI):
     backup_service.start_auto()
     probe_task = asyncio.create_task(_probe())
     await engine.start()
+    # 决策日志 → 打标 → 经验库 闭环: 周期回访到期决策并归档 (单轮异常自愈)
+    journal_task = asyncio.create_task(_journal_loop())
     try:
         yield
     finally:
         runtime_probe.stop()
         backup_service.stop_auto()
+        journal_task.cancel()
         probe_task.cancel()
         await engine.stop()
         # 停机前把队列里的订单写完, 不让已 ack 的成交丢在内存里
@@ -244,7 +263,7 @@ def create_app() -> FastAPI:
 
     for module in (
         auth, public, system, symbols, trade, ai, evolution, news, backup, backtest,
-        signal_follow, strategies,
+        signal_follow, strategies, journal,
     ):
         app.include_router(module.router, prefix="/api/v1")
     app.include_router(ws.router, prefix="/api/v1")

@@ -448,6 +448,30 @@ class SignalFollowSettings(BaseModel):
     dry_run: bool = Field(default=True, description="只记录意图不下单; 人工明确授权后才可关闭（RUNBOOK M4）")
 
 
+class JournalSettings(BaseModel):
+    """决策日志 → 打标 → RAG 经验库 闭环配置（借鉴「会学习的 Agent」思路）.
+
+    与 evolution（平仓复盘 → 心法，规则级）互补：这里是**决策级**的留痕与
+    场景化经验，24h 回访打标后按相似场景检索注入。
+    """
+
+    enabled: bool = True
+    #: 记录门槛: AI 置信度低于此值不记决策（避免记一堆低质量判断）
+    min_record_confidence: float = Field(default=0.45, ge=0, le=1)
+    #: 回访窗口（秒），默认 24h
+    label_after_sec: int = Field(default=86400, ge=300, le=604800)
+    #: 判定「判断正确」的最小方向收益 %（低于它视为 partial，避免噪声判对）
+    correct_threshold_pct: float = Field(default=0.15, ge=0.01, le=5.0)
+    #: 经验检索注入条数 (top-k)
+    retrieve_top_k: int = Field(default=5, ge=0, le=20)
+    #: 是否把经验注入 AI 决策上下文
+    inject_experiences: bool = True
+    #: 经验库容量上限（只增不减会爆炸，超出归档最旧条目）
+    max_experiences: int = Field(default=200, ge=10, le=2000)
+    #: 检索相似度阈值（0-1），低于则不注入
+    min_similarity: float = Field(default=0.15, ge=0, le=1)
+
+
 class PublicSettings(BaseModel):
     """公开前台 (无需登录) 的展示配置."""
 
@@ -473,6 +497,7 @@ GROUPS: dict[str, type[BaseModel]] = {
     "system": SystemSettings,
     "public": PublicSettings,
     "signal_follow": SignalFollowSettings,
+    "journal": JournalSettings,
 }
 
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -688,3 +713,7 @@ def get_system() -> SystemSettings:
 
 def get_signal_follow() -> SignalFollowSettings:
     return SignalFollowSettings(**get_group("signal_follow"))
+
+
+def get_journal() -> JournalSettings:
+    return JournalSettings(**get_group("journal"))

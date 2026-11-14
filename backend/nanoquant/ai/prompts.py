@@ -95,6 +95,10 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
     strategy = ctx.get("strategy")
     if strategy:
         payload["strategy"] = strategy
+    # 场景化经验同理：空就不占 token；符号版已紧凑，再截断防异常长文本撑大 v1 快照
+    experiences = str(ctx.get("experiences") or "").strip()
+    if experiences:
+        payload["experiences"] = experiences[:600]
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
