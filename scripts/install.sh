@@ -116,17 +116,35 @@ install_pkg() {
 }
 
 # 与 backend/requirements.txt（uv 按 3.12 编译）和 CI 矩阵保持一致：
-# 只在 3.12/3.13 上验证过，版本不够直接拒掉，比"装完了跑不起来"省事
+# 只在 3.12/3.13 上验证过，版本不够直接拒掉，比"装完了跑不起来"省事。
+# 另外必须能 import sqlite3：源码编译的 Python 若缺 libsqlite3-dev，
+# _sqlite3 C 扩展会被静默跳过，版本看着够、装到一半才炸，这里提前揪出来。
 MIN_MINOR=12
+py_usable() {
+  "$1" -c "import sys, sqlite3; sys.exit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null
+}
 PY=""
+PY_VER_OK_BUT_NOSQLITE=""
 for cand in python3.13 python3.12 python3; do
   command -v "$cand" >/dev/null 2>&1 || continue
   if "$cand" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null; then
-    PY="$cand"; break
+    if py_usable "$cand"; then
+      PY="$cand"; break
+    else
+      # 版本够但缺 sqlite3，记下以便报错更精准
+      [[ -z "$PY_VER_OK_BUT_NOSQLITE" ]] && PY_VER_OK_BUT_NOSQLITE="$cand"
+    fi
   fi
 done
 
 if [[ -z "$PY" ]]; then
+  if [[ -n "$PY_VER_OK_BUT_NOSQLITE" ]]; then
+    die "检测到 $PY_VER_OK_BUT_NOSQLITE 版本满足要求，但缺少 sqlite3 模块（_sqlite3 C 扩展）。
+        这是编译 Python 时系统缺 libsqlite3-dev 所致。修复（任选其一）：
+        1) 源码重编：apt-get install -y libsqlite3-dev，回到 Python 源码目录重跑 ./configure && make && make install
+        2) 改用系统完整发行版：deadsnakes PPA（Ubuntu）或 pyenv install 3.12.x
+        修好后重新运行本脚本即可。"
+  fi
   warn "未找到 Python 3.12+，尝试自动安装"
   if [[ "$PKG" == "apt" ]]; then
     apt-get update -qq || true
@@ -135,10 +153,9 @@ if [[ -z "$PY" ]]; then
     install_pkg python3 python3-pip || true
   fi
   for cand in python3.13 python3.12; do
-    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+    if command -v "$cand" >/dev/null 2>&1 && py_usable "$cand"; then PY="$cand"; break; fi
   done
-  if [[ -z "$PY" ]] && command -v python3 >/dev/null 2>&1 \
-     && python3 -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null; then
+  if [[ -z "$PY" ]] && command -v python3 >/dev/null 2>&1 && py_usable python3; then
     PY="python3"
   fi
   [[ -n "$PY" ]] || die "系统源里的 Python 低于 3.12。请先安装 3.12+（deadsnakes / pyenv / 官方源码）后重试"
