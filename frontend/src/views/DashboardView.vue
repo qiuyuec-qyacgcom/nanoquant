@@ -183,7 +183,10 @@ async function closePosition(id: number) {
 let timer: number | undefined
 onMounted(async () => {
   await load()
-  timer = window.setInterval(load, 8000)
+  // 总览一次要打 8 个接口。8 秒全量刷新 = 每个标签页每分钟 60 次请求，
+  // 而权益曲线/成交/信号/委托这些数据本身就以分钟为单位变化；
+  // 顶栏的实时状态由 ShellLayout 每 5s 单独轮询（后端有 2s 单飞缓存）。
+  timer = window.setInterval(load, 30000)
 })
 onBeforeUnmount(() => window.clearInterval(timer))
 </script>

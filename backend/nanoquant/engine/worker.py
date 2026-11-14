@@ -71,6 +71,18 @@ MAX_TASKS = 2
 SIGNAL_DEDUP_SEC = 60
 #: AI 议会一致度下限：低于该值视为分歧，`ai.require_agreement` 打开时直接观望
 AGREEMENT_MIN = 0.6
+#: flat 信号（扫描到了但没有方向）只保留审计需要的字段。
+#: 完整特征快照约 1.3KB，而 flat 占全部信号的 93%：一天两千多条 = 每天 3MB 纯冗余，
+#: 两周就是 34MB，还连带每次去重命中都把整块 JSON 重写一遍（WAL 放大）。
+FLAT_FEATURE_KEYS = (
+    "score", "price", "source", "atr_pct", "vol_ratio", "rsi",
+    "ema_gap_pct", "regime", "change_24h", "quote_volume",
+)
+
+
+def _flat_features(features: dict[str, Any]) -> dict[str, Any]:
+    """flat 信号的精简特征：保留"为什么没开"需要的量，丢掉逐指标快照."""
+    return {k: features[k] for k in FLAT_FEATURE_KEYS if k in features}
 
 
 def ai_agreement_reject(require_agreement: bool, agreement: float) -> str:
@@ -998,6 +1010,8 @@ class TradingEngine:
         mode = normalize_mode(get_engine().mode)
         now = int(time.time())
         features = {**sig.features, "price": ticker.last, "source": source}
+        if sig.direction == "flat":
+            features = _flat_features(features)
         reason = sig.blocked or ""
         decision = "pending" if sig.direction != "flat" else "flat"
         key = (mode, sig.symbol, sig.direction, decision, reason)
@@ -1011,10 +1025,10 @@ class TradingEngine:
                     row = s.get(Signal, cached_id)
                     first_ts = int((row.features or {}).get("first_ts", row.ts)) if row else 0
                     if row is not None and now - first_ts < SIGNAL_DEDUP_SEC:
+                        # 只更新计数与时间戳：特征快照几乎逐轮相同，重写它纯粹是放大 WAL
                         row.repeats = int(row.repeats or 1) + 1
                         row.ts = now
                         row.score = sig.score
-                        row.features = {**features, "first_ts": first_ts, "repeat": row.repeats}
                         s.flush()
                         return self._signal_view(row, sig, reason)
 
@@ -1023,7 +1037,7 @@ class TradingEngine:
                 symbol=sig.symbol,
                 direction=sig.direction,
                 score=sig.score,
-                features={**features, "first_ts": now, "repeat": 1},
+                features={**features, "first_ts": now},
                 decision=decision,
                 reject_reason=reason,
                 mode=mode,

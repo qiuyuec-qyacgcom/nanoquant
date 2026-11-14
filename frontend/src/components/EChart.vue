@@ -1,10 +1,36 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as echarts from 'echarts'
+// 按需引入：整包 echarts 1.0MB(gzip 343KB)，这里只用到折线/柱状/K 线与少量组件，
+// 全量引入会把首屏体积的一半浪费在永远不会渲染的图表类型上。
+import * as echarts from 'echarts/core'
+import { BarChart, CandlestickChart, LineChart } from 'echarts/charts'
+import {
+  AxisPointerComponent,
+  DataZoomComponent,
+  GridComponent,
+  LegendComponent,
+  TitleComponent,
+  TooltipComponent,
+} from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+import type { EChartsType } from 'echarts/core'
+
+echarts.use([
+  LineChart,
+  BarChart,
+  CandlestickChart,
+  GridComponent,
+  TooltipComponent,
+  AxisPointerComponent,
+  DataZoomComponent,
+  TitleComponent,
+  LegendComponent,
+  CanvasRenderer,
+])
 
 const props = defineProps<{ option: any; height?: string; loading?: boolean }>()
 const el = ref<HTMLDivElement | null>(null)
-let chart: echarts.ECharts | null = null
+let chart: EChartsType | null = null
 
 function render() {
   if (!el.value) return
