@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
-import { wsUrl } from '../api/client'
+import { wsUrl, getToken } from '../api/client'
 import { fmt, timeStr } from '../utils/format'
 
 const app = useAppStore()
@@ -79,6 +79,10 @@ async function toggleEngine() {
 function connectWs() {
   try {
     ws = new WebSocket(wsUrl())
+    ws.onopen = () => {
+      // 连接后首帧鉴权，token 不进 URL（避免进 access log / 浏览器历史）
+      ws?.send(JSON.stringify({ type: 'auth', token: getToken() }))
+    }
     ws.onmessage = (evt) => {
       try {
         const payload = JSON.parse(evt.data)
@@ -109,7 +113,10 @@ onMounted(async () => {
     app.loadSettings().catch(() => undefined)
   }
   await refresh()
-  timer = window.setInterval(refresh, 5000)
+  // 隐藏标签页不轮询：多开几个后台 tab 就是成倍请求，还会打交易所状态聚合
+  timer = window.setInterval(() => {
+    if (!document.hidden) refresh()
+  }, 5000)
   connectWs()
 })
 

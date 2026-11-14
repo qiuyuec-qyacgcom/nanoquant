@@ -279,6 +279,7 @@ const BASE_META: Record<string, FieldMeta> = {
   require_login: { label: '强制登录' },
   session_ttl_hours: { label: '会话有效期', unit: '小时' },
   login_fail_limit: { label: '登录失败锁定阈值', unit: '次' },
+  login_fail_window_sec: { label: '失败计数窗口', unit: '秒', hint: '窗口内同一 IP 失败达阈值即锁定；按 IP 隔离，攻击者刷错密码不会锁死管理员' },
 
   log_level: {
     label: '日志级别',
@@ -454,7 +455,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
     { title: '心法库', hint: '心法入库前会经过防污染审计', fields: ['max_injected', 'ttl_days', 'min_confidence', 'max_rule_chars', 'guard_strict', 'auto_disable_negative'] },
   ],
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
-  security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit'] }],
+  security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit', 'login_fail_window_sec'] }],
   system: [
     { title: '运行与日志', hint: '交易时段用的时区偏移在「引擎 → 交易时段」里，系统组不再重复配置', fields: ['log_level', 'ui_refresh_sec'] },
     { title: '数据保留', hint: '只管本组的事件/信号/权益；资讯条数在「资讯」，心法 TTL 在「自进化」，备份份数在「备份」', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days', 'risk_disclaimer_accepted'] },
@@ -506,6 +507,7 @@ const PROTECTED = new Set([
   'live_api_secret_enc',
   'password_hash',
   'last_run_ts',
+  'token_version',
 ])
 
 const app = useAppStore()

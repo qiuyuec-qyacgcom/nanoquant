@@ -553,7 +553,7 @@ def _metrics_authorized(authorization: str) -> bool:
     cfg = get_security()
     if not cfg.require_login:
         return True
-    return bool(verify_token(authorization.removeprefix("Bearer ").strip()))
+    return bool(verify_token(authorization.removeprefix("Bearer ").strip(), cfg.token_version))
 
 
 @router.get("/metrics", include_in_schema=False)

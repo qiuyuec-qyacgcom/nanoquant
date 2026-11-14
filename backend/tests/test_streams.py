@@ -131,15 +131,30 @@ def _token(client: TestClient) -> str:
     return res.json()["token"]
 
 
-def test_event_ws_rejects_missing_token(client):
+def _auth_frame(token: str = "bad.token") -> str:
+    return json.dumps({"type": "auth", "token": token})
+
+
+def test_event_ws_rejects_invalid_token(client):
     with pytest.raises(WebSocketDisconnect) as exc:
         with client.websocket_connect(f"{API}/ws") as ws:
+            ws.send_text(_auth_frame())
+            ws.receive_text()
+    assert exc.value.code == 4401
+
+
+def test_event_ws_rejects_non_auth_first_frame(client):
+    # 首帧不是 auth：立即判失败关闭，而不是干等 5s 超时
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(f"{API}/ws") as ws:
+            ws.send_text(json.dumps({"type": "ping"}))
             ws.receive_text()
     assert exc.value.code == 4401
 
 
 def test_event_ws_sends_hello_with_valid_token(client):
-    with client.websocket_connect(f"{API}/ws?token={_token(client)}") as ws:
+    with client.websocket_connect(f"{API}/ws") as ws:
+        ws.send_text(_auth_frame(_token(client)))
         hello = json.loads(ws.receive_text())
     assert hello["type"] == "hello" and hello["data"]["ok"] is True
 
@@ -155,15 +170,13 @@ def test_kline_ws_rejects_bad_interval(client):
 def test_kline_ws_rejects_symbol_outside_pool(client):
     """不在标的池里的合约不提供推送, 否则任何人都能借服务端打交易所接口。"""
     with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(
-            f"{API}/ws/klines?symbol=NOTACOIN&interval=1m&token={_token(client)}"
-        ) as ws:
+        with client.websocket_connect(f"{API}/ws/klines?symbol=NOTACOIN&interval=1m") as ws:
             ws.receive_text()
     assert exc.value.code == 4404
 
 
 def test_kline_ws_requires_login_or_public_site(client):
-    # 未登录且前台未开启 → 直接拒绝
+    # 未登录且前台未开启 → 拒绝（首帧不带 auth，按匿名处理）
     from nanoquant.services.settings import get_public, update_group
 
     pub = get_public()
@@ -173,5 +186,26 @@ def test_kline_ws_requires_login_or_public_site(client):
             with client.websocket_connect(f"{API}/ws/klines?symbol=BTCUSDT&interval=1m") as ws:
                 ws.receive_text()
         assert exc.value.code == 4403
+    finally:
+        update_group("public", {"site_enabled": pub.site_enabled})
+
+
+def test_kline_ws_admin_boots_over_closed_site(client):
+    """站点关闭时匿名 4403，但管理员首帧带合法 token 应能连上."""
+    from nanoquant.db import session_scope
+    from nanoquant.models import TradingSymbol
+    from nanoquant.services.settings import get_public, update_group
+
+    with session_scope() as s:
+        if not s.get(TradingSymbol, "BTCUSDT"):
+            s.add(TradingSymbol(symbol="BTCUSDT"))
+
+    pub = get_public()
+    update_group("public", {"site_enabled": False})
+    try:
+        with client.websocket_connect(f"{API}/ws/klines?symbol=BTCUSDT&interval=1m") as ws:
+            ws.send_text(_auth_frame(_token(client)))
+            hello = json.loads(ws.receive_text())
+        assert hello["type"] == "hello"
     finally:
         update_group("public", {"site_enabled": pub.site_enabled})

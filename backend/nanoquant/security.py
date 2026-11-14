@@ -118,15 +118,20 @@ def _sign(payload: bytes) -> str:
     return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
-def issue_token(username: str, ttl_hours: int) -> tuple[str, int]:
+def issue_token(username: str, ttl_hours: int, version: int = 0) -> tuple[str, int]:
+    """签发会话令牌.
+
+    ``version`` 是令牌代际（security.token_version）：改密后递增，旧令牌因代际
+    不匹配而立即失效 —— 无状态令牌靠这个实现"改密即踢人"，不需要黑名单落库。
+    """
     exp = int(time.time()) + max(1, ttl_hours) * 3600
-    body = {"u": username, "exp": exp, "n": secrets.token_hex(6)}
+    body = {"u": username, "exp": exp, "v": version, "n": secrets.token_hex(6)}
     raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
     encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     return f"{encoded}.{_sign(encoded.encode())}", exp
 
 
-def verify_token(token: str) -> dict | None:
+def verify_token(token: str, version: int | None = None) -> dict | None:
     if not token or "." not in token:
         return None
     encoded, sig = token.rsplit(".", 1)
@@ -138,6 +143,9 @@ def verify_token(token: str) -> dict | None:
     except (ValueError, json.JSONDecodeError):
         return None
     if int(body.get("exp", 0)) < time.time():
+        return None
+    if version is not None and int(body.get("v", 0)) != version:
+        # 令牌代际落后：通常是改密后残留的旧令牌，视同失效
         return None
     return body
 

@@ -12,7 +12,7 @@
  * 契约: 只展示标的池内合约，顺序 = 添加顺序；空池显示"未添加标的"。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { http } from '../api/client'
+import { http, getToken } from '../api/client'
 import { publicKlines, publicPool, publicQuotes } from '../api/public'
 import type { Candle, PoolSymbol } from '../types/candle'
 import { fmt, numClass, pct, px, timeStr } from '../utils/format'
@@ -278,6 +278,9 @@ function connectStream() {
   socket = ws
   ws.onopen = () => {
     if (socket !== ws) return
+    // 可选鉴权：登录态下首帧带 token，site_enabled 关闭时管理员仍能看 K 线
+    const token = getToken()
+    if (token) ws.send(JSON.stringify({ type: 'auth', token }))
     wsRetry = 0
     wsState.value = 'live'
   }

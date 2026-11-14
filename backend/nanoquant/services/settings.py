@@ -372,6 +372,11 @@ class SecuritySettings(BaseModel):
     session_ttl_hours: int = Field(default=12, ge=1, le=720)
     require_login: bool = True
     login_fail_limit: int = Field(default=8, ge=3, le=100)
+    #: 登录失败滑动窗口（秒）：窗口内同一 IP 失败达到 login_fail_limit 次即 429。
+    #: 之前失败计数是全局的、没有时间窗，任何匿名者刷 8 个错密码就能把管理员永久锁死。
+    login_fail_window_sec: int = Field(default=900, ge=60, le=86400)
+    #: 令牌代际：改密后 +1，使旧令牌立即失效（无需黑名单落库）。
+    token_version: int = Field(default=0, ge=0, le=2_147_483_647)
     #: 是否仍是出厂密码。True 时除改密外的 API 一律 403:
     #: 只提示不改密, 等于把 admin123 永久留在公网上。
     password_is_default: bool = False

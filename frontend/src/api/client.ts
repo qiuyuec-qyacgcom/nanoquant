@@ -103,6 +103,8 @@ export const http = {
 }
 
 export function wsUrl(): string {
+  // token 不进 URL：会留在 uvicorn access log、反向代理日志和浏览器历史里。
+  // 改为连接后首帧发送 {"type":"auth","token":...}，见 ShellLayout / KlineBoard。
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${location.host}/api/v1/ws?token=${encodeURIComponent(getToken())}`
+  return `${proto}://${location.host}/api/v1/ws`
 }
