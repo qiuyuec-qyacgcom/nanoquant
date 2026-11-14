@@ -37,17 +37,20 @@ def _status_of(raw: dict[str, Any] | None) -> str:
     return str((raw or {}).get("status") or "").strip().upper()
 
 
-def pending_orders(*, limit: int = BATCH, lookback_sec: int = LOOKBACK_SEC) -> list[dict[str, Any]]:
-    """需要向交易所确认的委托（新→旧）."""
+def pending_orders(
+    *, limit: int = BATCH, lookback_sec: int = LOOKBACK_SEC, mode: str | None = None
+) -> list[dict[str, Any]]:
+    """需要向交易所确认的委托（新→旧）.
+
+    ``mode`` 必须按当前交易环境过滤：模拟盘的单子拿去实盘查询只会得到
+    "Order does not exist"，反过来还会污染真实台账。
+    """
     since = int(time.time()) - lookback_sec
     with session_scope() as s:
-        rows = (
-            s.query(OrderRecord)
-            .filter(OrderRecord.ts >= since)
-            .order_by(OrderRecord.ts.desc())
-            .limit(limit * 5)
-            .all()
-        )
+        q = s.query(OrderRecord).filter(OrderRecord.ts >= since)
+        if mode:
+            q = q.filter(OrderRecord.mode == mode)
+        rows = q.order_by(OrderRecord.ts.desc()).limit(limit * 5).all()
         out: list[dict[str, Any]] = []
         for r in rows:
             status = str(r.status or "").strip().upper()
@@ -104,9 +107,16 @@ def _apply(order_id: int, resp: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-async def sync(*, limit: int = BATCH) -> dict[str, Any]:
-    """把非终态委托与交易所对齐；返回统计与"未成交入场单"清单."""
-    items = pending_orders(limit=limit)
+async def sync(*, limit: int = BATCH, mode: str | None = None) -> dict[str, Any]:
+    """把非终态委托与交易所对齐；返回统计与"未成交入场单"清单.
+
+    不传 ``mode`` 时只看当前交易环境的委托（模拟盘/实盘互不串台）。
+    """
+    if mode is None:
+        from .settings import get_engine, normalize_mode
+
+        mode = normalize_mode(get_engine().mode)
+    items = pending_orders(limit=limit, mode=mode)
     if not items:
         return {"checked": 0, "updated": 0, "errors": 0, "unfilled": []}
 

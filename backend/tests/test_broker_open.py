@@ -15,7 +15,7 @@ from nanoquant.db import init_db, session_scope
 from nanoquant.exchange import broker as broker_mod
 from nanoquant.exchange.client import BinanceError, NoCredentials, UncertainSubmission
 from nanoquant.exchange.precision import SymbolFilters
-from nanoquant.models import PositionRecord
+from nanoquant.models import OrderRecord, PositionRecord
 from nanoquant.services.settings import get_engine, update_group
 
 SYMBOL = "OPENTESTUSDT"
@@ -36,7 +36,10 @@ def _filters(price: float = 100.0) -> SymbolFilters:
 
 class _FakeClient:
     def __init__(self, *, avg: float = 100.0, ask: float = 100.0, bid: float = 99.99,
-                 fail: BaseException | None = None, resolve: dict | None = None) -> None:
+                 fail: BaseException | None = None, resolve: dict | None = None,
+                 ack_status: str | None = None, ack_qty: float | None = None) -> None:
+        self.ack_status = ack_status
+        self.ack_qty = ack_qty
         self.avg = avg
         self.ask = ask
         self.bid = bid
@@ -67,8 +70,11 @@ class _FakeClient:
             raise self.fail
         self.orders.append(kw)
         return {
-            "avgPrice": str(self.avg), "executedQty": str(kw["quantity"]),
-            "status": "FILLED", "orderId": 123, "clientOrderId": kw.get("newClientOrderId", ""),
+            "avgPrice": str(self.avg),
+            "executedQty": str(kw["quantity"] if self.ack_qty is None else self.ack_qty),
+            "status": self.ack_status or "FILLED",
+            "orderId": 123,
+            "clientOrderId": kw.get("newClientOrderId", ""),
         }
 
     async def place_algo_order(self, **kw):
@@ -103,6 +109,7 @@ def patched(monkeypatch):
     yield client, submitted
     with session_scope() as s:
         s.query(PositionRecord).filter(PositionRecord.symbol == SYMBOL).delete(synchronize_session=False)
+        s.query(OrderRecord).filter(OrderRecord.symbol == SYMBOL).delete(synchronize_session=False)
 
 
 def _broker() -> broker_mod.BinanceBroker:
@@ -266,3 +273,50 @@ def test_amend_stop_reaplies_take_profit(patched):
     assert kinds == {"STOP_MARKET", "TAKE_PROFIT_MARKET"}, "只挂止损会把止盈单撤掉不再补"
     stop = next(a for a in client.algos if a["type"] == "STOP_MARKET")
     assert stop["triggerPrice"] == "99.50"
+
+
+# ------------------------------------------------------------ 挂单未成交：不建仓
+def test_unfilled_resting_order_does_not_create_phantom_position(monkeypatch):
+    """post-only 回执 NEW + 成交 0 时，交易所还没建仓，账本绝不能先记一条."""
+    client = _FakeClient(ack_status="NEW", ack_qty=0.0, avg=0.0)
+    monkeypatch.setattr(broker_mod.binance_client, "client", client)
+    submitted: list = []
+    monkeypatch.setattr(broker_mod.db_writer, "submit", lambda fn, *a, **k: submitted.append(fn(*a, **k)))
+
+    out = _open()
+
+    assert out.ok is False
+    assert "尚未成交" in out.message
+    with session_scope() as s:
+        assert s.query(PositionRecord).filter(PositionRecord.symbol == SYMBOL).count() == 0, "不能写幽灵仓"
+        order = s.query(OrderRecord).filter(OrderRecord.symbol == SYMBOL).one()
+        assert order.status == "NEW" and order.qty == 0.0
+    # 保护单照样预挂：成交瞬间就该有止损
+    assert len(client.algos) == 2
+
+
+def test_immediately_canceled_order_is_reported(monkeypatch):
+    client = _FakeClient(ack_status="CANCELED", ack_qty=0.0)
+    monkeypatch.setattr(broker_mod.binance_client, "client", client)
+    monkeypatch.setattr(broker_mod.db_writer, "submit", lambda *a, **k: None)
+
+    out = _open()
+
+    assert out.ok is False and "CANCELED" in out.message
+    with session_scope() as s:
+        assert s.query(PositionRecord).filter(PositionRecord.symbol == SYMBOL).count() == 0
+
+
+def test_partial_fill_records_actual_quantity(monkeypatch):
+    """只成交了一部分就按成交记，不能按委托量记（否则风控按虚高仓位算）."""
+    client = _FakeClient(ack_status="PARTIALLY_FILLED", ack_qty=0.2)
+    monkeypatch.setattr(broker_mod.binance_client, "client", client)
+    monkeypatch.setattr(broker_mod.db_writer, "submit", lambda fn, *a, **k: fn(*a, **k))
+
+    out = _open(qty=0.5)
+
+    assert out.ok is True
+    assert out.qty == pytest.approx(0.2)
+    with session_scope() as s:
+        row = s.query(PositionRecord).filter(PositionRecord.symbol == SYMBOL).one()
+        assert row.qty == pytest.approx(0.2)

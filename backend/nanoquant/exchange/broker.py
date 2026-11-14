@@ -60,6 +60,16 @@ def _persist_entry(order_fields: dict[str, Any], position_fields: dict[str, Any]
         s.add(OrderRecord(**order_fields))
 
 
+def _persist_order(order_fields: dict[str, Any]) -> None:
+    """只落委托、不建仓（挂单尚未成交时用）.
+
+    成交那一刻交易所才有仓位，账本由 `_reconcile_live` 以外部仓位接管；
+    这里提前写一条仓位只会得到一条幽灵仓。
+    """
+    with session_scope() as s:
+        s.add(OrderRecord(**order_fields))
+
+
 #: 正在平仓的仓位 id (互斥闸门, 写库完成后释放)
 _CLOSING: set[int] = set()
 
@@ -438,7 +448,47 @@ class BinanceBroker:
                 STAGE_SINK.reset(sink_token)
             stage["send_ms"] = (time.perf_counter() - t0) * 1000
             latency_ms = int(stage["send_ms"])
-            filled_qty = float(resp.get("executedQty", 0) or 0) or qty
+            status_txt = str(resp.get("status") or "").strip().upper()
+            filled_qty = float(resp.get("executedQty", 0) or 0)
+            order_fields = {
+                "symbol": symbol,
+                "side": side_txt,
+                "order_type": params["type"],
+                "qty": filled_qty,
+                "price": 0.0,
+                "status": status_txt or "NEW",
+                "purpose": "entry",
+                "client_order_id": cid,
+                "exchange_order_id": str(resp.get("orderId", "")),
+                "mode": self.mode,
+                "latency_ms": latency_ms,
+                "raw": _compact_raw(resp),
+            }
+            # 挂单（post-only / 限价）回执通常是 NEW + executedQty=0：这时交易所**还没建仓**。
+            # 以前这里用 `or qty` 兜底，会凭空写出一条全量仓位（幽灵仓），
+            # 后续 max_positions / 敞口都按它算，直到对账把它按 venue_sync 关掉。
+            # 现在的取舍：不记账、只记委托；保护单照挂（成交后立即生效），
+            # 成交后由 `_reconcile_live` 以「外部仓位」身份接管，保护价从交易所条件单回填。
+            if filled_qty <= 0:
+                db_writer.submit(_persist_order, order_fields)
+                try:
+                    await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
+                except Exception as exc:  # noqa: BLE001  保护单失败不能吞掉「委托已提交」这个事实
+                    log.warning("挂单未成交时预挂保护单失败 %s: %s", symbol, exc)
+                if status_txt in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                    return ExecResult(
+                        False,
+                        message=f"下单未成交（{status_txt}），订单已记录但未建仓",
+                        order_id=str(resp.get("orderId", "")),
+                    )
+                return ExecResult(
+                    False,
+                    message=(
+                        f"挂单已提交但尚未成交（{status_txt or 'NEW'}），本轮不记账；"
+                        "成交后由交易所对账接管并套用已挂好的止损止盈"
+                    ),
+                    order_id=str(resp.get("orderId", "")),
+                )
             avg = float(resp.get("avgPrice", 0) or 0)
             if avg <= 0:
                 avg = filters.last_price
@@ -460,20 +510,7 @@ class BinanceBroker:
             # 不再承受 WAL checkpoint / fsync 的几十毫秒尖刺.
             db_writer.submit(
                 _persist_entry,
-                {
-                    "symbol": symbol,
-                    "side": side_txt,
-                    "order_type": params["type"],
-                    "qty": filled_qty,
-                    "price": avg,
-                    "status": str(resp.get("status", "NEW")),
-                    "purpose": "entry",
-                    "client_order_id": cid,
-                    "exchange_order_id": str(resp.get("orderId", "")),
-                    "mode": self.mode,
-                    "latency_ms": latency_ms,
-                    "raw": _compact_raw(resp),
-                },
+                {**order_fields, "qty": filled_qty, "price": avg},
                 {
                     "symbol": symbol,
                     "side": side,

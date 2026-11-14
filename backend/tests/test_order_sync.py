@@ -30,20 +30,21 @@ def _database():
 
 @pytest.fixture(autouse=True)
 def _clean():
+    # 其它用例也会往订单表写东西，这里按整表清理才能保证"待查队列"可预期
     with session_scope() as s:
-        s.query(OrderRecord).filter(OrderRecord.symbol == SYMBOL).delete(synchronize_session=False)
+        s.query(OrderRecord).delete(synchronize_session=False)
     yield
     with session_scope() as s:
-        s.query(OrderRecord).filter(OrderRecord.symbol == SYMBOL).delete(synchronize_session=False)
+        s.query(OrderRecord).delete(synchronize_session=False)
 
 
 def _order(status: str = "NEW", *, purpose: str = "entry", order_id: str = "123",
-           cid: str = "nq-1", ts: int | None = None) -> int:
+           cid: str = "nq-1", ts: int | None = None, mode: str = "demo") -> int:
     with session_scope() as s:
         row = OrderRecord(
             symbol=SYMBOL, side="BUY", order_type="LIMIT", qty=0.0, price=0.0,
             status=status, purpose=purpose, client_order_id=cid,
-            exchange_order_id=order_id, mode="demo",
+            exchange_order_id=order_id, mode=mode,
             ts=ts or int(time.time()),
         )
         s.add(row)
@@ -205,3 +206,20 @@ def test_worker_swallows_sync_failure(monkeypatch):
     monkeypatch.setattr(worker_mod.order_sync, "sync", _boom)
 
     asyncio.run(eng._sync_orders_if_due())  # 不抛即通过
+
+
+def test_pending_orders_is_scoped_to_current_environment(monkeypatch):
+    """模拟盘的单不能拿去实盘查：只会得到 Order does not exist，还会污染台账."""
+    demo_id = _order("NEW", cid="demo-1")
+    live_id = _order("NEW", cid="live-1", mode="live")
+    client = _Client({"status": "FILLED", "executedQty": "1", "avgPrice": "100"})
+    _patch(monkeypatch, client)
+
+    out = asyncio.run(order_sync.sync(mode="demo"))
+
+    assert [i["id"] for i in order_sync.pending_orders(mode="demo")] == []
+    assert out["checked"] == 1
+    assert [i["id"] for i in order_sync.pending_orders(mode="live")] == [live_id]
+    with session_scope() as s:
+        assert s.get(OrderRecord, demo_id).status == "FILLED"
+        assert s.get(OrderRecord, live_id).status == "NEW", "另一个环境的单不许被改"
