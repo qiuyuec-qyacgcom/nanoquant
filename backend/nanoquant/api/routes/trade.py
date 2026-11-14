@@ -11,7 +11,7 @@ from ...db import session_scope
 from ...engine.worker import engine
 from ...evolution.review import trade_stats
 from ...exchange.broker import get_broker
-from ...exchange.client import BinanceError
+from ...exchange.client import BinanceError, NoCredentials
 from ...exchange.client import client as binance_client
 from ...models import EquityPoint, OrderRecord, PositionRecord, Signal, TradeRecord
 from ...security import decrypt_secret
@@ -69,7 +69,12 @@ async def trade_mode(user: str = Depends(current_user)) -> dict:
     from ...services import symbols as symbol_service
 
     broker = get_broker(normalize_mode(get_engine().mode))
-    return await broker.trade_mode_status(sorted(symbol_service.known_symbols()))
+    try:
+        return await broker.trade_mode_status(sorted(symbol_service.known_symbols()))
+    except (BinanceError, NoCredentials) as exc:
+        # 交易所限频/返回非 JSON/没配凭证时给一个可解释的 503，
+        # 不要让前端每 8s 的体检轮询把 500 和堆栈刷进日志
+        raise HTTPException(status_code=503, detail=f"交易模式体检暂不可用: {str(exc)[:200]}") from exc
 
 
 @router.post("/engine/trade-mode")

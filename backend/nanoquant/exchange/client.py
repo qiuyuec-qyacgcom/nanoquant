@@ -138,6 +138,24 @@ class NoCredentials(RuntimeError):
     pass
 
 
+def _parse_response_json(response: Any) -> Any:
+    """解析交易所响应体；HTTP 200 但返回 HTML/空白时转成可捕获的 BinanceError.
+
+    代理/CDN 偶尔会回一段 HTML 或纯文本（尤其限频、被 WAF 拦、出口被重置时），
+    直接 ``r.json()`` 会抛 JSONDecodeError 穿透到路由变成 500，日志里刷一屏
+    "未处理异常"，前端也只会显示"请求失败"。统一收敛成 BinanceError，
+    调用方可以按交易所错误处理（降级/503）。
+    """
+    text = getattr(response, "text", "") or ""
+    if not text.strip():
+        return {}
+    try:
+        return response.json()
+    except (ValueError, TypeError) as exc:
+        status = getattr(response, "status_code", 0)
+        raise BinanceError(-1, f"交易所返回非 JSON (HTTP {status}): {text[:120]!r}", status) from exc
+
+
 @dataclass
 class Ticker:
     symbol: str
@@ -422,9 +440,7 @@ class BinanceClient:
             if code in UNCERTAIN_CODES and method.upper() != "GET":
                 raise UncertainSubmission(code, msg, r.status_code)
             raise BinanceError(code, msg, r.status_code)
-        if not r.text:
-            return {}
-        return r.json()
+        return _parse_response_json(r)
 
     # ------------------------------------------------------------ public data
     async def symbol_filters(self, force: bool = False) -> dict[str, SymbolFilters]:
