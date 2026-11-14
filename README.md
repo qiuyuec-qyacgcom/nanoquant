@@ -31,7 +31,8 @@
 > 下单精度按合约步进格式化（修复 `-1111`）、**模型思考强度可调（对齐 astra-quant-agent）**、
 > **推理型模型库（14 族，含 GPT-6/o 系列/Gemini 3/Qwen3/Kimi K3/GLM-5 等）**、
 > **持仓与账户浮盈亏同源同刻**、**K 线价格精度/静态价格/单根竞态修复**、
-> **心法 AI 语义替代、旧版本自动删除与存量去重**。
+> **心法 AI 语义替代、旧版本自动删除与存量去重**、
+> **决策经验闭环（日志→打标→RAG 经验库）、K 线工作台移前台首页、备份还原支持上传文件、登录限流按 IP 与改密吊销旧 token**。
 > 逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#76。
 
 ## ✨ 特性
@@ -42,10 +43,11 @@
 | 📈 **1–100x 杠杆** | 单笔风险预算反推名义额，再被保证金上限与**可用余额**双重截断（留 10% 安全垫，避免 `-2019`）；杠杆只能逐层封顶 |
 | 🤖 **AI 辅助开平仓** | OpenAI 兼容 / Anthropic 协议，单模型 / 多席位议会；输出强制 JSON 契约，**只能收紧风控、不能放宽**；小时/月度双重预算；默认紧凑英文协议 v2（后台转中文，省约 50% 输入 / 63% 输出）；**思考强度可调**（auto/none/minimal/low/medium/high/xhigh/max，Anthropic 映射 thinking 预算、OpenAI 映射 reasoning_effort），内置 **14 族推理模型库**自动识别支持范围 |
 | 🧬 **自进化心法** | **每笔平仓由 AI 复盘**（低思考强度 + 足额输出预算，失败才回退规则），结论经防污染审计后沉淀为心法；语义重复时新版本**自动替代**并删除旧版本（AI 可点名 `replaces`，含 6h 冷却防抖动），存量重复可一键「合并重复」；按健康度回注后续决策，注入 ID 随成交落库，用「采用 vs 未采用」对照量化效果，胜负回写命中率 |
+| 🧠 **决策经验闭环** | AI 每次方向判断留「决策快照」（方向/信心/目标/理由/市场快照），24h 后按真实价格自动打标对错，错判带标签归档为场景经验；下次相似场景（币种/RSI 区间/趋势）检索注入 top-k 历史经验，闭环「日志 → 打标 → RAG 经验库」，经验正文符号化压缩省 token |
 | 🧾 **信号审计** | 每一轮扫描的五因子评分、AI 复核与最终裁决；拒绝原因按 Top 分布，"为什么没开仓"一页看尽；相同状态的 flat 信号 60s 合并为一行并用 `repeats` 还原真实扫描次数 |
 | 📰 **资讯与情绪** | 10 个源（含币安广场 / 公告），情绪指数与币种共现，可选注入 AI 上下文，源体检逐项给状态码 |
 | 🌐 **前台 / 后台双端** | 前台公开站点（首页 / 观点 / 关于，响应式）+ 后台管理终端（需登录） |
-| 📈 **前台 K 线（跟随标的池）** | 前台只展示后台已添加的合约，严格按添加顺序排列；空池显示「未添加标的」，增删 10 秒内自动同步 |
+| 📈 **前台 K 线工作台（跟随标的池）** | K 线工作台直接嵌入前台首页，只展示后台已添加的合约，严格按添加顺序排列；空池显示「未添加标的」，增删 10 秒内自动同步 |
 | 🎯 **astra 规则标的池** | 添加前用币安在线合约表校验（USDT 永续 / 交易中），分层派生杠杆与止损，去重 + 容量上限，删除需确认短语且持仓禁删 |
 | 🧩 **执行内核 sidecar** | Rust 只签名不下单：`shadow` 旁路逐字节比对（零阻塞）、`enforce` 不一致直接拒单；掉线自动降级 + 5s 静默（详见[执行内核](#-执行内核-sidecar)） |
 | 🧪 **回测与样本外验证** | 与实盘共用策略函数：计入手续费/滑点/点差/资金费，部分止盈同口径；参数网格 + walk-forward（前段选参、后段冻结）给出过拟合差距 |
@@ -77,7 +79,8 @@
 | 后台 | `/admin/ai` | 模型接入、诊断、**决策演练（原始英文输出 / 后台中文译文对照、token 估算）**、协议版本切换 |
 | 后台 | `/admin/strategy` | 交易环境（模拟盘 / 实盘）+ 引擎/风控/策略/数据源/执行内核/**安全与观测**等分区参数 |
 | 后台 | `/admin/evolution` | 心法库、注入预览、复盘记录、心法效果对照（4 张 KPI + 逐心法命中/胜率表） |
-| 后台 | `/admin/backup` | 备份 / 还原 / 下载 |
+| 后台 | `/admin/journal` | 决策日志 + 经验库：AI 方向判断留痕、24h 回访打标、场景经验归档与检索预览 |
+| 后台 | `/admin/backup` | 备份 / 还原 / 下载 / 上传外部备份包 |
 | 后台 | `/admin/dead-letters` | 落库死信：查看失败载荷、重放、忽略 |
 | 后台 | `/admin/system` | 系统诊断、执行内核状态、告警记录、归档、运行事件与日志 |
 
@@ -93,6 +96,15 @@
 | Node.js | 18+ | 可选，仅构建前端时需要；不装则没有面板，API 与引擎照常工作 |
 | 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下 |
 | 系统 | Linux（可选 systemd）/ Windows 10+ / macOS | 常驻运行建议 Linux + systemd |
+
+### 获取代码
+
+```bash
+git clone https://github.com/qiuyuec-qyacgcom/nanoquant.git
+cd nanoquant
+```
+
+> 下面所有方式都在仓库根目录下执行。
 
 ### 方式一：一键脚本（推荐）
 
@@ -220,6 +232,7 @@ nanoquant/
 │   ├── exchange/        # 币安行情 + 签名客户端（exec_client：sidecar 长连接）、执行层、精度与限频
 │   ├── ai/              # 多模型调用、JSON 契约决策、议会聚合、诊断
 │   ├── evolution/       # 复盘、心法库、防污染审计、effectiveness（采用/未采用对照）
+│   ├── journal/         # 决策留痕、24h 回访打标、场景经验库与相似度检索（决策级闭环）
 │   ├── news/            # 资讯源适配、情绪打分、聚合与源体检
 │   ├── backtest/        # 回测引擎 + 参数网格 + walkforward（与实盘共用策略函数）
 │   ├── services/        # 配置热更新、运行态、事件总线、标的池、备份、写库队列、api_guard、
@@ -278,6 +291,10 @@ nanoquant/
 平仓后自动进入复盘：规则兜底 + AI 复盘 → 防污染审计 → 心法入库（带健康度、版本、替代关系）
 → 每 N 笔触发全局复盘 → 心法回注下一次 AI 决策。
 
+AI 每次方向判断（开多/开空）另留一份「决策快照」，24 小时后按真实价格回访打标对错，错判带标签
+归档为场景经验；下一次相似场景自动检索注入 top-k 历史经验（同币种 + 标签 Jaccard + 数值相似度，
+零 embedding），形成「日志 → 打标 → RAG 经验库」的决策级闭环，与平仓复盘的规则级心法互补。
+
 ---
 
 ## 🧩 执行内核 sidecar
@@ -322,6 +339,7 @@ nanoquant/
 | 安全 | API 限频 / Prometheus 指标 | 0 关闭（按 IP 计次） / 开启 |
 | 轮询 | 资金费率缓存 / 持仓量缓存 / flat 信号合并窗口 | 60s / 60s / 60s（`repeats` 计数） |
 | 心法 | 效果对照最小样本 | 每组 ≥ 10 笔才给结论（观察性统计） |
+| 决策经验 | 回访窗口 / 正确判定阈值 / 注入条数 / 经验库容量 | 24h / 0.15% / 5 条 / 200 条 |
 | AI | 模式 / 最低置信 / 调用上限 / 月预算 | single / 0.45 / 30 次每小时 / $3 |
 | AI | 决策协议 / 供应商 max_tokens | v2 紧凑英文 + 后台转中文 / 3000（推理型模型防截断） |
 | AI | 思考强度 | `auto`（跟随服务端默认）；可选 none/minimal/low/medium/high/xhigh/max |
@@ -345,14 +363,15 @@ nanoquant/
 | 回测 | `POST /backtest/run`、`POST /backtest/grid`、`POST /backtest/walkforward`（样本外验证） |
 | AI | `GET/POST /ai/providers`、`PATCH/DELETE /ai/providers/{id}`、`POST /ai/providers/fetch-models`、`POST /ai/providers/{id}/test`、`GET /ai/providers/{id}/diagnose`、`GET /ai/providers/{id}/models`、`POST /ai/analyze`、`POST /ai/decision-preview`、`GET /ai/logs`、`GET /ai/usage` |
 | 自进化 | `GET/POST /evolution/mantras`、`PATCH/DELETE /evolution/mantras/{id}`、`GET /evolution/injection`、`GET /evolution/runs`、`POST /evolution/review/{trade_id}`、`POST /evolution/global-review`、`GET /evolution/stats`、`GET /evolution/effectiveness` |
+| 决策经验 | `GET /journal`、`GET /journal/stats`、`POST /journal/label`、`POST /journal/archive`、`GET /journal/experiences`、`DELETE /journal/experiences/{id}`、`POST /journal/retrieve` |
 | 资讯 | `GET /news`、`POST /news/refresh`、`GET /news/overview`、`GET /news/diagnostics`、`POST /news/ai-summary` |
-| 备份 | `GET /backup/options`、`POST /backup/create`、`GET /backup/jobs`、`POST /backup/{id}/restore`、`DELETE /backup/{id}`、`GET /backup/{id}/download` |
+| 备份 | `GET /backup/options`、`POST /backup/create`、`POST /backup/upload`、`GET /backup/jobs`、`POST /backup/{id}/restore`、`DELETE /backup/{id}`、`GET /backup/{id}/download` |
 | 配置 | `GET /settings`、`GET/PUT /settings/{group}`、`POST /settings/{group}/reset`、`GET/POST/DELETE /settings/credentials/exchange` |
 | 系统 | `GET /health`、`GET /system/info`、`GET /system/diagnostics`、`GET /system/events`、`GET /system/logs`、`GET /system/runtime`、`GET /system/write-health`、`GET /system/system-settings`、`GET /system/archives`、`GET /system/archives/{name}`、`GET /system/dead-letters`、`POST /system/dead-letters/{id}/replay`、`POST /system/dead-letters/{id}/ignore`、`POST /system/dead-letters/replay-all`、`GET /system/alerts/logs`、`POST /system/alerts/test` |
 | 执行内核 | `GET /system/exec-sidecar`、`POST /system/exec-sidecar/self-test`、`POST /system/exec-sidecar/reset` |
 | 指标 | `GET /metrics`（Prometheus 文本，只读免鉴权；仅队列/死信/比对计数与状态位） |
 | 公开 | `GET /public/config`、`/public/overview`、`/public/pool`（按添加顺序）、`/public/quotes`、`/public/klines`、`/public/klines/batch`（仅池内合约）、`/public/news`、`/public/mantras`、`/public/performance` |
-| 实时 | `WS /ws?token=...`（事件流）、`WS /ws/klines?symbol=&interval=`（K 线推送，服务端复用币安 WebSocket 流，不占 REST 权重） |
+| 实时 | `WS /ws`（事件流，连接后首帧 `{"type":"auth","token":...}` 鉴权）、`WS /ws/klines?symbol=&interval=`（K 线推送，服务端复用币安 WebSocket 流，不占 REST 权重） |
 
 公开接口严格脱敏：不含账户余额、持仓、订单、密钥与心法正文；绩效默认关闭，开启后也只给比例。
 
@@ -419,8 +438,13 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - **死信补偿**：写库失败进 `dead_letters`，后台重放或忽略；`/system/write-health` 给出积压与最近耗时。
 - **归档**：过期事件/信号先 gzip 到 `data/archive/` 再批量删除，可在系统页预览。
 - **备份**：选择性打包 + SHA-256 校验，还原前自动快照；主密钥不入包（换机需另行迁移 `data/.master_key`）。
+  支持**上传外部备份包**（明文 `.zip` 或加密 `.zip.enc`）：自动识别加密、登记为可还原 job，用于跨机迁移/灾备恢复，
+  非法文件直接拒绝不落盘。
 - **限频与指标**：`system.api_rate_limit_per_min` 按 IP 限流（0=关闭，健康检查与 `/metrics` 豁免）；
   `GET /metrics` 提供 Prometheus 文本（引擎状态、写队列、死信、sidecar 比对计数），不含任何账户或密钥数据。
+- **认证加固**：登录失败按 **IP + 滑动窗口**限流（`security.login_fail_window_sec`，失败按 IP 隔离、超窗自清、
+  成功清空，杜绝全局计数被远程锁死管理员）；**改密立即吊销旧 token**（token 带代际 `v`，改密 +1）；WS 不再把
+  token 放 URL，改为连接后首帧 `{"type":"auth","token":...}` 鉴权；前端隐藏标签页自动停止轮询省请求。
 - **轮询成本**：资金费率/持仓量按 60s 缓存；相同状态的 flat 信号 60s 内合并为一行并以 `repeats` 计数，
   审计页与密度图按 `repeats` 还原真实扫描次数；引擎轮询下限 15s（5m 策略无需更快）。
 - **盈亏口径**：持仓浮盈亏优先取交易所 `positionRisk` 的 `unRealizedProfit`（按 markPrice 结算，
