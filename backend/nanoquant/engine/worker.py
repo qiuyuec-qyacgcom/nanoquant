@@ -122,6 +122,28 @@ def _channel_of(parsed: dict[str, Any]) -> str:
 
 
 class TradingEngine:
+    """引擎主体：一轮 cycle = 对账 → 管仓 → 体检 → 扫描 → 决策 → 开仓。
+
+    这个类现在有 2400 行左右，按关注点分组，找代码时按下表跳（顺序即文件顺序）：
+
+    生命周期    start / stop / _loop / _idle_tick / _heartbeat
+    每轮主循环  cycle
+    对账        _reconcile_live / _sync_orders_if_due / _flatten_on_halt
+    持仓管理    _manage_positions / _close / protect_position / _algo_sl_tp
+    复盘调度    _review_trade / _review_backfill_* / _maybe_global_review
+    体检        _check_trade_mode / _check_liquidation_risk / _health_check
+    扫描        _symbols / _scan（并发取数 + 串行落库）/ _record_signal
+    开仓决策    _do_open（点差闸门 → AI 裁决 → 定仓 → 下单）/ _open_entry_guarded
+    外部信号    _follow_signal_locked 起（约 700 行：去重/池检查/闸门/定仓/下单/
+                加仓/减仓/移止损/平仓），与扫描-开仓主循环是两条独立入口
+    面板数据    status / signal_follow_status
+
+    注意：这些方法大量共享模块级绑定（`binance_client` / `symbol_service` /
+    `risk_mod` 等），测试也是直接 patch `worker.<名字>`。拆成 mixin 会导致
+    绑定出现两份、patch 只对其中一份生效（试过：31 个用例因此失败），
+    所以刻意保持单文件；需要导览时看这张表。
+    """
+
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
