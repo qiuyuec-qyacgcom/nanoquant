@@ -259,9 +259,9 @@ class AiSettings(BaseModel):
     monthly_budget_usd: float = Field(default=3.0, ge=0, le=10000)
     timeout_sec: int = Field(default=45, ge=5, le=300)
     temperature: float = Field(default=0.2, ge=0, le=2)
-    #: 已停用（保留字段兼容老配置）：AI 开仓杠杆统一由「风控 → 杠杆下限/上限」钳制，
-    #: 不再由模型侧单独设上限，也不跟随心法里的杠杆建议。
-    max_position_leverage: int = Field(default=20, ge=1, le=100, description="已停用: 开仓杠杆由风控全局上下限决定")
+    #: 旧字段 max_position_leverage（"AI 可设最大杠杆"）已删除：开仓杠杆统一由
+    #: 「风控 → 杠杆下限/上限」钳制，模型侧的独立上限从没被读过。老库里的值在
+    #: _migrate_legacy_group 里丢弃；不要再引入第三个控制杠杆的开关。
     inject_news: bool = True
     inject_mantras: bool = True
     personas: list[AiPersona] = Field(
@@ -384,7 +384,8 @@ class SystemSettings(BaseModel):
     signal_retention_days: int = Field(default=14, ge=1, le=365)
     #: 权益曲线保留天数
     equity_retention_days: int = Field(default=30, ge=1, le=730)
-    timezone_offset: int = Field(default=8, ge=-12, le=14)
+    # 时区偏移只在 engine 组：交易时段计算 (_now_local) 读的是 EngineSettings。
+    # 曾经 system 组也有一份同名字段，UI 上出现两次、改了却没有任何代码读。
     ui_refresh_sec: int = Field(default=5, ge=1, le=60)
     risk_disclaimer_accepted: bool = False
     #: 告警推送: 事件总线里达到级别的消息推送到 Webhook / Telegram
@@ -522,6 +523,13 @@ def _migrate_legacy_group(name: str, data: dict[str, Any]) -> dict[str, Any]:
         # 由 1 分钟级升级为 15–60 分钟短线: 旧主周期 1m/3m/5m 统一迁到 15m
         if out.get("timeframe") in {"1m", "3m", "5m"}:
             out["timeframe"] = "15m"
+    elif name == "system":
+        # 老库里 system.timezone_offset 是个死开关：交易时段只认 engine 那份。
+        # 直接丢弃而不是搬到 engine —— 搬过去会突然改变已运行的交易时段。
+        out.pop("timezone_offset", None)
+    elif name == "ai":
+        # 见 AiSettings 注释：模型侧杠杆上限已停用，别让老配置继续出现在面板数据里
+        out.pop("max_position_leverage", None)
     return out
 
 

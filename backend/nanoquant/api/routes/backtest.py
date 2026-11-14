@@ -47,10 +47,21 @@ async def _candles(symbol: str, payload: BacktestIn) -> list:
     return candles
 
 
+def _fee_bps(payload: BacktestIn) -> float:
+    """回测手续费：请求里显式给了就用，否则跟实盘风控配置保持一致.
+
+    risk.fee_rate_taker 存的是比例（0.0005 = 5bps）。以前 API 默认值写死 5，
+    前端虽然会同步，但脚本/直接调接口的人改了风控费率后回测仍按旧值算。
+    """
+    if payload.fee_bps is not None:
+        return float(payload.fee_bps)
+    return round(float(get_risk().fee_rate_taker) * 10_000, 4)
+
+
 def _costs(payload: BacktestIn) -> dict:
     risk = get_risk()
     return {
-        "fee_bps": payload.fee_bps,
+        "fee_bps": _fee_bps(payload),
         "slippage_bps": payload.slippage_bps,
         "spread_bps": payload.spread_bps,
         "funding_bps_8h": payload.funding_bps_8h,
@@ -89,7 +100,7 @@ def _meta(payload: BacktestIn, symbol: str, candles: list) -> dict:
         "from_ts": int(getattr(candles[0], "open_time", 0)),
         "to_ts": int(getattr(candles[-1], "open_time", 0)),
         "assumptions": {
-            "fee_bps": payload.fee_bps,
+            "fee_bps": _fee_bps(payload),
             "slippage_bps": payload.slippage_bps,
             "spread_bps": payload.spread_bps,
             "funding_bps_8h": payload.funding_bps_8h,

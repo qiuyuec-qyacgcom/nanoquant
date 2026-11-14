@@ -238,7 +238,6 @@ def test_auto_disable_negative_mantra(monkeypatch):
 FRONTEND_ONLY = {
     "ui_refresh_sec": "前端轮询间隔，后端不参与",
     "risk_disclaimer_accepted": "前端风险提示勾选状态",
-    "max_position_leverage": "已停用：开仓杠杆统一由风控上下限钳制，保留字段兼容老配置",
 }
 
 

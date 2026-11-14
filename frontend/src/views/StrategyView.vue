@@ -146,8 +146,7 @@ const BASE_META: Record<string, FieldMeta> = {
   scan_concurrency: { label: '扫描并发', unit: '路', hint: '串行时 12 个标的约 2.2s；并发只降延迟，不增加权重' },
   max_positions: { label: '最大同时持仓', unit: '个' },
   trading_windows: { label: '交易时段', widget: 'tags', hint: 'HH:MM-HH:MM，可多个；00:00-24:00 表示全天' },
-  timezone_offset: { label: '时区偏移', unit: '小时', hint: '交易时段所用时区，中国为 +8' },
-  demo_start_balance: { label: '模拟盘初始资金', unit: 'USDT', hint: '仅模拟盘生效；改动不会重置已有余额' },
+  timezone_offset: { label: '时区偏移', unit: '小时', hint: '交易时段所用时区，中国为 +8；仅此一处生效' },
   order_type: {
     label: '下单类型',
     widget: 'seg',
@@ -347,13 +346,38 @@ const BASE_META: Record<string, FieldMeta> = {
   show_performance: { label: '展示绩效指标', hint: '胜率/盈亏比等比例数据，不含金额' },
 }
 
-const GROUP_META: Record<string, Record<string, FieldMeta>> = {}
+// BASE_META 是按"字段名"索引的扁平表，但有些 key 在多个分组里语义不同。
+// 这里按分组覆盖，避免以后把 engine.mode / ai.min_confidence 加进参数页时
+// 串成"信号模型 trend/meanrev"这种完全不对的标签和选项。
+const GROUP_META: Record<string, Record<string, FieldMeta>> = {
+  engine: {
+    mode: {
+      label: '交易环境', widget: 'select',
+      options: [['demo', 'demo 模拟盘（测试网）'], ['live', 'live 实盘（主网）']],
+      hint: '与「策略 → 信号模型」的 mode 不是一回事；切换前先确认对应环境的 API 凭证',
+    },
+  },
+  ai: {
+    mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },
+    min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
+  },
+  evolution: {
+    min_confidence: { label: '心法最低置信度', hint: '低于该值的复盘结论不进入心法库' },
+  },
+  news: {
+    proxy: { label: '资讯代理', hint: '留空则复用「数据源 → HTTP 代理」；资讯要走单独出口时才填' },
+    request_timeout_sec: { label: '资讯抓取超时', unit: '秒', hint: '只作用于资讯源，不影响行情请求' },
+  },
+  data: {
+    request_timeout_sec: { label: '行情请求超时', unit: '秒', hint: '只作用于交易所行情接口' },
+  },
+}
 
 const SECTIONS: Record<string, SectionDef[]> = {
   engine: [
     { title: '运行与节奏', hint: '引擎每轮扫描标的池，节奏决定灵敏度', fields: ['cycle_interval_sec', 'max_symbols_per_cycle', 'scan_concurrency', 'max_positions'] },
     { title: '交易时段', hint: '只在窗口内开新仓，持仓管理不受限', fields: ['trading_windows', 'timezone_offset'] },
-    { title: '模拟盘与下单', fields: ['demo_start_balance', 'order_type', 'recv_window_ms', 'close_on_halt'] },
+    { title: '模拟盘与下单', fields: ['order_type', 'recv_window_ms', 'close_on_halt'] },
   ],
   risk: [
     {
@@ -370,8 +394,8 @@ const SECTIONS: Record<string, SectionDef[]> = {
       ],
     },
     { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'drawdown_peak_window_days', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
-    { title: '止损熔断', hint: '窗口内多次止损 = 策略与行情脱节，先暂停观察', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
-    { title: '尾部风险', hint: '强平价监控 + 相关性组敞口（山寨多仓本质是加杠杆）+ 手动仓保护单', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct', 'auto_protect_external'] },
+    { title: '止损熔断', hint: '与上面的「熔断与冷却」是两套独立闸门，会同时生效；重复设置容易叠加停机时间', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
+    { title: '尾部风险', hint: '「相关性组敞口」是在「仓位与杠杆 → 总敞口上限」之上的第二层约束，不是替代它', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct', 'auto_protect_external'] },
     { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },
   ],
   strategy: [
@@ -432,8 +456,8 @@ const SECTIONS: Record<string, SectionDef[]> = {
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
   security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit'] }],
   system: [
-    { title: '运行与日志', fields: ['log_level', 'ui_refresh_sec', 'timezone_offset'] },
-    { title: '数据保留', hint: '过期数据先写 gzip 归档到 data/archive/ 再按批删除', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days', 'risk_disclaimer_accepted'] },
+    { title: '运行与日志', hint: '交易时段用的时区偏移在「引擎 → 交易时段」里，系统组不再重复配置', fields: ['log_level', 'ui_refresh_sec'] },
+    { title: '数据保留', hint: '只管本组的事件/信号/权益；资讯条数在「资讯」，心法 TTL 在「自进化」，备份份数在「备份」', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days', 'risk_disclaimer_accepted'] },
     {
       title: '告警推送',
       hint: '引擎停摆、账户异常、连续止损等事件推送到 Webhook / Telegram；保存后可用 POST /system/alerts/test 自测',

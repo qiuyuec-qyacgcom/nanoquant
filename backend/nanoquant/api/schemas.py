@@ -26,7 +26,9 @@ class BacktestIn(BaseModel):
     symbol: str
     interval: str = "15m"
     limit: int = Field(default=1000, ge=200, le=1500)
-    fee_bps: float = Field(default=5.0, ge=0, le=100)
+    # None = 跟随实盘配置 risk.fee_rate_taker（比例 ×10000 = bps）。
+    # 以前这里写死 5bps，风控里调了费率回测结论却没跟着变，是两个独立真相源。
+    fee_bps: float | None = Field(default=None, ge=0, le=100)
     slippage_bps: float = Field(default=2.0, ge=0, le=100)
     #: 点差成本(往返, 开平各一半); 历史 K 线没有买卖价, 只能按成本近似
     spread_bps: float = Field(default=0.0, ge=0, le=100)
