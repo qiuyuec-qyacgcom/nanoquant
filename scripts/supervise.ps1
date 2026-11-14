@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   NanoQuant 守护进程（Windows）：进程挂了自动拉起，日志按大小/时间轮转。
 
