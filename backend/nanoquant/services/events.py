@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from typing import Any
 
@@ -14,6 +15,9 @@ log = get_logger("events")
 _RING: deque[dict[str, Any]] = deque(maxlen=400)
 _SUBSCRIBERS: set[asyncio.Queue] = set()
 _SEQ = 0
+#: 告警推送失败的上次告警时间（秒），避免推送通道故障时每个事件都刷一条日志
+_ALERT_FAIL_TS = 0.0
+_ALERT_FAIL_INTERVAL = 300.0
 
 
 def subscribe() -> asyncio.Queue:
@@ -78,7 +82,12 @@ def record(
 
         on_event(level, category, message)
     except Exception:  # noqa: BLE001
-        pass
+        global _ALERT_FAIL_TS
+        now = time.monotonic()
+        if now - _ALERT_FAIL_TS > _ALERT_FAIL_INTERVAL:
+            _ALERT_FAIL_TS = now
+            # 静默吞掉这条等于"告警通道坏了, 但没人知道", 5 分钟最多提示一次
+            log.warning("告警推送失败(5 分钟内只提示一次)", exc_info=True)
     return item
 
 

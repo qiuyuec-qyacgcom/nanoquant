@@ -13,7 +13,8 @@ import asyncio
 import hashlib
 import os
 import time
-from typing import Any
+from functools import partial
+from typing import Any, Sequence
 
 from sqlalchemy.exc import IntegrityError
 
@@ -211,7 +212,8 @@ class TradingEngine:
 
             fd = os.open(str(state_file()), os.O_CREAT | os.O_RDWR)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # typeshed 的 Windows fcntl 桩没有 flock/LOCK_*（真机不会走到这里，ImportError 分支已兜住）
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
             except OSError:
                 os.close(fd)
                 return False
@@ -524,7 +526,7 @@ class TradingEngine:
                 .filter(PositionRecord.status == "open", PositionRecord.mode == mode)
                 .all()
             )
-            targets = [
+            targets: list[dict[str, Any]] = [
                 {"id": r.id, "symbol": r.symbol, "side": r.side, "qty": float(r.qty)}
                 for r in rows
             ]
@@ -612,7 +614,7 @@ class TradingEngine:
             pos = s.get(PositionRecord, position_id)
             if pos is None or pos.status != "open":
                 return {"ok": False, "reason": "仓位不存在或已平仓"}
-            info = {
+            info: dict[str, Any] = {
                 "symbol": pos.symbol,
                 "side": pos.side,
                 "qty": float(pos.qty),
@@ -1042,8 +1044,13 @@ class TradingEngine:
                     broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, rec["signal_id"]
                 )
             )
-            self._entry_tasks[symbol].add_done_callback(lambda t, s=symbol: self._entry_tasks.pop(s, None))
+            # partial 绑定 symbol: 用 lambda 默认参数也行, 但闭包捕获循环变量是经典坑
+            self._entry_tasks[symbol].add_done_callback(partial(self._drop_entry_task, symbol))
         return results
+
+    def _drop_entry_task(self, symbol: str, _task: asyncio.Task) -> None:
+        """入场任务收尾后清掉登记."""
+        self._entry_tasks.pop(symbol, None)
 
     def _record_signal(self, sig, ticker, source: str) -> dict[str, Any]:
         # 先取环境再开事务: 避免在写事务里再嵌套一次配置读取
@@ -1814,7 +1821,7 @@ class TradingEngine:
                 sl_pct = max(0.05, min(abs(ref - parsed["stop"]) / ref * 100, 20.0))
             qty, info = risk_mod.plan_position(
                 price=last, filters=filters, account=account, cfg_risk=risk_cfg,
-                sl_pct=sl_pct, leverage=float(pos.leverage or 1),
+                sl_pct=sl_pct, leverage=int(pos.leverage or 1),
                 available=self._margin.remaining,
             )
         if qty <= 0:
@@ -2211,7 +2218,8 @@ class TradingEngine:
                         "Ticker WebSocket 已断开，行情走 REST 兜底（无盘口，点差闸门失效）",
                     )
         except Exception:  # noqa: BLE001
-            pass
+            # 体检自己挂掉不该拖垮主循环, 但必须留痕 —— 否则 WS 真断了也没人知道
+            log.warning("健康检查: Ticker WS 状态读取失败", exc_info=True)
 
         # 2) 引擎心跳：超过 5 分钟没有新信号落库，说明扫描可能卡死
         try:
@@ -2228,7 +2236,7 @@ class TradingEngine:
                     f"引擎已 {int(now - last_ts)} 秒没有产生新信号，扫描可能停滞",
                 )
         except Exception:  # noqa: BLE001
-            pass
+            log.warning("健康检查: 信号心跳查询失败（扫描是否停滞无法判断）", exc_info=True)
 
     async def _check_liquidation_risk(self, broker: Broker, risk_cfg: Any) -> None:
         """强平价监控：标记价逼近强平价时告警，并写进 engine_events。
@@ -2354,7 +2362,7 @@ class TradingEngine:
         account_res, venue_res = await asyncio.gather(
             broker.account(), broker.positions(), return_exceptions=True
         )
-        if isinstance(account_res, Exception):
+        if isinstance(account_res, BaseException):
             # 交易所临时报错（限频/网络抖动）不能把整个账户面板刷成 0:
             # 保留上一轮成功读到的权益与浮盈亏，并标记 stale 让前端提示
             account_d = {
@@ -2369,7 +2377,7 @@ class TradingEngine:
         else:
             account_d = account_res.as_dict()
         venue_map: dict[str, Any] = {}
-        if not isinstance(venue_res, Exception):
+        if not isinstance(venue_res, BaseException):
             venue_map = {vp.symbol: vp for vp in venue_res}
         with session_scope() as s:
             # 只展示当前交易环境的仓位, 模拟盘与实盘互不串台
@@ -2430,7 +2438,7 @@ class TradingEngine:
         latencies = sorted(ms for (ms,) in order_rows if ms > 0)
         slippages = [t.slippage_bps for t in trades if t.slippage_bps]
 
-        def _pct(arr: list[float], q: float) -> float:
+        def _pct(arr: Sequence[float], q: float) -> float:
             if not arr:
                 return 0.0
             idx = min(len(arr) - 1, int(len(arr) * q))

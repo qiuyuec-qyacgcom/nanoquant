@@ -27,6 +27,10 @@ class Paths:
         self.DATA = Path(os.getenv("NANOQUANT_DATA_DIR", str(self.HOME / "data"))).resolve()
         self.LOGS = Path(os.getenv("NANOQUANT_LOG_DIR", str(self.HOME / "logs"))).resolve()
         self.BACKUPS = self.DATA / "backups"
+        #: 备份镜像目录：指向**另一块盘**时每次备份会多抄一份.
+        #: 主库、日志、备份全在 data/ 下，一块盘写满或损坏就是一起没，镜像才有意义。
+        _mirror = (os.getenv("NANOQUANT_BACKUP_MIRROR") or "").strip()
+        self.BACKUP_MIRROR: Path | None = Path(_mirror).resolve() if _mirror else None
         self.CACHE = self.DATA / "cache"
         self.DB_PATH = Path(os.getenv("NANOQUANT_DB", str(self.DATA / "nanoquant.db"))).resolve()
         self.FRONTEND_DIST = Path(

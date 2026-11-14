@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..exchange.exec_client import ExecSidecar, ExecSidecarError
+from ..logging_setup import get_logger
+
+log = get_logger("exec_shadow")
 
 #: 影子模式下同时最多有多少个比对任务（防止下单高峰把任务表撑爆）
 MAX_INFLIGHT = 32
@@ -164,7 +167,8 @@ class ExecShadow:
         except ExecShadowError:
             pass
         except Exception:  # noqa: BLE001
-            pass
+            # 比对任务异常必须留痕: 影子模式的结论就是靠这些统计得出的
+            log.warning("影子比对任务异常退出", exc_info=True)
 
     async def _compare(self, query: str, signature: str, *, strict: bool = False) -> bool:
         started = time.perf_counter()
@@ -212,7 +216,8 @@ class ExecShadow:
         try:
             self._notifier(message, self.last_mismatch)
         except Exception:  # noqa: BLE001
-            pass
+            # 通知器坏了不该影响下单, 但"签名不一致却没人收到通知"必须记录下来
+            log.warning("影子比对通知推送失败", exc_info=True)
 
     # ----------------------------------------------------------------- 观测
     def status(self) -> dict[str, Any]:

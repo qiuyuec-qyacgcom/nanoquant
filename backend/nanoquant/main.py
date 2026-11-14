@@ -25,19 +25,38 @@ from .services.db_writer import db_writer
 from .exchange.ticker_stream import ticker_hub
 from .logging_setup import get_logger, setup_logging
 from .models import TradingSymbol
-from .security import hash_password
+from .security import hash_password, verify_password
 from .services import events
-from .services.settings import SettingsValidationError, get_security, get_system, update_group
+from .services.settings import (
+    SettingsValidationError, get_security, get_system, has_explicit_key, update_group,
+)
 
 log = get_logger("main")
+
+#: 未改出厂密码时仍然放行的接口（只能登录、改密、查当前用户、探活）
+_PASSWORD_CHANGE_ALLOWED = {
+    "/api/v1/auth/login",
+    "/api/v1/auth/password",
+    "/api/v1/auth/me",
+    "/api/v1/health",
+    "/api/v1/metrics",
+}
+#: 前台公开站点面向访客, 不涉及后台权限, 不因出厂密码被挡
+_PUBLIC_API_PREFIX = "/api/v1/public/"
 
 
 def bootstrap() -> None:
     init_db()
     sec = get_security()
     if not sec.password_hash:
-        update_group("security", {"password_hash": hash_password("admin123")})
+        update_group("security", {"password_hash": hash_password("admin123"), "password_is_default": True})
         events.record("warn", "system", "已生成默认管理员 admin / admin123, 请登录后立即修改密码")
+    elif not has_explicit_key("security", "password_is_default"):
+        # 老库升级路径: 之前没有这个标记, 这里补一次判定 —— 密码仍是 admin123 的
+        # 老实例同样必须被拦下, 否则"新装才有防护"等于没修
+        if verify_password("admin123", sec.password_hash):
+            update_group("security", {"password_is_default": True})
+            events.record("warn", "system", "检测到仍在使用的初始密码 admin123, 已要求修改后才能继续操作")
     # 标的池不再预置默认值: 由用户在「标的池」页显式添加, 避免引擎扫描一堆用不到 (或买不起) 的品种
     with session_scope() as s:
         if s.query(TradingSymbol).count() == 0:
@@ -104,6 +123,30 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def _force_password_change(request: Request, call_next):
+        """出厂密码未修改前，除改密外的后台接口一律 403.
+
+        只写一条"请修改密码"的事件不构成防护：面板一旦映射到公网，
+        admin123 就是一个现成的后门。这里的判定放在中间件而不是各路由上，
+        是因为路由有几十个，漏一个就等于没做。
+        """
+        cfg = get_security()
+        if not cfg.require_login or not cfg.password_is_default:
+            return await call_next(request)
+        path = request.url.path
+        if path in _PASSWORD_CHANGE_ALLOWED or path.startswith(_PUBLIC_API_PREFIX):
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "当前仍是初始密码 admin123，请先修改密码后再操作",
+                    "code": "password_change_required",
+                },
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def _cache_policy(request: Request, call_next):

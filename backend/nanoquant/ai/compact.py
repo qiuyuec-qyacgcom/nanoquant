@@ -204,7 +204,8 @@ def localize(data: dict[str, Any], ctx: dict[str, Any] | None = None) -> dict[st
     if not reasons:
         reasons = ["模型未给出理由码，按缺省 hold 处理"] if action == "hold" else ["模型未给出理由码"]
     reason = "；".join(reasons)
-    numeric = _numbers_text(numbers)
+    # clean_features 在缺字段时返回 None，直接传进去会让 _numbers_text 崩在 .items()
+    numeric = _numbers_text(numbers or {})
     if numeric:
         reason += f"｜指标：{numeric}"
     free = str(data.get("f") or "").strip()

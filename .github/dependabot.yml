@@ -1,0 +1,46 @@
+version: 2
+updates:
+  # 运行时依赖用 uv 锁定，Dependabot 只提 PR，重新锁仍然走
+  #   uv pip compile requirements.in ... （见 requirements.txt 头部注释）
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      python-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      npm-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  - package-ecosystem: cargo
+    directory: /rust/exec-service
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps"
+
+  # Actions 版本漂移最容易被忽略，也最容易因为淘汰的 runner 突然全红
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

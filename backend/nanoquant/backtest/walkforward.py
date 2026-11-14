@@ -62,7 +62,8 @@ def run_walkforward(
         need = WARMUP + train_bars + (WARMUP + 1)
         return {"error": f"K 线不足: 至少需要约 {need} 根 (当前 {len(candles)})"}
 
-    costs = dict(
+    # 这些成本项会原样展开进 run_backtest(**costs)，键名与参数一一对应
+    costs: dict[str, Any] = dict(
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
         spread_bps=spread_bps,

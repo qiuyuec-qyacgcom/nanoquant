@@ -125,7 +125,7 @@ class KlineStreamHub:
             return
         k = data.get("k") or {}
         try:
-            payload = {
+            payload: dict[str, Any] = {
                 "symbol": str(k["s"]).upper(),
                 "interval": str(k["i"]),
                 "t": int(k["t"]),

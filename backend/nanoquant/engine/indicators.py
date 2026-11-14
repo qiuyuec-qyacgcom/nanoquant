@@ -108,9 +108,10 @@ def adx(candles: list[Candle], period: int = 14) -> float:
     if not atr_s or atr_s[-1] <= 0:
         return 0.0
     dx: list[float] = []
-    for a, p, m in zip(atr_s, pdi_s, mdi_s):
-        s = p + m
-        dx.append(100.0 * abs(p - m) / s if s > 0 else 0.0)
+    # 变量别复用 p/m: 上面 p 已经是 Candle, 同名会让人误以为这里也是价格对象
+    for _a, plus_dm, minus_dm in zip(atr_s, pdi_s, mdi_s):
+        s = plus_dm + minus_dm
+        dx.append(100.0 * abs(plus_dm - minus_dm) / s if s > 0 else 0.0)
     # ADX = 对 DX 再做一次 Wilder 平滑
     if len(dx) < period + 1:
         return 0.0

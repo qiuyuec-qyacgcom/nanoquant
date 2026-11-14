@@ -61,7 +61,8 @@ def compare_groups(rows: list[dict[str, Any]]) -> dict[str, Any]:
     per_mantra: dict[int, list[dict[str, Any]]] = {}
 
     for row in rows:
-        features = row.get("features") if isinstance(row.get("features"), dict) else {}
+        raw_features = row.get("features")
+        features: dict[str, Any] = raw_features if isinstance(raw_features, dict) else {}
         ai_used = features.get("ai_used")
         ids = _ids(row)
         if ai_used is None:

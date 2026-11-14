@@ -11,8 +11,13 @@ concurrency:
 
 jobs:
   backend:
-    name: backend (pytest)
+    name: backend (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 本地跑的是 3.13，CI 长期只测 3.12 —— 版本偏移会让"本地过、CI 挂"变成常态
+        python: ["3.12", "3.13"]
     defaults:
       run:
         working-directory: backend
@@ -21,7 +26,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
@@ -34,12 +39,16 @@ jobs:
         # 只开 F/E9：未定义名字、未使用导入、重复定义这类"几乎一定是 bug"的规则
         run: python -m ruff check .
 
+      - name: Type check (mypy)
+        # 配置在 mypy.ini；当前基线是 0 错误，破了就说明引入了新的类型问题
+        run: python -m mypy
+
       - name: Byte-compile
         run: python -m compileall -q nanoquant
 
       - name: Tests + coverage
-        # 门槛只防"大幅倒退"（当前基线 56%，设 52 留跨平台余量）；
-        # term-missing 会把没覆盖到的行号打出来，便于针对性补测。
+        # 门槛只防"大幅倒退"：当前基线 68%，留 4 个点余量给跨平台差异。
+        # 改这里的数字时请同步改这行注释 —— 上一版注释还写着 52，早就和参数脱节了。
         run: python -m pytest tests -q --cov=nanoquant --cov-report=term-missing --cov-fail-under=64
 
   rust:
@@ -55,6 +64,26 @@ jobs:
 
       - name: Cargo test
         run: cargo test --release
+
+  audit:
+    name: deps (pip-audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Audit runtime dependencies
+        # 先跑起来把家底摸清; 等基线清干净后再去掉 continue-on-error 变成硬门禁
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --progress-spinner off
 
   e2e:
     name: e2e (smoke)
@@ -101,7 +130,30 @@ jobs:
           done
           cat "$GITHUB_WORKSPACE/logs/stdout.log"; exit 1
 
+      - name: Seed admin password
+        # 出厂密码状态下后台接口会被 403 拦下（main._force_password_change）。
+        # 这里按真实用户流程把密码改掉，后面的用例才有意义。
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          BASE = "http://127.0.0.1:8899/api/v1"
+
+          def post(path, body, token=""):
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(), headers=headers)
+              with urllib.request.urlopen(req) as resp:
+                  return json.load(resp)
+
+          token = post("/auth/login", {"username": "admin", "password": "admin123"})["token"]
+          post("/auth/password", {"old_password": "admin123", "new_password": "e2e-Pass-1234"}, token)
+          print("admin password seeded")
+          PY
+
       - name: Playwright smoke
+        env:
+          E2E_PASS: e2e-Pass-1234
         run: cd frontend && npx playwright test
 
       - name: Logs on failure
@@ -128,6 +180,10 @@ jobs:
 
       - name: Type check
         run: npm run typecheck
+
+      - name: Unit tests (vitest)
+        # 纯逻辑单测：比 e2e 快两个量级，格式化/换算类回归先在这里拦
+        run: npm test
 
       - name: Build
         run: npm run build

@@ -25,6 +25,10 @@ import time
 import uuid
 from typing import Any
 
+from ..logging_setup import get_logger
+
+log = get_logger("exec_client")
+
 DEFAULT_TARGET = "/run/nanoquant/exec.sock"
 
 
@@ -66,6 +70,11 @@ class ExecSidecar:
             host, _, port = target[4:].partition(":")
             return await asyncio.open_connection(host or "127.0.0.1", int(port or 9101))
         path = target[5:] if target.startswith("unix:") else target
+        if not hasattr(asyncio, "open_unix_connection"):  # pragma: no cover - Windows
+            # Windows 上这个属性根本不存在, 直接 AttributeError 会让人以为是配置问题之外的事
+            raise ExecSidecarError(
+                "当前平台不支持 unix socket, 请把执行内核地址配成 tcp:127.0.0.1:9101"
+            )
         return await asyncio.open_unix_connection(path)
 
     async def _ensure(self) -> None:
@@ -86,7 +95,8 @@ class ExecSidecar:
             try:
                 writer.close()
             except Exception:  # noqa: BLE001
-                pass
+                # 断线清理路径: 连接可能已经半关闭, 关不掉是常态, 只留 debug 线索
+                log.debug("关闭执行通道时出错(已忽略)", exc_info=True)
 
     def _guard(self) -> asyncio.Lock:
         if self._lock is None:
@@ -157,7 +167,7 @@ class ExecSidecar:
             try:
                 await writer.wait_closed()
             except Exception:  # noqa: BLE001
-                pass
+                log.debug("等待执行通道关闭超时(已忽略)", exc_info=True)
 
 
 sidecar = ExecSidecar()

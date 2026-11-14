@@ -155,7 +155,8 @@ def evaluate_factors(symbol: str, interval: str, bars: int, forward: int) -> dic
     candles = load_klines(symbol, interval, bars)
     if len(candles) < 120:
         return {"error": f"{symbol} 数据不足 {len(candles)} 根"}
-    cfg = StrategySettings(timeframe=interval)
+    # interval 已在调用侧按 timeframe 白名单校验过；这里直接构造避免多一层字符串收窄
+    cfg = StrategySettings(timeframe=interval)  # type: ignore[arg-type]
     series: dict[str, list[float]] = {k: [] for k in _OHLCV_FACTORS}
     fwd: list[float] = []
     # 只需最近 warmup 根就能算全所有指标（EMA/RSI/ATR/ADX/z-score/量比）。
@@ -289,10 +290,10 @@ def evaluate_cvd(
         if resp.status_code == 429:
             break
         resp.raise_for_status()
-        rows = resp.json()
-        if not isinstance(rows, list) or not rows:
+        batch = resp.json()
+        if not isinstance(batch, list) or not batch:
             break
-        for r in rows:
+        for r in batch:
             t = int(r["T"])
             bucket = t - (t % (4 * 3600 * 1000))  # 按 4h 分桶
             qty = float(r["q"])
@@ -300,8 +301,8 @@ def evaluate_cvd(
                 taker_buy[bucket] = taker_buy.get(bucket, 0.0) + qty
             else:
                 taker_sell[bucket] = taker_sell.get(bucket, 0.0) + qty
-        end_ms = int(rows[0]["T"]) - 1
-        if len(rows) < per:
+        end_ms = int(batch[0]["T"]) - 1
+        if len(batch) < per:
             break
         time.sleep(0.25)
 

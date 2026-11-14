@@ -58,7 +58,7 @@ def _dead_letter(fn: Callable[..., Any], args: tuple, kwargs: dict, error: str, 
 
         events.record("error", "db", f"写库最终失败, 已进死信队列: {(error or '')[:120]}")
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("死信已落库, 但写系统事件失败(前端看不到这条)", exc_info=True)
 
 
 def _safe_call(fn: Callable[..., Any], args: tuple, kwargs: dict) -> tuple[bool, str]:
@@ -179,7 +179,7 @@ class DbWriter:
                 f"写库队列积压 {backlog} 条, 单次写入 {elapsed_ms:.0f}ms, 请检查磁盘/慢查询",
             )
         except Exception:  # noqa: BLE001
-            pass
+            log.debug("写库积压告警无法写入事件表(已忽略)", exc_info=True)
 
     def _run(self) -> None:
         while not self._stopped.is_set() or not self._queue.empty():

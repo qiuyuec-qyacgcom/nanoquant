@@ -155,3 +155,23 @@ python scripts/cleanup_history.py --apply --vacuum  # 再重建库回收磁盘�
 系统诊断里有一项「告警通道」：未配置时是红色。在 `参数配置 → 系统` 填
 Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「发送测试告警」验证。
 不配的话，熔断、下单失败、爆仓预警只会写进页面——没人会看。
+
+### 8.5 出厂密码会把后台锁住（这是故意的）
+
+首次启动会用 `admin123` 建管理员，并且 `security.password_is_default = true`。
+在这个状态下，**除登录/改密/健康检查外，所有 `/api/v1/*` 都返回 403**
+（`code: password_change_required`），前端会把你送到「参数配置 → 安全」。
+
+改完密码该标记自动置 false，一切恢复。为什么不做成"只提示"：面板一旦映射到公网，
+`admin123` 就是现成的后门，提示等于没防护。
+
+- 老库升级也会被拦：启动时若发现密码仍是 `admin123` 但没有这个标记，会补标一次
+- 测试/CI 需要绕过时：预置 `password_hash` + `password_is_default=false`（见 `tests/conftest.py`）
+- 忘记密码：`python scripts/reset_password.py`（无此脚本时删 `security` 配置组重启即可重置）
+
+### 8.6 备份要有第二块盘
+
+主库、日志、备份默认全在 `data/` 下，一块盘写满就是三样一起没。
+设 `NANOQUANT_BACKUP_MIRROR=F:/nanoquant-backups` 后，每次备份会多抄一份到该目录
+（镜像写失败只告警，不影响本地备份）。恢复时优先用镜像里那份 —— 它的存在本身
+就说明当时主盘还没坏。

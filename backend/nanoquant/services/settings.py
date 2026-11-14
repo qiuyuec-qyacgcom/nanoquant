@@ -41,7 +41,8 @@ def normalize_mode(mode: str | None, default: str = MODE_DEMO) -> str:
 
 class EngineSettings(BaseModel):
     enabled: bool = False
-    mode: Literal["demo", "live"] = MODE_DEMO
+    # 直接写 "demo" 而不是 MODE_DEMO：常量是 str，Pydantic 的 Literal 校验需要字面量类型
+    mode: Literal["demo", "live"] = "demo"
     cycle_interval_sec: int = Field(default=MIN_CYCLE_INTERVAL_SEC, ge=MIN_CYCLE_INTERVAL_SEC, le=3600)
     max_positions: int = Field(default=2, ge=1, le=20)
     max_symbols_per_cycle: int = Field(default=12, ge=1, le=60)
@@ -371,6 +372,9 @@ class SecuritySettings(BaseModel):
     session_ttl_hours: int = Field(default=12, ge=1, le=720)
     require_login: bool = True
     login_fail_limit: int = Field(default=8, ge=3, le=100)
+    #: 是否仍是出厂密码。True 时除改密外的 API 一律 403:
+    #: 只提示不改密, 等于把 admin123 永久留在公网上。
+    password_is_default: bool = False
 
 
 class SystemSettings(BaseModel):
@@ -567,6 +571,17 @@ def get_group(name: str, use_cache: bool = True) -> dict[str, Any]:
 
 def get_all() -> dict[str, Any]:
     return {name: get_group(name) for name in GROUPS}
+
+
+def has_explicit_key(name: str, key: str) -> bool:
+    """配置里是否**显式**存过某个键.
+
+    ``get_group`` 会把默认值补全, 所以"值等于 False"无法区分
+    "用户设成了 False" 和 "老库根本没有这个字段" —— 升级迁移需要后者。
+    """
+    if name not in GROUPS:
+        raise KeyError(name)
+    return key in _load_raw(name)
 
 
 def update_group(name: str, patch: dict[str, Any]) -> dict[str, Any]:

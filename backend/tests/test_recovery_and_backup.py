@@ -349,3 +349,49 @@ def test_equity_downsample_is_noop_for_small_tables():
     assert retention._downsample_equity(now) == 0  # noqa: SLF001
     with session_scope() as s:
         s.query(EquityPoint).delete(synchronize_session=False)
+
+
+# ------------------------------------------------------------ 备份异盘副本
+def test_backup_mirror_copies_bytes_to_target(monkeypatch, tmp_path):
+    """配了镜像目录就要真的多一份，且内容与本盘那份逐字节一致."""
+    from pathlib import Path
+
+    from nanoquant.config import paths
+
+    monkeypatch.setattr(paths, "BACKUP_MIRROR", tmp_path / "mirror")
+    job = backup_service.create_backup(
+        name="mirror", settings_groups=["risk"], tables=[], encrypt=False, created_by="test"
+    )
+
+    assert job["mirror"], "配了镜像却返回空路径"
+    mirrored = Path(job["mirror"])
+    assert mirrored.is_file()
+    assert mirrored.read_bytes() == Path(job["path"]).read_bytes()
+
+
+def test_backup_mirror_defaults_to_disabled(monkeypatch):
+    from nanoquant.config import paths
+
+    monkeypatch.setattr(paths, "BACKUP_MIRROR", None)
+    job = backup_service.create_backup(
+        name="no-mirror", settings_groups=["risk"], tables=[], encrypt=False, created_by="test"
+    )
+    assert job["mirror"] is None
+
+
+def test_backup_survives_mirror_failure(monkeypatch, tmp_path):
+    """镜像盘不可写时，本地备份必须照常成功 —— 否则等于把可用性押在第二块盘上."""
+    from pathlib import Path
+
+    from nanoquant.config import paths
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("occupied", encoding="utf-8")
+    monkeypatch.setattr(paths, "BACKUP_MIRROR", blocker / "mirror")
+
+    job = backup_service.create_backup(
+        name="mirror-fail", settings_groups=["risk"], tables=[], encrypt=False, created_by="test"
+    )
+    assert job["ok"] is True
+    assert job["mirror"] is None
+    assert Path(job["path"]).is_file()

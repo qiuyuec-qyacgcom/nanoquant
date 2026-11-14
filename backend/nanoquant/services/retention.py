@@ -37,6 +37,15 @@ EQUITY_RECENT_HOURS = 48
 EQUITY_BUCKET_SEC = 600
 
 
+def _rowcount(result: Any) -> int:
+    """DELETE/UPDATE 的影响行数.
+
+    SQLAlchemy 2.0 里 ``session.execute(dml)`` 实际返回 CursorResult（有 rowcount），
+    但类型上标的是 Result，直接取 .rowcount 会被类型检查判错。
+    """
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 def _archive(name: str, rows: list[dict[str, Any]]) -> Path | None:
     if not rows:
         return None
@@ -94,7 +103,7 @@ def _downsample_equity(now: int, *, recent_hours: int = EQUITY_RECENT_HOURS,
     for i in range(0, len(drop), BATCH):
         chunk = drop[i : i + BATCH]
         with session_scope() as s:
-            removed += s.execute(delete(EquityPoint).where(EquityPoint.id.in_(chunk))).rowcount or 0
+            removed += _rowcount(s.execute(delete(EquityPoint).where(EquityPoint.id.in_(chunk))))
         time.sleep(0.02)
     return removed
 
@@ -156,10 +165,8 @@ def purge_expired(now: int | None = None) -> dict[str, int]:
 
     stats["equity_downsampled"] = _downsample_equity(now)
     with session_scope() as s:
-        stats["equity"] = (
-            s.execute(delete(EquityPoint).where(EquityPoint.ts < now - cfg.equity_retention_days * 86400)).rowcount or 0
+        stats["equity"] = _rowcount(
+            s.execute(delete(EquityPoint).where(EquityPoint.ts < now - cfg.equity_retention_days * 86400))
         )
-        stats["cooldowns"] = (
-            s.execute(delete(Cooldown).where(Cooldown.until_ts < now - 86400)).rowcount or 0
-        )
+        stats["cooldowns"] = _rowcount(s.execute(delete(Cooldown).where(Cooldown.until_ts < now - 86400)))
     return stats

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -530,7 +531,7 @@ def signals(
 
         from sqlalchemy import func
 
-        summary = {
+        summary: dict[str, Any] = {
             "total": base.count(),
             "opened": base.filter(Signal.decision == "opened").count(),
             "rejected": base.filter(Signal.decision == "rejected").count(),

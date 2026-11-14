@@ -151,7 +151,9 @@ async def evaluate() -> dict[str, Any]:
         window_ok, window_reason = trading_window_open(engine_cfg)
         window_reason = window_reason or "当前处于可交易时段"
     except Exception:  # noqa: BLE001
-        pass
+        # 时段闸门算不出来时按"可交易"放行(与原行为一致), 但必须留痕:
+        # 这条静默意味着闸门可能一直是失效状态, 却看不出来
+        log.warning("交易时段计算失败, 本次按全天可交易放行", exc_info=True)
     cooldowns = state.active_cooldowns(int(__import__("time").time()))
     consecutive = state.get_int("consecutive_losses", 0)
     halted = state.normalize_halted(state.get("halted"))

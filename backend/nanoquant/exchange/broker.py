@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ..db import session_scope
 from ..logging_setup import get_logger
@@ -1041,7 +1041,9 @@ class BinanceBroker:
 
 def get_broker(mode: str | None = None) -> Broker:
     """执行层: 模拟盘与实盘都走币安, 差别是域名与凭证 (由当前交易环境决定)."""
-    return BinanceBroker()
+    # Broker 是 Protocol, BinanceBroker 结构上满足它但没显式声明继承,
+    # mypy 无法自己确认, 这里显式收敛类型
+    return cast(Broker, BinanceBroker())
 
 
 def position_from_db(position_id: int) -> PositionRecord | None:

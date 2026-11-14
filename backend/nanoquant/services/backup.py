@@ -108,6 +108,26 @@ def _row_to_dict(row: Any, model: Any) -> dict[str, Any]:
     return data
 
 
+def _copy_to_mirror(out_path: Path, blob: bytes) -> str | None:
+    """把备份再抄一份到另一块盘（``NANOQUANT_BACKUP_MIRROR``）.
+
+    本地备份、主库、日志都在 data/ 下：同一块盘写满或损坏时三样一起没，
+    所以"备份"如果没有异地/异盘副本，抗风险能力和主库是一样的。
+    镜像失败只告警 —— 本地那份已经写成功了，不能因此把整次备份判失败。
+    """
+    target = paths.BACKUP_MIRROR
+    if not target:
+        return None
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        dst = target / out_path.name
+        dst.write_bytes(blob)
+        return str(dst)
+    except OSError as exc:
+        log.warning("备份镜像写入失败（本地备份仍然有效）: %s", exc)
+        return None
+
+
 def create_backup(
     *,
     name: str = "",
@@ -166,6 +186,7 @@ def create_backup(
     out_path = paths.BACKUPS / f"nanoquant-{safe_label}-{ts}{suffix}"
     blob = _fernet().encrypt(raw) if encrypt else raw
     out_path.write_bytes(blob)
+    mirror_path = _copy_to_mirror(out_path, blob)
     # 摘要必须取**落盘字节**：以前算的是加密前的 zip，于是所有加密备份在列表里
     # 都显示 sha256 校验失败（默认就是加密），把真正的文件损坏淹掉了。
     digest = hashlib.sha256(blob).hexdigest()
@@ -183,7 +204,16 @@ def create_backup(
 
     _apply_retention()
     events.record("info", "backup", f"备份完成 #{job_id} ({out_path.stat().st_size / 1024:.1f} KB)")
-    return {"ok": True, "job_id": job_id, "path": str(out_path), "size": out_path.stat().st_size, "sha256": digest, "encrypted": encrypt, "manifest": manifest}
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "path": str(out_path),
+        "mirror": mirror_path,
+        "size": out_path.stat().st_size,
+        "sha256": digest,
+        "encrypted": encrypt,
+        "manifest": manifest,
+    }
 
 
 def _apply_retention() -> None:

@@ -143,6 +143,7 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 | `NANOQUANT_DATA_DIR` / `NANOQUANT_DB` | `$HOME/data`、`data/nanoquant.db` | 数据目录与库文件 |
 | `NANOQUANT_LOG_DIR` | `$HOME/logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 主密钥；**丢失后已加密的 API 密钥无法解密** |
+| `NANOQUANT_BACKUP_MIRROR` | 空（不启用） | 备份异盘副本目录，如 `F:/nanoquant-backups`。主库/日志/备份都在 `data/` 下，同一块盘写满就一起没；指向另一块盘后每次备份会多抄一份（镜像失败不影响本地备份） |
 | `NANOQUANT_FRONTEND` | `$HOME/frontend/dist` | 前端产物目录 |
 | `NANOQUANT_VENV` | 空 | Windows 启动脚本的虚拟环境目录（迁移场景） |
 | `EXEC_SOCKET` | 空 → `/run/nanoquant/exec.sock` | sidecar 地址，如 `unix:/run/nanoquant/exec.sock` / `tcp:127.0.0.1:9101`；参数页 `exec_socket` 优先 |
