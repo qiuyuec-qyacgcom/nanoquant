@@ -11,15 +11,36 @@
     python scripts/reset_password.py            # 随机密码
     python scripts/reset_password.py --password 'My-Pass-2026'
 
+脚本会自动改用仓库根目录的 .venv 解释器运行，所以用系统 python 敲上面这行也没关系
+（不必手动写 .venv/bin/python）。
 注意：需要在与数据目录同一台机器、同一个 NANOQUANT_HOME 下执行。
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+_SCRIPT = Path(__file__).resolve()
+_REPO_ROOT = _SCRIPT.parents[1]
+
+# 依赖（sqlalchemy 等）装在项目自带的 .venv 里，系统 python 通常没有。
+# 直接 `python scripts/reset_password.py` 会报 No module named 'sqlalchemy'。
+# 这里检测到 <仓库>/.venv 的解释器与当前解释器不同时，就 execv 过去重跑一遍
+# （重跑后 sys.executable 已指向 venv，不会再进这个分支，不会死循环）。
+for _cand in (
+    _REPO_ROOT / ".venv" / "bin" / "python",
+    _REPO_ROOT / ".venv" / "Scripts" / "python.exe",
+):
+    if _cand.is_file():
+        if os.path.normcase(str(_cand.resolve())) != os.path.normcase(
+            str(Path(sys.executable).resolve())
+        ):
+            os.execv(str(_cand), [str(_cand), str(_SCRIPT), *sys.argv[1:]])
+        break
+
+sys.path.insert(0, str(_REPO_ROOT / "backend"))
 
 from nanoquant.db import init_db  # noqa: E402
 from nanoquant.security import generate_password, hash_password  # noqa: E402

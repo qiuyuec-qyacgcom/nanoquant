@@ -36,13 +36,26 @@ done
 
 INSTALL_DIR="${INSTALL_DIR:-./nanoquant}"
 
-# ---------- 下载工具兜底（curl 优先，wget 次之）----------
+# ---------- 下载工具兜底（curl 优先，wget 次之；都没有则自动装 curl）----------
 if command -v curl >/dev/null 2>&1; then
   FETCH="curl"
 elif command -v wget >/dev/null 2>&1; then
   FETCH="wget"
 else
-  die "未找到 curl 或 wget，无法下载代码。请先安装其一：apt-get install -y curl"
+  warn "未检测到 curl / wget，尝试自动安装 curl"
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl || die "自动安装 curl 失败，请手动: apt-get install -y curl"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q curl || die "自动安装 curl 失败，请手动: dnf install -y curl"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q curl || die "自动安装 curl 失败，请手动: yum install -y curl"
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache curl || die "自动安装 curl 失败，请手动: apk add curl"
+  else
+    die "未找到 curl 或 wget，且无法识别包管理器，请手动安装 curl"
+  fi
+  FETCH="curl"
 fi
 ok "下载工具：$FETCH"
 

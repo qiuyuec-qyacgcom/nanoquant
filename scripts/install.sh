@@ -13,12 +13,13 @@
 #   sudo bash scripts/install.sh --password 'xxx' # 指定初始管理员密码
 #   sudo bash scripts/install.sh --force         # 强制重装依赖（默认按 requirements 哈希跳过）
 #
-# 密码：不指定时首次启动会随机生成（打印在启动日志里），登录后必须改密。
+# 密码：不指定时由安装脚本随机生成、装完直接打印，登录后必须改密。
 #
 # 设计取舍：
 # - 幂等：重复执行不会每次重装依赖/重建 venv，改完 requirements 再跑一次即可；
 # - 失败可见：任何一步失败都以非 0 退出并说明下一步，绝不打印"安装完成"；
-# - 不自作主张：缺 Node 只警告不中止（后端可独立跑），Python 版本不够才中止。
+# - 尽量自动补齐：缺 Node 会自动装（apt → NodeSource 20 LTS），装不上才警告跳过；
+#   Python 缺 sqlite3 或版本不够会自动补（libsqlite3-dev / apt 3.12+），补不上才中止。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -127,42 +128,60 @@ MIN_MINOR=12
 py_usable() {
   "$1" -c "import sys, sqlite3; sys.exit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null
 }
-PY=""
-PY_VER_OK_BUT_NOSQLITE=""
-for cand in python3.13 python3.12 python3; do
-  command -v "$cand" >/dev/null 2>&1 || continue
-  if "$cand" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null; then
-    if py_usable "$cand"; then
-      PY="$cand"; break
-    else
-      # 版本够但缺 sqlite3，记下以便报错更精准
-      [[ -z "$PY_VER_OK_BUT_NOSQLITE" ]] && PY_VER_OK_BUT_NOSQLITE="$cand"
-    fi
-  fi
-done
+# 只判版本（不查 sqlite3），用来区分「版本不够」和「版本够但缺 sqlite3」
+py_version_ok() {
+  "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null
+}
+# 找到第一个「版本够且能 import sqlite3」的解释器，写入全局 PY（始终返回 0，避免 set -e 误杀）
+scan_python() {
+  PY=""
+  local cand
+  for cand in python3.13 python3.12 python3; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if py_usable "$cand"; then PY="$cand"; return 0; fi
+  done
+  return 0
+}
+# 找「版本够但缺 sqlite3」的解释器，用于精准报错
+find_broken_sqlite() {
+  local cand
+  for cand in python3.13 python3.12 python3; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if py_version_ok "$cand" && ! py_usable "$cand"; then printf '%s\n' "$cand"; return 0; fi
+  done
+  return 1
+}
 
+scan_python
 if [[ -z "$PY" ]]; then
-  if [[ -n "$PY_VER_OK_BUT_NOSQLITE" ]]; then
-    die "检测到 $PY_VER_OK_BUT_NOSQLITE 版本满足要求，但缺少 sqlite3 模块（_sqlite3 C 扩展）。
-        这是编译 Python 时系统缺 libsqlite3-dev 所致。修复（任选其一）：
-        1) 源码重编：apt-get install -y libsqlite3-dev，回到 Python 源码目录重跑 ./configure && make && make install
-        2) 改用系统完整发行版：deadsnakes PPA（Ubuntu）或 pyenv install 3.12.x
-        修好后重新运行本脚本即可。"
+  BROKEN="$(find_broken_sqlite || true)"
+  if [[ -n "$BROKEN" ]]; then
+    warn "检测到 $BROKEN 版本满足要求，但缺少 sqlite3 模块（_sqlite3 C 扩展）"
+    info "尝试自动修复：装 libsqlite3-dev，并尽量用 apt 装一个完整版 Python 绕开"
+  else
+    warn "未找到 Python 3.12+，尝试自动安装"
   fi
-  warn "未找到 Python 3.12+，尝试自动安装"
   if [[ "$PKG" == "apt" ]]; then
     apt-get update -qq || true
+    # 缺 sqlite3 时补上开发库（重编才能成功）；再显式试装 3.12/3.13（Ubuntu 24.04+ / Debian 13 源里有）
+    [[ -n "$BROKEN" ]] && install_pkg libsqlite3-dev || true
     install_pkg python3 python3-venv python3-pip || true
+    install_pkg python3.12 || true
+    install_pkg python3.13 || true
   else
     install_pkg python3 python3-pip || true
   fi
-  for cand in python3.13 python3.12; do
-    if command -v "$cand" >/dev/null 2>&1 && py_usable "$cand"; then PY="$cand"; break; fi
-  done
-  if [[ -z "$PY" ]] && command -v python3 >/dev/null 2>&1 && py_usable python3; then
-    PY="python3"
+  scan_python
+fi
+
+if [[ -z "$PY" ]]; then
+  if [[ -n "$BROKEN" ]]; then
+    die "仍没有可用的 Python（$BROKEN 缺 sqlite3，且 apt 源里没有完整版 3.12+）。
+已自动装好 libsqlite3-dev，现在只需重编一次解释器：
+  cd <你的 Python 源码目录> && ./configure --enable-optimizations && make -j\"\$(nproc)\" && make altinstall
+或改用 pyenv 装完整发行版：pyenv install 3.12.x（改完再重跑本脚本）"
   fi
-  [[ -n "$PY" ]] || die "系统源里的 Python 低于 3.12。请先安装 3.12+（deadsnakes / pyenv / 官方源码）后重试"
+  die "系统源里的 Python 低于 3.12，且没有可自动安装的 3.12+。请先装 3.12+（deadsnakes / pyenv / 官方源码）后重试"
 fi
 ok "Python: $($PY --version 2>&1)"
 
@@ -216,25 +235,53 @@ fi
 ok "后端可导入（nanoquant.main）"
 
 # ---------------------------------------------------------------- 前端构建
+# 自动补齐 Node.js：前端要 18+，缺了或太旧就自动装（apt 优先，装不到走 NodeSource 20 LTS）
+node_ready() {
+  command -v node >/dev/null 2>&1 || return 1
+  local maj
+  maj="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [[ "${maj:-0}" -ge 18 ]]
+}
+ensure_node() {
+  node_ready && return 0
+  info "未检测到 Node.js 18+，尝试自动安装"
+  if [[ "$PKG" == "apt" ]]; then
+    apt-get update -qq || true
+    install_pkg nodejs npm || true
+    if node_ready; then ok "Node.js: $(node -v)"; return 0; fi
+    # apt 源里的 nodejs 偏老（Ubuntu 22.04 只有 12），换 NodeSource 装 20 LTS
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+      warn "apt 的 nodejs 版本过旧（$(node -v 2>/dev/null || echo 无)），改用 NodeSource 装 Node 20 LTS"
+      install_pkg ca-certificates gnupg || true
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | sed 's/^/  /' || true
+      else
+        wget -qO- https://deb.nodesource.com/setup_20.x | bash - 2>&1 | sed 's/^/  /' || true
+      fi
+      install_pkg nodejs || true
+      node_ready && { ok "Node.js: $(node -v)"; return 0; }
+    fi
+    return 1
+  fi
+  install_pkg nodejs npm || true
+  node_ready && { ok "Node.js: $(node -v)"; return 0; }
+  return 1
+}
+
 if [[ "$WITH_FRONTEND" == "1" ]]; then
   if [[ -f "$ROOT/frontend/dist/index.html" ]]; then
     info "已存在前端产物，跳过构建（要重建请先删 frontend/dist）"
-  elif ! command -v npm >/dev/null 2>&1; then
-    warn "未安装 Node.js/npm，跳过前端构建"
-    warn "面板打不开但 API 正常；装好 Node 18+ 后执行: cd frontend && npm ci && npm run build"
-  else
-    NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-    if [[ "${NODE_MAJOR:-0}" -lt 18 ]]; then
-      warn "Node 版本过低（当前 $(node -v 2>/dev/null)），前端需要 18+，已跳过构建"
+  elif ensure_node; then
+    info "构建前端（npm ci + build）"
+    if [[ -f "$ROOT/frontend/package-lock.json" ]]; then
+      ( cd "$ROOT/frontend" && npm ci --no-audit --no-fund && npm run build ) || die "前端构建失败"
     else
-      info "构建前端（npm ci + build）"
-      if [[ -f "$ROOT/frontend/package-lock.json" ]]; then
-        ( cd "$ROOT/frontend" && npm ci --no-audit --no-fund && npm run build ) || die "前端构建失败"
-      else
-        ( cd "$ROOT/frontend" && npm install --no-audit --no-fund && npm run build ) || die "前端构建失败"
-      fi
-      ok "前端构建完成（frontend/dist）"
+      ( cd "$ROOT/frontend" && npm install --no-audit --no-fund && npm run build ) || die "前端构建失败"
     fi
+    ok "前端构建完成（frontend/dist）"
+  else
+    warn "未能自动安装 Node.js 18+，跳过前端构建"
+    warn "面板打不开但 API 正常；手动装好 Node 18+ 后执行: cd frontend && npm ci && npm run build"
   fi
 fi
 
