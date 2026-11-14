@@ -14,7 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 
 [profile.release]
