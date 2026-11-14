@@ -1,5 +1,6 @@
 const BASE = '/api/v1'
 const TOKEN_KEY = 'nq_token'
+const MUST_CHANGE_KEY = 'nq_must_change_pwd'
 
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) || ''
@@ -8,6 +9,16 @@ export function getToken(): string {
 export function setToken(token: string) {
   if (token) localStorage.setItem(TOKEN_KEY, token)
   else localStorage.removeItem(TOKEN_KEY)
+}
+
+/** 是否仍在使用出厂密码：为真时后台只放行改密，其余接口都会 403。 */
+export function getMustChangePassword(): boolean {
+  return localStorage.getItem(MUST_CHANGE_KEY) === '1'
+}
+
+export function setMustChangePassword(flag: boolean) {
+  if (flag) localStorage.setItem(MUST_CHANGE_KEY, '1')
+  else localStorage.removeItem(MUST_CHANGE_KEY)
 }
 
 export class ApiError extends Error {
@@ -62,6 +73,13 @@ export async function api<T = any>(path: string, init: RequestInit = {}, timeout
   }
   const text = await res.text()
   const payload = text ? safeJson(text) : null
+  if (res.status === 403 && payload?.code === 'password_change_required') {
+    // 后端拦下来说明仍是出厂密码：把标记记下来并把人送到改密页，
+    // 否则用户只会看到一串莫名其妙的"请求失败"
+    setMustChangePassword(true)
+    if (!location.hash.startsWith('#/admin/strategy')) location.hash = '#/admin/strategy'
+    throw new ApiError(403, detailOf(payload))
+  }
   if (!res.ok) throw new ApiError(res.status, detailOf(payload))
   return payload as T
 }

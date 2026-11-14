@@ -9,7 +9,7 @@
  * - 顶部保留「未保存」提示与保存/恢复默认, 避免改完不知道有没有生效。
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
@@ -487,6 +487,7 @@ const PROTECTED = new Set([
 const app = useAppStore()
 const auth = useAuthStore()
 const route = useRoute()
+const router = useRouter()
 
 const current = ref('engine')
 const draft = ref<Record<string, any>>({})
@@ -1108,11 +1109,14 @@ async function changePassword() {
     return
   }
   try {
+    // 被"出厂密码"拦到这里的人, 改完就该放回原路, 而不是留在参数页
+    const forced = auth.mustChangePassword
     await auth.changePassword(pwd.old_password, pwd.new_password)
     pwd.old_password = ''
     pwd.new_password = ''
     await app.loadSettings()
     app.notify('密码已更新', 'ok')
+    if (forced) router.push('/admin/dashboard')
   } catch (err: any) {
     app.notify(err.message, 'error')
   }

@@ -1,5 +1,5 @@
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router'
-import { getToken } from '../api/client'
+import { getToken, getMustChangePassword } from '../api/client'
 
 const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('../views/LoginView.vue') },
@@ -51,6 +51,10 @@ router.beforeEach((to) => {
   const needsAuth = to.path.startsWith('/admin')
   if (needsAuth && !token) return { path: '/login', query: { next: to.fullPath } }
   if (to.path === '/login' && token) return { path: '/admin/dashboard' }
+  // 出厂密码未改时, 后台其余页面即便打开也全是 403, 直接送到改密页
+  if (needsAuth && getMustChangePassword() && to.path !== '/admin/strategy') {
+    return { path: '/admin/strategy' }
+  }
   return true
 })
 
