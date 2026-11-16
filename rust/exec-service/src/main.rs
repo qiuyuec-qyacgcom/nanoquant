@@ -13,6 +13,7 @@
 //!
 //! 协议见 docs/EXEC_PROTOCOL.md。
 
+mod http;
 mod model;
 mod sign;
 
@@ -24,6 +25,7 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+use http::HttpClient;
 use model::{Request, Response};
 use sign::Signer;
 
@@ -32,6 +34,7 @@ struct Config {
     socket: PathBuf,
     secret: String,
     tcp: Option<String>,
+    http: http::HttpConfig,
 }
 
 impl Config {
@@ -42,11 +45,12 @@ impl Config {
                 .into(),
             secret: std::env::var("EXEC_SECRET").expect("EXEC_SECRET 未设置"),
             tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
+            http: http::HttpConfig::from_env(),
         }
     }
 }
 
-async fn handle<S>(stream: S, signer: Arc<Signer>)
+async fn handle<S>(stream: S, signer: Arc<Signer>, http: Arc<HttpClient>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -59,7 +63,7 @@ where
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch(req, &signer),
+            Ok(req) => dispatch(req, &signer, &http).await,
             Err(exc) => Response::err("unknown", format!("bad json: {exc}")),
         };
         let mut payload = serde_json::to_string(&resp).unwrap_or_default();
@@ -71,11 +75,13 @@ where
     }
 }
 
-fn dispatch(req: Request, signer: &Signer) -> Response {
+async fn dispatch(req: Request, signer: &Signer, http: &HttpClient) -> Response {
     match req.op.as_str() {
         "health" => {
             let mut resp = Response::ok(&req.id);
             resp.algo = Some(signer.algo().to_string());
+            // P3-1：附带连接池状态（旧调用方忽略该字段即可）
+            resp.http = Some(http.status());
             resp
         }
         // 影子模式：签名并回显，供 Python 侧逐字节比对
@@ -89,6 +95,22 @@ fn dispatch(req: Request, signer: &Signer) -> Response {
             resp.query = Some(req.query);
             resp
         }
+        // P3-1：只读探活连接池（GET /fapi/v1/time），不签名、不下单
+        "probe" => {
+            let mut resp = Response::ok(&req.id);
+            resp.algo = Some(signer.algo().to_string());
+            match http.probe().await {
+                Ok(ms) => {
+                    resp.latency_ms = Some(ms);
+                }
+                Err(exc) => {
+                    resp.ok = false;
+                    resp.error = Some(exc);
+                }
+            }
+            resp.http = Some(http.status());
+            resp
+        }
         other => Response::err(&req.id, format!("unknown op: {other}")),
     }
 }
@@ -97,18 +119,28 @@ fn dispatch(req: Request, signer: &Signer) -> Response {
 async fn main() -> std::io::Result<()> {
     let cfg = Config::from_env();
     let signer = Arc::new(Signer::detect(&cfg.secret));
+    let http = Arc::new(HttpClient::new(cfg.http.clone()));
+
+    // P3-1：后台预热连接池（best-effort，失败不影响签名服务）
+    if cfg.http.enabled() {
+        eprintln!("exec-service http pool enabled: base={}", cfg.http.base_url);
+        let warm = http.clone();
+        tokio::spawn(async move { warm.warmup().await });
+    }
 
     // 回环 TCP：Windows 无 UDS，容器/联调也用这条；与 UDS 可并存
     if let Some(addr) = cfg.tcp.as_deref() {
         let listener = TcpListener::bind(addr).await?;
         eprintln!("exec-service tcp listening on {addr} (algo={})", signer.algo());
         let signer_tcp = signer.clone();
+        let http_tcp = http.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let s = signer_tcp.clone();
-                        tokio::spawn(async move { handle(stream, s).await });
+                        let h = http_tcp.clone();
+                        tokio::spawn(async move { handle(stream, s, h).await });
                     }
                     Err(exc) => eprintln!("tcp accept failed: {exc}"),
                 }
@@ -145,7 +177,8 @@ async fn main() -> std::io::Result<()> {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let s = signer.clone();
-                    tokio::spawn(async move { handle(stream, s).await });
+                    let h = http.clone();
+                    tokio::spawn(async move { handle(stream, s, h).await });
                 }
                 Err(exc) => eprintln!("uds accept failed: {exc}"),
             }

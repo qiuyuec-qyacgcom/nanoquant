@@ -37,8 +37,17 @@ Linux（UDS，推荐）：
 ```bash
 EXEC_SECRET="$(cat /etc/nanoquant/exec_secret)" \
 EXEC_SOCKET=/run/nanoquant/exec.sock \
+EXEC_BASE_URL=https://fapi.binance.com \
 ./target/release/exec-service
 ```
+
+P3-1 起可启用 HTTP/2 连接池（可选，不填则保持纯签名）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `EXEC_BASE_URL` | 空（关闭） | 交易所 REST 根地址；空=只签名，不建连接池 |
+| `EXEC_HTTP_TIMEOUT_MS` | `3000` | 单请求超时（200–30000） |
+| `EXEC_HTTP_WARMUP` | `1` | 启动后台预热（DNS+TLS+HTTP2），失败只告警不阻断 |
 
 Windows / 容器联调（回环 TCP；给了 `EXEC_TCP` 就只走 TCP）：
 
@@ -101,6 +110,7 @@ exec-service/
 └── src/
     ├── main.rs    UDS/TCP 监听、JSON Lines 分发
     ├── model.rs   请求/响应结构
+    ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
 ```
 
@@ -116,8 +126,17 @@ exec-service/
 
 ## 下一步（P3）
 
-1. 在 VPS 上用 UDS 跑一次 `cargo test && cargo build --release`，补 systemd 守护与 `0600` 权限；
-2. 接入 `reqwest`（rustls）做 HTTP/2 连接池 + 启动预热；
-3. 订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`；
-4. 保护单并行下发（STOP + TP），参数走 Algo 接口；
-5. 落库改由 Rust 单写线程组提交，Python 只读。
+1. ✅ **已完成** 接入 `reqwest`（rustls）做 HTTP/2 连接池 + 启动预热（`src/http.rs`，
+   `EXEC_BASE_URL` 启用，`probe` op 可验证；6 个单测通过）；
+2. 订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`；
+3. 保护单并行下发（STOP + TP），参数走 Algo 接口；
+4. 落库改由 Rust 单写线程组提交，Python 只读。
+
+## P3-1 已实现（连接池）
+
+- `src/http.rs`：rustls 纯 Rust TLS + HTTP/2，keep-alive 连接池（idle 90s / 每 host 8 条），
+  `connect_timeout` 与总超时同源；**不依赖系统 OpenSSL**，VPS 缺 libssl 也能构建运行。
+- 启动预热：后台任务 `GET {EXEC_BASE_URL}/fapi/v1/time`，失败只告警，**绝不阻断签名服务**。
+- 新 op `probe`：只读探活并回 `latency_ms` / `http`；`health` 附带 `http` 状态（向后兼容）。
+- 实测（Windows 回环 TCP，真实 `fapi.binance.com`）：预热 `warmed=true / warmup_ms=595`，
+  `probe` `latency_ms=155`；probe 之后签名向量仍为 `c5bee7ef...`（与签名路径完全隔离）。

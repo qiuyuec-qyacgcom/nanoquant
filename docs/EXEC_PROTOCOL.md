@@ -25,10 +25,21 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 | op | 入参 | 出参 | 说明 |
 |---|---|---|---|
-| `health` | — | `algo` | 探活，返回当前密钥类型 |
+| `health` | — | `algo` / `http` | 探活，返回当前密钥类型与连接池状态（`http` 可忽略） |
 | `plan` / `sign` | `query` | `signature` / `algo` / `query` | **只签名，不发单**（影子模式） |
+| `probe` | — | `latency_ms` / `http` | P3-1：只读探活连接池（`GET {base}/fapi/v1/time`），不签名、不下单 |
 
 错误响应：`{"id":"...","ok":false,"error":"..."}`，调用方应视为失败而非重试。
+
+### 3.1 连接池环境变量（P3-1，均可选）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `EXEC_BASE_URL` | 空（关闭） | 交易所 REST 根地址，如 `https://fapi.binance.com`；为空则只做签名，不建连接池 |
+| `EXEC_HTTP_TIMEOUT_MS` | `3000` | 单请求超时（200–30000） |
+| `EXEC_HTTP_WARMUP` | `1` | 启动时后台预热（DNS+TLS+HTTP2 握手），失败只告警、不阻断签名 |
+
+连接池失败或预热超时**不会影响** `sign`/`health`：P2 影子比对照常可用。
 
 ## 4. 签名规则（必须与 Python 逐字节一致）
 

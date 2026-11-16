@@ -1297,18 +1297,42 @@
 - **过程要点**：`exchange/ratelimit.py` 把固定 `MAX_BAN_HONOR_SEC=180` 探测改为指数退避（基础 60s，×2 递增，封顶 1800s，最多 6 连）；新增 `ban_streak` 计数；只要任一次请求成功收到权重响应头（`observe_weight`）即把退避计数归零。仍保留交易所声明解封时间 `ban_declared_until` 用于面板展示。
 - **验证**：`pytest tests -q` → 新增封禁指数退避契约（连续封禁退避递增、成功一次即归零）；`compileall` 通过；前端构建通过。
 
+### 93. P3-1：Rust sidecar 接入 HTTP/2 连接池 + 启动预热
+- **状态**：✅ 已完成
+- **背景**：P2 影子/签名接管已在 VPS 闭环（enforce、`一致 22 / 不一致 0`）。P3 要让 sidecar 具备发 HTTP 的能力，第一步先建可复用的 HTTP/2 连接池并预热，避免第一笔真实下单吃 DNS/TLS 握手开销。
+- **过程要点**：
+  - 新增 `rust/exec-service/src/http.rs`：`reqwest` + `rustls-tls`（**纯 Rust TLS，不依赖系统 OpenSSL**），`pool_idle_timeout=90s`、`pool_max_idle_per_host=8`、`http2_adaptive_window`。
+  - `EXEC_BASE_URL` 为空时**不建连接池**（保持纯签名模式）；`EXEC_HTTP_TIMEOUT_MS`（默认 3000，夹 200–30000）、`EXEC_HTTP_WARMUP`（默认开）。
+  - 启动时后台预热 `GET {base}/fapi/v1/time`：**best-effort**，失败只告警，绝不阻断签名服务启动。
+  - 协议新增 `probe` op（只读探活，回 `latency_ms` + `http` 状态）；`health` 附带 `http` 字段。两者都是**新增可选字段**，旧调用方零改动。
+- **验证**：
+  - `cargo test --release` → **6 passed**（3 个原有签名向量未变 + 3 个新连接池用例）。
+  - 真实回环冒烟（Windows TCP + 真实 `fapi.binance.com`）：预热 `warmed=true / warmup_ms=595`；`probe` `latency_ms=155`；**probe 之后再签名仍为 `c5bee7ef...`**（连接池与签名完全隔离）。
+  - Python 侧 `pytest -k 'sidecar or exec'` → **9 passed**；`scripts/verify_sidecar.py` 自起 mock → 通过。
+- **未做**：VPS 上尚未重新 `cargo build --release` 并重启 `nanoquant-exec`（本次产物在 Windows 验证）。
+
 ---
 
 ## 二、未开始
 
 ### 1. VPS 上的 UDS 部署与 P3 接管
-- **状态**：⬜ 未开始（二进制已在 Windows 编译验证，见 #56）
+- **状态**：🚧 进行中 —— 部署/验证/enforce 切流已在 VPS 完成（`一致 22 / 不一致 0`），P3-1 连接池已落地。
+- **已完成**：
+  - VPS UDS 部署 + systemd（`nanoquant-exec.service`）、`/etc/nanoquant/exec.env` 0600。
+  - `verify_sidecar.py --target unix:/run/nanoquant/exec.sock` 真比对通过；面板自检一致。
+  - `exec_mode` 切到 `enforce`，`一致 22 / 不一致 0 / 失败 0 / 跳过 0`，p99 1.17ms。
+  - **P3-1**：`src/http.rs`（reqwest+rustls HTTP/2 连接池 + 启动预热 + `probe` op），见 TASKS #93。
 - **待办**：
-  - VPS：`cargo test` + `cargo build --release`（Linux 产物）。
-  - 起进程：`EXEC_SOCKET=/run/nanoquant/exec.sock EXEC_SECRET=... ./exec-service`，目录属主与 `0600` 权限。
-  - `EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock`（已支持 `--secret`/`EXEC_SECRET` 比对签名）。
-  - 面板「自检」通过后切 `enforce` 灰度 24h（`mismatched` 必须恒为 0）。
-  - P3：`reqwest` 连接池 + 订单状态机（Planned → Sent → Acked → Filled）+ 保护单并行 + 单写线程落库。
+  - P3-2：订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`。
+  - P3-3：保护单并行下发（STOP + TP，走 Algo 接口）。
+  - P3-4：落库改由 Rust 单写线程组提交，Python 只读。
+  - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
+- **VPS 踩坑记录**（已确认，供复盘）：
+  - `exec.env` 的 `EXEC_SECRET` 若带尖括号 `<...>`：systemd 会把括号当值的一部分 → sidecar 与 Python 签名不一致；且 shell `source` 会因 `<` 触发重定向语法错误。
+  - `umask 077` 对 `sudo tee` 不生效（root 进程用 root umask）→ 必须 `sudo install -m 600` 或写完 `chmod 600`。
+  - `verify_sidecar.py --target` 与面板「自检」用的密钥来源不同：前者读 `EXEC_SECRET`/`--secret`，后者用当前交易环境（demo/live）配置的交易所 Secret —— **两把必须同一把**。
+  - 换 Secret / 切 demo↔live 后必须面板「清零」，否则切换窗口内的在途比对会残留 `mismatched`。
+  - 切流开关在**参数配置 → 系统 → 执行内核（sidecar）**；「清零/自检」在**系统诊断**页，两处不在同一页面。
 
 ### 2. 回测 / 实盘同口径对账（需实盘样本）
 - **状态**：⬜ 未开始（工具已就绪：`scripts/reconcile.py`，含 `suggested_slippage_bps`）
