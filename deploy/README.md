@@ -43,6 +43,9 @@ EXEC_SECRET='<密钥>' .venv/bin/python scripts/verify_sidecar.py --target unix:
 3. `mismatched` 恒为 0 再切 `enforce`（灰度 24h）；
 4. 换 Secret 后必须点「清零」，否则切换窗口内的在途比对会残留不一致计数。
 
+> 保护单代发、台账权威源等 P3 能力的**启用顺序、判据与回滚**见
+> [`deploy/P3_ROLLOUT.md`](./P3_ROLLOUT.md)。
+
 ## 监控（可选）
 
 `GET /api/v1/metrics` 是免鉴权的 Prometheus 文本（可在参数页「系统 → 安全与观测」关闭）：
