@@ -147,13 +147,30 @@ def _parse_response_json(response: Any) -> Any:
     调用方可以按交易所错误处理（降级/503）。
     """
     text = getattr(response, "text", "") or ""
+    status = getattr(response, "status_code", 0)
     if not text.strip():
         return {}
+    # HTTP 3xx 不跟随重定向（跟到钓鱼页更危险），直接给可操作诊断：
+    # 币安/CDN 对 VPS 数据中心 IP、被墙地区常回 302 到 HTML。
+    if 300 <= status < 400:
+        headers = getattr(response, "headers", {}) or {}
+        location = str(headers.get("location") or "")
+        hint = (
+            "交易所/CDN 返回重定向（非 JSON API 响应）。常见原因："
+            "VPS 出口 IP 被币安拦截、base_url 填成了网页地址而非 API 域名、或代理配置错误。"
+        )
+        if location:
+            hint += f" 重定向目标: {location[:160]}"
+        raise BinanceError(-1, f"交易所返回 HTTP {status} 重定向: {hint}", status)
     try:
         return response.json()
     except (ValueError, TypeError) as exc:
-        status = getattr(response, "status_code", 0)
-        raise BinanceError(-1, f"交易所返回非 JSON (HTTP {status}): {text[:120]!r}", status) from exc
+        raise BinanceError(
+            -1,
+            f"交易所返回非 JSON (HTTP {status}): {text[:120]!r}；"
+            "若持续出现请检查 base_url / 代理 / 出口 IP（Cloudflare 会回 HTML 验证页）",
+            status,
+        ) from exc
 
 
 @dataclass
@@ -415,6 +432,15 @@ class BinanceClient:
         except ValueError:
             pass
 
+        # 3xx（302/301）：不是币安 JSON API 的正常响应。只读请求换线路重试一次
+        # （用户配了 backup_base_urls 时可能救回来），写请求保持结果未知、不重发。
+        if 300 <= r.status_code < 400:
+            if method.upper() in {"POST", "PUT", "DELETE"}:
+                raise UncertainSubmission(-1, "交易所返回 3xx 重定向，写请求结果未知，禁止重发", r.status_code)
+            if _retry and self._rotate_base():
+                return await self._request(
+                    method, path, params, signed=signed, weight=weight, order=order, _retry=False
+                )
         if r.status_code >= 400:
             try:
                 body = r.json()
