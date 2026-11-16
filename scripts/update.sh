@@ -22,7 +22,8 @@
 #   - 重启后做健康检查，失败会打印日志位置而不是假装成功。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# NANOQUANT_ROOT 由根目录 update.sh 引导脚本传入（内部脚本在 /tmp 时 BASH_SOURCE 不可靠）
+ROOT="${NANOQUANT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PORT=""
 CHECK_ONLY=0
 DO_BACKUP=1
