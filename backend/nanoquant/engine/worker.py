@@ -2173,12 +2173,10 @@ class TradingEngine:
         mantras: list[dict[str, Any]] = []
         injected_ids: list[int] = []
         if ai_cfg.inject_mantras:
-            lessons = mantra_store.rank_lessons()
-            # 只传标题与健康度，**不传规则原文**：心法文本里可能含「用 Nx 杠杆」之类的历史表述，
-            # 开仓杠杆必须只由风控全局上下限决定，不能让模型照着心法给杠杆。
-            mantras = [{"title": m["title"], "health": m["health"]} for m in lessons]
-            # 只记 id，不把 id 塞进 prompt（快照用于事后「采用/未采用」对照）
-            injected_ids = [int(m["id"]) for m in lessons if m.get("id")]
+            # 结构化注入：标题 + 去杠杆数值的规则正文 + 健康度 + 类别。
+            # 心法是「历史复盘的统计倾向」，不是当下指令；规则里的杠杆倍数已剥离，
+            # 避免模型照抄历史数值覆盖风控已钳好的杠杆。仅 id 记快照，不进 prompt。
+            mantras, injected_ids = mantra_store.injection_payload()
         # 场景化经验 (决策日志 → 打标 → 经验库 闭环)：检索注入 top-k，失败只降级不打断
         experiences_text = ""
         injected_experience_ids: list[int] = []
@@ -2186,6 +2184,12 @@ class TradingEngine:
             experiences_text, injected_experience_ids, _ = journal_injection(
                 sig.symbol, self._journal_snapshot(sig, ticker)
             )
+            if experiences_text:
+                experiences_text = (
+                    "【场景化经验·历史相似场景的对错结论，仅作参考；"
+                    "与当前策略/实时行情冲突时以策略与行情为准，不得据此放宽风控】\n"
+                    + experiences_text
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning("经验检索跳过: %s", exc)
         news_items = news_service.digest(6) if ai_cfg.inject_news else []

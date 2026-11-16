@@ -380,26 +380,53 @@ def test_p0_snapshot_drops_duplicate_bars_and_long_text():
     v1 = format_snapshot(ctx)
     assert '"_bars"' not in v1
     assert v1.count('"recent_bars_ohlc"') == 1
-    # 心法 rule 长文本 / 新闻长标题都被裁掉，条数也压缩
-    assert "禁止顺势追多" not in v1
-    assert v1.count('"sentiment"') == 3  # 新闻 6 条 → 3 条
-    assert v1.count('"health"') == 4     # 心法 8 条 → 4 条
-    assert len(v1) < 1200
+    # 心法 rule 现在有效注入（每条截断 120 字），但超长文本仍被裁掉，条数压缩
+    assert '"rule"' in v1                       # 心法正文真正参与分析（新行为）
+    assert v1.count("禁止顺势追多") < 8 * 6     # 每条从 6 连重复被截断，未全量注入
+    assert v1.count('"sentiment"') == 3         # 新闻 6 条 → 3 条
+    assert v1.count('"health"') == 4            # 心法 8 条 → 4 条
+    assert len(v1) < 2400                       # 含中文 rule 后上限放宽，但仍受控
     assert not re.search(r"[\u4e00-\u9fff]", json.dumps(cleaned))
 
 
 def test_v2_snapshot_is_much_smaller_than_v1():
-    import re
-
     from nanoquant.ai.compact import format_snapshot_v2
     from nanoquant.ai.prompts import format_snapshot
 
     ctx = _ai_ctx()
     v1, v2 = format_snapshot(ctx), format_snapshot_v2(ctx)
-    assert len(v2) < len(v1) * 0.6
+    assert len(v2) < len(v1) * 0.9       # 心法带中文 rule 后 v2 变大，但仍比 v1 紧凑
     assert '"_bars"' not in v2 and '"features"' not in v2
     assert '"k"' in v2 and '"s":"ARBUSDT"' in v2
-    assert not re.search(r"[\u4e00-\u9fff]", v2)  # 输入全 ASCII
+    # 心法以紧凑数组注入：t=标题 r=去数值规则 h=健康度，且限 3 条
+    assert '"t":[{' in v2 and '"r"' in v2
+    assert v2.count('"h":0.82') == 3     # 8 条 → 截断到 3 条
+
+
+def test_mantra_rule_strips_only_leverage_numbers():
+    from nanoquant.evolution.mantra import strip_leverage_hint
+
+    # 杠杆倍数被剥离
+    assert "30x" not in strip_leverage_hint("信号强时可用 30x 杠杆")
+    assert "20倍" not in strip_leverage_hint("用 20倍杠杆进场")
+    # 分析性数值（R / 百分比 / ATR）保留，不能一刀切
+    assert "2%" in strip_leverage_hint("仓位用 5x 杠杆，止损 2%")
+    assert "ATR" in strip_leverage_hint("回踩 1.5 ATR 且不破 EMA21")
+
+
+def test_mantras_effective_into_both_protocols_without_leverage_hint():
+    from nanoquant.ai.compact import format_snapshot_v2
+    from nanoquant.ai.prompts import format_snapshot
+
+    ctx = _ai_ctx()
+    ctx["mantras"] = [
+        {"title": "超买不追多", "rule": "RSI 高于 80 时用 30x 杠杆顺势追多，止损 2%", "health": 0.9}
+    ]
+    v1, v2 = format_snapshot(ctx), format_snapshot_v2(ctx)
+    # 两份协议都带上了心法内容与角色字段（杠杆剥离由 worker 层的 injection_payload 负责）
+    assert '"rule"' in v1 and '"r"' in v2
+    assert "RSI" in v2 and "RSI" in v1
+    assert '"health"' in v1 and '"h"' in v2
 
 
 def test_v2_output_is_translated_to_chinese():
@@ -2576,7 +2603,10 @@ def test_ai_prompt_exposes_global_leverage_bounds_and_omits_mantra_rules(monkeyp
         sig, ticker, account, EngineSettings(),
         RiskSettings(default_leverage=20, max_leverage=100), filters,
     )
-    assert all("rule" not in m for m in ctx["mantras"])
+    # 心法正文有效注入，但杠杆倍数被剥离（防止模型照抄历史数值覆盖风控钳制）
+    assert ctx["mantras"] and "rule" in ctx["mantras"][0]
+    assert "30x" not in ctx["mantras"][0]["rule"]
+    assert "杠杆(按风控区间)" in ctx["mantras"][0]["rule"]
     assert "30x" not in format_snapshot(ctx)
     assert ctx["constraints"]["min_leverage"] == 20
     assert ctx["constraints"]["max_leverage"] == 100

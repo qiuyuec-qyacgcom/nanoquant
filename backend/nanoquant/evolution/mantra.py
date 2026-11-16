@@ -169,8 +169,23 @@ def rank_lessons(limit: int | None = None) -> list[dict[str, Any]]:
         return [serialize(r, cfg.ttl_days) for _, r in scored[:limit]]
 
 
+#: 心法正文里可能出现的杠杆倍数写法。宿主已按全局上下限钳制杠杆，
+#: 模型照抄这类历史数值反而会把已经钳好的杠杆带偏，故注入前统一剥离。
+#: 只匹配「N倍/Nx」且上下文是杠杆的表述，不动 R / ATR / 百分比等分析性数值。
+_LEVERAGE_HINT_RE = re.compile(
+    r"(?:杠杆|leverage)\s*[:：]?\s*\d{1,3}\s*(?:倍|[xX×])?"
+    r"|\d{1,3}\s*(?:倍|[xX×])\s*(?:杠杆|leverage)",
+    re.I,
+)
+
+
+def strip_leverage_hint(rule: str) -> str:
+    """剥离心法正文里的杠杆倍数建议，替换成中性提示；其余数值原样保留。"""
+    return _LEVERAGE_HINT_RE.sub("杠杆(按风控区间)", rule or "")
+
+
 def injection() -> tuple[str, list[dict[str, Any]]]:
-    """返回 (注入文本, 注入明细)."""
+    """返回 (注入文本, 注入明细). 面板披露用，保留原始规则全文。"""
     cfg = get_evolution()
     if cfg.max_injected <= 0:
         return "", []
@@ -186,6 +201,30 @@ def injection() -> tuple[str, list[dict[str, Any]]]:
         for m in lessons
     ]
     return "\n".join(lines), detail
+
+
+def injection_payload() -> tuple[list[dict[str, Any]], list[int]]:
+    """给 AI 决策上下文用的结构化心法：带角色标签、去杠杆数值。
+
+    与 ``injection()`` 的区别：面板要展示规则全文（可审计），prompt 只要
+    「标题 + 去数值化规则 + 健康度」——两者用途不同，不能互相替代。
+    """
+    cfg = get_evolution()
+    if cfg.max_injected <= 0:
+        return [], []
+    lessons = rank_lessons()
+    if not lessons:
+        return [], []
+    items = [
+        {
+            "title": str(m.get("title") or "")[:24],
+            "rule": strip_leverage_hint(str(m.get("rule") or ""))[:200],
+            "category": m.get("category", "entry"),
+            "health": round(float(m.get("health") or 0), 2),
+        }
+        for m in lessons
+    ]
+    return items, [int(m["id"]) for m in lessons if m.get("id")]
 
 
 def injection_report() -> dict[str, Any]:

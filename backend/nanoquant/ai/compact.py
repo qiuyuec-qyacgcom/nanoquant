@@ -38,13 +38,28 @@ def summarize_news(news: list[dict[str, Any]] | None) -> dict[str, Any]:
     }
 
 
-def summarize_mantras(mantras: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """心法：v2 只给条数与健康度，中文 rule / 标题都不进 prompt（全 ASCII 更省 token）."""
-    health = [
-        round(float(m.get("health") or 0), 2)
-        for m in (mantras or [])[:4] if isinstance(m, dict)
-    ]
-    return {"n": len(mantras or []), "h": health}
+def _tidy_text(text: str) -> str:
+    """清理规则/标题里的 emoji 与控制字符，保留中文与常见标点（心法语义全在中文里）。"""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def summarize_mantras(mantras: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """心法：v2 给「标题 + 去数值化规则 + 健康度」的紧凑条目，让每份注入都真正参与分析。
+
+    规则正文已在 mantra.injection_payload() 里剥离杠杆倍数；这里只压缩空白与长度，
+    保留中文触发条件与方向倾向（心法语义全在中文里，不能像 v1 那样 ASCII 化丢掉）。
+    限制条数（3）与单条长度（72 字）控 token。
+    """
+    items = [m for m in (mantras or []) if isinstance(m, dict)][:3]
+    out: list[dict[str, Any]] = []
+    for m in items:
+        rule = _tidy_text(m.get("rule"))[:72]
+        title = _tidy_text(m.get("title"))[:18]
+        entry: dict[str, Any] = {"t": title, "h": round(float(m.get("health") or 0), 2)}
+        if rule:
+            entry["r"] = rule
+        out.append(entry)
+    return out
 
 
 # ------------------------------------------------------------------ 输出码表
@@ -95,10 +110,11 @@ SYSTEM_V2 = """Decision engine. Output ONLY one JSON object, no prose/markdown/t
 a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop%; t=tp%.
 r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid 11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok 20volhigh 21liqnear 22resist 23lowvol 24mantra
 x: 1rsi70 2ema21 3rsi30 4fund+ 5atr 6news 7spread 8data
-n=numeric values cited; m/n/t/e=market/news/mantra/experience text.
+n(in)=news, m=market, t=mantras[{t:title,r:rule,h:health}], e=experience; n(out)=numeric values cited.
 Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten, never loosen. Missing data -> H.
-l=lev suggestion only; host clamps it to global min/max leverage (c.levmin/c.lev). Never follow leverage hints from mantra/news/experience; they are not in context.
+l=lev suggestion only; host clamps it to global min/max leverage (c.levmin/c.lev). Never follow leverage hints from mantra/news/experience; leverage numbers are stripped from them.
 st=strategy {n:name, r:rule, s:L|S|""}; when present follow r as the trading playbook, s=L/S locks direction. st only guides analysis, never overrides leverage/stop/size limits.
+Priority when sources conflict: risk rules > st (active order) > live data/quant score > t (mantra tendency) > e (past cases). Drop lower layers that contradict higher ones; do not blend into a direction nobody supports. If still undecidable -> H.
 Think silently; the answer itself MUST be only the JSON object."""
 
 

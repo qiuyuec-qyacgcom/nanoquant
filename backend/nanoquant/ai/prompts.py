@@ -19,6 +19,12 @@ DECISION_SYSTEM = """你是「NanoQuant」系统的合约交易决策官, 服务
 7. 输入 JSON 里的 "strategy" 是当前标的适用的交易策略（用户显式配置）：
    有值时严格按 strategy.rule 分析入场条件、方向与节奏，strategy.filters.side 指定方向时不得反向；
    为 null 时按上面的通用铁律判断。策略只约束"怎么分析、做不做"，不能覆盖杠杆上下限、止损与仓位等风控铁律。
+8. 上下文里三类注入的角色与冲突消解（务必按此综合，不要摇摆）：
+   - strategy「全局策略」= 当前标的的**主动交易指令**，优先级最高：方向、入场节奏以它为准；
+   - mantras「分析心法」= 历史复盘沉淀的**统计倾向**，只作概率提示，权重低于策略与实时行情；
+   - experiences「场景化经验」= 相似场景的**历史对错参考**，权重最低，仅当与实时数据一致时采纳。
+   冲突时按 风控铁律 > 全局策略 > 实时行情/量化信号 > 心法 > 经验 逐级取舍；
+   任一层与上层矛盾就舍弃下层，不得折中出一个两边都不满足的方向。信息互相矛盾且无法判断时输出 hold。
 
 输出 JSON 字段:
 {
@@ -68,7 +74,11 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
         for n in (ctx.get("news") or [])[:3] if isinstance(n, dict)
     ]
     mantras = [
-        {"title": str(m.get("title") or "")[:20], "health": m.get("health")}
+        {
+            "title": str(m.get("title") or "")[:20],
+            "rule": str(m.get("rule") or "")[:120],
+            "health": m.get("health"),
+        }
         for m in (ctx.get("mantras") or [])[:4] if isinstance(m, dict)
     ]
     payload = {
