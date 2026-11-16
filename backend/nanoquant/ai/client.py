@@ -392,6 +392,14 @@ def output_problem(text: str, finish: str, max_tokens: int) -> str:
     返回空串表示输出可用；否则是可直接展示给用户的中文原因。
     """
     if finish == "length":
+        # 小预算探针（32/48）被截断不意味着正式决策也不够：
+        # 提示按预算大小分流，避免误导用户去改供应商设置。
+        if max_tokens < 512:
+            return (
+                f"输出被 max_tokens={max_tokens} 截断 (finish_reason=length)；"
+                "该探针预算偏小，推理模型光思考就会耗尽——"
+                "请升级到最新版（诊断探针已放宽到 4096），或改用非推理模型/关闭思考"
+            )
         return (
             f"输出被 max_tokens={max_tokens} 截断 (finish_reason=length)；"
             "请把供应商 max_tokens 提到 3000+，或改用非推理模型/关闭思考"

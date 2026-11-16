@@ -34,12 +34,15 @@ async def diagnose(provider_id: int, deep: bool = True) -> dict[str, Any]:
     checks.append(_check("模型", bool(provider.model), provider.model or "未填写模型名"))
 
     if deep:
+        # 推理模型（deepseek-r1 / v4-pro 等）会先输出很长的 thinking 再给正文，
+        # 探针以前给 32 tokens，思考没结束就被截断 → 永远报「基础对话失败」。
+        # 诊断探针不是省钱场景，给足预算只为验证连通与正常输出。
         started = time.perf_counter()
         result = await ai_client.chat(
-            [{"role": "user", "content": "只回答两个字: 正常"}],
+            [{"role": "user", "content": "请直接回答两个字：正常。不要展开分析。"}],
             provider=provider,
             purpose="diagnose",
-            max_tokens=32,
+            max_tokens=4096,
             temperature=0,
             json_mode=False,
             retries=0,
@@ -58,10 +61,10 @@ async def diagnose(provider_id: int, deep: bool = True) -> dict[str, Any]:
         if result.ok:
             json_started = time.perf_counter()
             json_result = await ai_client.chat(
-                [{"role": "user", "content": '输出 JSON: {"ok":true}'}],
+                [{"role": "user", "content": '只输出这个 JSON，不要任何其他文字：{"ok":true}'}],
                 provider=provider,
                 purpose="diagnose",
-                max_tokens=48,
+                max_tokens=4096,  # 同上：推理模型思考过程也吃预算
                 temperature=0,
                 json_mode=True,
                 retries=0,
