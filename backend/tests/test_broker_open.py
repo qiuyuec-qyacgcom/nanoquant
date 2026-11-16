@@ -285,8 +285,10 @@ def test_unfilled_resting_order_does_not_create_phantom_position(monkeypatch):
 
     out = _open()
 
+    # pending=True：委托已提交、仅等待成交，**不是失败**（调用方据此不报 error）
     assert out.ok is False
-    assert "尚未成交" in out.message
+    assert out.pending is True
+    assert "等待成交" in out.message and "失败" not in out.message
     with session_scope() as s:
         assert s.query(PositionRecord).filter(PositionRecord.symbol == SYMBOL).count() == 0, "不能写幽灵仓"
         order = s.query(OrderRecord).filter(OrderRecord.symbol == SYMBOL).one()

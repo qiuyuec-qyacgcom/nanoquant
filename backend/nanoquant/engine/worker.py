@@ -2129,6 +2129,16 @@ class TradingEngine:
         if not res.ok:
             # 成交前失败 → 归还预留额度；成交后保留到下一轮 begin_cycle
             await self._margin.settle(rid, opened=False)
+            if res.pending:
+                # 挂单已提交、仅等待成交：不是失败。记为 info，避免误导与误告警。
+                # 成交后由 _reconcile_live 接管仓位，止损止盈已预挂在交易所。
+                self._update_signal_reject(signal_id, f"挂单待成交: {res.message}"[:200])
+                events.record(
+                    "info", "trade",
+                    f"{sig.symbol} {direction} 挂单已提交，等待成交；止损止盈已预挂"[:250],
+                    {"symbol": sig.symbol, "side": direction, "order_id": res.order_id},
+                )
+                return
             # broker 的错误文案已带「下单失败 N:」，不要拼成「下单失败: 下单失败 N:」
             detail = res.message if res.message.startswith("下单失败") else f"下单失败: {res.message}"
             self._update_signal_reject(signal_id, detail[:200])

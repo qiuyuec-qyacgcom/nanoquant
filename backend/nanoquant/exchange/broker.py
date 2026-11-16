@@ -267,6 +267,10 @@ class ExecResult:
     message: str = ""
     order_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    #: 挂单已提交但尚未成交（NEW / 部分成交）。这不是失败：
+    #: 委托在交易所挂着、保护单已预挂，成交后由对账接管。
+    #: 调用方据此避免把「等待成交」误报成 error 级「开仓失败」。
+    pending: bool = False
 
 
 class Broker(Protocol):
@@ -507,13 +511,15 @@ class BinanceBroker:
                         message=f"下单未成交（{status_txt}），订单已记录但未建仓",
                         order_id=str(resp.get("orderId", "")),
                     )
+                # pending=True：委托在交易所挂着，**不是失败**。调用方不应报 error。
                 return ExecResult(
                     False,
                     message=(
-                        f"挂单已提交但尚未成交（{status_txt or 'NEW'}），本轮不记账；"
-                        "成交后由交易所对账接管并套用已挂好的止损止盈"
+                        f"挂单已提交，等待成交（{status_txt or 'NEW'}）；"
+                        "止损止盈已预挂，成交后自动生效并由对账接管仓位"
                     ),
                     order_id=str(resp.get("orderId", "")),
+                    pending=True,
                 )
             avg = float(resp.get("avgPrice", 0) or 0)
             if avg <= 0:
