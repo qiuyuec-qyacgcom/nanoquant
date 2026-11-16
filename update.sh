@@ -18,20 +18,49 @@ warn() { printf "${C_WARN}[注意]${C_RESET} %s\n" "$*"; }
 die()  { printf "${C_ERR}[失败]${C_RESET} %s\n" "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1. 定位已部署仓库
+# 优先级：显式环境变量 > 当前目录 > systemd unit 里的 WorkingDirectory（最可靠）> 常见路径 > 浅层搜索
 ROOT=""
+is_repo() { [[ -d "$1/.git" && -d "$1/backend" ]]; }
+
 if [[ -n "${NANOQUANT_HOME:-}" ]]; then
   ROOT="$NANOQUANT_HOME"
-elif [[ -d .git && -d backend ]]; then
+elif is_repo "$(pwd)"; then
   ROOT="$(pwd)"
-elif [[ -d "$HOME/nanoquant/.git" ]]; then
-  ROOT="$HOME/nanoquant"
-elif [[ -d /root/nanoquant/.git ]]; then
-  ROOT=/root/nanoquant
+else
+  # systemd unit 里写了 WorkingDirectory=/实际/路径，直接读出来最准
+  for _unit in /etc/systemd/system/nanoquant.service /lib/systemd/system/nanoquant.service \
+               /usr/lib/systemd/system/nanoquant.service; do
+    [[ -f "$_unit" ]] || continue
+    _wd="$(sed -n 's/^[[:space:]]*WorkingDirectory[[:space:]]*=[[:space:]]*//p' "$_unit" | head -1)"
+    if [[ -n "$_wd" ]] && is_repo "$_wd"; then ROOT="$_wd"; break; fi
+  done
+  # 常见安装路径
+  if [[ -z "$ROOT" ]]; then
+    for _p in "$HOME/nanoquant" /root/nanoquant /opt/nanoquant /srv/nanoquant \
+              /data/nanoquant /var/www/nanoquant /usr/local/nanoquant; do
+      if is_repo "$_p"; then ROOT="$_p"; break; fi
+    done
+  fi
+  # 最后兜底：限定深度搜一下（别扫整个文件系统）
+  if [[ -z "$ROOT" ]]; then
+    for _base in "$HOME" /root /opt /srv /data /var/www /usr/local; do
+      [[ -d "$_base" ]] || continue
+      while IFS= read -r _d; do
+        if is_repo "$_d"; then ROOT="$_d"; break 2; fi
+      done < <(find "$_base" -maxdepth 3 -type d -name nanoquant 2>/dev/null)
+    done
+  fi
 fi
 
-[[ -n "$ROOT" && -d "$ROOT/.git" ]] || die "找不到已部署的 nanoquant 仓库。
-请进入仓库目录再执行，或指定路径：
-  NANOQUANT_HOME=/你的/路径 bash <(curl -sSL .../update.sh)"
+if ! is_repo "$ROOT"; then
+  echo
+  echo "找不到已部署的 nanoquant 仓库。请先执行下面这条命令找到路径：" >&2
+  echo "  find / -maxdepth 5 -type d -name nanoquant 2>/dev/null" >&2
+  echo >&2
+  echo "找到后（假设是 /xxx/nanoquant），再执行：" >&2
+  echo "  NANOQUANT_HOME=/xxx/nanoquant bash <(curl -sSL https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/update.sh)" >&2
+  exit 1
+fi
 
 cd "$ROOT"
 info "已定位仓库: $ROOT"
