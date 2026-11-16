@@ -382,6 +382,33 @@ class TradingEngine:
         state.set("cycle_timings", __import__("json").dumps(timings))
         return {"signals": len(signals), "equity": round(account.equity, 6)}
 
+    @staticmethod
+    def _recent_entry_order(symbol: str, mode: str, lookback_sec: int = 6 * 3600) -> bool:
+        """该标的近期是否有**本系统**下的入场委托（用于区分「我们挂单成交」与「手动外部仓位」）。
+
+        有 → 成交后应由系统自动补挂保护单（挂单阶段无持仓，预挂常被交易所拒绝）；
+        无 → 视为手动外部仓位，只在 `auto_protect_external` 开启时补挂。
+        """
+        from ..models import OrderRecord
+
+        since = int(time.time()) - lookback_sec
+        try:
+            with session_scope() as s:
+                return (
+                    s.query(OrderRecord)
+                    .filter(
+                        OrderRecord.symbol == symbol,
+                        OrderRecord.mode == mode,
+                        OrderRecord.ts >= since,
+                        OrderRecord.purpose == "entry",
+                        OrderRecord.client_order_id != "",
+                    )
+                    .first()
+                    is not None
+                )
+        except Exception:  # noqa: BLE001  查不到就当外部仓位，走保守路径
+            return False
+
     async def _reconcile_live(self, broker: Broker) -> None:
         mode = normalize_mode(getattr(broker, "mode", get_engine().mode))
         try:
@@ -402,12 +429,43 @@ class TradingEngine:
         for symbol, vp in venue_map.items():
             if symbol not in local_map:
                 sl, tp = await self._algo_sl_tp(symbol)
+                ours = self._recent_entry_order(symbol, mode)
                 record_external_position(
                     symbol, vp.side, vp.qty, vp.entry_price, vp.mark_price, vp.leverage, mode,
                     unrealized=vp.unrealized, sl_price=sl, tp_price=tp,
                 )
-                events.record("warn", "engine", f"发现交易所外部仓位 {symbol} {vp.side} {vp.qty}", {"symbol": symbol})
+                reason = "本系统挂单已成交，已接管入账" if ours else "外部/手动仓位，已接管入账"
+                events.record(
+                    "warn", "engine",
+                    f"{symbol} 发现交易所仓位 {vp.side} {vp.qty}（{reason}）",
+                    {"symbol": symbol, "qty": vp.qty, "mode": mode, "ours": ours},
+                )
                 if sl <= 0 and tp <= 0:
+                    if ours:
+                        # 本系统挂单成交：保护单在挂单阶段可能因无持仓被拒，
+                        # 成交后必须由系统自己补上，否则就是裸奔。
+                        with session_scope() as s:
+                            row = (
+                                s.query(PositionRecord)
+                                .filter(
+                                    PositionRecord.symbol == symbol,
+                                    PositionRecord.status == "open",
+                                    PositionRecord.mode == mode,
+                                )
+                                .first()
+                            )
+                            pid = row.id if row else 0
+                        if pid:
+                            outcome = await self.protect_position(
+                                pid, reason="挂单成交后自动补挂"
+                            )
+                            if not outcome.get("ok"):
+                                events.record(
+                                    "error", "engine",
+                                    f"{symbol} 挂单成交后补挂保护单失败: {outcome.get('reason')}",
+                                    {"symbol": symbol, "position_id": pid},
+                                )
+                            continue
                     # 裸仓：手动开仓常常没挂保护单，系统只"看到 0"不会替你挂。
                     # 默认只告警（auto_protect_external=False），需要时一键补挂。
                     events.record(

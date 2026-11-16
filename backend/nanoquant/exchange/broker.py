@@ -499,12 +499,32 @@ class BinanceBroker:
             # 现在的取舍：不记账、只记委托；保护单照挂（成交后立即生效），
             # 成交后由 `_reconcile_live` 以「外部仓位」身份接管，保护价从交易所条件单回填。
             if filled_qty <= 0:
+                # 把计划保护价写进委托 raw：成交后 `_reconcile_live` 接管仓位时
+                # 要按这个价补挂（否则只能按 ATR 重算，和原计划不一致）。
+                order_fields["raw"] = {
+                    **(order_fields.get("raw") or {}),
+                    "plan_sl": sl_price,
+                    "plan_tp": tp_price,
+                }
                 db_writer.submit(_persist_order, order_fields)
                 _ledger_notify(cid, symbol, order_fields["status"])
+                # 预挂保护单：交易所对无持仓的 closePosition 单常会拒绝，
+                # 失败**必须上报**（以前只写 log，用户完全看不到）。
+                protect_errors: list[str] = []
                 try:
-                    await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
+                    protect_errors = await self._place_protection(
+                        symbol, side, sl_price, tp_price, filters, dual=dual
+                    )
                 except Exception as exc:  # noqa: BLE001  保护单失败不能吞掉「委托已提交」这个事实
+                    protect_errors = [f"{type(exc).__name__}: {exc}"[:120]]
                     log.warning("挂单未成交时预挂保护单失败 %s: %s", symbol, exc)
+                if protect_errors:
+                    events.record(
+                        "warn", "trade",
+                        f"{symbol} 挂单已提交，但保护单预挂失败（{protect_errors[0][:80]}）；"
+                        "成交后需补挂，否则仓位裸奔",
+                        {"symbol": symbol, "order_id": cid, "errors": protect_errors},
+                    )
                 if status_txt in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
                     return ExecResult(
                         False,
@@ -569,11 +589,28 @@ class BinanceBroker:
             # P3-5：把「已成交」投递给 sidecar 台账（后台 fire-and-forget，不影响下单）
             _ledger_notify(cid, symbol, order_fields["status"], filled_qty, avg)
             t_protect = time.perf_counter()
-            await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
+            protect_errors = await self._place_protection(
+                symbol, side, sl_price, tp_price, filters, dual=dual
+            )
             stage["protect_ms"] = (time.perf_counter() - t_protect) * 1000
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
             label = "实盘" if self.mode == "live" else "模拟盘"
+            if protect_errors:
+                # 已成交但保护单没挂上 = 裸仓，必须让用户看到，不能只留日志
+                events.record(
+                    "error", "trade",
+                    f"{symbol} 已开仓但保护单挂单失败（{protect_errors[0][:80]}），仓位暂无止损保护",
+                    {"symbol": symbol, "errors": protect_errors},
+                )
+                return ExecResult(
+                    True,
+                    price=avg,
+                    qty=filled_qty,
+                    order_id=str(resp.get("orderId", "")),
+                    message=f"{label}开仓成功，但保护单失败: {protect_errors[0][:60]}",
+                    raw=resp,
+                )
             return ExecResult(True, price=avg, qty=filled_qty, order_id=str(resp.get("orderId", "")), message=f"{label}开仓成功", raw=resp)
         except NoCredentials as exc:
             return ExecResult(False, message=str(exc))
@@ -721,21 +758,29 @@ class BinanceBroker:
         filters: Any = None,
         *,
         dual: bool = False,
-    ) -> None:
+    ) -> list[str]:
+        """挂止损/止盈保护单，返回**失败项**列表（空 = 全部成功）。
+
+        以前这里把失败只写进 `log.warning`，调用方完全不知道保护单没挂上——
+        挂单入场时交易所还没有持仓，`closePosition=true` 的条件单常被拒，
+        结果就是「仓位裸奔但没人知道」。现在把失败返回给调用方上报事件。
+        """
         close_side = "SELL" if side == "long" else "BUY"
         # 双向持仓：closePosition 需配合 positionSide 指明平哪一侧；不能用 reduceOnly
         side_params = hedge_order_params(dual, side, closing=True) if dual else {}
         #: P3-3 对账用：本地构造的 (kind, trigger_price, query)，不参与发送
         local_legs: list[tuple[str, str, str, str]] = []
+        failures: list[str] = []
 
         def _fmt(price: float) -> str:
             if isinstance(filters, SymbolFilters) and filters.price_tick > 0:
                 return filters.format_price(price)
             return f"{price:.8f}".rstrip("0").rstrip(".")
 
-        async def place(kind: str, price: float) -> None:
+        async def place(kind: str, price: float) -> str:
+            """返回空串表示成功，否则返回失败原因。"""
             if price <= 0:
-                return
+                return ""
             px = _fmt(price)
             # 币安已要求 closePosition 类条件单走 Algo 接口(-4120), 老接口仅作回落
             algo_params = {
@@ -774,8 +819,11 @@ class BinanceBroker:
                         await binance_client.client.place_order(**legacy)
                     except BinanceError as exc2:
                         log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc2)
+                        return f"{kind}: {exc2.message}"
                 else:
                     log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc)
+                    return f"{kind}: {exc.message}"
+            return ""
 
         # P3-3 收尾：优先尝试 sidecar 代发（双重闸门：本开关 + sidecar EXEC_PLACE_MODE）
         # 结果未知时**绝不回退重发**，否则可能重复挂保护单。
@@ -787,11 +835,14 @@ class BinanceBroker:
             side_params=side_params,
             fmt=_fmt,
         ):
-            return
+            return failures
 
         # 止损与止盈是两笔独立的 reduce-only 单, 并行发出:
         # 串行会让开仓关键路径多背一个 RTT, 直接体现在下单 p99 上.
-        await asyncio.gather(place("STOP_MARKET", sl_price), place("TAKE_PROFIT_MARKET", tp_price))
+        results = await asyncio.gather(
+            place("STOP_MARKET", sl_price), place("TAKE_PROFIT_MARKET", tp_price)
+        )
+        failures = [r for r in results if r]
         # P3-3：把本地构造交给 sidecar 并行重算并逐字节对账（只比对，不影响已发出的单）
         try:
             from ..services.order_ledger import order_ledger
@@ -813,6 +864,7 @@ class BinanceBroker:
                 )
         except Exception:  # noqa: BLE001  对账失败绝不影响保护单
             log.debug("保护单对账投递失败(已忽略)", exc_info=True)
+        return failures
 
     async def _try_sidecar_protection(
         self,
