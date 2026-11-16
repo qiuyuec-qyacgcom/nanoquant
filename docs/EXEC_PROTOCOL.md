@@ -34,6 +34,26 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `order_snapshot` | — | `order` | P3-2：全量台账 + 按状态统计 + `duplicate_hits` |
 | `protection_plan` | `symbol` / `close_side` / `stop_price` / `take_price` / `position_side?` / `stop_client_id?` / `take_client_id?` | `protections` | P3-3：并行构造 STOP+TP 两笔保护单的 query+签名，**只构造不发送** |
 | `store_status` | — | `store` | P3-4：台账落库统计（pending/written/batches/dropped/errors） |
+| `protection_place` | 同 `protection_plan` + `api_key` | `protections`[] | P3-3 收尾：**真正代发**保护单（需 `EXEC_PLACE_MODE=enabled`）|
+
+### 3.4 保护单代发闸门（P3-3 收尾）
+
+**双重闸门**，缺一不发：
+
+| 闸门 | 位置 | 默认 |
+|---|---|---|
+| `system.exec_place_protection` | 参数配置 → 系统 | `false` |
+| `EXEC_PLACE_MODE=enabled` | sidecar 环境变量 | 未设置（拒绝） |
+
+失败语义（决定能否回退 Python 重发）：
+
+| 结果 | 含义 | 能否回退重发 |
+|---|---|---|
+| `ok=true` | 交易所已受理 | 已发出，**不得再发** |
+| `ok=false, unknown=false` | 明确拒绝（4xx / 缺 Key / 未启用） | ✅ 可安全回退 |
+| `ok=false, unknown=true` | 超时 / 5xx / 429 / 连接中断 | ❌ **禁止重发**（可能已挂上），记 error 事件 |
+
+> `unknown=true` 时会写一条 error 事件，提示用交易所持仓/挂单人工核对。
 
 ### 3.3 台账落库（P3-4）
 

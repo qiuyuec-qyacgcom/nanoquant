@@ -192,6 +192,14 @@ mod tests {
         assert!(req.query.ends_with("clientAlgoId=np9&positionSide=SHORT"));
     }
 
+    #[test]
+    fn signature_urlencode_is_strict() {
+        // Python: quote(sig, safe='') —— '+' '/=' 都必须编码
+        let raw = "ab+/=Z";
+        let got = crate::http::urlencode_component_for_test(raw);
+        assert_eq!(got, "ab%2B%2F%3DZ");
+    }
+
     #[tokio::test]
     async fn pair_is_built_in_parallel() {
         let signer = Signer::detect("secret");

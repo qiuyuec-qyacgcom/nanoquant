@@ -64,7 +64,16 @@ class OrderLedger:
         }
         self.last_error = ""
         #: P3-3：保护单构造对账（sidecar 并行构造 vs Python 本地构造）
-        self.protect_counts = {"matched": 0, "mismatched": 0, "errors": 0, "skipped": 0}
+        self.protect_counts = {
+            "matched": 0,
+            "mismatched": 0,
+            "errors": 0,
+            "skipped": 0,
+            # P3-3 收尾：sidecar 真代发的统计
+            "placed": 0,
+            "place_failed": 0,
+            "place_unknown": 0,
+        }
         self.last_protect_mismatch: dict[str, Any] | None = None
 
     @staticmethod
@@ -86,6 +95,22 @@ class OrderLedger:
 
     def enabled(self) -> bool:
         return self._mode_of() in {"shadow", "enforce"}
+
+    def place_enabled(self) -> bool:
+        """P3-3 收尾：是否由 sidecar 代发保护单。
+
+        双重闸门：Python 侧 `system.exec_place_protection=True`
+        **且** sidecar 侧 `EXEC_PLACE_MODE=enabled`（由 sidecar 拒绝兜底）。
+        另需 sidecar 处于 shadow/enforce（即已接入）。
+        """
+        if not self.enabled():
+            return False
+        try:
+            from .settings import get_system
+
+            return bool(getattr(get_system(), "exec_place_protection", False))
+        except Exception:  # noqa: BLE001  读不到配置一律按关闭处理
+            return False
 
     def reset(self) -> None:
         self.counts = {
@@ -167,6 +192,60 @@ class OrderLedger:
             self.counts["duplicates"] += 1
             return
         self._spawn(self._do_observe(cid, symbol, st, filled_qty, avg_price))
+
+    async def place_protection(
+        self,
+        *,
+        symbol: str,
+        close_side: str,
+        stop_price: str,
+        take_price: str,
+        api_key: str,
+        position_side: str = "",
+        stop_client_id: str = "",
+        take_client_id: str = "",
+    ) -> dict[str, Any]:
+        """P3-3 收尾：让 sidecar 代发保护单。
+
+        **同步调用**（不是 fire-and-forget）：调用方需要明确的成功/未知结果来决定
+        是否回退 Python 发单。任何异常都转成 `{"ok": False, "unknown": False}`，
+        让调用方安全回退；只有 `unknown=True` 时禁止回退。
+        """
+        if not self.enabled():
+            return {"ok": False, "unknown": False, "reason": "ledger_disabled"}
+        if time.monotonic() < self._down_until:
+            return {"ok": False, "unknown": False, "reason": "cooldown"}
+        try:
+            res = await self._client.protection_place(
+                symbol=symbol,
+                close_side=close_side,
+                stop_price=stop_price,
+                take_price=take_price,
+                api_key=api_key,
+                position_side=position_side,
+                stop_client_id=stop_client_id,
+                take_client_id=take_client_id,
+            )
+            if res.get("unknown"):
+                self.protect_counts["place_unknown"] += 1
+                self.last_error = "sidecar 代发结果未知"
+            elif res.get("ok"):
+                self.protect_counts["placed"] += 1
+                self.last_error = ""
+            else:
+                self.protect_counts["place_failed"] += 1
+            return res
+        except ExecSidecarError as exc:
+            self.protect_counts["place_failed"] += 1
+            self.last_error = str(exc)[:200]
+            if not getattr(self._client, "connected", False):
+                self._down_until = time.monotonic() + DOWN_COOLDOWN
+            # sidecar 明确不可用（连接失败/超时）→ 允许回退 Python 发单
+            return {"ok": False, "unknown": False, "reason": self.last_error}
+        except Exception as exc:  # noqa: BLE001
+            self.protect_counts["place_failed"] += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+            return {"ok": False, "unknown": False, "reason": self.last_error}
 
     def observe_protection(
         self,

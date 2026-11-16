@@ -415,6 +415,12 @@ class SystemSettings(BaseModel):
     exec_socket: str = Field(default="", description="留空读 EXEC_SOCKET 环境变量; unix:/path 或 tcp:host:port")
     exec_sample_pct: int = Field(default=100, ge=1, le=100, description="影子比对抽样比例%")
     exec_timeout_ms: int = Field(default=500, ge=50, le=5000, description="单次比对超时")
+    #: P3-3 收尾：是否允许 sidecar **真正代发**保护单。
+    #: 默认 False——代发会改变生产发单路径，需人工确认后再开；
+    #: 同时 sidecar 侧还需 EXEC_PLACE_MODE=enabled（双重闸门，防止只改一侧就生效）。
+    exec_place_protection: bool = Field(
+        default=False, description="允许 sidecar 代发保护单（需 sidecar 侧 EXEC_PLACE_MODE=enabled）"
+    )
     api_rate_limit_per_min: int = Field(
         default=0, ge=0, le=10000, description="每 IP 每分钟 API 请求上限, 0=关闭（防爆破/刷接口）"
     )

@@ -216,6 +216,39 @@ class ExecSidecar:
         legs = resp.get("protections") or []
         return legs if isinstance(legs, list) else []
 
+    async def protection_place(
+        self,
+        *,
+        symbol: str,
+        close_side: str,
+        stop_price: str,
+        take_price: str,
+        api_key: str,
+        position_side: str = "",
+        stop_client_id: str = "",
+        take_client_id: str = "",
+    ) -> dict[str, Any]:
+        """P3-3 收尾：让 sidecar **真正下发**保护单（需 sidecar 侧 `EXEC_PLACE_MODE=enabled`）。
+
+        返回 `{"ok": bool, "unknown": bool, "results": [...]}`：
+        `unknown=True` 表示结果未知，**调用方绝不能回退重发**。
+        """
+        resp = await self.request(
+            "protection_place",
+            symbol=symbol,
+            close_side=close_side,
+            stop_price=stop_price,
+            take_price=take_price,
+            api_key=api_key,
+            position_side=position_side,
+            stop_client_id=stop_client_id,
+            take_client_id=take_client_id,
+        )
+        results = resp.get("protections") or []
+        legs = results if isinstance(results, list) else []
+        unknown = any(isinstance(x, dict) and x.get("unknown") for x in legs)
+        return {"ok": bool(resp.get("ok")), "unknown": unknown, "results": legs}
+
     async def close(self) -> None:
         writer = self._writer
         self._drop()

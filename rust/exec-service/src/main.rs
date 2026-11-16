@@ -248,6 +248,94 @@ async fn dispatch(
             resp.query = Some(req.query);
             resp
         }
+        // P3-3 收尾：真正下发保护单（**默认关闭**，需 EXEC_PLACE_MODE=enabled）
+        "protection_place" => {
+            let mode = std::env::var("EXEC_PLACE_MODE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if mode != "enabled" {
+                return Response::err(
+                    &req.id,
+                    format!("sidecar 代发未启用（EXEC_PLACE_MODE={mode:?}，需 enabled）"),
+                );
+            }
+            if req.symbol.trim().is_empty() || req.close_side.trim().is_empty() {
+                return Response::err(&req.id, "symbol / close_side 不能为空");
+            }
+            let ps = req.position_side.trim();
+            let position_side = if ps.is_empty() { None } else { Some(ps) };
+            let stop_id = if req.stop_client_id.trim().is_empty() {
+                "np_stop".to_string()
+            } else {
+                req.stop_client_id.trim().to_string()
+            };
+            let take_id = if req.take_client_id.trim().is_empty() {
+                "np_take".to_string()
+            } else {
+                req.take_client_id.trim().to_string()
+            };
+            let (stop_req, take_req) = build_pair(
+                signer,
+                LegSpec {
+                    symbol: &req.symbol,
+                    close_side: &req.close_side,
+                    kind: ProtectKind::StopMarket,
+                    trigger_price: &req.stop_price,
+                    client_algo_id: &stop_id,
+                    position_side,
+                },
+                LegSpec {
+                    symbol: &req.symbol,
+                    close_side: &req.close_side,
+                    kind: ProtectKind::TakeProfitMarket,
+                    trigger_price: &req.take_price,
+                    client_algo_id: &take_id,
+                    position_side,
+                },
+            )
+            .await;
+
+            // 两笔并行发送；任一「结果未知」都必须如实上报，调用方禁止重发
+            let (sr, tr) = tokio::join!(
+                http.post_signed("/fapi/v1/algoOrder", &stop_req.query, &stop_req.signature, &req.api_key),
+                http.post_signed("/fapi/v1/algoOrder", &take_req.query, &take_req.signature, &req.api_key)
+            );
+            let mut results = Vec::new();
+            let mut unknown = false;
+            let mut failed = false;
+            for (kind, r) in [("STOP_MARKET", sr), ("TAKE_PROFIT_MARKET", tr)] {
+                match r {
+                    Ok(body) => results.push(serde_json::json!({
+                        "kind": kind, "ok": true, "unknown": false, "body": body
+                    })),
+                    Err(exc) => {
+                        if exc.is_unknown() {
+                            unknown = true;
+                        } else {
+                            failed = true;
+                        }
+                        results.push(serde_json::json!({
+                            "kind": kind, "ok": false,
+                            "unknown": exc.is_unknown(),
+                            "error": exc.message()
+                        }));
+                    }
+                }
+            }
+            let mut resp = Response::ok(&req.id);
+            if unknown || failed {
+                resp.ok = false;
+                // unknown=true 时调用方**不得**回退重发
+                resp.error = Some(if unknown {
+                    "保护单结果未知（禁止重发）；请用交易所持仓/挂单核对".to_string()
+                } else {
+                    "保护单被交易所拒绝".to_string()
+                });
+            }
+            resp.protections = Some(serde_json::json!(results));
+            resp
+        }
         // P3-1：只读探活连接池（GET /fapi/v1/time），不签名、不下单
         "probe" => {
             let mut resp = Response::ok(&req.id);

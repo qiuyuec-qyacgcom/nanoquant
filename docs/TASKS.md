@@ -1365,6 +1365,24 @@
   - 端到端：4 笔写入 `errors=0 / dropped=0`，SQLite 落盘正确（`nqA` upsert 到 `FILLED 0.02 @74000.5`，3 单 + 4 条历史）；**重启后 total=4 数据留存**，新单可继续追加。
   - `pytest tests -q` → **499 passed**（Python 侧无改动，无回归）。
 
+### 98. P3-3 收尾：sidecar 代发保护单（双重闸门 + 结果未知禁止重发）
+- **状态**：✅ 已完成（默认关闭，需人工开启）
+- **背景**：P3-3 已做到「构造与 Python 逐字节一致」。这一步把发单权真正交给 sidecar，但这是**改变生产发单路径**，必须可灰度、可回退、不能重复挂单。
+- **过程要点**：
+  - `http.rs` 新增 `post_signed`：POST 已签名请求，返回三态 `Ok / PlaceError::Rejected / PlaceError::Unknown`；**`unknown` 与 `rejected` 严格区分**（5xx/429/超时/断连 = 未知）。
+  - 签名二次 URL 编码（`quote(sig, safe='')` 对齐）。
+  - 新 op `protection_place`：并行下发 STOP+TP，任一 unknown 即整体 `ok=false` 并标注。
+  - **双重闸门**：sidecar `EXEC_PLACE_MODE=enabled` + Python `system.exec_place_protection`（默认 `false`）。
+  - Python `order_ledger.place_protection()`（同步、非 fire-and-forget，调用方需要结果决定是否回退）；`broker._try_sidecar_protection()` 三态处理：
+    - 成功 → **不再本地发**
+    - 明确失败 → 安全回退 Python
+    - **未知 → 记 error 事件并阻止回退**（宁可少挂不可重挂）
+- **验证**：
+  - `cargo test --release` → **22 passed**（新增签名编码用例）。
+  - E2E 闸门：未设置 / `off` → 拒绝「未启用」；`enabled` 但无 API Key → **明确拒绝且 `unknown=false`**（可安全回退）。
+  - `pytest tests -q` → **505 passed**（新增 `tests/test_protection_place.py` 6 条）。
+  - `vue-tsc --noEmit` 0 error（前端新增开关字段）。
+
 ---
 
 ## 二、未开始
@@ -1380,8 +1398,9 @@
   - **P3-5**：`services/order_ledger.py`（Python 投递 + shadow 对账），见 TASKS #95。
   - **P3-3**：`src/protection.rs`（保护单并行构造 + 逐字节对账），见 TASKS #96。
   - **P3-4**：`src/store.rs`（单写线程 + 批量事务，先只落 sidecar 自有台账），见 TASKS #97。
+  - **P3-3 收尾**：`protection_place` 代发（双重闸门，默认关闭），见 TASKS #98。
 - **待办**：
-  - P3-3 收尾：保护单由 sidecar 代发（需先积累一段 `protect_counts.mismatched == 0`）。
+  - 开启代发前：先积累一段 `protect_counts.mismatched == 0`，再置 `exec_place_protection=true` + `EXEC_PLACE_MODE=enabled`。
   - P3-4 收尾：Python 主表写权迁到 Rust（需先让 sidecar 台账成为权威源，风险最高，需灰度）。
   - P3-5 收尾：把 sidecar 台账从「shadow 对账」提升为权威源（需先积累一段对账无差异样本）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。

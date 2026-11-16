@@ -720,15 +720,17 @@ class BinanceBroker:
         # 双向持仓：closePosition 需配合 positionSide 指明平哪一侧；不能用 reduceOnly
         side_params = hedge_order_params(dual, side, closing=True) if dual else {}
         #: P3-3 对账用：本地构造的 (kind, trigger_price, query)，不参与发送
-        local_legs: list[tuple[str, str, str]] = []
+        local_legs: list[tuple[str, str, str, str]] = []
+
+        def _fmt(price: float) -> str:
+            if isinstance(filters, SymbolFilters) and filters.price_tick > 0:
+                return filters.format_price(price)
+            return f"{price:.8f}".rstrip("0").rstrip(".")
 
         async def place(kind: str, price: float) -> None:
             if price <= 0:
                 return
-            if isinstance(filters, SymbolFilters) and filters.price_tick > 0:
-                px = filters.format_price(price)
-            else:
-                px = f"{price:.8f}".rstrip("0").rstrip(".")
+            px = _fmt(price)
             # 币安已要求 closePosition 类条件单走 Algo 接口(-4120), 老接口仅作回落
             algo_params = {
                 "algoType": "CONDITIONAL",
@@ -769,6 +771,18 @@ class BinanceBroker:
                 else:
                     log.warning("挂保护单 %s %s 失败: %s", symbol, kind, exc)
 
+        # P3-3 收尾：优先尝试 sidecar 代发（双重闸门：本开关 + sidecar EXEC_PLACE_MODE）
+        # 结果未知时**绝不回退重发**，否则可能重复挂保护单。
+        if await self._try_sidecar_protection(
+            symbol=symbol,
+            close_side=close_side,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            side_params=side_params,
+            fmt=_fmt,
+        ):
+            return
+
         # 止损与止盈是两笔独立的 reduce-only 单, 并行发出:
         # 串行会让开仓关键路径多背一个 RTT, 直接体现在下单 p99 上.
         await asyncio.gather(place("STOP_MARKET", sl_price), place("TAKE_PROFIT_MARKET", tp_price))
@@ -793,6 +807,61 @@ class BinanceBroker:
                 )
         except Exception:  # noqa: BLE001  对账失败绝不影响保护单
             log.debug("保护单对账投递失败(已忽略)", exc_info=True)
+
+    async def _try_sidecar_protection(
+        self,
+        *,
+        symbol: str,
+        close_side: str,
+        sl_price: float,
+        tp_price: float,
+        side_params: dict[str, str],
+        fmt: Any,
+    ) -> bool:
+        """P3-3 收尾：尝试由 sidecar 代发保护单。
+
+        返回值语义（决定调用方是否继续用 Python 发）：
+        - `True`  → sidecar 已成功发出（**调用方不得再发**）；
+        - `False` → 未启用 / sidecar 明确失败（**可以安全回退 Python 发单**）；
+        - 结果未知 → 记 error 事件并返回 `True`（**阻止重发**，宁可少挂不可重挂）。
+        """
+        try:
+            from ..services.order_ledger import order_ledger
+
+            if not order_ledger.place_enabled():
+                return False
+            key, _secret = binance_client.current_credentials()
+            if not key:
+                return False
+            res = await order_ledger.place_protection(
+                symbol=symbol,
+                close_side=close_side,
+                stop_price=fmt(sl_price) if sl_price > 0 else "",
+                take_price=fmt(tp_price) if tp_price > 0 else "",
+                api_key=key,
+                position_side=str(side_params.get("positionSide", "")) if side_params else "",
+                stop_client_id=new_client_order_id("np"),
+                take_client_id=new_client_order_id("np"),
+            )
+            if res.get("ok"):
+                log.info("保护单已由 sidecar 代发 %s %s", symbol, close_side)
+                return True
+            if res.get("unknown"):
+                # 关键：结果未知绝不能回退重发，否则可能挂出两套保护单
+                from ..services import events
+
+                events.record(
+                    "error",
+                    "exec",
+                    f"{symbol} 保护单由 sidecar 发出但结果未知，已阻止重发；"
+                    "请用交易所持仓/挂单核对后手工处理",
+                    {"symbol": symbol, "close_side": close_side, "detail": res.get("reason", "")},
+                )
+                return True
+            return False
+        except Exception:  # noqa: BLE001  代发通路异常一律回退 Python，不影响保护
+            log.warning("sidecar 代发保护单异常，回退 Python 发单", exc_info=True)
+            return False
 
     async def _resolve_entry(self, symbol: str, cid: str) -> dict | None:
         for _ in range(4):

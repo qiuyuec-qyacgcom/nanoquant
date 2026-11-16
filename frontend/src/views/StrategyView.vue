@@ -307,6 +307,10 @@ const BASE_META: Record<string, FieldMeta> = {
   exec_socket: { label: 'sidecar 地址', hint: 'unix:/run/nanoquant/exec.sock 或 tcp:127.0.0.1:9101；留空读 EXEC_SOCKET' },
   exec_sample_pct: { label: '比对抽样', unit: '%', hint: '下单高峰时可只比对一部分，enforce 模式建议 100' },
   exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为 Python 签名' },
+  exec_place_protection: {
+    label: '由 sidecar 代发保护单',
+    hint: '默认关闭。开启后止损/止盈由 Rust 直接下发（还需 sidecar 侧 EXEC_PLACE_MODE=enabled）；结果未知时阻止重发，避免重复挂单',
+  },
   api_rate_limit_per_min: {
     label: 'API 限频',
     unit: '次/分/IP',
@@ -458,7 +462,7 @@ const SECTIONS: Record<string, SectionDef[]> = {
     {
       title: '执行内核（sidecar）',
       hint: 'Rust sidecar 只签名不下单：shadow 旁路比对不影响下单，enforce 不一致直接拒绝下单；sidecar 不可用时自动降级为 Python 签名',
-      fields: ['exec_mode', 'exec_socket', 'exec_sample_pct', 'exec_timeout_ms'],
+      fields: ['exec_mode', 'exec_socket', 'exec_sample_pct', 'exec_timeout_ms', 'exec_place_protection'],
     },
     {
       title: '安全与观测',

@@ -133,8 +133,15 @@ exec-service/
    `EXEC_BASE_URL` 启用，`probe` op 可验证；6 个单测通过）；
 2. ✅ **已完成** 订单状态机（`src/order.rs`，幂等 `clientOrderId`，
    `order_register/transition/get/snapshot` 四个 op，7 个单测通过）；**只记账不发单**；
-3. 🚧 保护单并行（STOP + TP，Algo 接口）：**构造+签名已就绪并与 Python 逐字节一致**（`src/protection.rs`），代发留待下一阶段；
+3. ✅ 保护单并行（STOP + TP，Algo 接口）：构造+签名与 Python 逐字节一致（`src/protection.rs`），**代发已实现但默认关闭**（双重闸门）；
 4. ✅ **部分完成** 单写线程 + 批量事务落库（`src/store.rs`）：**先只落 sidecar 自己的台账**（独立库，不碰 Python 主表）。
+
+## P3-3 收尾已实现（保护单代发，默认关闭）
+
+- 新 op `protection_place`：真正 POST `/fapi/v1/algoOrder` 下发 STOP + TP 两笔。
+- **双重闸门**：`EXEC_PLACE_MODE=enabled`（sidecar 侧）+ `system.exec_place_protection=true`（Python 侧）。
+- **失败三分**：明确拒绝可回退；**结果未知（超时/5xx/429/断连）禁止重发**，Python 记 error 事件。
+- 签名二次 URL 编码（`+`→`%2B`），与 Python `quote(sig, safe='')` 一致。
 
 ## P3-4 已实现（台账落库：单写线程 + 批量事务）
 

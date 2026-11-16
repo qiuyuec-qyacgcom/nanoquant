@@ -72,6 +72,51 @@ pub struct HttpStatus {
     pub last_error: String,
 }
 
+/// 发单失败的两种语义（**绝不能混用**）。
+#[derive(Debug)]
+pub enum PlaceError {
+    /// 交易所明确拒绝：可安全回退/上报
+    Rejected(String),
+    /// 结果未知：**禁止重发**，否则可能重复下单
+    Unknown(String),
+}
+
+impl PlaceError {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Rejected(m) | Self::Unknown(m) => m,
+        }
+    }
+}
+
+/// 测试出口：与 Python `quote(signature, safe='')` 对齐的最小 URL 编码。
+#[cfg(test)]
+pub fn urlencode_component_for_test(raw: &str) -> String {
+    urlencode_component(raw)
+}
+
+/// 与 Python `quote(signature, safe='')` 对齐的最小 URL 编码。
+fn urlencode_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len() * 2);
+    for b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 pub struct HttpClient {
     inner: Option<reqwest::Client>,
     cfg: HttpConfig,
@@ -126,6 +171,73 @@ impl HttpClient {
         self.errors.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = msg;
+        }
+    }
+
+    /// P3-3 收尾：**真正发送**一笔已签名的 POST（仅 `EXEC_PLACE_MODE=enabled` 时被调用）。
+    ///
+    /// 返回值语义严格区分三种情形，调用方据此决定是否回退 Python：
+    /// - `Ok(body)`：交易所明确返回 2xx；
+    /// - `Err(PlaceError::Rejected(msg))`：交易所明确拒绝（4xx 带 code）→ 可安全回退/报错；
+    /// - `Err(PlaceError::Unknown(msg))`：**结果未知**（超时、连接中断、5xx）→
+    ///   **绝不能重发**，否则可能重复挂保护单。
+    pub async fn post_signed(
+        &self,
+        path: &str,
+        query: &str,
+        signature: &str,
+        api_key: &str,
+    ) -> Result<String, PlaceError> {
+        let Some(client) = self.inner.as_ref() else {
+            return Err(PlaceError::Rejected("连接池未启用（EXEC_BASE_URL 为空）".into()));
+        };
+        if api_key.trim().is_empty() {
+            return Err(PlaceError::Rejected("缺少 API Key".into()));
+        }
+        // 与 Python 一致：签名再做一次 URL 编码（base64 的 '+' 会被当空格）
+        let encoded_sig = urlencode_component(signature);
+        let url = format!(
+            "{}{}?{}&signature={}",
+            self.cfg.base_url, path, query, encoded_sig
+        );
+        let started = Instant::now();
+        let resp = client
+            .post(&url)
+            .header("X-MBX-APIKEY", api_key)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let elapsed = started.elapsed().as_millis() as u64;
+                if status.is_success() {
+                    self.ok.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut slot) = self.last_error.lock() {
+                        slot.clear();
+                    }
+                    let _ = elapsed;
+                    Ok(body)
+                } else {
+                    let msg = format!("HTTP {}: {}", status.as_u16(), body.chars().take(280).collect::<String>());
+                    // 5xx / 429 视作结果未知（可能已受理），4xx 视作明确拒绝
+                    let unknown = status.is_server_error() || status.as_u16() == 429;
+                    self.record_err(msg.clone());
+                    if unknown {
+                        Err(PlaceError::Unknown(msg))
+                    } else {
+                        Err(PlaceError::Rejected(msg))
+                    }
+                }
+            }
+            Err(exc) => {
+                // 超时/连接中断：请求可能已到达交易所 → 结果未知
+                let msg = format!("{exc}");
+                self.record_err(msg.clone());
+                Err(PlaceError::Unknown(msg))
+            }
         }
     }
 

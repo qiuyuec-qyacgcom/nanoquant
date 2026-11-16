@@ -43,6 +43,9 @@ pub struct Request {
     pub stop_client_id: String,
     #[serde(default)]
     pub take_client_id: String,
+    /// P3-3 收尾：发单用的 API Key（仅 protection_place 需要）
+    #[serde(default)]
+    pub api_key: String,
 }
 
 #[derive(Debug, Serialize)]
