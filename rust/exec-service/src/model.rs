@@ -6,11 +6,26 @@ use serde::{Deserialize, Serialize};
 pub struct Request {
     /// 请求 id，由调用方生成，原样回传
     pub id: String,
-    /// sign | plan | health
+    /// sign | plan | health | probe | order_register | order_transition | order_get | order_snapshot
     pub op: String,
     /// 待签名的 query string（不含 signature 本身）
     #[serde(default)]
     pub query: String,
+    /// P3-2：订单幂等键（币安 newClientOrderId）
+    #[serde(default)]
+    pub client_order_id: String,
+    /// P3-2：标的
+    #[serde(default)]
+    pub symbol: String,
+    /// P3-2：目标状态（迁移用），如 SENT / ACKED / FILLED
+    #[serde(default)]
+    pub state: String,
+    /// P3-2：累计成交量（可选）
+    #[serde(default)]
+    pub filled_qty: Option<f64>,
+    /// P3-2：成交均价（可选）
+    #[serde(default)]
+    pub avg_price: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -30,6 +45,12 @@ pub struct Response {
     /// probe 成功时的往返耗时（毫秒）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// P3-2：订单台账（register/transition/get/snapshot 回传）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<serde_json::Value>,
+    /// P3-2：register 是否命中去重（幂等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -44,6 +65,8 @@ impl Response {
             query: None,
             http: None,
             latency_ms: None,
+            order: None,
+            duplicate: None,
             error: None,
         }
     }
@@ -57,6 +80,8 @@ impl Response {
             query: None,
             http: None,
             latency_ms: None,
+            order: None,
+            duplicate: None,
             error: Some(msg.into()),
         }
     }

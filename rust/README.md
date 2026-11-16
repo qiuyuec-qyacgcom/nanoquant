@@ -111,6 +111,7 @@ exec-service/
     ├── main.rs    UDS/TCP 监听、JSON Lines 分发
     ├── model.rs   请求/响应结构
     ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
+    ├── order.rs   P3-2 订单状态机（幂等 clientOrderId，Planned→Filled）
     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
 ```
 
@@ -128,9 +129,20 @@ exec-service/
 
 1. ✅ **已完成** 接入 `reqwest`（rustls）做 HTTP/2 连接池 + 启动预热（`src/http.rs`，
    `EXEC_BASE_URL` 启用，`probe` op 可验证；6 个单测通过）；
-2. 订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`；
+2. ✅ **已完成** 订单状态机（`src/order.rs`，幂等 `clientOrderId`，
+   `order_register/transition/get/snapshot` 四个 op，7 个单测通过）；**只记账不发单**；
 3. 保护单并行下发（STOP + TP），参数走 Algo 接口；
 4. 落库改由 Rust 单写线程组提交，Python 只读。
+
+## P3-2 已实现（订单状态机）
+
+- `src/order.rs`：`PLANNED → SENT → ACKED → PARTIALLY_FILLED → FILLED`，
+  终态 `FILLED/CANCELED/EXPIRED/REJECTED` 与 `services/order_sync.py::TERMINAL` 同口径。
+- 幂等：同一 `client_order_id` 重复登记返回原记录 + `duplicate=true`，不产生重复台账。
+- 严格迁移：终态回退、跨级跳（`PLANNED → FILLED`）一律拒绝并返回可读原因。
+- `filled_qty` 只增不减；`avg_price` 仅接受 >0；`history` 记录每次迁移时间戳。
+- 实测（回环 TCP）：complete 生命周期 + 幂等 + 两条非法迁移均按预期拒绝，
+  订单操作后签名向量仍为 `c5bee7ef...`。
 
 ## P3-1 已实现（连接池）
 

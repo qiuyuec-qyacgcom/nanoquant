@@ -1311,6 +1311,19 @@
   - Python 侧 `pytest -k 'sidecar or exec'` → **9 passed**；`scripts/verify_sidecar.py` 自起 mock → 通过。
 - **未做**：VPS 上尚未重新 `cargo build --release` 并重启 `nanoquant-exec`（本次产物在 Windows 验证）。
 
+### 94. P3-2：Rust 订单状态机（幂等 clientOrderId）
+- **状态**：✅ 已完成
+- **背景**：Python 侧 `services/order_sync.py` 只是「按需查询交易所补台账」，没有本地权威状态。P3-2 在 sidecar 建幂等订单台账，为 P3-3 保护单并行、P3-4 单写落库铺路。**本阶段不发单**。
+- **过程要点**：
+  - 新增 `rust/exec-service/src/order.rs`：状态 `PLANNED → SENT → ACKED → PARTIALLY_FILLED → FILLED`；终态 `FILLED/CANCELED/EXPIRED/REJECTED` 与 `order_sync.py::TERMINAL` **同口径**。
+  - **幂等**：同一 `client_order_id` 重复 register 返回原记录 + `duplicate=true`，不新增；`duplicate_hits` 计数可观测。
+  - **严格迁移**：终态回退、跨级跳（`PLANNED → FILLED`）、未知订单一律 `ok:false` 且带可读原因；`filled_qty` 只增不减、`avg_price` 仅 >0 生效；`history` 记录每次迁移时间戳。
+  - 协议新增 4 个 op：`order_register / order_transition / order_get / order_snapshot`；`Request` 增可选字段 `client_order_id / symbol / state / filled_qty / avg_price`，`Response` 增 `order / duplicate`（**全部可选，旧调用方零改动**）。
+  - 台账用 `tokio::sync::Mutex<OrderBook>` 跨连接共享，进程内唯一权威。
+- **验证**：
+  - `cargo test --release` → **13 passed**（3 签名向量 + 3 连接池 + 7 订单状态机）。
+  - 真实回环冒烟：完整生命周期 → `FILLED`（`avg_price=73800.5`、`terminal=true`）；重复 register `dup=true`；终态回退与跨级跳均正确拒绝；`snapshot` = `{FILLED:1, PLANNED:1}, dup_hits=1`；**订单操作后签名仍为 `c5bee7ef...`**（与签名路径隔离）。
+
 ---
 
 ## 二、未开始
@@ -1322,10 +1335,11 @@
   - `verify_sidecar.py --target unix:/run/nanoquant/exec.sock` 真比对通过；面板自检一致。
   - `exec_mode` 切到 `enforce`，`一致 22 / 不一致 0 / 失败 0 / 跳过 0`，p99 1.17ms。
   - **P3-1**：`src/http.rs`（reqwest+rustls HTTP/2 连接池 + 启动预热 + `probe` op），见 TASKS #93。
+  - **P3-2**：`src/order.rs`（幂等订单状态机 + 4 个 op），见 TASKS #94。
 - **待办**：
-  - P3-2：订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`。
   - P3-3：保护单并行下发（STOP + TP，走 Algo 接口）。
   - P3-4：落库改由 Rust 单写线程组提交，Python 只读。
+  - P3-5（新增，P3-2 的收尾）：Python 侧把订单生命周期投递给 sidecar（`order_register/transition`），先在 shadow 对账、一致后再作为权威台账。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
 - **VPS 踩坑记录**（已确认，供复盘）：
   - `exec.env` 的 `EXEC_SECRET` 若带尖括号 `<...>`：systemd 会把括号当值的一部分 → sidecar 与 Python 签名不一致；且 shell `source` 会因 `<` 触发重定向语法错误。

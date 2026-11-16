@@ -28,8 +28,26 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `health` | — | `algo` / `http` | 探活，返回当前密钥类型与连接池状态（`http` 可忽略） |
 | `plan` / `sign` | `query` | `signature` / `algo` / `query` | **只签名，不发单**（影子模式） |
 | `probe` | — | `latency_ms` / `http` | P3-1：只读探活连接池（`GET {base}/fapi/v1/time`），不签名、不下单 |
+| `order_register` | `client_order_id` / `symbol` / `state?` | `order` / `duplicate` | P3-2：幂等登记订单（重复登记返回原记录、`duplicate=true`） |
+| `order_transition` | `client_order_id` / `state` / `filled_qty?` / `avg_price?` | `order` | P3-2：状态迁移，非法迁移 / 终态回退一律 `ok:false` |
+| `order_get` | `client_order_id` | `order` | P3-2：查询单笔台账 |
+| `order_snapshot` | — | `order` | P3-2：全量台账 + 按状态统计 + `duplicate_hits` |
 
 错误响应：`{"id":"...","ok":false,"error":"..."}`，调用方应视为失败而非重试。
+
+### 3.2 订单状态机（P3-2）
+
+状态：`PLANNED → SENT → ACKED → PARTIALLY_FILLED → FILLED`。
+
+| 约束 | 说明 |
+|---|---|
+| 幂等 | 同一 `client_order_id` 重复 `order_register` 不新增记录，返回 `duplicate=true` |
+| 终态 | `FILLED / CANCELED / EXPIRED / REJECTED` 不可再迁移 |
+| 禁跨级 | `PLANNED → FILLED` 之类无成交过程的跳转被拒（异常数据） |
+| 累计量 | `filled_qty` 只增不减；`avg_price` 仅接受 >0 |
+| 别名 | `NEW→ACKED`、`CANCELLED→CANCELED`、`TRADE→FILLED` 等交易所口径可解析 |
+
+> 本阶段**只记账不发单**；终态集合与 `services/order_sync.py::TERMINAL` 保持一致。
 
 ### 3.1 连接池环境变量（P3-1，均可选）
 
