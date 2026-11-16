@@ -55,19 +55,26 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    /// 读取配置。**缺 EXEC_SECRET 时返回 None 而不是 panic**：
+    /// systemd unit 是 `Restart=always`，panic 会让服务无限重启刷日志；
+    /// 调用方改为打印一条明确提示后以配置错误码退出（配合 `ExecCondition` 更好）。
+    fn from_env() -> Option<Self> {
+        let secret = std::env::var("EXEC_SECRET").unwrap_or_default();
+        if secret.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
             socket: std::env::var("EXEC_SOCKET")
                 .unwrap_or_else(|_| "/tmp/nanoquant-exec.sock".into())
                 .into(),
-            secret: std::env::var("EXEC_SECRET").expect("EXEC_SECRET 未设置"),
+            secret,
             tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
             http: http::HttpConfig::from_env(),
             ledger_path: std::env::var("EXEC_LEDGER_DB")
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
-        }
+        })
     }
 }
 
@@ -358,7 +365,15 @@ async fn dispatch(
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let cfg = Config::from_env();
+    let Some(cfg) = Config::from_env() else {
+        // 退出码 78 = EX_CONFIG（与 systemd 约定一致）：让 Restart=always 别无限重试。
+        // 安装脚本据此提示「在面板填好 API Key 后执行 setup_sidecar.sh --from-settings」。
+        eprintln!(
+            "exec-service: EXEC_SECRET 未配置，服务不启动。\n\
+             请先填好交易所 API 凭证，再执行：sudo bash scripts/setup_sidecar.sh --from-settings"
+        );
+        std::process::exit(78);
+    };
     let signer = Arc::new(Signer::detect(&cfg.secret));
     let http = Arc::new(HttpClient::new(cfg.http.clone()));
     // P3-2：订单台账（跨连接共享，进程内唯一权威）
