@@ -180,3 +180,144 @@ def test_admission_survives_symbol_without_trading_rules(monkeypatch):
     assert item["tradeable"] is False
     assert item["reason"] == "缺少交易规则或行情"
     assert item["min_notional"] is None
+
+
+def _patch_admission_cfg(monkeypatch, *, risk, engine=None):
+    """admission.evaluate() 直接读全局配置，测试用 monkeypatch 固定口径。"""
+    monkeypatch.setattr(
+        admission, "get_risk",
+        lambda: SimpleNamespace(
+            margin_pct=risk["margin_pct"], default_leverage=risk["default_leverage"],
+            max_leverage=risk["max_leverage"], risk_per_trade_pct=risk["risk_per_trade_pct"],
+            min_equity_usdt=0.0, min_notional_buffer=1.05, consecutive_loss_limit=5,
+        ),
+    )
+    monkeypatch.setattr(
+        admission, "get_engine",
+        lambda: engine or SimpleNamespace(mode="demo", enabled=True, max_positions=3, trading_windows=[]),
+    )
+    monkeypatch.setattr(
+        admission, "get_data",
+        lambda: SimpleNamespace(
+            demo_api_key_enc="x", demo_api_secret_enc="y",
+            live_api_key_enc="", live_api_secret_enc="",
+        ),
+    )
+    monkeypatch.setattr(admission, "get_ai", lambda: SimpleNamespace(enabled=False))
+    monkeypatch.setattr(
+        admission, "get_strategy",
+        lambda: SimpleNamespace(timeframe="5m", entry_threshold=60),
+    )
+
+
+def test_admission_suggests_higher_leverage_when_default_too_small(monkeypatch):
+    """复现真实场景: 权益 14.78U、默认 1x、可分配 5.47，ICP 类标的需 7.73 名义额。
+
+    旧逻辑按默认杠杆判一次就输出"不可开仓"；但 20x 下保证金只要 0.39 U，
+    真实开仓链路允许把杠杆提到全局上限——体检必须把这个可行路径算出来。
+    """
+    symbol = "ADMLEVUSDT"
+    with session_scope() as s:
+        if s.get(TradingSymbol, symbol) is None:
+            s.add(
+                TradingSymbol(
+                    symbol=symbol, enabled=True, max_leverage=20, precision=4,
+                    tick_sz="0.0001", min_sz="0.1", min_notional=7.73, sort_order=902,
+                )
+            )
+    _patch_admission_cfg(
+        monkeypatch,
+        risk=dict(margin_pct=37.0, default_leverage=1, max_leverage=20, risk_per_trade_pct=2.0),
+    )
+
+    class _Broker:
+        async def account(self):
+            return SimpleNamespace(equity=14.78, available=14.78)
+
+    class _Filters:
+        max_leverage = 20
+        qty_step = 0.1
+
+        def effective_min_notional(self, price: float) -> float:
+            return 7.73
+
+        def effective_min_qty(self, price: float) -> float:
+            return 4.0
+
+        def validate(self, qty: float, price: float):
+            return True, ""
+
+    async def _tickers(symbols):
+        return {s: SimpleNamespace(last=2.455, change_pct=0.0, quote_volume=1e8) for s in symbols}
+
+    monkeypatch.setattr(admission, "get_broker", lambda mode: _Broker())
+    monkeypatch.setattr(admission, "decrypt_secret", lambda cipher: "configured")
+    monkeypatch.setattr(admission.binance_client, "tickers", _tickers)
+    monkeypatch.setattr(admission.symbol_service, "filters_for", lambda s: _Filters())
+
+    try:
+        out = asyncio.run(admission.evaluate())
+    finally:
+        with session_scope() as s:
+            row = s.get(TradingSymbol, symbol)
+            if row is not None:
+                s.delete(row)
+    row = next(x for x in out["symbols"] if x["symbol"] == symbol)
+    assert row["tradeable"] is True, row["reason"]
+    assert row["leverage_used"] == 1            # 默认杠杆没动
+    assert 2 <= row["suggested_leverage"] <= 20  # 给出可达的建议杠杆
+    assert row["qty_if_open"] > 0
+
+
+def test_admission_flags_risk_budget_too_small_when_leverage_cannot_help(monkeypatch):
+    """风险预算（与杠杆无关）低于最小名义额时，提示必须指向风险参数而非杠杆。"""
+    symbol = "ADMRISKUSDT"
+    with session_scope() as s:
+        if s.get(TradingSymbol, symbol) is None:
+            s.add(
+                TradingSymbol(
+                    symbol=symbol, enabled=True, max_leverage=20, precision=4,
+                    tick_sz="0.0001", min_sz="0.1", min_notional=7.73, sort_order=903,
+                )
+            )
+    _patch_admission_cfg(
+        monkeypatch,
+        risk=dict(margin_pct=37.0, default_leverage=1, max_leverage=20, risk_per_trade_pct=0.1),
+    )
+
+    class _Broker:
+        async def account(self):
+            return SimpleNamespace(equity=14.78, available=14.78)
+
+    class _Filters:
+        max_leverage = 20
+        qty_step = 0.1
+
+        def effective_min_notional(self, price: float) -> float:
+            return 7.73
+
+        def effective_min_qty(self, price: float) -> float:
+            return 4.0
+
+        def validate(self, qty: float, price: float):
+            return True, ""
+
+    async def _tickers(symbols):
+        return {s: SimpleNamespace(last=2.455, change_pct=0.0, quote_volume=1e8) for s in symbols}
+
+    monkeypatch.setattr(admission, "get_broker", lambda mode: _Broker())
+    monkeypatch.setattr(admission, "decrypt_secret", lambda cipher: "configured")
+    monkeypatch.setattr(admission.binance_client, "tickers", _tickers)
+    monkeypatch.setattr(admission.symbol_service, "filters_for", lambda s: _Filters())
+
+    try:
+        out = asyncio.run(admission.evaluate())
+    finally:
+        with session_scope() as s:
+            row = s.get(TradingSymbol, symbol)
+            if row is not None:
+                s.delete(row)
+    row = next(x for x in out["symbols"] if x["symbol"] == symbol)
+    assert row["tradeable"] is False
+    assert "风险预算不足" in row["reason"]
+    assert row["suggested_leverage"] == 0

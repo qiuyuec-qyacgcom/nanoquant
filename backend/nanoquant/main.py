@@ -151,26 +151,40 @@ def _import_installer_credentials() -> None:
     prefix = "live" if env == "live" else "demo"
     api_key = str(payload.get("api_key") or "").strip()
     api_secret = str(payload.get("api_secret") or "").strip()
-    try:
-        if api_key and api_secret:
-            from .security import encrypt_secret
-
-            update_group(
-                "data",
-                {
-                    f"{prefix}_api_key_enc": encrypt_secret(api_key),
-                    f"{prefix}_api_secret_enc": encrypt_secret(api_secret),
-                },
-            )
-            log.warning("已按安装参数写入 %s 环境交易所凭证（明文文件随即删除）", prefix)
-            events.record("warn", "system", f"已按安装参数写入 {prefix} 环境交易所凭证")
-    except Exception as exc:  # noqa: BLE001  导入失败不能挡住启动
-        log.warning("安装期凭证入库失败（请手动在面板填写）: %s", exc)
-    finally:
+    if not (api_key and api_secret):
+        # 空文件没有导入价值：删掉，避免每次启动都空跑一遍
         try:
             cred_file.unlink()
-        except OSError as exc:
-            log.warning("安装期凭证文件删除失败（请手动删除 %s）: %s", cred_file, exc)
+        except OSError:
+            pass
+        return
+    imported = False
+    try:
+        from .security import encrypt_secret
+
+        update_group(
+            "data",
+            {
+                f"{prefix}_api_key_enc": encrypt_secret(api_key),
+                f"{prefix}_api_secret_enc": encrypt_secret(api_secret),
+            },
+        )
+        imported = True
+        log.warning("已按安装参数写入 %s 环境交易所凭证（明文文件随即删除）", prefix)
+        events.record("warn", "system", f"已按安装参数写入 {prefix} 环境交易所凭证")
+    except Exception as exc:  # noqa: BLE001  导入失败不能挡住启动
+        # 失败时保留文件（0600 明文），下次启动自动重试；成功才删除。
+        # 之前"无论成败都删"的做法会把一次性的安装期凭证永久丢掉。
+        log.warning(
+            "安装期凭证入库失败（文件已保留，下次启动重试；也可在面板手动填写后删除 %s）: %s",
+            cred_file.name, exc,
+        )
+    finally:
+        if imported:
+            try:
+                cred_file.unlink()
+            except OSError as exc:
+                log.warning("安装期凭证文件删除失败（请手动删除 %s）: %s", cred_file, exc)
 
 
 async def _journal_loop() -> None:

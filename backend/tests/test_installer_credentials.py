@@ -80,3 +80,17 @@ def test_partial_credentials_skip_write(cred_file, monkeypatch):
     main_mod._import_installer_credentials()
     assert not captured, "缺字段时不得写入空凭证"
     assert not cred_file.exists()
+
+
+def test_import_failure_keeps_file_for_retry(cred_file, monkeypatch):
+    """入库失败时必须保留文件供下次启动重试——曾经"无论成败都删"，
+    一次性的安装期凭证会被永久丢掉，用户只能在面板再填一遍。"""
+    def _boom(group, patch):
+        raise RuntimeError("db not ready")
+
+    monkeypatch.setattr(main_mod, "update_group", _boom)
+    _write(cred_file, {"env": "demo", "api_key": "KEY123", "api_secret": "SECRET456"})
+
+    main_mod._import_installer_credentials()  # 不得抛异常
+
+    assert cred_file.exists(), "入库失败时明文文件应保留（0600），下次启动重试"

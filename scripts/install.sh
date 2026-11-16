@@ -564,17 +564,25 @@ fi
 ok "已暂存初始密码（首次启动写入数据库后自动删除）"
 ok "运行目录就绪（data/ logs/ data/backups/）"
 
-# ---------------------------------------------------------------- Rust 内核：凭证落盘
-# 两处都要写：
-#   1) data/.exchange_credentials —— 主服务首次启动时加密入库（省得再手动填面板）
-#   2) /etc/nanoquant/exec.env   —— sidecar 的 EXEC_SECRET（与交易所 Secret 同一把）
-if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
+# ---------------------------------------------------------------- 凭证落盘
+# 凭证有两个去向，且条件不同（这是曾经的 bug：把它们绑在同一个 if 里，
+# Rust 编译失败回退 Python 时凭证直接被丢弃，用户还得在面板再填一遍）：
+#   1) data/.exchange_credentials —— 主服务首次启动时加密入库。
+#      只要用户填了凭证就**必须**落盘，与 sidecar 编译成败无关：
+#      凭证是交易所接入的配置，不是 sidecar 的附属品。
+#   2) /etc/nanoquant/exec.env —— sidecar 的 EXEC_SECRET（与交易所 Secret 同一把）。
+#      只在 sidecar 二进制真正装好时写；编译失败时写了也没人读。
+CRED_FILLED=0
+if [[ "$KERNEL" == "rust" || "$SIDECAR_OK" == "1" ]] && [[ -n "$SIDECAR_API_KEY" && -n "$SIDECAR_API_SECRET" ]]; then
+  CRED_FILLED=1
   umask 077
   printf '{"env":"%s","api_key":"%s","api_secret":"%s"}\n' \
-    "$SIDECAR_ENV" "$SIDECAR_API_KEY" "$SIDECAR_API_SECRET" > "$ROOT/data/.exchange_credentials"
+    "${SIDECAR_ENV:-demo}" "$SIDECAR_API_KEY" "$SIDECAR_API_SECRET" > "$ROOT/data/.exchange_credentials"
   chmod 600 "$ROOT/data/.exchange_credentials" 2>/dev/null || true
   ok "已暂存交易所凭证（首次启动加密入库后自动删除）"
+fi
 
+if [[ "$SIDECAR_OK" == "1" && "$CRED_FILLED" == "1" ]]; then
   mkdir -p /etc/nanoquant
   install -m 600 -o root -g root /dev/null /etc/nanoquant/exec.env
   printf 'EXEC_SECRET=%s\n' "$SIDECAR_API_SECRET" > /etc/nanoquant/exec.env
@@ -590,6 +598,10 @@ if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
   umask 022
   ok "已写入 /etc/nanoquant/exec.env（0600，含 EXEC_SECRET / EXEC_API_KEY）"
 fi
+if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" != "1" && "$CRED_FILLED" == "1" ]]; then
+  warn "sidecar 编译失败已回退 Python 内核；你填的凭证仍会在首次启动时入库，无需在面板重填"
+fi
+umask 022
 
 # ---------------------------------------------------------------- systemd
 stage "阶段 6/8 · 服务注册与启动"

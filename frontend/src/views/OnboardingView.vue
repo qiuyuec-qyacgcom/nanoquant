@@ -27,6 +27,8 @@ interface SymbolRow {
   max_leverage_used: number
   required_margin_at_max: number
   allocatable_notional: number
+  /** 默认杠杆开不了、提杠杆能开时的建议杠杆（0 = 不需要/无法提杠杆） */
+  suggested_leverage: number
   qty_if_open: number
   notional_if_open: number
 }
@@ -216,7 +218,12 @@ onMounted(load)
                 <td class="mono">{{ fmt(s.allocatable_notional, 2) }}</td>
                 <td class="mono">{{ s.qty_if_open || '—' }}</td>
                 <td style="white-space: normal; max-width: 220px">
-                  <span class="tag" :class="s.tradeable ? 'tag-long' : 'tag-warn'">{{ s.tradeable ? '可开仓' : '不可开仓' }}</span>
+                  <span class="tag" :class="s.tradeable ? 'tag-long' : 'tag-warn'">
+                    {{ s.tradeable ? (s.suggested_leverage > s.leverage_used ? `可开仓 (需 ≥${s.suggested_leverage}x)` : '可开仓') : '不可开仓' }}
+                  </span>
+                  <div v-if="s.tradeable && s.suggested_leverage > s.leverage_used" class="hint" style="margin-top: 4px">
+                    默认 {{ s.leverage_used }}x 保证金不够；把杠杆提到 ≥{{ s.suggested_leverage }}x（上限 {{ s.max_leverage_used }}x）即可满足最小名义额
+                  </div>
                   <div v-if="!s.tradeable" class="hint" style="margin-top: 4px">{{ s.reason }}</div>
                 </td>
               </tr>

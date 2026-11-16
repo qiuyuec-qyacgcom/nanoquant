@@ -7,11 +7,12 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from ..ai.client import providers_available
 from ..db import session_scope
-from ..exchange.broker import estimate_qty, get_broker, min_notional_buffer
+from ..exchange.broker import MARGIN_SAFETY, estimate_qty, get_broker, min_notional_buffer
 from ..exchange.client import BinanceError, NoCredentials
 from ..exchange.client import client as binance_client
 from ..logging_setup import get_logger
@@ -212,17 +213,63 @@ async def evaluate() -> dict[str, Any]:
                     "min_notional": None,
                     "leverage_used": 0,
                     "required_margin": 0.0,
+                    "suggested_leverage": 0,
                 }
             )
             continue
         # 与真实开仓一致：杠杆下限/上限取全局风控，交易所上限更低时以交易所为准
         lev_upper = max(1, min(int(risk_cfg.max_leverage), int(filters.max_leverage or 100), 100))
         leverage = max(1, min(int(risk_cfg.default_leverage), lev_upper))
+        # 体检的止损距离与引擎风险预算口径一致（0.5%）
+        sl_pct_check = 0.005
+        need = filters.effective_min_notional(ticker.last) * min_notional_buffer(risk_cfg)
         qty, note = estimate_qty(
-            equity, ticker.last, leverage, risk_cfg, 0.005, filters,
+            equity, ticker.last, leverage, risk_cfg, sl_pct_check, filters,
             # 账户接口不可用时不要把"可用 0"误判成余额不足
             available=available if account else None,
         )
+        suggested_leverage = 0
+        if qty <= 0:
+            # 先区分「杠杆能救」和「杠杆救不了」两类不足：
+            # 风险预算 = equity × risk_per_trade_pct ÷ 止损距离，与杠杆无关——
+            # 它不够时再高的杠杆也没用，提示必须指向风险参数而不是杠杆。
+            risk_notional = equity * risk_cfg.risk_per_trade_pct / 100.0 / sl_pct_check
+            if risk_notional < need:
+                note = (
+                    f"风险预算不足: 按 {risk_cfg.risk_per_trade_pct:g}% 风险/笔与 0.5% 止损距离, "
+                    f"名义额上限约 {risk_notional:.2f} USDT, 低于该标的最小名义额约 {need:.2f} USDT"
+                    f"（含 {min_notional_buffer(risk_cfg):g}x 缓冲）; "
+                    f"提高「单笔风险%」或加入更小面值标的, 提杠杆解决不了这一类"
+                )
+            elif lev_upper > leverage:
+                # 默认杠杆开不了 ≠ 真开不了：真实开仓链路允许把杠杆提到全局上限
+                # （choose_leverage 的钳制区间是 [default, max]）。小资金 + 高最小名义额
+                # 的组合在这里曾被整批误判"不可开仓"（14.78 U、1x、可分配 5.47，
+                # 但 20x 下保证金只要零点几 U），必须把这个可行路径算出来。
+                margin_base = equity * risk_cfg.margin_pct / 100.0
+                lev_floor = 1
+                if margin_base > 0:
+                    lev_floor = math.ceil(need / margin_base)
+                if account and available > 0:
+                    # 交易所按 availableBalance 校验初始保证金（留 10% 安全垫），与 estimate_qty 同口径
+                    lev_floor = max(lev_floor, math.ceil(need / (available * MARGIN_SAFETY)))
+                suggested_leverage = min(max(lev_floor, leverage), lev_upper)
+                qty, note = estimate_qty(
+                    equity, ticker.last, suggested_leverage, risk_cfg, sl_pct_check, filters,
+                    available=available if account else None,
+                )
+                if qty > 0:
+                    note = ""
+                else:
+                    # 理论上不该发生（风险预算已过检），回落到最高杠杆的报错更有指导意义
+                    suggested_leverage = 0
+                    qty, note = estimate_qty(
+                        equity, ticker.last, lev_upper, risk_cfg, sl_pct_check, filters,
+                        available=available if account else None,
+                    )
+                    if qty > 0:
+                        suggested_leverage = lev_upper
+                        note = ""
         # 引擎按「交易所下限 × 缓冲」下单，体检必须用同一个门槛，
         # 否则面板说"够开"、引擎却因为差几分钱拒绝，用户只能看到莫名奇妙的跳过。
         min_notional = filters.effective_min_notional(ticker.last) * min_notional_buffer(risk_cfg)
@@ -242,6 +289,8 @@ async def evaluate() -> dict[str, Any]:
                 "max_leverage_used": lev_upper,
                 "required_margin_at_max": round(min_notional / max(1.0, lev_upper), 4),
                 "allocatable_notional": round(allocatable, 4),
+                # 默认杠杆开不了、提杠杆能开时给出建议杠杆（0 = 不需要/无法提杠杆）
+                "suggested_leverage": suggested_leverage,
                 "qty_if_open": qty,
                 "notional_if_open": round(qty * ticker.last, 4) if qty else 0.0,
             }
