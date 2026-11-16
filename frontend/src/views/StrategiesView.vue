@@ -160,7 +160,7 @@ onMounted(load)
   <div class="stack">
     <div class="kpi-grid">
       <div class="kpi">
-        <div class="kpi-label">AI 策略数</div>
+        <div class="kpi-label">全局策略数</div>
         <div class="kpi-value">{{ stats?.total ?? 0 }}</div>
         <div class="kpi-foot">启用 {{ enabledCount }} 条</div>
       </div>
@@ -185,19 +185,20 @@ onMounted(load)
     </div>
 
     <div class="note">
-      本页是 <b>AI 分析指令</b>：引擎照常扫描全部标的，决策时把适用策略的正文交给模型，由它按策略判断是否开仓、方向与节奏。
-      一条策略都没启用、或标的不在适用范围时，AI 按通用铁律分析（默认行为）。<b>这里改不了杠杆、止损与仓位</b>——那些是风控铁律。
-      要调机器实际执行的模式、周期、杠杆区间、止损止盈，去
-      <router-link to="/admin/strategy?group=strategy">参数配置 → 策略</router-link>。
+      全局策略是 <b>AI 开仓分析指令</b>：引擎照常扫描全部标的，决策前按「优先级 + 适用范围」命中一条策略，把它的正文交给模型，由模型判断是否开仓、方向与节奏。
+      一条都没启用、或标的不在适用范围时，AI 按通用铁律分析（默认行为）。<b>这里改不了杠杆、止损与仓位</b>——那些是风控铁律。
+      开仓分析链路分工：<b>全局策略</b>管「模型怎么想」→
+      <router-link to="/admin/ai">AI 模型</router-link>管「用哪个模型、什么决策协议」→
+      <router-link to="/admin/strategy?group=strategy">参数配置 → 策略</router-link>管「机器实际执行的周期/杠杆/止损止盈」。
     </div>
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">AI 策略列表</span>
+        <span class="panel-title">全局策略列表</span>
         <div class="right" style="gap: 8px">
           <span class="tag tag-dim">{{ items.length }} 条</span>
           <button class="btn btn-sm" :disabled="busy" @click="runPreview">预览适用标的</button>
-          <button class="btn btn-sm btn-primary" :disabled="busy" @click="openCreate">新增 AI 策略</button>
+          <button class="btn btn-sm btn-primary" :disabled="busy" @click="openCreate">新增全局策略</button>
         </div>
       </div>
       <div class="panel-body flush table-scroll">
@@ -237,7 +238,7 @@ onMounted(load)
             </tr>
             <tr v-if="!items.length">
               <td colspan="7" class="empty">
-                还没有策略 · 当前 AI 走默认通用分析；新增一条即可让它按你的打法判断
+                还没有全局策略 · 当前 AI 走默认通用分析；新增一条即可让它按你的打法判断
               </td>
             </tr>
           </tbody>
@@ -245,7 +246,7 @@ onMounted(load)
       </div>
     </div>
 
-    <Modal v-if="showForm" :title="editing ? '编辑策略' : '新增策略'" wide @close="showForm = false">
+    <Modal v-if="showForm" :title="editing ? '编辑全局策略' : '新增全局策略'" wide @close="showForm = false">
       <div class="stack">
         <div class="grid g2" style="gap: 12px">
           <div class="field">

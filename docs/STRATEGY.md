@@ -15,14 +15,14 @@
 
 | | `StrategySettings`（本文件的策略） | `StrategyProfile` |
 |---|---|---|
-| 界面上叫 | **参数配置 → 策略** | **AI 策略** |
+| 界面上叫 | **参数配置 → 策略** | **全局策略** |
 | 存哪 | `app_settings` 的 `strategy` 分组 | `strategy_profiles` 表（多条） |
 | 是什么 | 引擎**真正执行**的硬参数：模式、周期、杠杆区间、止损止盈、准入闸门 | 交给 AI 的**文本判断指令**（一段中文正文） |
 | 谁执行 | 代码：`build_features` → `score_signal` → `detect_exit` | 模型：读正文后自行判断是否开仓 |
 | 能不能改杠杆/止损 | **能**（`leverage_min/max`、`sl_atr_mult`…） | **不能**（风控铁律不可被文本覆盖） |
 | 什么时候生效 | 每轮扫描 | AI 决策时（命中适用标的） |
 
-一句话：**`StrategySettings` 决定机器怎么做，`StrategyProfile` 建议模型怎么想**。调「快慢/杠杆/止损」去参数配置；调「AI 的分析口吻与判断规则」去 AI 策略。
+一句话：**`StrategySettings` 决定机器怎么做，`StrategyProfile` 建议模型怎么想**。调「快慢/杠杆/止损」去参数配置；调「AI 的分析口吻与判断规则」去全局策略。
 
 ---
 
