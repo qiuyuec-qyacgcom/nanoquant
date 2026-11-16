@@ -15,16 +15,52 @@ if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec
 引导脚本 `install.sh` 下载代码后转交 `scripts/install.sh --systemd`：在 clone 目录里建 venv、
 编译前端，并动态生成 `/etc/systemd/system/nanoquant.service`（`WorkingDirectory`/`ExecStart` 都指向 clone 目录）。
 
-## 执行内核 sidecar（可选）
+### 安装时会选「执行内核」
+
+安装脚本会问一句用哪套执行内核：
+
+```
+请选择执行内核：
+  1) Python（默认；无需额外配置，装完即用）
+  2) Rust（更低的签名延迟；需要填写币安 API Key 与 Secret）
+```
+
+- 选 **1 / 直接回车**：走 Python 内核，跳过所有 Rust 步骤，装完即用（推荐首次部署）。
+- 选 **2**：要求填写 **API Key + API Secret**（Secret 输入不回显），随后自动完成
+  「装 Rust → 编译 → 装二进制 → 写 `/etc/nanoquant/exec.env` → 注册并启动 `nanoquant-exec`」，
+  **不需要再手工执行任何 cargo / systemctl 命令**。填写的凭证会在首次启动时加密入库并删除明文。
+
+非交互场景用参数：
 
 ```bash
-# Secret 用单引号包住，避免 shell 解释；与 Python 侧交易所 API secret 是同一把密钥
+bash install.sh --kernel python          # 显式选 Python
+bash install.sh --kernel rust            # 选 Rust（凭证走环境变量或交互）
+NANOQUANT_KERNEL=rust NANOQUANT_API_KEY=xxx NANOQUANT_API_SECRET=yyy bash install.sh
+```
+
+> 若 Rust 编译失败，脚本会**自动回退 Python 内核**并继续装完主服务，
+> 事后可补：`sudo bash scripts/setup_sidecar.sh --from-settings`。
+
+## 执行内核 sidecar（补装 / 重建）
+
+面板填好 API 凭证后，一条命令即可（自动读取**当前交易环境**的 Secret，不必手工复制）：
+
+```bash
+sudo bash scripts/setup_sidecar.sh --from-settings
+```
+
+也可以显式给密钥（与 Python 侧交易所 API secret 是同一把）：
+
+```bash
 sudo bash scripts/setup_sidecar.sh --secret '<base64 PKCS#8 或 HMAC secret>'
 ```
 
-脚本会检测/安装 Rust、`cargo build --release`，把二进制装到 clone 目录 `exec-service`，
-写 `/etc/nanoquant/exec.env`（0600），并动态生成 `/etc/systemd/system/nanoquant-exec.service`
-（`ExecStart` 指向 clone 目录的 `exec-service`）。
+脚本会检测/安装 Rust、`cargo build --release`（已编译可加 `--skip-build` 复用），
+把二进制装到 clone 目录 `exec-service`，写 `/etc/nanoquant/exec.env`（0600），
+并生成 `/etc/systemd/system/nanoquant-exec.service`。
+
+> unit 带 `ConditionPathExists=/etc/nanoquant/exec.env`：**没写密钥就不会启动**，
+> 而不是启动后 panic 被 `Restart=always` 无限拉起。
 
 ## 验证
 

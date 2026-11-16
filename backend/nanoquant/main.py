@@ -122,6 +122,55 @@ def bootstrap() -> None:
     with session_scope() as s:
         if s.query(TradingSymbol).count() == 0:
             log.info("标的池为空: 请在后台「标的池」页添加要交易的合约")
+    _import_installer_credentials()
+
+
+def _import_installer_credentials() -> None:
+    """消费安装脚本留下的交易所凭证（`data/.exchange_credentials`）。
+
+    安装脚本在选 Rust 内核时会要求填 API Key/Secret；但那时数据库还没建，
+    只能先留文件。这里在首次启动时加密入库并**立即删除明文**。
+    文件格式（JSON）：{"env": "demo"|"live", "api_key": "...", "api_secret": "..."}
+    """
+    cred_file = paths.DATA / ".exchange_credentials"
+    if not cred_file.is_file():
+        return
+    try:
+        import json as _json
+
+        payload = _json.loads(cred_file.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError) as exc:
+        log.warning("安装期凭证文件解析失败（请手动在面板填写）: %s", exc)
+        try:
+            cred_file.unlink()
+        except OSError:
+            pass
+        return
+
+    env = str(payload.get("env") or "demo").strip().lower()
+    prefix = "live" if env == "live" else "demo"
+    api_key = str(payload.get("api_key") or "").strip()
+    api_secret = str(payload.get("api_secret") or "").strip()
+    try:
+        if api_key and api_secret:
+            from .security import encrypt_secret
+
+            update_group(
+                "data",
+                {
+                    f"{prefix}_api_key_enc": encrypt_secret(api_key),
+                    f"{prefix}_api_secret_enc": encrypt_secret(api_secret),
+                },
+            )
+            log.warning("已按安装参数写入 %s 环境交易所凭证（明文文件随即删除）", prefix)
+            events.record("warn", "system", f"已按安装参数写入 {prefix} 环境交易所凭证")
+    except Exception as exc:  # noqa: BLE001  导入失败不能挡住启动
+        log.warning("安装期凭证入库失败（请手动在面板填写）: %s", exc)
+    finally:
+        try:
+            cred_file.unlink()
+        except OSError as exc:
+            log.warning("安装期凭证文件删除失败（请手动删除 %s）: %s", cred_file, exc)
 
 
 async def _journal_loop() -> None:

@@ -14,6 +14,11 @@
 #   sudo bash scripts/install.sh --force         # 强制重装依赖（默认按 requirements 哈希跳过）
 #   sudo bash scripts/install.sh --no-pyenv      # 不用 pyenv 兜底编译 Python（跳过自动编译）
 #   sudo bash scripts/install.sh --no-start      # 装完不自动后台启动（默认装完即后台运行）
+#   sudo bash scripts/install.sh --kernel python # 只用 Python 执行内核（不编译 Rust，默认）
+#   sudo bash scripts/install.sh --kernel rust   # 用 Rust 执行内核；需填 API Key/Secret，且会自动编译安装
+#   sudo bash scripts/install.sh --no-sidecar    # 等价 --kernel python（兼容旧参数）
+#
+# 内核选择：不给 --kernel 时会**交互询问**；非交互环境（无 TTY）默认 python。
 #
 # 密码：不指定时由安装脚本随机生成、装完直接打印，登录后必须改密。
 #
@@ -35,6 +40,11 @@ ADMIN_PASSWORD="${NANOQUANT_ADMIN_PASSWORD:-}"
 NO_PYENV=0
 NO_START=0
 PYENV_MIRROR=""
+#: 执行内核: python（默认）| rust（需 API 凭证，会编译并安装 sidecar）
+KERNEL="${NANOQUANT_KERNEL:-}"
+SIDECAR_API_KEY="${NANOQUANT_API_KEY:-}"
+SIDECAR_API_SECRET="${NANOQUANT_API_SECRET:-}"
+SIDECAR_ENV="${NANOQUANT_CRED_ENV:-demo}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,6 +53,13 @@ while [[ $# -gt 0 ]]; do
       [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "--port 需要一个数字"; exit 1; }
       shift 2 ;;
     --systemd) WITH_SYSTEMD=1; shift ;;
+    --kernel)
+      KERNEL="${2:-}"
+      case "$KERNEL" in
+        python|rust|py) [[ "$KERNEL" == "py" ]] && KERNEL="python"; shift 2 ;;
+        *) echo "--kernel 只支持 python / rust"; exit 1 ;;
+      esac ;;
+    --no-sidecar) KERNEL="python"; shift ;;
     --no-frontend) WITH_FRONTEND=0; shift ;;
     --mirror)
       case "${2:-}" in
@@ -83,6 +100,62 @@ EOF
 banner
 info "安装目录: $ROOT"
 info "监听端口: $PORT"
+
+# ---------------------------------------------------------------- 执行内核选择
+# 交互式询问（无 TTY 或已用 --kernel 指定时跳过）。
+# 选 rust 必须提供 API Key/Secret：sidecar 的签名密钥与交易所 Secret 是同一把，
+# 且没有它 sidecar 根本起不来（见 rust/exec-service 的 EXEC_SECRET）。
+if [[ -z "$KERNEL" ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    echo
+    echo "请选择执行内核："
+    echo "  1) Python（默认；无需额外配置，装完即用）"
+    echo "  2) Rust（更低的签名延迟；需要填写币安 API Key 与 Secret）"
+    printf "输入 1 或 2 [1]: "
+    read -r _choice || _choice=""
+    case "${_choice:-1}" in
+      2|r|R|rust|RUST) KERNEL="rust" ;;
+      *) KERNEL="python" ;;
+    esac
+  else
+    KERNEL="python"
+  fi
+fi
+[[ -n "$KERNEL" ]] || KERNEL="python"
+
+if [[ "$KERNEL" == "rust" ]]; then
+  info "已选择 Rust 执行内核：需要交易所 API 凭证"
+  # 环境归属：sidecar 的 EXEC_SECRET 必须与**当前交易环境**的 Secret 一致
+  if [[ -z "${SIDECAR_ENV:-}" || "$SIDECAR_ENV" == "demo" ]]; then
+    if [[ -t 0 && -t 1 && -z "${NANOQUANT_CRED_ENV:-}" ]]; then
+      printf "凭证用于哪个环境？1) 模拟盘/测试网（默认）  2) 实盘/主网 [1]: "
+      read -r _env_choice || _env_choice=""
+      case "${_env_choice:-1}" in 2|l|L|live|LIVE) SIDECAR_ENV="live" ;; *) SIDECAR_ENV="demo" ;; esac
+    fi
+  fi
+  [[ "$SIDECAR_ENV" == "live" ]] || SIDECAR_ENV="demo"
+
+  # Key：普通输入；Secret：不回显（-s）
+  if [[ -z "$SIDECAR_API_KEY" && -t 0 ]]; then
+    printf "币安 API Key: "
+    read -r SIDECAR_API_KEY || SIDECAR_API_KEY=""
+  fi
+  if [[ -z "$SIDECAR_API_SECRET" && -t 0 ]]; then
+    printf "币安 API Secret（输入不回显）: "
+    read -rs SIDECAR_API_SECRET || SIDECAR_API_SECRET=""
+    echo
+  fi
+  # 容错：去掉误粘的首尾尖括号/引号/空白（真实场景踩过：把 <...> 一起粘进来）
+  clean_cred() {
+    printf '%s' "$1" | tr -d '[:space:]' | sed -e "s/^[<\"']//" -e "s/[>\"']\$//"
+  }
+  SIDECAR_API_KEY="$(clean_cred "$SIDECAR_API_KEY")"
+  SIDECAR_API_SECRET="$(clean_cred "$SIDECAR_API_SECRET")"
+
+  [[ -n "$SIDECAR_API_KEY" ]] || die "选择 Rust 内核时必须填写 API Key（可改用 --kernel python）"
+  [[ -n "$SIDECAR_API_SECRET" ]] || die "选择 Rust 内核时必须填写 API Secret（可改用 --kernel python）"
+  ok "已收到凭证：Key 长度 ${#SIDECAR_API_KEY}，Secret 长度 ${#SIDECAR_API_SECRET}（不打印内容）"
+fi
 if [[ -n "$ADMIN_PASSWORD" ]]; then
   [[ ${#ADMIN_PASSWORD} -ge 8 ]] || die "--password 至少 8 位（这是唯一能进后台的凭据）"
   info "初始管理员密码: 使用你指定的值（不回显，装完会打印）"
@@ -368,6 +441,51 @@ if [[ "$WITH_FRONTEND" == "1" ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 执行内核 sidecar（Rust）
+# 仅当用户选择 rust 时执行：编译 → 装二进制 → 写密钥 → 注册 systemd。
+# 选 python 时这里完全跳过，不留任何 Rust 相关残留。
+SIDECAR_OK=0
+if [[ "$KERNEL" == "rust" && -d "$ROOT/rust/exec-service" ]]; then
+  info "准备 Rust 执行内核：编译并安装 sidecar"
+
+  # C 工具链：rusqlite 的 bundled SQLite 需要 cc/gcc
+  if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+    info "缺少 C 编译器（bundled SQLite 需要），尝试自动安装"
+    [[ "$PKG" == "apt" ]] && install_pkg build-essential || install_pkg gcc make || true
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+      info "安装 Rust（rustup minimal，仅用于本次构建）"
+      if command -v curl >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal 2>&1 | sed 's/^/  /' || true
+      else
+        wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal 2>&1 | sed 's/^/  /' || true
+      fi
+      # shellcheck disable=SC1091
+      [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+      [[ -f /root/.cargo/env ]] && source /root/.cargo/env
+    fi
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    info "编译 sidecar（cargo build --release，首次约 1~2 分钟）"
+    if ( cd "$ROOT/rust/exec-service" && cargo build --release ) 2>&1 | sed 's/^/  /'; then
+      SRC_BIN="$ROOT/rust/exec-service/target/release/exec-service"
+      if [[ -x "$SRC_BIN" ]]; then
+        install -m 0755 "$SRC_BIN" "$ROOT/exec-service"
+        SIDECAR_OK=1
+        ok "sidecar 二进制已安装：$ROOT/exec-service"
+      fi
+    fi
+  fi
+  if [[ "$SIDECAR_OK" != "1" ]]; then
+    warn "Rust 内核编译失败：本次将回退为 Python 内核（主服务不受影响）"
+    warn "排查后可重试：sudo bash scripts/setup_sidecar.sh --secret '<Secret>'"
+    KERNEL="python"
+  fi
+fi
+
 # ---------------------------------------------------------------- 运行目录
 mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
 chmod 700 "$ROOT/data" 2>/dev/null || true
@@ -393,6 +511,33 @@ if [[ "$PASSWORD_GENERATED" == "1" ]]; then
 fi
 ok "已暂存初始密码（首次启动写入数据库后自动删除）"
 ok "运行目录就绪（data/ logs/ data/backups/）"
+
+# ---------------------------------------------------------------- Rust 内核：凭证落盘
+# 两处都要写：
+#   1) data/.exchange_credentials —— 主服务首次启动时加密入库（省得再手动填面板）
+#   2) /etc/nanoquant/exec.env   —— sidecar 的 EXEC_SECRET（与交易所 Secret 同一把）
+if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
+  umask 077
+  printf '{"env":"%s","api_key":"%s","api_secret":"%s"}\n' \
+    "$SIDECAR_ENV" "$SIDECAR_API_KEY" "$SIDECAR_API_SECRET" > "$ROOT/data/.exchange_credentials"
+  chmod 600 "$ROOT/data/.exchange_credentials" 2>/dev/null || true
+  ok "已暂存交易所凭证（首次启动加密入库后自动删除）"
+
+  mkdir -p /etc/nanoquant
+  install -m 600 -o root -g root /dev/null /etc/nanoquant/exec.env
+  printf 'EXEC_SECRET=%s\n' "$SIDECAR_API_SECRET" > /etc/nanoquant/exec.env
+  # 连接池与台账：有值才生效，缺省不影响签名
+  {
+    echo "EXEC_BASE_URL=https://fapi.binance.com"
+    echo "EXEC_LEDGER_DB=/var/lib/nanoquant/exec-ledger.db"
+    echo "EXEC_API_KEY=$SIDECAR_API_KEY"
+  } >> /etc/nanoquant/exec.env
+  chmod 600 /etc/nanoquant/exec.env
+  mkdir -p /var/lib/nanoquant
+  chmod 700 /var/lib/nanoquant 2>/dev/null || true
+  umask 022
+  ok "已写入 /etc/nanoquant/exec.env（0600，含 EXEC_SECRET / EXEC_API_KEY）"
+fi
 
 # ---------------------------------------------------------------- systemd
 if [[ "$WITH_SYSTEMD" == "1" ]]; then
@@ -434,6 +579,49 @@ EOF
       warn "服务已注册但健康检查未通过：journalctl -u nanoquant -n 50 --no-pager"
       warn "常见原因：端口被占用 / 依赖缺失 / data 目录权限不足"
     fi
+
+    # ---------------- sidecar systemd（仅 Rust 内核）----------------
+    if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" && -f /etc/nanoquant/exec.env ]]; then
+      SIDECAR_SERVICE=/etc/systemd/system/nanoquant-exec.service
+      cat > "$SIDECAR_SERVICE" <<SIDECAR_EOF
+[Unit]
+Description=NanoQuant exec-service (Rust signing sidecar, sign-only)
+Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant/blob/main/docs/EXEC_PROTOCOL.md
+After=network-online.target
+Wants=network-online.target
+Before=nanoquant.service
+ConditionPathExists=/etc/nanoquant/exec.env
+
+[Service]
+Type=simple
+RuntimeDirectory=nanoquant
+RuntimeDirectoryMode=0750
+Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
+EnvironmentFile=-/etc/nanoquant/exec.env
+ExecStart=$ROOT/exec-service
+RestartPreventExitStatus=78
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+SIDECAR_EOF
+      systemctl daemon-reload || true
+      systemctl enable nanoquant-exec >/dev/null 2>&1 || true
+      if systemctl restart nanoquant-exec 2>/dev/null; then
+        sleep 1
+        if systemctl is-active nanoquant-exec >/dev/null 2>&1; then
+          ok "sidecar 已启动（systemctl status nanoquant-exec）"
+        else
+          warn "sidecar 未激活：journalctl -u nanoquant-exec -n 30 --no-pager"
+        fi
+      else
+        warn "sidecar 启动失败：journalctl -u nanoquant-exec -n 30 --no-pager"
+      fi
+    fi
   fi
 fi
 
@@ -460,6 +648,25 @@ if [[ "$WITH_SYSTEMD" != "1" && "$NO_START" != "1" ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 非 systemd：后台拉起 sidecar
+if [[ "$WITH_SYSTEMD" != "1" && "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" && -f /etc/nanoquant/exec.env ]]; then
+  info "后台启动 sidecar（无 systemd）"
+  mkdir -p /run/nanoquant && chmod 750 /run/nanoquant 2>/dev/null || true
+  # shellcheck disable=SC1091
+  set -a; . /etc/nanoquant/exec.env; set +a
+  if EXEC_SOCKET=/run/nanoquant/exec.sock nohup "$ROOT/exec-service" \
+      >"$ROOT/logs/exec-service.log" 2>&1 & then
+    sleep 1
+    if [[ -S /run/nanoquant/exec.sock ]]; then
+      ok "sidecar 已在后台运行（socket=/run/nanoquant/exec.sock）"
+    else
+      warn "sidecar 未生成 socket，日志见 $ROOT/logs/exec-service.log"
+    fi
+  else
+    warn "sidecar 后台启动失败，日志见 $ROOT/logs/exec-service.log"
+  fi
+fi
+
 # hostname -I 不是所有发行版都支持（BusyBox / macOS 都没有），
 # set -o pipefail 下失败会直接把脚本整段带走，所以这里必须兜住
 IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
@@ -482,6 +689,15 @@ else
   START_LINE="启动     : 已自动后台运行；机器重启后请 bash scripts/start.sh --daemon"
 fi
 
+# 内核一行：明确本次装的是哪套执行内核
+if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
+  SIDECAR_LINE="执行内核 : Rust sidecar 已安装并启用（签名与交易所 Secret 同一把；默认 off，需在面板开启 shadow→enforce）"
+elif [[ "$KERNEL" == "rust" ]]; then
+  SIDECAR_LINE="执行内核 : Rust 编译失败，已回退 Python；修复后执行 sudo bash scripts/setup_sidecar.sh --from-settings"
+else
+  SIDECAR_LINE="执行内核 : Python（默认；如需 Rust 请重跑并选 2，或 --kernel rust）"
+fi
+
 cat <<EOF
 
 $(printf "${C_OK}========================================${C_RESET}")
@@ -496,6 +712,7 @@ $(printf "${C_OK}========================================${C_RESET}")
   改密前后台除登录/改密/健康检查外的接口一律 403。
 
   $START_LINE
+  $SIDECAR_LINE
   停止     : bash scripts/stop.sh
   查看状态 : bash scripts/status.sh
   健康检查 : curl http://127.0.0.1:$PORT/api/v1/health

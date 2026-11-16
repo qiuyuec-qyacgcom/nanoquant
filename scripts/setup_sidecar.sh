@@ -11,6 +11,9 @@
 # --secret  必填：与 Python 侧交易所 API secret 是**同一把密钥**
 #            （Ed25519 私钥的 base64 PKCS#8，或 HMAC secret）
 #            也可以不传，部署后手动写 /etc/nanoquant/exec.env（权限 0600）
+# --from-settings  从主服务数据库里读**当前交易环境**的交易所 Secret（最省事）：
+#            面板填好 API 凭证后执行一次即可，不必再手工复制密钥
+# --skip-build     二进制已存在时跳过编译（install.sh 自动调用时用）
 # --home    二进制安装目录，默认仓库根目录（clone 目录）
 set -euo pipefail
 
@@ -18,12 +21,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_HOME="$REPO_ROOT"
 SECRET=""
+FROM_SETTINGS=0
+SKIP_BUILD=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --secret) SECRET="${2:-}"; shift 2 ;;
+    --from-settings) FROM_SETTINGS=1; shift ;;
+    --skip-build) SKIP_BUILD=1; shift ;;
     --home)   APP_HOME="${2:-$REPO_ROOT}"; shift 2 ;;
-    *) echo "未知参数: $1（支持 --secret / --home）"; exit 1 ;;
+    *) echo "未知参数: $1（支持 --secret / --from-settings / --skip-build / --home）"; exit 1 ;;
   esac
 done
 
@@ -34,27 +41,59 @@ die()  { printf '\033[1;31m[sidecar]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || die "需要 root：sudo bash scripts/setup_sidecar.sh ..."
 
-# ---------- 1. Rust 工具链 ----------
-if command -v cargo >/dev/null 2>&1; then
-  ok "Rust 已就绪：$(cargo --version)"
-else
-  info "未检测到 Rust，安装 rustup（minimal profile）..."
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  # shellcheck disable=SC1091
-  source "$HOME/.cargo/env"
-  command -v cargo >/dev/null 2>&1 || die "rustup 安装失败，请手动检查"
-  ok "Rust 安装完成：$(cargo --version)"
+# ---------- 0. --from-settings：直接从数据库读当前环境的交易所 Secret ----------
+if [[ "$FROM_SETTINGS" == "1" && -z "$SECRET" ]]; then
+  VENV_PY="$REPO_ROOT/.venv/bin/python"
+  [[ -x "$VENV_PY" ]] || die "未找到 $VENV_PY：请先跑 install.sh 建好虚拟环境"
+  info "从主服务数据库读取当前交易环境的交易所 Secret"
+  SECRET="$(cd "$REPO_ROOT/backend" && "$VENV_PY" - <<'PY'
+import sys
+try:
+    from nanoquant.services.settings import get_data, get_engine, normalize_mode
+    from nanoquant.security import decrypt_secret
+except Exception as exc:  # noqa: BLE001
+    print(f"__ERR__{exc}", file=sys.stderr)
+    raise SystemExit(1)
+cfg = get_data()
+env = normalize_mode(get_engine().mode)
+secret = decrypt_secret(
+    cfg.demo_api_secret_enc if env == "demo" else cfg.live_api_secret_enc
+)
+if not secret:
+    print(f"__ERR__当前环境（{env}）未配置 API Secret", file=sys.stderr)
+    raise SystemExit(1)
+print(secret)
+PY
+)" || die "读取失败：请先在面板「参数配置 → 数据源」填好该环境的 API Key/Secret"
+  [[ -n "$SECRET" ]] || die "数据库里的 API Secret 为空"
+  ok "已取到当前环境的 Secret（长度 ${#SECRET}，不打印内容）"
 fi
 
-# ---------- 2. 编译（Linux 产物）----------
-SRC_DIR="$REPO_ROOT/rust/exec-service"
-[[ -d "$SRC_DIR" ]] || die "找不到 $SRC_DIR，请在仓库根目录运行本脚本"
-cd "$SRC_DIR"
-info "编译 sidecar（cargo test + build --release）..."
-cargo test --release || die "cargo test 失败"
-cargo build --release || die "cargo build 失败"
-BIN="$SRC_DIR/target/release/exec-service"
-ok "编译完成：$BIN（$(du -h "$BIN" | cut -f1)）"
+# ---------- 1. Rust 工具链 ----------
+BIN="$REPO_ROOT/rust/exec-service/target/release/exec-service"
+if [[ "$SKIP_BUILD" == "1" && -x "$BIN" ]]; then
+  ok "复用已编译二进制：$BIN"
+else
+  if command -v cargo >/dev/null 2>&1; then
+    ok "Rust 已就绪：$(cargo --version)"
+  else
+    info "未检测到 Rust，安装 rustup（minimal profile）..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+    command -v cargo >/dev/null 2>&1 || die "rustup 安装失败，请手动检查"
+    ok "Rust 安装完成：$(cargo --version)"
+  fi
+
+  # 2. 编译（Linux 产物）
+  SRC_DIR="$REPO_ROOT/rust/exec-service"
+  [[ -d "$SRC_DIR" ]] || die "找不到 $SRC_DIR，请在仓库根目录运行本脚本"
+  cd "$SRC_DIR"
+  info "编译 sidecar（cargo test + build --release）..."
+  cargo test --release || die "cargo test 失败"
+  cargo build --release || die "cargo build 失败"
+  ok "编译完成：$BIN（$(du -h "$BIN" | cut -f1)）"
+fi
 
 # ---------- 3. 安装二进制 ----------
 info "安装二进制到 $APP_HOME/exec-service"
@@ -64,13 +103,15 @@ ok "二进制已安装"
 # ---------- 4. Secret（必须与 Python 侧交易所签名密钥一致）----------
 mkdir -p /etc/nanoquant
 if [[ -n "$SECRET" ]]; then
-  (umask 077; printf 'EXEC_SECRET=%s\n' "$SECRET" > /etc/nanoquant/exec.env)
-  chown root:root /etc/nanoquant/exec.env
-  ok "已写入 /etc/nanoquant/exec.env（0600）"
+  # 先建 0600 空文件再写内容：`umask` 管不住别的进程，靠 install+chmod 最稳
+  install -m 600 -o root -g root /dev/null /etc/nanoquant/exec.env
+  printf 'EXEC_SECRET=%s\n' "$SECRET" > /etc/nanoquant/exec.env
+  chmod 600 /etc/nanoquant/exec.env
+  chown root:root /etc/nanoquant/exec.env 2>/dev/null || true
+  ok "已写入 /etc/nanoquant/exec.env（0600，长度 ${#SECRET}）"
 else
-  warn "未提供 --secret，跳过写入。稍后手动执行："
-  warn "  sudo sh -c 'umask 077; printf \"EXEC_SECRET=%s\\n\" \"<密钥>\" > /etc/nanoquant/exec.env'"
-  warn "  sudo chown root:root /etc/nanoquant/exec.env"
+  warn "未提供 --secret，跳过写入。填好面板 API 凭证后执行一次："
+  warn "  sudo bash scripts/setup_sidecar.sh --from-settings"
 fi
 
 # ---------- 5. systemd ----------
@@ -85,6 +126,9 @@ Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant/blob/main/docs/EXEC_
 After=network-online.target
 Wants=network-online.target
 Before=nanoquant.service
+# 没写密钥就不启动（而不是启动后 panic 退出、被 Restart=always 无限拉起）。
+# 填好面板 API 凭证后执行 setup_sidecar.sh --from-settings 即会创建该文件。
+ConditionPathExists=/etc/nanoquant/exec.env
 
 [Service]
 Type=simple
@@ -92,9 +136,10 @@ Type=simple
 RuntimeDirectory=nanoquant
 RuntimeDirectoryMode=0750
 Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
-# EXEC_SECRET=...；文件不存在也能起（二进制会明确报错），避免 unit 直接失败
 EnvironmentFile=-/etc/nanoquant/exec.env
 ExecStart=$APP_HOME/exec-service
+# 78=EX_CONFIG（缺 EXEC_SECRET）：不给它无限重试的机会
+RestartPreventExitStatus=78
 Restart=always
 RestartSec=3
 
