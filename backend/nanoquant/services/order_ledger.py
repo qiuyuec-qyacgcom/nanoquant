@@ -247,6 +247,96 @@ class OrderLedger:
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]
             return {"ok": False, "unknown": False, "reason": self.last_error}
 
+    async def reconcile(self, *, lookback_sec: int = 24 * 3600, limit: int = 500) -> dict[str, Any]:
+        """P3-5 收尾的**前置**：sidecar 台账 ↔ Python `orders` 表双向对账（只读）。
+
+        为什么要先做对账而不是直接移交写权：
+        只有先量化「两个台账到底差多少」，才能判断能否把权威源交给 sidecar。
+        本方法**不改任何数据**，只比对并分类差异：
+
+        | 差异类型 | 含义 |
+        |---|---|
+        | `missing_in_sidecar` | 本地有、sidecar 没有（投递丢失/未开启时下的单） |
+        | `missing_in_local` | sidecar 有、本地没有（本地写库失败/死信） |
+        | `state_mismatch` | 两侧都有但状态不同（迁移丢失或异步未达） |
+        | `qty_mismatch` | 成交量不同 |
+
+        返回统计 + 最多 50 条样本，供面板/人工判断。
+        """
+        import time as _time
+
+        from ..db import session_scope
+        from ..models import OrderRecord as LocalOrder
+
+        since = int(_time.time()) - lookback_sec
+        with session_scope() as s:
+            rows = (
+                s.query(LocalOrder)
+                .filter(LocalOrder.ts >= since)
+                .order_by(LocalOrder.ts.desc())
+                .limit(limit)
+                .all()
+            )
+            local = {
+                str(r.client_order_id or ""): {
+                    "symbol": r.symbol,
+                    "status": str(r.status or "").strip().upper(),
+                    "qty": float(r.qty or 0),
+                }
+                for r in rows
+                if str(r.client_order_id or "")
+            }
+
+        try:
+            snap = await self._client.order_snapshot()
+        except ExecSidecarError as exc:
+            return {"ok": False, "reason": str(exc)[:200], "checked": 0}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200], "checked": 0}
+
+        orders = (snap.get("order") or {}).get("orders") or []
+        remote: dict[str, dict[str, Any]] = {}
+        for item in orders:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("client_order_id") or "")
+            if cid:
+                remote[cid] = item
+
+        missing_in_sidecar = [c for c in local if c not in remote]
+        missing_in_local = [c for c in remote if c not in local]
+        state_mismatch: list[dict[str, Any]] = []
+        qty_mismatch: list[dict[str, Any]] = []
+        for cid in local.keys() & remote.keys():
+            ls = local[cid]["status"]
+            rs = str(remote[cid].get("state") or "").upper()
+            # 终态集合不同表述（CANCELLED/CANCELED）不算差异
+            norm = lambda x: "CANCELED" if x in {"CANCELED", "CANCELLED"} else x  # noqa: E731
+            if norm(ls) != norm(rs):
+                state_mismatch.append({"client_order_id": cid, "local": ls, "sidecar": rs})
+            lq = local[cid]["qty"]
+            rq = float(remote[cid].get("filled_qty") or 0)
+            if abs(lq - rq) > 1e-9:
+                qty_mismatch.append({"client_order_id": cid, "local": lq, "sidecar": rq})
+
+        diffs = (
+            len(missing_in_sidecar)
+            + len(missing_in_local)
+            + len(state_mismatch)
+            + len(qty_mismatch)
+        )
+        return {
+            "ok": True,
+            "checked": len(local),
+            "sidecar_total": len(remote),
+            "diff_count": diffs,
+            "aligned": diffs == 0 and len(local) > 0,
+            "missing_in_sidecar": missing_in_sidecar[:50],
+            "missing_in_local": missing_in_local[:50],
+            "state_mismatch": state_mismatch[:50],
+            "qty_mismatch": qty_mismatch[:50],
+        }
+
     def observe_protection(
         self,
         symbol: str,

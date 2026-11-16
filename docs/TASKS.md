@@ -1383,6 +1383,17 @@
   - `pytest tests -q` → **505 passed**（新增 `tests/test_protection_place.py` 6 条）。
   - `vue-tsc --noEmit` 0 error（前端新增开关字段）。
 
+### 99. P3-5 前置：sidecar 台账 ↔ Python orders 双向对账（只读）
+- **状态**：✅ 已完成
+- **背景**：把 sidecar 台账升为权威源之前，必须先能量化「两个台账差多少」。本步只做**只读对账**，不改任何写权，是移交前唯一能安全推进的动作。
+- **过程要点**：
+  - `order_ledger.reconcile()`：拉 `order_snapshot`，与本地 `orders` 表按 `client_order_id` 比对，输出四类差异：`missing_in_sidecar` / `missing_in_local` / `state_mismatch` / `qty_mismatch`（各取前 50 条样本）。
+  - `CANCELED` 与 `CANCELLED` 归一为同一状态，避免表述差异造成假告警；成交量按 `1e-9` 容差比较。
+  - 新接口 `GET /system/exec-sidecar/reconcile?lookback_hours=&limit=`；sidecar 不可用时返回 `ok=false` 而非抛异常。
+- **验证**：
+  - 端到端（真实 sidecar + 伪造本地表）：`checked=3 / sidecar_total=3 / diff_count=3 / aligned=false`，三类差异分类**全部命中**（`onlylocal` 缺于 sidecar、`onlyremote` 缺于本地、`statediff` 状态 `ACKED vs FILLED`）。
+  - `pytest tests -q` → **508 passed**（新增 `tests/test_ledger_reconcile.py` 3 条：sidecar 失败降级、完全对齐、四类差异）。
+
 ---
 
 ## 二、未开始
@@ -1399,10 +1410,11 @@
   - **P3-3**：`src/protection.rs`（保护单并行构造 + 逐字节对账），见 TASKS #96。
   - **P3-4**：`src/store.rs`（单写线程 + 批量事务，先只落 sidecar 自有台账），见 TASKS #97。
   - **P3-3 收尾**：`protection_place` 代发（双重闸门，默认关闭），见 TASKS #98。
+  - **对账前置**：`GET /system/exec-sidecar/reconcile` 双向差异对账，见 TASKS #99。
 - **待办**：
   - 开启代发前：先积累一段 `protect_counts.mismatched == 0`，再置 `exec_place_protection=true` + `EXEC_PLACE_MODE=enabled`。
-  - P3-4 收尾：Python 主表写权迁到 Rust（需先让 sidecar 台账成为权威源，风险最高，需灰度）。
-  - P3-5 收尾：把 sidecar 台账从「shadow 对账」提升为权威源（需先积累一段对账无差异样本）。
+  - P3-5 收尾：`reconcile.diff_count` 长期为 0 后，才可把 sidecar 台账升为权威源。
+  - P3-4 收尾：Python 主表写权迁到 Rust（依赖上一条，风险最高）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
 - **VPS 踩坑记录**（已确认，供复盘）：
   - `exec.env` 的 `EXEC_SECRET` 若带尖括号 `<...>`：systemd 会把括号当值的一部分 → sidecar 与 Python 签名不一致；且 shell `source` 会因 `<` 触发重定向语法错误。

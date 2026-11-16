@@ -131,6 +131,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `GET /system/exec-sidecar` | 模式、连接、algo、一致/不一致/失败/跳过、p50/p95/p99、verdict |
 | `POST /system/exec-sidecar/self-test` | 用固定 query 与当前环境 Secret 做一次比对（不消耗权重、不下单） |
 | `POST /system/exec-sidecar/reset` | 清零计数（换密钥/换环境后重新统计） |
+| `GET /system/exec-sidecar/reconcile` | P3-5 前置：sidecar 台账 ↔ `orders` 表**双向对账**（只读） |
 
 > 侧车只持有 Secret 并回传签名，不接触账户、持仓与订单。
 

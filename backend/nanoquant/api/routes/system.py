@@ -653,6 +653,18 @@ async def exec_sidecar_self_test(user: str = Depends(current_user)) -> dict:
     return result
 
 
+@router.get("/system/exec-sidecar/reconcile")
+async def exec_sidecar_reconcile(
+    lookback_hours: int = Query(default=24, ge=1, le=168),
+    limit: int = Query(default=500, ge=1, le=5000),
+    user: str = Depends(current_user),
+) -> dict:
+    """P3-5 收尾前置：sidecar 台账 ↔ Python orders 表双向对账（只读，不改写权）."""
+    from ...services.order_ledger import order_ledger
+
+    return await order_ledger.reconcile(lookback_sec=lookback_hours * 3600, limit=limit)
+
+
 @router.post("/system/exec-sidecar/reset")
 def exec_sidecar_reset(user: str = Depends(current_user)) -> dict:
     """清零比对计数 (切换密钥/环境后重新开始统计, 避免旧的不一致长期挂着)."""
