@@ -4,6 +4,32 @@
 > 用仓库自带的脚本自动生成 systemd unit。本目录里的两个 `.service` 仅是**模板参考**，
 > 正常部署请勿手抄。
 
+## 已部署机器如何更新
+
+**不要重跑 `install.sh`**：它发现 `frontend/dist` 已存在会**跳过前端构建**，更新后会继续跑旧界面。
+用专用更新脚本（在仓库根目录）：
+
+```bash
+cd ~/nanoquant
+bash scripts/update.sh --check            # 先看会更新什么（只读，不改任何文件）
+sudo bash scripts/update.sh               # 实际更新：拉代码 + 备份 + 依赖 + 强制重建前端 + 重启 + 健康检查
+```
+
+常用参数：
+
+| 参数 | 用途 |
+|---|---|
+| `--check` | 只预览版本差异、变更文件，不动任何东西 |
+| `--no-backup` | 跳过更新前备份（默认会在 `data/backups/` 建 `pre-update` 备份） |
+| `--no-frontend` | 只更新后端（已有可用 dist 时） |
+| `--with-sidecar` | 顺带重编 Rust sidecar（之前装过才需要） |
+| `--force` | 已是最新也强制重装依赖 + 重建前端 |
+
+安全边界：有未提交改动会**中止**（先 `git stash`）；`data/` 与 `.master_key` 从不覆盖；
+健康检查失败会打印回滚命令（输出末尾的 `git reset --hard <旧版本>`）。
+
+非 systemd（nohup 部署）同样适用，脚本会调用 `scripts/stop.sh` / `start.sh --daemon`。
+
 ## 主服务
 
 一条命令在线安装（`curl` 缺失自动改用 `wget`），无需先 clone：
