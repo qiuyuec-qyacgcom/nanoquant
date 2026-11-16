@@ -113,6 +113,7 @@ exec-service/
     ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
     ├── order.rs   P3-2 订单状态机（幂等 clientOrderId，Planned→Filled）
     ├── protection.rs  P3-3 保护单并行构造与签名（STOP + TP，只构造不发送）
+    ├── store.rs   P3-4 台账落库（单写线程 + 批量事务，独立 SQLite）
     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
 ```
 
@@ -133,7 +134,15 @@ exec-service/
 2. ✅ **已完成** 订单状态机（`src/order.rs`，幂等 `clientOrderId`，
    `order_register/transition/get/snapshot` 四个 op，7 个单测通过）；**只记账不发单**；
 3. 🚧 保护单并行（STOP + TP，Algo 接口）：**构造+签名已就绪并与 Python 逐字节一致**（`src/protection.rs`），代发留待下一阶段；
-4. 落库改由 Rust 单写线程组提交，Python 只读。
+4. ✅ **部分完成** 单写线程 + 批量事务落库（`src/store.rs`）：**先只落 sidecar 自己的台账**（独立库，不碰 Python 主表）。
+
+## P3-4 已实现（台账落库：单写线程 + 批量事务）
+
+- `src/store.rs`：`sync_channel` 有界队列（8192）+ 专职写线程，每批 ≤64 用单个事务提交（摊薄 fsync）。
+- 表：`exec_orders`（按 `client_order_id` upsert）+ `exec_order_history`（每次迁移留痕）。
+- 安全边界：队列满**丢弃并计数**（台账是旁路，绝不阻塞下单）；打不开库**降级纯内存**；`shutdown` drain。
+- `EXEC_LEDGER_DB` 为空 = 纯内存，行为与 P3-2 完全一致；`store_status` op + `health.store` 可观测。
+- 实测：4 笔写入 `errors=0`、SQLite 落盘正确（upsert 到最后状态）、**重启后数据留存**并能继续追加。
 
 ## P3-3 已实现（保护单并行构造）
 

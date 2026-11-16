@@ -33,6 +33,18 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `order_get` | `client_order_id` | `order` | P3-2：查询单笔台账 |
 | `order_snapshot` | — | `order` | P3-2：全量台账 + 按状态统计 + `duplicate_hits` |
 | `protection_plan` | `symbol` / `close_side` / `stop_price` / `take_price` / `position_side?` / `stop_client_id?` / `take_client_id?` | `protections` | P3-3：并行构造 STOP+TP 两笔保护单的 query+签名，**只构造不发送** |
+| `store_status` | — | `store` | P3-4：台账落库统计（pending/written/batches/dropped/errors） |
+
+### 3.3 台账落库（P3-4）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `EXEC_LEDGER_DB` | 空（纯内存） | sidecar 自己的台账库路径，如 `/var/lib/nanoquant/exec-ledger.db` |
+
+- **只写 sidecar 自己的两张表**（`exec_orders` / `exec_order_history`），**不动 Python 的 21 张主表**。
+- 单写线程 + 批量事务（每批 ≤64），与 Python `db_writer` 同取舍：关键路径只付一次入队。
+- 队列满（8192）**丢弃并计数**，绝不阻塞下单；`shutdown` 时 drain。
+- 打不开库就降级为纯内存，行为与 P3-2 完全一致。
 
 错误响应：`{"id":"...","ok":false,"error":"..."}`，调用方应视为失败而非重试。
 

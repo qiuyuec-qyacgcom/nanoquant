@@ -1352,6 +1352,19 @@
   - 端到端逐字节比对：单向（BTC SL/TP）、双向（ETH positionSide=SHORT）、小数价（72999.9）三组，**query 与签名全部一致**。
   - `pytest tests -q` → **499 passed**（新增 `tests/test_protection_plan.py` 5 条）。
 
+### 97. P3-4：sidecar 台账落库（单写线程 + 批量事务）
+- **状态**：✅ 已完成（范围：sidecar 自有台账；Python 主表仍由 Python 写）
+- **背景**：P3-4 目标是「落库改由 Rust 提交」，但直接接管 Python 的 21 张主表风险极高（schema 迁移、WAL 锁竞争、双写冲突）。故先落地**架构件本身**：Rust 侧单写线程 + 批量事务，只写 sidecar 自己的台账（独立库文件）。
+- **过程要点**：
+  - 新增 `rust/exec-service/src/store.rs`：`sync_channel` 有界队列（8192）→ 专职写线程 → 每批 ≤64 单事务提交（摊薄 fsync）；`rusqlite` bundled（自带 SQLite C 源码，不依赖系统库）。
+  - 表：`exec_orders`（按 `client_order_id` upsert）+ `exec_order_history`（每次迁移留痕）。
+  - 三条安全边界：队列满**丢弃并计数**（台账是旁路，绝不阻塞下单）、打不开库**降级纯内存**、`shutdown` 排空队列。
+  - `EXEC_LEDGER_DB` 为空 = 纯内存（行为与 P3-2 一致）；新增 `store_status` op，`health` 附带 `store` 段。
+- **验证**：
+  - `cargo test --release` → **21 passed**（新增 3 条 store：批量 upsert、shutdown drain、空路径降级）。
+  - 端到端：4 笔写入 `errors=0 / dropped=0`，SQLite 落盘正确（`nqA` upsert 到 `FILLED 0.02 @74000.5`，3 单 + 4 条历史）；**重启后 total=4 数据留存**，新单可继续追加。
+  - `pytest tests -q` → **499 passed**（Python 侧无改动，无回归）。
+
 ---
 
 ## 二、未开始
@@ -1366,9 +1379,10 @@
   - **P3-2**：`src/order.rs`（幂等订单状态机 + 4 个 op），见 TASKS #94。
   - **P3-5**：`services/order_ledger.py`（Python 投递 + shadow 对账），见 TASKS #95。
   - **P3-3**：`src/protection.rs`（保护单并行构造 + 逐字节对账），见 TASKS #96。
+  - **P3-4**：`src/store.rs`（单写线程 + 批量事务，先只落 sidecar 自有台账），见 TASKS #97。
 - **待办**：
   - P3-3 收尾：保护单由 sidecar 代发（需先积累一段 `protect_counts.mismatched == 0`）。
-  - P3-4：落库改由 Rust 单写线程组提交，Python 只读。
+  - P3-4 收尾：Python 主表写权迁到 Rust（需先让 sidecar 台账成为权威源，风险最高，需灰度）。
   - P3-5 收尾：把 sidecar 台账从「shadow 对账」提升为权威源（需先积累一段对账无差异样本）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
 - **VPS 踩坑记录**（已确认，供复盘）：

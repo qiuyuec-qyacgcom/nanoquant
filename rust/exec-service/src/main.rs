@@ -18,6 +18,7 @@ mod model;
 mod order;
 mod protection;
 mod sign;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +33,16 @@ use model::{Request, Response};
 use order::{OrderBook, OrderState};
 use protection::{build_pair, LegSpec, ProtectKind};
 use sign::Signer;
+use store::{LedgerRow, Store};
 use tokio::sync::Mutex;
+
+/// 当前 Unix 秒（台账时间戳）。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Config {
@@ -40,6 +50,8 @@ struct Config {
     secret: String,
     tcp: Option<String>,
     http: http::HttpConfig,
+    /// P3-4：台账落库路径；空 = 纯内存（与 P3-2 行为一致）
+    ledger_path: String,
 }
 
 impl Config {
@@ -51,12 +63,21 @@ impl Config {
             secret: std::env::var("EXEC_SECRET").expect("EXEC_SECRET 未设置"),
             tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
             http: http::HttpConfig::from_env(),
+            ledger_path: std::env::var("EXEC_LEDGER_DB")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         }
     }
 }
 
-async fn handle<S>(stream: S, signer: Arc<Signer>, http: Arc<HttpClient>, book: Arc<Mutex<OrderBook>>)
-where
+async fn handle<S>(
+    stream: S,
+    signer: Arc<Signer>,
+    http: Arc<HttpClient>,
+    book: Arc<Mutex<OrderBook>>,
+    store: Arc<Store>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -68,7 +89,7 @@ where
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch(req, &signer, &http, &book).await,
+            Ok(req) => dispatch(req, &signer, &http, &book, &store).await,
             Err(exc) => Response::err("unknown", format!("bad json: {exc}")),
         };
         let mut payload = serde_json::to_string(&resp).unwrap_or_default();
@@ -80,13 +101,27 @@ where
     }
 }
 
-async fn dispatch(req: Request, signer: &Signer, http: &HttpClient, book: &Mutex<OrderBook>) -> Response {
+async fn dispatch(
+    req: Request,
+    signer: &Signer,
+    http: &HttpClient,
+    book: &Mutex<OrderBook>,
+    store: &Store,
+) -> Response {
     match req.op.as_str() {
         "health" => {
             let mut resp = Response::ok(&req.id);
             resp.algo = Some(signer.algo().to_string());
             // P3-1：附带连接池状态（旧调用方忽略该字段即可）
             resp.http = Some(http.status());
+            // P3-4：附带台账落库状态
+            resp.store = Some(store.status());
+            resp
+        }
+        // P3-4：台账落库统计（只读）
+        "store_status" => {
+            let mut resp = Response::ok(&req.id);
+            resp.store = Some(store.status());
             resp
         }
         // P3-2：订单台账（幂等登记 / 状态迁移 / 查询 / 快照），全程不发单
@@ -107,6 +142,15 @@ async fn dispatch(req: Request, signer: &Signer, http: &HttpClient, book: &Mutex
             };
             let mut guard = book.lock().await;
             let (record, dup) = guard.register(&req.client_order_id, &req.symbol, initial);
+            // P3-4：异步落库（入队即返回，满队列丢弃不影响台账内存态）
+            store.submit(LedgerRow {
+                client_order_id: record.client_order_id.clone(),
+                symbol: record.symbol.clone(),
+                state: record.state.as_str().to_string(),
+                filled_qty: record.filled_qty,
+                avg_price: record.avg_price,
+                ts: now_secs(),
+            });
             let mut resp = Response::ok(&req.id);
             resp.order = Some(record.to_json());
             resp.duplicate = Some(dup);
@@ -119,6 +163,15 @@ async fn dispatch(req: Request, signer: &Signer, http: &HttpClient, book: &Mutex
             let mut guard = book.lock().await;
             match guard.transition(&req.client_order_id, to, req.filled_qty, req.avg_price) {
                 Ok(record) => {
+                    // P3-4：迁移成功也落库（upsert + 历史）
+                    store.submit(LedgerRow {
+                        client_order_id: record.client_order_id.clone(),
+                        symbol: record.symbol.clone(),
+                        state: record.state.as_str().to_string(),
+                        filled_qty: record.filled_qty,
+                        avg_price: record.avg_price,
+                        ts: now_secs(),
+                    });
                     let mut resp = Response::ok(&req.id);
                     resp.order = Some(record.to_json());
                     resp
@@ -222,6 +275,11 @@ async fn main() -> std::io::Result<()> {
     let http = Arc::new(HttpClient::new(cfg.http.clone()));
     // P3-2：订单台账（跨连接共享，进程内唯一权威）
     let book = Arc::new(Mutex::new(OrderBook::new()));
+    // P3-4：台账落库（单写线程 + 批量事务）。路径为空则纯内存，行为同 P3-2。
+    let ledger_store = Arc::new(Store::open(&cfg.ledger_path));
+    if ledger_store.enabled() {
+        eprintln!("exec-service ledger store: {}", cfg.ledger_path);
+    }
 
     // P3-1：后台预热连接池（best-effort，失败不影响签名服务）
     if cfg.http.enabled() {
@@ -237,6 +295,7 @@ async fn main() -> std::io::Result<()> {
         let signer_tcp = signer.clone();
         let http_tcp = http.clone();
         let book_tcp = book.clone();
+        let store_tcp = ledger_store.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -244,7 +303,8 @@ async fn main() -> std::io::Result<()> {
                         let s = signer_tcp.clone();
                         let h = http_tcp.clone();
                         let b = book_tcp.clone();
-                        tokio::spawn(async move { handle(stream, s, h, b).await });
+                        let st = store_tcp.clone();
+                        tokio::spawn(async move { handle(stream, s, h, b, st).await });
                     }
                     Err(exc) => eprintln!("tcp accept failed: {exc}"),
                 }
@@ -283,7 +343,8 @@ async fn main() -> std::io::Result<()> {
                     let s = signer.clone();
                     let h = http.clone();
                     let b = book.clone();
-                    tokio::spawn(async move { handle(stream, s, h, b).await });
+                    let st = ledger_store.clone();
+                    tokio::spawn(async move { handle(stream, s, h, b, st).await });
                 }
                 Err(exc) => eprintln!("uds accept failed: {exc}"),
             }

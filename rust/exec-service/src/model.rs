@@ -71,6 +71,9 @@ pub struct Response {
     /// P3-3：两笔保护单的构造结果（query + signature，仅构造不发送）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protections: Option<serde_json::Value>,
+    /// P3-4：台账落库统计
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<crate::store::StoreStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -88,6 +91,7 @@ impl Response {
             order: None,
             duplicate: None,
             protections: None,
+            store: None,
             error: None,
         }
     }
@@ -104,6 +108,7 @@ impl Response {
             order: None,
             duplicate: None,
             protections: None,
+            store: None,
             error: Some(msg.into()),
         }
     }
