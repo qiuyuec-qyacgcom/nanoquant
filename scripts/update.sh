@@ -149,6 +149,23 @@ PY
 fi
 
 # ---------------------------------------------------------------- 3. 依赖
+# venv 自愈：老机器/被裁剪的 python3-venv 常有 python 但没 pip
+if ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  warn "虚拟环境缺少 pip，尝试恢复"
+  "$VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  if ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+    _gp="$(mktemp /tmp/get-pip.XXXXXX.py)"
+    if command -v curl >/dev/null 2>&1; then curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$_gp" || true
+    elif command -v wget >/dev/null 2>&1; then wget -q -O "$_gp" https://bootstrap.pypa.io/get-pip.py || true; fi
+    [[ -s "$_gp" ]] && "$VENV/bin/python" "$_gp" --quiet >/dev/null 2>&1 || true
+    rm -f "$_gp"
+  fi
+  "$VENV/bin/python" -m pip --version >/dev/null 2>&1 || die "pip 恢复失败：
+  $VENV/bin/python -m ensurepip --upgrade
+  或 curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && $VENV/bin/python /tmp/get-pip.py"
+  ok "pip 已恢复"
+fi
+
 REQ="$ROOT/backend/requirements.txt"
 HASH_FILE="$VENV/.requirements.sha256"
 NEW_HASH="$(sha256sum "$REQ" | awk '{print $1}')"

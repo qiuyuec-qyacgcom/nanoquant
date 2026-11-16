@@ -366,6 +366,44 @@ else
   info "复用已有虚拟环境 $VENV"
 fi
 
+# venv 自愈：Debian 的 python3-venv 常被裁剪成「有 python 没 pip」。
+# 复用旧 venv 或 ensurepip 被禁用时都会中招，安装前必须先把 pip 补上。
+ensure_pip() {
+  if "$VPY" -m pip --version >/dev/null 2>&1; then return 0; fi
+  warn "虚拟环境缺少 pip，尝试修复"
+  # 1) ensurepip（多数 venv 自带）
+  if "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 && "$VPY" -m pip --version >/dev/null 2>&1; then
+    ok "pip 已通过 ensurepip 恢复"
+    return 0
+  fi
+  # 2) 补装系统包（Debian/Ubuntu 的 python3-venv 提供 ensurepip）
+  if [[ "$PKG" == "apt" ]]; then
+    install_pkg python3-pip python3-venv >/dev/null 2>&1 || true
+    if "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 && "$VPY" -m pip --version >/dev/null 2>&1; then
+      ok "pip 已通过系统包恢复"
+      return 0
+    fi
+  fi
+  # 3) get-pip.py 兜底（不依赖 ensurepip / 系统包）
+  local GETPIP
+  GETPIP="$(mktemp /tmp/get-pip.XXXXXX.py)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$GETPIP" || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$GETPIP" https://bootstrap.pypa.io/get-pip.py || true
+  fi
+  if [[ -s "$GETPIP" ]] && "$VPY" "$GETPIP" --quiet >/dev/null 2>&1; then
+    rm -f "$GETPIP"
+    ok "pip 已通过 get-pip.py 恢复"
+    return 0
+  fi
+  rm -f "$GETPIP"
+  die "无法为虚拟环境恢复 pip。请手动执行：
+  curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && $VPY /tmp/get-pip.py
+  或：apt install -y python3-pip python3-venv"
+}
+ensure_pip
+
 # ---------------------------------------------------------------- 后端依赖
 REQ="$ROOT/backend/requirements.txt"
 HASH_FILE="$VENV/.requirements.sha256"
