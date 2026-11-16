@@ -74,6 +74,30 @@ def _persist_order(order_fields: dict[str, Any]) -> None:
 _CLOSING: set[int] = set()
 
 
+def _ledger_notify(
+    client_order_id: str,
+    symbol: str,
+    status: str,
+    filled_qty: float | None = None,
+    avg_price: float | None = None,
+) -> None:
+    """把订单生命周期投递给 sidecar 台账（P3-5）。
+
+    - **绝不抛异常**：台账只是旁路观测，任何失败都不能影响真实下单；
+    - 先 `register`（幂等，仅第一次真正发送），再 `transition` 到实际状态；
+    - `off` 模式下 `order_ledger` 内部直接短路，零开销。
+    """
+    try:
+        from ..services.order_ledger import order_ledger
+
+        cid = str(client_order_id or "").strip()
+        if not cid:
+            return
+        order_ledger.observe(cid, symbol, status, filled_qty, avg_price)
+    except Exception:  # noqa: BLE001  台账失败不得影响下单
+        log.debug("订单台账投递失败(已忽略)", exc_info=True)
+
+
 def _entry_fee_rate(risk_cfg: Any) -> float:
     """入场腿费率：挂单入场（limit_post_only / GTX）用 maker，市价入场用 taker.
 
@@ -471,6 +495,7 @@ class BinanceBroker:
             # 成交后由 `_reconcile_live` 以「外部仓位」身份接管，保护价从交易所条件单回填。
             if filled_qty <= 0:
                 db_writer.submit(_persist_order, order_fields)
+                _ledger_notify(cid, symbol, order_fields["status"])
                 try:
                     await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
                 except Exception as exc:  # noqa: BLE001  保护单失败不能吞掉「委托已提交」这个事实
@@ -534,6 +559,8 @@ class BinanceBroker:
                 },
             )
             stage["persist_ms"] = (time.perf_counter() - t_persist) * 1000
+            # P3-5：把「已成交」投递给 sidecar 台账（后台 fire-and-forget，不影响下单）
+            _ledger_notify(cid, symbol, order_fields["status"], filled_qty, avg)
             t_protect = time.perf_counter()
             await self._place_protection(symbol, side, sl_price, tp_price, filters, dual=dual)
             stage["protect_ms"] = (time.perf_counter() - t_protect) * 1000
@@ -655,6 +682,8 @@ class BinanceBroker:
             )
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
+            # P3-5：加仓单投递（后台，不影响加仓关键路径）
+            _ledger_notify(cid, position.symbol, str(resp.get("status", "FILLED")), filled, avg)
             label = "实盘" if self.mode == "live" else "模拟盘"
             return ExecResult(
                 True,
@@ -822,6 +851,14 @@ class BinanceBroker:
             stage["persist_ms"] = (time.perf_counter() - t_persist) * 1000
             stage["total_ms"] = (time.perf_counter() - t_call) * 1000
             exec_metrics.record(stage)
+            # P3-5：平仓单同样投递（后台，不影响平仓关键路径）
+            _ledger_notify(
+                str(resp.get("clientOrderId", "")),
+                position.symbol,
+                str(resp.get("status", "")),
+                close_qty,
+                avg,
+            )
             # 只有全平才撤保护单; 部分止盈后剩余仓位仍需止损/止盈保护
             if close_qty >= live_qty - 1e-12:
                 try:

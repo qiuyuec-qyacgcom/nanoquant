@@ -630,8 +630,12 @@ def exec_sidecar_status(user: str = Depends(current_user)) -> dict:
     切流判据是 `counts.mismatched == 0`, 而不是"连上了"。
     """
     from ...services.exec_shadow import exec_shadow
+    from ...services.order_ledger import order_ledger
 
-    return exec_shadow.status()
+    out = exec_shadow.status()
+    # P3-5：订单台账投递状态（旁路观测，不影响签名比对结论）
+    out["order_ledger"] = order_ledger.status()
+    return out
 
 
 @router.post("/system/exec-sidecar/self-test")

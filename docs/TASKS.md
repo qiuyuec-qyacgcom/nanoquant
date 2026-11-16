@@ -1324,6 +1324,19 @@
   - `cargo test --release` → **13 passed**（3 签名向量 + 3 连接池 + 7 订单状态机）。
   - 真实回环冒烟：完整生命周期 → `FILLED`（`avg_price=73800.5`、`terminal=true`）；重复 register `dup=true`；终态回退与跨级跳均正确拒绝；`snapshot` = `{FILLED:1, PLANNED:1}, dup_hits=1`；**订单操作后签名仍为 `c5bee7ef...`**（与签名路径隔离）。
 
+### 95. P3-5：Python 侧订单生命周期投递 sidecar（shadow 对账）
+- **状态**：✅ 已完成
+- **背景**：P3-2 在 sidecar 建了幂等台账，但没人告诉它订单发生了什么。本步打通 Python → sidecar 的投递链路，先在 shadow 对账。
+- **过程要点**：
+  - `exchange/exec_client.py`：`request()` 支持额外字段；新增 `order_register / order_transition / order_snapshot`。
+  - 新增 `services/order_ledger.py`：照 `exec_shadow` 的护栏设计——**fire-and-forget**（`create_task`，并发上限 32）、**绝不抛异常**（失败只计数）、sidecar 掉线进 5s 静默期、`off` 模式零投递、`(cid, state)` 去重（终态只投一次）。
+  - **关键修正**：首投必须**按实际状态建档**。最初实现是 `register(PLANNED)` 再 `transition(FILLED)`，被状态机当作跨级跳正确拒绝——E2E 暴露后改为「首次直接用实际状态 register，已存在才 transition」，既保住严格性又不制造非法迁移。
+  - `exchange/broker.py`：入场成交、挂单提交、平仓、加仓四处接 `_ledger_notify`，全部 `try/except` 包裹，台账失败不影响下单。
+  - `GET /system/exec-sidecar` 响应新增 `order_ledger` 段（mode/enabled/counts/cooldown）。
+- **验证**：
+  - `pytest tests -q` → **494 passed**（新增 `tests/test_order_ledger.py` 7 条：off 零投递、首投按实际状态、二次合法迁移、同态去重、失败不抛、静默期跳过、空 ID 忽略）。
+  - 端到端（真实 Rust sidecar + 真实 ledger）：`registered=1 / transitioned=1 / errors=0`，Rust 台账 `{FILLED:1}` `avg_price=73800.5`，`off` 模式零新增。
+
 ---
 
 ## 二、未开始
@@ -1336,10 +1349,11 @@
   - `exec_mode` 切到 `enforce`，`一致 22 / 不一致 0 / 失败 0 / 跳过 0`，p99 1.17ms。
   - **P3-1**：`src/http.rs`（reqwest+rustls HTTP/2 连接池 + 启动预热 + `probe` op），见 TASKS #93。
   - **P3-2**：`src/order.rs`（幂等订单状态机 + 4 个 op），见 TASKS #94。
+  - **P3-5**：`services/order_ledger.py`（Python 投递 + shadow 对账），见 TASKS #95。
 - **待办**：
   - P3-3：保护单并行下发（STOP + TP，走 Algo 接口）。
   - P3-4：落库改由 Rust 单写线程组提交，Python 只读。
-  - P3-5（新增，P3-2 的收尾）：Python 侧把订单生命周期投递给 sidecar（`order_register/transition`），先在 shadow 对账、一致后再作为权威台账。
+  - P3-5 收尾：把 sidecar 台账从「shadow 对账」提升为权威源（需先积累一段对账无差异样本）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
 - **VPS 踩坑记录**（已确认，供复盘）：
   - `exec.env` 的 `EXEC_SECRET` 若带尖括号 `<...>`：systemd 会把括号当值的一部分 → sidecar 与 Python 签名不一致；且 shell `source` 会因 `<` 触发重定向语法错误。

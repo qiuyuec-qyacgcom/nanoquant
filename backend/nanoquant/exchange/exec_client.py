@@ -104,8 +104,11 @@ class ExecSidecar:
         return self._lock
 
     # ------------------------------------------------------------------ request
-    async def request(self, op: str, query: str = "") -> dict[str, Any]:
-        payload = json.dumps({"id": uuid.uuid4().hex[:12], "op": op, "query": query}) + "\n"
+    async def request(self, op: str, query: str = "", **extra: Any) -> dict[str, Any]:
+        body: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "op": op, "query": query}
+        # P3-2/3-5：订单台账 op 需要额外字段（client_order_id / symbol / state / ...）
+        body.update({k: v for k, v in extra.items() if v is not None})
+        payload = json.dumps(body) + "\n"
         async with self._guard():
             self.counters["requests"] += 1
             # 计时从拿到锁开始: 排队时长不是 sidecar 的往返, 算进去会让宕机时的 p99 虚高
@@ -159,6 +162,34 @@ class ExecSidecar:
     async def sign(self, query: str) -> dict[str, Any]:
         """影子模式：只签名，不发单."""
         return await self.request("plan", query)
+
+    # ------------------------------------------------------ P3-2/3-5 订单台账
+    async def order_register(
+        self, client_order_id: str, symbol: str, state: str = "PLANNED"
+    ) -> dict[str, Any]:
+        """幂等登记订单；重复登记返回 `duplicate=true`（不发单）。"""
+        return await self.request(
+            "order_register", client_order_id=client_order_id, symbol=symbol, state=state
+        )
+
+    async def order_transition(
+        self,
+        client_order_id: str,
+        state: str,
+        filled_qty: float | None = None,
+        avg_price: float | None = None,
+    ) -> dict[str, Any]:
+        """状态迁移；非法迁移 sidecar 会返回 `ok:false`。"""
+        return await self.request(
+            "order_transition",
+            client_order_id=client_order_id,
+            state=state,
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+        )
+
+    async def order_snapshot(self) -> dict[str, Any]:
+        return await self.request("order_snapshot")
 
     async def close(self) -> None:
         writer = self._writer
