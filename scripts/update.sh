@@ -44,10 +44,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 C_RESET='\033[0m'; C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'
-info() { printf "${C_INFO}[信息]${C_RESET} %s\n" "$*"; }
-ok()   { printf "${C_OK}[完成]${C_RESET} %s\n" "$*"; }
-warn() { printf "${C_WARN}[注意]${C_RESET} %s\n" "$*"; }
-die()  { printf "${C_ERR}[失败]${C_RESET} %s\n" "$*" >&2; exit 1; }
+info() { printf "${C_INFO}  · ${C_RESET}%s\n" "$*"; }
+ok()   { printf "${C_OK}  ✓ ${C_RESET}%s\n" "$*"; }
+warn() { printf "${C_WARN}  ⚠ ${C_RESET}%s\n" "$*"; }
+die()  { printf "${C_ERR}  ✗ ${C_RESET}%s\n" "$*" >&2; exit 1; }
 
 VENV="$ROOT/.venv"
 [[ -d "$ROOT/.git" ]] || die "$ROOT 不是 git 仓库：无法用本脚本更新（手工替换代码后重启亦可）"

@@ -79,27 +79,33 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-C_RESET='\033[0m'; C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'
-info() { printf "${C_INFO}[信息]${C_RESET} %s\n" "$*"; }
-ok()   { printf "${C_OK}[完成]${C_RESET} %s\n" "$*"; }
-warn() { printf "${C_WARN}[注意]${C_RESET} %s\n" "$*"; }
-die()  { printf "${C_ERR}[失败]${C_RESET} %s\n" "$*" >&2; exit 1; }
+C_RESET='\033[0m'; C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'; C_DIM='\033[2m'
+#: 统一输出前缀；行宽对齐交给前缀本身，消息里不再各自拼空格
+info() { printf "${C_INFO}  · ${C_RESET}%s\n" "$*"; }
+ok()   { printf "${C_OK}  ✓ ${C_RESET}%s\n" "$*"; }
+warn() { printf "${C_WARN}  ⚠ ${C_RESET}%s\n" "$*"; }
+die()  { printf "${C_ERR}  ✗ ${C_RESET}%s\n" "$*" >&2; exit 1; }
+
+#: 阶段标题：进入一个新的安装阶段时调用，让长输出有清晰的分节。
+#: 注意：分隔线直接写进 printf 的**格式串**（转义才会生效），不能当 %s 参数传。
+stage() {
+  printf "\n${C_DIM}────────────────────────────────────────────────${C_RESET}\n"
+  printf "  ${C_INFO}▸ %s${C_RESET}\n" "$*"
+  printf "${C_DIM}────────────────────────────────────────────────${C_RESET}\n"
+}
 
 banner() {
   cat <<'EOF'
- _   _             ___                      _
-| \ | | __ _ _ __ / _ \ _   _  __ _ _ __   | |_
-|  \| |/ _` | '_ \ | | | | | |/ _` | '_ \  | __|
-| |\  | (_| | | | | |_| | |_| | (_| | | | | |_
-|_| \_|\__,_|_| |_|\__\_\\__,_|\__,_|_| |_|\__|
 
-  小资金 · 币安 U 本位永续 · 超短线量化终端
+  ══════════════════════════════════════════════════
+    NanoQuant  安装程序
+    小资金 · 币安 U 本位永续 · 超短线量化终端
+  ══════════════════════════════════════════════════
 EOF
 }
 
 banner
-info "安装目录: $ROOT"
-info "监听端口: $PORT"
+printf "  ${C_DIM}安装目录   %s\n  监听端口   %s${C_RESET}\n" "$ROOT" "$PORT"
 
 # ---------------------------------------------------------------- 执行内核选择
 # 交互式询问（无 TTY 或已用 --kernel 指定时跳过）。
@@ -167,7 +173,7 @@ fi
 # 在这里"装成功了"只会在后面启动时炸；直接把 Windows 用户送到正确脚本
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*)
-    printf "${C_ERR}[失败]${C_RESET} 检测到 Git Bash / Cygwin。\n" >&2
+    printf "${C_ERR}  ✗ ${C_RESET} 检测到 Git Bash / Cygwin。\n" >&2
     echo "  Windows 请用: powershell -ExecutionPolicy Bypass -File scripts\\install.ps1" >&2
     exit 1 ;;
 esac
@@ -176,7 +182,7 @@ if [[ "$(id -u)" == "0" ]]; then
   info "以 root 运行：生成的文件属主是 root，后续请用同一用户执行 start.sh"
 fi
 
-# ---------------------------------------------------------------- 磁盘空间
+stage "阶段 1/8 · 环境检查（Python / 磁盘 / 系统包）"
 # SQLite / 备份 / 日志都在 data/ 下，空间不足会变成"盘中写入失败"，比启动失败更难查
 FREE_KB="$(df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
 if [[ -n "${FREE_KB:-}" && "$FREE_KB" -lt 2097152 ]]; then
@@ -348,6 +354,7 @@ if ! "$PY" -c 'import venv' 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------- 虚拟环境
+stage "阶段 2/8 · 虚拟环境与后端依赖"
 VENV="$ROOT/.venv"
 # 兼容 Windows 布局（Scripts/python.exe）：仓库放在 Windows 盘上被 WSL 挂进来时
 # 常见这种 venv，直接判成"没有 venv"会把它重建一遍
@@ -429,6 +436,7 @@ fi
 ok "后端可导入（nanoquant.main）"
 
 # ---------------------------------------------------------------- 前端构建
+stage "阶段 3/8 · 前端构建（自动补齐 Node.js 18+）"
 # 自动补齐 Node.js：前端要 18+，缺了或太旧就自动装（apt 优先，装不到走 NodeSource 20 LTS）
 node_ready() {
   command -v node >/dev/null 2>&1 || return 1
@@ -480,6 +488,11 @@ if [[ "$WITH_FRONTEND" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------- 执行内核 sidecar（Rust）
+if [[ "$KERNEL" == "rust" ]]; then
+  stage "阶段 4/8 · Rust 执行内核（编译 / 安装 / 配密钥）"
+else
+  info "执行内核: Python（跳过 Rust 编译）"
+fi
 # 仅当用户选择 rust 时执行：编译 → 装二进制 → 写密钥 → 注册 systemd。
 # 选 python 时这里完全跳过，不留任何 Rust 相关残留。
 SIDECAR_OK=0
@@ -525,6 +538,7 @@ if [[ "$KERNEL" == "rust" && -d "$ROOT/rust/exec-service" ]]; then
 fi
 
 # ---------------------------------------------------------------- 运行目录
+stage "阶段 5/8 · 运行目录 / 管理员密码 / 交易所凭证"
 mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
 chmod 700 "$ROOT/data" 2>/dev/null || true
 # 端口持久化：--port 要真的被 start.sh 沿用，否则只是个"提示里好看"的参数
@@ -578,6 +592,7 @@ if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------- systemd
+stage "阶段 6/8 · 服务注册与启动"
 if [[ "$WITH_SYSTEMD" == "1" ]]; then
   if [[ ! -d /etc/systemd/system ]]; then
     warn "当前系统没有 systemd，跳过服务注册"
@@ -664,6 +679,9 @@ SIDECAR_EOF
 fi
 
 # ---------------------------------------------------------------- 自动后台启动（非 systemd）
+if [[ "$WITH_SYSTEMD" != "1" ]]; then
+  stage "阶段 6/8 · 后台启动（无 systemd）"
+fi
 # 没走 systemd 时，装完直接后台拉起服务（等价 start.sh --daemon），省去手动敲启动命令。
 # 首次启动会顺带消费 data/.admin_password（哈希入库并删除），这里启动正好闭环。
 # --no-start 可跳过（只想装好环境、稍后自己启动）。
@@ -711,59 +729,65 @@ IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 IP="${IP:-127.0.0.1}"
 
 if [[ "$PASSWORD_GENERATED" == "1" ]]; then
-  PASS_LINE="初始密码 : $GEN_PASSWORD"
+  PASS_LINE="初始密码   $GEN_PASSWORD"
   PASS_HINT="该密码由安装脚本随机生成，仅本次显示；登录后必须先改密。"
 else
-  PASS_LINE="初始密码 : $GEN_PASSWORD"
+  PASS_LINE="初始密码   $GEN_PASSWORD"
   PASS_HINT="登录后建议改成新的强口令（首次登录不强制）。"
 fi
 
 # 结尾「启动」一行按实际状态展示，避免误导
 if [[ "$WITH_SYSTEMD" == "1" ]]; then
-  START_LINE="启动     : systemd 已接管（开机自启；手动重启: systemctl restart nanoquant）"
+  START_LINE="systemd 已接管（开机自启）      手动重启 : systemctl restart nanoquant"
 elif [[ "$NO_START" == "1" ]]; then
-  START_LINE="启动     : bash scripts/start.sh --daemon   （本次按 --no-start 未自动启动）"
+  START_LINE="本次按 --no-start 未自动启动    手动启动 : bash scripts/start.sh --daemon"
 else
-  START_LINE="启动     : 已自动后台运行；机器重启后请 bash scripts/start.sh --daemon"
+  START_LINE="已自动后台运行                  机器重启后 : bash scripts/start.sh --daemon"
 fi
 
 # 内核一行：明确本次装的是哪套执行内核
 if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
-  SIDECAR_LINE="执行内核 : Rust sidecar 已安装并启用（签名与交易所 Secret 同一把；默认 off，需在面板开启 shadow→enforce）"
+  SIDECAR_LINE="Rust sidecar 已启用（签名密钥与交易所 Secret 同一把）"
+  SIDECAR_NOTE="默认 exec_mode=off；到「参数配置 → 系统 → 执行内核」按 shadow → enforce 灰度开启"
 elif [[ "$KERNEL" == "rust" ]]; then
-  SIDECAR_LINE="执行内核 : Rust 编译失败，已回退 Python；修复后执行 sudo bash scripts/setup_sidecar.sh --from-settings"
+  SIDECAR_LINE="Rust 编译失败，已回退 Python"
+  SIDECAR_NOTE="修复后执行 : sudo bash scripts/setup_sidecar.sh --from-settings"
 else
-  SIDECAR_LINE="执行内核 : Python（默认；如需 Rust 请重跑并选 2，或 --kernel rust）"
+  SIDECAR_LINE="Python（内置签名）"
+  SIDECAR_NOTE="如需 Rust : 重跑安装选 2，或 sudo bash scripts/setup_sidecar.sh --from-settings"
 fi
 
+stage "安装完成"
+
 cat <<EOF
-
-$(printf "${C_OK}========================================${C_RESET}")
- 安装完成
-$(printf "${C_OK}========================================${C_RESET}")
-
-  访问地址 : http://$IP:$PORT
-  默认账号 : admin
-  $PASS_LINE
+  $(printf "${C_INFO}访问地址${C_RESET}   http://$IP:$PORT")
+  $(printf "${C_INFO}默认账号${C_RESET}   admin")
+  $(printf "${C_INFO}$PASS_LINE${C_RESET}")
 
   $(printf "${C_WARN}$PASS_HINT${C_RESET}")
   改密前后台除登录/改密/健康检查外的接口一律 403。
 
-  $START_LINE
-  $SIDECAR_LINE
-  停止     : bash scripts/stop.sh
-  查看状态 : bash scripts/status.sh
-  健康检查 : curl http://127.0.0.1:$PORT/api/v1/health
+  $(printf "${C_INFO}服务${C_RESET}")
+    启动     $START_LINE
+    停止     bash scripts/stop.sh
+    查看状态 bash scripts/status.sh
+    健康检查 curl http://127.0.0.1:$PORT/api/v1/health
 
-  数据目录 : $ROOT/data     (SQLite / 备份 / 缓存)
-  日志目录 : $ROOT/logs
-  参数配置 : 全部在面板里，存于数据库，改完即时生效
+  $(printf "${C_INFO}执行内核${C_RESET}")
+    当前     $SIDECAR_LINE
+    $(printf "${C_DIM}%s${C_RESET}" "$SIDECAR_NOTE")
 
-  首次使用建议顺序:
-   1. 用初始密码登录，立即改成自己的强口令（随机密码首次登录会被强制）
-   2. 「参数配置 → 数据源」填币安 API Key（只开合约交易，关闭提币）
-   3. 「参数配置 → 系统 → 告警」配 Webhook / Telegram，否则出事只能在页面里看
-   4. 「AI 模型」接入 DeepSeek / Qwen / GPT 等 OpenAI 兼容模型并点「诊断」
-   5. 「标的池」添加合约 → 「总览」以 DEMO 模式启动 → 观察后再切 LIVE
+  $(printf "${C_INFO}目录${C_RESET}")
+    数据     $ROOT/data   （SQLite / 备份 / 缓存）
+    日志     $ROOT/logs
+    配置     全部在面板里，存于数据库，改完即时生效
+EOF
 
+stage "首次使用建议"
+cat <<EOF
+  1. 用初始密码登录，立即改成自己的强口令（随机密码首次登录会被强制）
+  2. 「参数配置 → 数据源」填币安 API Key（只开合约交易，关闭提币）
+  3. 「参数配置 → 系统 → 告警」配 Webhook / Telegram，否则出事只能在页面里看
+  4. 「AI 模型」接入 DeepSeek / Qwen / GPT 等 OpenAI 兼容模型并点「诊断」
+  5. 「标的池」添加合约 → 「总览」以 DEMO 模式启动 → 观察后再切 LIVE
 EOF
