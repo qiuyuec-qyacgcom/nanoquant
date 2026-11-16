@@ -15,7 +15,7 @@ serde_json = "1"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
+ed25519-dalek = { version = "3", features = ["pkcs8"] }
 # P3-1：HTTP/2 连接池。纯 Rust TLS（rustls），不依赖系统 OpenSSL，
 # 避免 VPS 上缺 libssl 或版本不匹配导致构建/运行失败。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip"] }
