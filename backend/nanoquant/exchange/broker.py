@@ -9,6 +9,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
+from urllib.parse import urlencode
 
 from ..db import session_scope
 from ..logging_setup import get_logger
@@ -718,6 +719,8 @@ class BinanceBroker:
         close_side = "SELL" if side == "long" else "BUY"
         # 双向持仓：closePosition 需配合 positionSide 指明平哪一侧；不能用 reduceOnly
         side_params = hedge_order_params(dual, side, closing=True) if dual else {}
+        #: P3-3 对账用：本地构造的 (kind, trigger_price, query)，不参与发送
+        local_legs: list[tuple[str, str, str]] = []
 
         async def place(kind: str, price: float) -> None:
             if price <= 0:
@@ -739,6 +742,11 @@ class BinanceBroker:
                 "clientAlgoId": new_client_order_id("np"),
                 **side_params,
             }
+            # P3-3：记录本地构造的 query 与 clientAlgoId（供 sidecar 逐字节对账）
+            try:
+                local_legs.append((kind, px, urlencode(algo_params), str(algo_params["clientAlgoId"])))
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await binance_client.client.place_algo_order(**algo_params)
             except BinanceError as exc:
@@ -764,6 +772,27 @@ class BinanceBroker:
         # 止损与止盈是两笔独立的 reduce-only 单, 并行发出:
         # 串行会让开仓关键路径多背一个 RTT, 直接体现在下单 p99 上.
         await asyncio.gather(place("STOP_MARKET", sl_price), place("TAKE_PROFIT_MARKET", tp_price))
+        # P3-3：把本地构造交给 sidecar 并行重算并逐字节对账（只比对，不影响已发出的单）
+        try:
+            from ..services.order_ledger import order_ledger
+
+            if local_legs:
+                stop_cid = next((c for k, _p, _q, c in local_legs if k == "STOP_MARKET"), "")
+                take_cid = next(
+                    (c for k, _p, _q, c in local_legs if k == "TAKE_PROFIT_MARKET"), ""
+                )
+                order_ledger.observe_protection(
+                    symbol,
+                    close_side,
+                    [(k, p, q) for k, p, q, _c in local_legs],
+                    position_side=(
+                        str(side_params.get("positionSide", "")) if side_params else ""
+                    ),
+                    stop_client_id=stop_cid,
+                    take_client_id=take_cid,
+                )
+        except Exception:  # noqa: BLE001  对账失败绝不影响保护单
+            log.debug("保护单对账投递失败(已忽略)", exc_info=True)
 
     async def _resolve_entry(self, symbol: str, cid: str) -> dict | None:
         for _ in range(4):

@@ -16,6 +16,7 @@
 mod http;
 mod model;
 mod order;
+mod protection;
 mod sign;
 
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ use tokio::net::UnixListener;
 use http::HttpClient;
 use model::{Request, Response};
 use order::{OrderBook, OrderState};
+use protection::{build_pair, LegSpec, ProtectKind};
 use sign::Signer;
 use tokio::sync::Mutex;
 
@@ -139,6 +141,47 @@ async fn dispatch(req: Request, signer: &Signer, http: &HttpClient, book: &Mutex
             let guard = book.lock().await;
             let mut resp = Response::ok(&req.id);
             resp.order = Some(guard.snapshot());
+            resp
+        }
+        // P3-3：并行构造 STOP + TP 两笔保护单（只签名，不发送），供 Python 逐字节比对
+        "protection_plan" => {
+            if req.symbol.trim().is_empty() || req.close_side.trim().is_empty() {
+                return Response::err(&req.id, "symbol / close_side 不能为空");
+            }
+            let ps = req.position_side.trim();
+            let position_side = if ps.is_empty() { None } else { Some(ps) };
+            let stop_id = if req.stop_client_id.trim().is_empty() {
+                "np_stop".to_string()
+            } else {
+                req.stop_client_id.trim().to_string()
+            };
+            let take_id = if req.take_client_id.trim().is_empty() {
+                "np_take".to_string()
+            } else {
+                req.take_client_id.trim().to_string()
+            };
+            let (stop, take) = build_pair(
+                signer,
+                LegSpec {
+                    symbol: &req.symbol,
+                    close_side: &req.close_side,
+                    kind: ProtectKind::StopMarket,
+                    trigger_price: &req.stop_price,
+                    client_algo_id: &stop_id,
+                    position_side,
+                },
+                LegSpec {
+                    symbol: &req.symbol,
+                    close_side: &req.close_side,
+                    kind: ProtectKind::TakeProfitMarket,
+                    trigger_price: &req.take_price,
+                    client_algo_id: &take_id,
+                    position_side,
+                },
+            )
+            .await;
+            let mut resp = Response::ok(&req.id);
+            resp.protections = Some(serde_json::json!([stop, take]));
             resp
         }
         // 影子模式：签名并回显，供 Python 侧逐字节比对

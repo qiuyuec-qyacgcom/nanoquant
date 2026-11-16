@@ -112,6 +112,7 @@ exec-service/
     ├── model.rs   请求/响应结构
     ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
     ├── order.rs   P3-2 订单状态机（幂等 clientOrderId，Planned→Filled）
+    ├── protection.rs  P3-3 保护单并行构造与签名（STOP + TP，只构造不发送）
     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
 ```
 
@@ -131,8 +132,18 @@ exec-service/
    `EXEC_BASE_URL` 启用，`probe` op 可验证；6 个单测通过）；
 2. ✅ **已完成** 订单状态机（`src/order.rs`，幂等 `clientOrderId`，
    `order_register/transition/get/snapshot` 四个 op，7 个单测通过）；**只记账不发单**；
-3. 保护单并行下发（STOP + TP），参数走 Algo 接口；
+3. 🚧 保护单并行（STOP + TP，Algo 接口）：**构造+签名已就绪并与 Python 逐字节一致**（`src/protection.rs`），代发留待下一阶段；
 4. 落库改由 Rust 单写线程组提交，Python 只读。
+
+## P3-3 已实现（保护单并行构造）
+
+- `src/protection.rs`：`form_urlencode` 逐字节复刻 Python `urlencode(quote_plus)`；
+  `build_pair` 用 `tokio::join!` 并行构造 STOP_MARKET + TAKE_PROFIT_MARKET。
+- 参数顺序与 `broker._place_protection` 的 `algo_params` 完全一致，双向持仓时
+  `positionSide` 追加在末尾（与 `hedge_order_params` 的 `**` 展开顺序一致）。
+- 新 op `protection_plan`：只回 query + signature，**不发送**。
+- Python 侧 `order_ledger.observe_protection` 做 shadow 对账（`protect_counts`）。
+- 实测：单向 / 双向 / 小数价三组场景 query 与签名**逐字节一致**。
 
 ## P3-2 已实现（订单状态机）
 

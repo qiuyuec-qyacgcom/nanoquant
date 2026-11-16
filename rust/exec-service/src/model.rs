@@ -26,6 +26,23 @@ pub struct Request {
     /// P3-2：成交均价（可选）
     #[serde(default)]
     pub avg_price: Option<f64>,
+    /// P3-3：保护单方向（已按 close_side 归一，SELL/BUY）
+    #[serde(default)]
+    pub close_side: String,
+    /// P3-3：止损触发价（已格式化的字符串，由调用方保证精度）
+    #[serde(default)]
+    pub stop_price: String,
+    /// P3-3：止盈触发价（同上）
+    #[serde(default)]
+    pub take_price: String,
+    /// P3-3：双向持仓的 positionSide（LONG/SHORT），单向留空
+    #[serde(default)]
+    pub position_side: String,
+    /// P3-3：两笔保护单的幂等 id（缺省由 sidecar 生成）
+    #[serde(default)]
+    pub stop_client_id: String,
+    #[serde(default)]
+    pub take_client_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +68,9 @@ pub struct Response {
     /// P3-2：register 是否命中去重（幂等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<bool>,
+    /// P3-3：两笔保护单的构造结果（query + signature，仅构造不发送）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protections: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -67,6 +87,7 @@ impl Response {
             latency_ms: None,
             order: None,
             duplicate: None,
+            protections: None,
             error: None,
         }
     }
@@ -82,6 +103,7 @@ impl Response {
             latency_ms: None,
             order: None,
             duplicate: None,
+            protections: None,
             error: Some(msg.into()),
         }
     }

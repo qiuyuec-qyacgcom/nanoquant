@@ -191,6 +191,31 @@ class ExecSidecar:
     async def order_snapshot(self) -> dict[str, Any]:
         return await self.request("order_snapshot")
 
+    async def protection_plan(
+        self,
+        *,
+        symbol: str,
+        close_side: str,
+        stop_price: str,
+        take_price: str,
+        position_side: str = "",
+        stop_client_id: str = "",
+        take_client_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """P3-3：让 sidecar 并行构造 STOP+TP 两笔保护单（只签名，不发送）。"""
+        resp = await self.request(
+            "protection_plan",
+            symbol=symbol,
+            close_side=close_side,
+            stop_price=stop_price,
+            take_price=take_price,
+            position_side=position_side,
+            stop_client_id=stop_client_id,
+            take_client_id=take_client_id,
+        )
+        legs = resp.get("protections") or []
+        return legs if isinstance(legs, list) else []
+
     async def close(self) -> None:
         writer = self._writer
         self._drop()

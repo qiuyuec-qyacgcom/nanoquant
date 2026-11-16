@@ -63,6 +63,9 @@ class OrderLedger:
             "inflight": 0,
         }
         self.last_error = ""
+        #: P3-3：保护单构造对账（sidecar 并行构造 vs Python 本地构造）
+        self.protect_counts = {"matched": 0, "mismatched": 0, "errors": 0, "skipped": 0}
+        self.last_protect_mismatch: dict[str, Any] | None = None
 
     @staticmethod
     def _default_mode() -> str:
@@ -165,6 +168,87 @@ class OrderLedger:
             return
         self._spawn(self._do_observe(cid, symbol, st, filled_qty, avg_price))
 
+    def observe_protection(
+        self,
+        symbol: str,
+        close_side: str,
+        legs: list[tuple[str, str, str]],
+        *,
+        position_side: str = "",
+        stop_client_id: str = "",
+        take_client_id: str = "",
+    ) -> None:
+        """P3-3：让 sidecar 并行构造保护单，与 Python 本地构造逐字节对账。
+
+        `legs` 是 Python 侧 `[(kind, trigger_price, query), ...]`；**只比对不代发**。
+        对账失败只计数，绝不影响真实保护单下发。
+        """
+        if not symbol or not close_side or not legs:
+            return
+        if not self.enabled():
+            return
+        if time.monotonic() < self._down_until:
+            self.protect_counts["skipped"] += 1
+            return
+        self._spawn(
+            self._do_protection(
+                symbol, close_side, legs, position_side, stop_client_id, take_client_id
+            )
+        )
+
+    async def _do_protection(
+        self,
+        symbol: str,
+        close_side: str,
+        legs: list[tuple[str, str, str]],
+        position_side: str,
+        stop_client_id: str,
+        take_client_id: str,
+    ) -> None:
+        try:
+            by_kind = {kind: (px, q) for kind, px, q in legs}
+            stop = by_kind.get("STOP_MARKET")
+            take = by_kind.get("TAKE_PROFIT_MARKET")
+            if not stop and not take:
+                self.protect_counts["skipped"] += 1
+                return
+            remote = await self._client.protection_plan(
+                symbol=symbol,
+                close_side=close_side,
+                stop_price=(stop or ("", ""))[0],
+                take_price=(take or ("", ""))[0],
+                position_side=position_side,
+                stop_client_id=stop_client_id,
+                take_client_id=take_client_id,
+            )
+            rmap = {str(x.get("kind")): x for x in remote if isinstance(x, dict)}
+            ok = True
+            for kind, (_px, local_q) in by_kind.items():
+                r = rmap.get(kind)
+                if not r or r.get("query") != local_q:
+                    ok = False
+                    self.last_protect_mismatch = {
+                        "ts": int(time.time()),
+                        "symbol": symbol,
+                        "kind": kind,
+                        "local": local_q[:200],
+                        "remote": str((r or {}).get("query"))[:200],
+                    }
+                    break
+            if ok:
+                self.protect_counts["matched"] += 1
+                self.last_error = ""
+            else:
+                self.protect_counts["mismatched"] += 1
+        except ExecSidecarError as exc:
+            self.protect_counts["errors"] += 1
+            if not getattr(self._client, "connected", False):
+                self._down_until = time.monotonic() + DOWN_COOLDOWN
+            self.last_error = str(exc)[:200]
+        except Exception as exc:  # noqa: BLE001
+            self.protect_counts["errors"] += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+
     # ------------------------------------------------------------------ 投递
     async def _do_observe(
         self,
@@ -212,6 +296,8 @@ class OrderLedger:
             "target": client.target,
             "connected": bool(client.connected),
             "counts": dict(self.counts),
+            "protect_counts": dict(self.protect_counts),
+            "last_protect_mismatch": self.last_protect_mismatch,
             "last_error": self.last_error,
             "cooldown_ms": max(0, int((self._down_until - time.monotonic()) * 1000)),
         }

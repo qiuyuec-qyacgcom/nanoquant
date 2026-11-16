@@ -1337,6 +1337,21 @@
   - `pytest tests -q` → **494 passed**（新增 `tests/test_order_ledger.py` 7 条：off 零投递、首投按实际状态、二次合法迁移、同态去重、失败不抛、静默期跳过、空 ID 忽略）。
   - 端到端（真实 Rust sidecar + 真实 ledger）：`registered=1 / transitioned=1 / errors=0`，Rust 台账 `{FILLED:1}` `avg_price=73800.5`，`off` 模式零新增。
 
+### 96. P3-3：保护单并行构造（STOP + TP，与 Python 逐字节一致）
+- **状态**：✅ 已完成（构造+签名；代发留待下一阶段）
+- **背景**：开仓后要立刻挂止损/止盈。直接让 sidecar 代发风险高（价格精度、positionSide、-4120 回落、结果未知），故先做「并行构造 + 逐字节对账」，与 P2 影子模式同节奏。
+- **过程要点**：
+  - 新增 `rust/exec-service/src/protection.rs`：
+    - `form_urlencode` **逐字节复刻** Python `urlencode(quote_plus)`（保留 `A-Za-z0-9_.-~`、空格→`+`、其余 `%XX` 大写）；
+    - `build_pair` 用 `tokio::join!` 并行构造两笔；
+    - 参数顺序与 `broker._place_protection::algo_params` 完全一致，双向持仓时 `positionSide` 追加末尾。
+  - 新 op `protection_plan`（只回 query+signature，**不发送**）；`Response` 增可选 `protections`。
+  - Python：`exec_client.protection_plan()`；`order_ledger.observe_protection()` 做 shadow 对账（`protect_counts` / `last_protect_mismatch`），`broker._place_protection` 发出后投递，**不改发送逻辑**、失败不影响保护单。
+- **验证**：
+  - `cargo test --release` → **18 passed**（含 4 条 protection：编码一致性、参数顺序、双向 positionSide、并行）。
+  - 端到端逐字节比对：单向（BTC SL/TP）、双向（ETH positionSide=SHORT）、小数价（72999.9）三组，**query 与签名全部一致**。
+  - `pytest tests -q` → **499 passed**（新增 `tests/test_protection_plan.py` 5 条）。
+
 ---
 
 ## 二、未开始
@@ -1350,8 +1365,9 @@
   - **P3-1**：`src/http.rs`（reqwest+rustls HTTP/2 连接池 + 启动预热 + `probe` op），见 TASKS #93。
   - **P3-2**：`src/order.rs`（幂等订单状态机 + 4 个 op），见 TASKS #94。
   - **P3-5**：`services/order_ledger.py`（Python 投递 + shadow 对账），见 TASKS #95。
+  - **P3-3**：`src/protection.rs`（保护单并行构造 + 逐字节对账），见 TASKS #96。
 - **待办**：
-  - P3-3：保护单并行下发（STOP + TP，走 Algo 接口）。
+  - P3-3 收尾：保护单由 sidecar 代发（需先积累一段 `protect_counts.mismatched == 0`）。
   - P3-4：落库改由 Rust 单写线程组提交，Python 只读。
   - P3-5 收尾：把 sidecar 台账从「shadow 对账」提升为权威源（需先积累一段对账无差异样本）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。

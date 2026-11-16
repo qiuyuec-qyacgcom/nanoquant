@@ -32,6 +32,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `order_transition` | `client_order_id` / `state` / `filled_qty?` / `avg_price?` | `order` | P3-2：状态迁移，非法迁移 / 终态回退一律 `ok:false` |
 | `order_get` | `client_order_id` | `order` | P3-2：查询单笔台账 |
 | `order_snapshot` | — | `order` | P3-2：全量台账 + 按状态统计 + `duplicate_hits` |
+| `protection_plan` | `symbol` / `close_side` / `stop_price` / `take_price` / `position_side?` / `stop_client_id?` / `take_client_id?` | `protections` | P3-3：并行构造 STOP+TP 两笔保护单的 query+签名，**只构造不发送** |
 
 错误响应：`{"id":"...","ok":false,"error":"..."}`，调用方应视为失败而非重试。
 
