@@ -42,7 +42,7 @@ interface Row extends FieldMeta {
 const groups = [
   { id: 'engine', label: '引擎', hint: '开关、节奏与时段' },
   { id: 'risk', label: '风控', hint: '仓位、熔断与费用' },
-  { id: 'strategy', label: '策略', hint: '机器实际执行的信号与出场（不是 AI 策略）' },
+  { id: 'strategy', label: '策略', hint: '机器实际执行的信号与出场（不是「全局策略」）' },
   { id: 'data', label: '数据源', hint: '行情源、网络与密钥' },
   { id: 'news', label: '资讯', hint: '抓取与情绪' },
   { id: 'evolution', label: '自进化', hint: '复盘与心法' },
@@ -51,27 +51,6 @@ const groups = [
   { id: 'system', label: '系统', hint: '日志与保留' },
   { id: 'public', label: '公开站点', hint: '前台展示' },
 ]
-
-//: 常用参数（默认视图）：只保留真正影响交易结果的项，其余收进「显示全部」
-const BASIC_FIELDS: Record<string, string[]> = {
-  engine: ['cycle_interval_sec', 'max_positions', 'trading_windows', 'order_type', 'close_on_halt'],
-  risk: [
-    'risk_per_trade_pct', 'margin_pct', 'default_leverage', 'max_leverage',
-    'daily_loss_limit_pct', 'max_drawdown_pct', 'drawdown_peak_window_days', 'consecutive_loss_limit', 'max_spread_bps',
-  ],
-  strategy: [
-    'timeframe', 'entry_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max',
-    'sl_atr_mult', 'tp_atr_mult', 'trailing_pct', 'max_hold_minutes',
-    'breakeven_at_r', 'partial_tp_at_r', 'partial_tp_ratio', 'roi_table',
-  ],
-  data: ['max_pool_size', 'demo_base_url', 'live_base_url', 'proxy'],
-  news: ['enabled', 'refresh_minutes', 'keep_days'],
-  evolution: ['enabled', 'max_injected', 'ttl_days', 'min_lesson_sample'],
-  backup: ['retention', 'encrypt', 'auto_daily'],
-  security: ['require_login', 'session_ttl_hours', 'login_fail_limit'],
-  system: ['log_level', 'event_retention_days'],
-  public: ['site_enabled', 'show_engine_status', 'show_mantras', 'show_performance'],
-}
 
 //: 面向普通用户的白话说明：覆盖原始技术描述（仅影响展示）
 const PLAIN_HINTS: Record<string, string> = {
@@ -561,25 +540,9 @@ function rowOf(group: string, key: string, value: any): Row {
   return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min, max: meta.max }
 }
 
-/** 默认只看「常用参数」，一键展开全部高级项，降低第一次上手的理解成本 */
-const showAll = ref(false)
-
 function skippedKeys(): Set<string> {
   return new Set([...PROTECTED, ...(SKIP[current.value] || []), 'symbols'])
 }
-
-function allowField(key: string): boolean {
-  if (showAll.value) return true
-  const basic = BASIC_FIELDS[current.value]
-  return !basic || basic.includes(key)
-}
-
-const hiddenCount = computed(() => {
-  const basic = BASIC_FIELDS[current.value]
-  if (showAll.value || !basic) return 0
-  const skip = skippedKeys()
-  return Object.keys(draft.value || {}).filter((k) => !skip.has(k) && !basic.includes(k)).length
-})
 
 // ------------------------------------------------------------ 参数检索
 /**
@@ -684,7 +647,7 @@ function clearSearch() {
   hitsOpen.value = false
 }
 
-/** 跳到某个参数：必要时切分组、展开高级项、滚动到视野中央并闪一下 */
+/** 跳到某个参数：必要时切分组、滚动到视野中央并闪一下 */
 async function jumpTo(group: string, key: string) {
   // 首屏还在拉配置时点「常用直达」会没有任何反应：先等配置到位再跳
   if (!Object.keys(app.settings || {}).length) await app.loadSettings()
@@ -692,7 +655,6 @@ async function jumpTo(group: string, key: string) {
     if (dirty.value && !confirm('当前分组有未保存的修改，切换后会被丢弃，继续？')) return
     loadGroup(group)
   }
-  showAll.value = true
   onlyDirty.value = false
   clearSearch()
   focusKey.value = key
@@ -724,10 +686,9 @@ function onHotkey(e: KeyboardEvent) {
   if (e.key === 'Escape') clearSearch()
 }
 
-/** 只看改动：长表单保存前核对到底动了哪几项（顺手展开高级项，避免改动项被折叠看不见） */
+/** 只看改动：长表单保存前核对到底动了哪几项 */
 function toggleOnlyDirty() {
   onlyDirty.value = !onlyDirty.value
-  if (onlyDirty.value) showAll.value = true
 }
 
 const currentSections = computed(() => {
@@ -735,7 +696,7 @@ const currentSections = computed(() => {
   const keep = onlyDirty.value ? new Set(changedKeys.value) : null
   const rows = new Map<string, Row>()
   for (const [key, value] of Object.entries(draft.value || {})) {
-    if (skip.has(key) || !allowField(key)) continue
+    if (skip.has(key)) continue
     if (keep && !keep.has(key)) continue
     rows.set(key, rowOf(current.value, key, value))
   }
@@ -1275,10 +1236,6 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
               <span class="muted" style="font-size: 10.5px">{{ currentGroup?.hint }}</span>
             </div>
             <div class="right" style="flex-wrap: wrap">
-              <span v-if="!showAll && hiddenCount" class="tag tag-dim">已隐藏 {{ hiddenCount }} 项高级参数</span>
-              <button class="btn btn-sm btn-ghost" @click="showAll = !showAll">
-                {{ showAll ? '只看常用' : '显示全部参数' }}
-              </button>
               <button
                 v-if="changedKeys.length"
                 class="btn btn-sm btn-ghost"
@@ -1447,7 +1404,7 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
             <div v-if="current === 'strategy'" class="note">
               这里是<b>机器真正执行的策略参数</b>：模式、周期、杠杆区间、准入闸门、止损止盈，改完直接影响下单。
               想改「AI 怎么分析」的文本指令，去
-              <router-link to="/admin/strategies">AI 策略</router-link>。
+              <router-link to="/admin/strategies">全局策略</router-link>。
             </div>
 
             <!-- 风控: 日亏基准（充值/重置资金后必须对齐，否则会算出假 -99%） -->
