@@ -247,6 +247,45 @@ class OrderLedger:
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]
             return {"ok": False, "unknown": False, "reason": self.last_error}
 
+    def authoritative_enabled(self) -> bool:
+        """P3-5 收尾：是否把 sidecar 台账当读取权威源（默认关）。"""
+        if not self.enabled():
+            return False
+        try:
+            from .settings import get_system
+
+            return bool(getattr(get_system(), "exec_ledger_authoritative", False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def authoritative_orders(self, limit: int = 500) -> dict[str, dict[str, Any]] | None:
+        """取 sidecar 台账作为权威视图；不可用时返回 None（调用方回退本地表）。
+
+        只返回状态类字段（state / filled_qty / avg_price），其余元数据仍以本地为准。
+        """
+        if not self.authoritative_enabled():
+            return None
+        try:
+            snap = await self._client.order_snapshot()
+        except ExecSidecarError:
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        orders = (snap.get("order") or {}).get("orders") or []
+        out: dict[str, dict[str, Any]] = {}
+        for item in orders[:limit]:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("client_order_id") or "")
+            if not cid:
+                continue
+            out[cid] = {
+                "state": str(item.get("state") or "").upper(),
+                "filled_qty": float(item.get("filled_qty") or 0),
+                "avg_price": float(item.get("avg_price") or 0),
+            }
+        return out
+
     async def reconcile(self, *, lookback_sec: int = 24 * 3600, limit: int = 500) -> dict[str, Any]:
         """P3-5 收尾的**前置**：sidecar 台账 ↔ Python `orders` 表双向对账（只读）。
 
@@ -466,6 +505,9 @@ class OrderLedger:
             "connected": bool(client.connected),
             "counts": dict(self.counts),
             "protect_counts": dict(self.protect_counts),
+            # P3-5 收尾：是否把 sidecar 台账当读取权威源
+            "authoritative": self.authoritative_enabled(),
+            "place_enabled": self.place_enabled(),
             "last_protect_mismatch": self.last_protect_mismatch,
             "last_error": self.last_error,
             "cooldown_ms": max(0, int((self._down_until - time.monotonic()) * 1000)),

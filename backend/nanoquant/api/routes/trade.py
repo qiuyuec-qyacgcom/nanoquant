@@ -318,7 +318,13 @@ async def close_position(position_id: int, payload: ClosePositionIn, user: str =
 
 
 @router.get("/engine/orders")
-def orders(limit: int = Query(default=80, ge=1, le=500), user: str = Depends(current_user)) -> dict:
+async def orders(limit: int = Query(default=80, ge=1, le=500), user: str = Depends(current_user)) -> dict:
+    """订单列表。
+
+    P3-5 收尾：`system.exec_ledger_authoritative=true` 时，状态类字段
+    （status / qty / price）以 sidecar 台账为准；sidecar 不可用自动回退本地表。
+    **只影响本接口的读取视图，不写任何数据**，关闭开关即刻恢复原行为。
+    """
     mode = normalize_mode(get_engine().mode)
     with session_scope() as s:
         rows = (
@@ -346,7 +352,28 @@ def orders(limit: int = Query(default=80, ge=1, le=500), user: str = Depends(cur
             }
             for o in rows
         ]
-    return {"items": items}
+
+    source = "local"
+    try:
+        from ...services.order_ledger import order_ledger
+
+        authoritative = await order_ledger.authoritative_orders(limit=limit)
+    except Exception:  # noqa: BLE001  权威源异常一律回退本地，绝不 5xx
+        authoritative = None
+    if authoritative is not None:
+        source = "sidecar"
+        for item in items:
+            hit = authoritative.get(str(item.get("client_order_id") or ""))
+            if not hit:
+                continue
+            if hit["state"]:
+                item["status"] = hit["state"]
+            if hit["filled_qty"] > 0:
+                item["qty"] = hit["filled_qty"]
+            if hit["avg_price"] > 0:
+                item["price"] = hit["avg_price"]
+            item["ledger_state"] = hit["state"]
+    return {"items": items, "ledger_source": source}
 
 
 @router.get("/engine/protection")

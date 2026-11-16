@@ -55,6 +55,20 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 > `unknown=true` 时会写一条 error 事件，提示用交易所持仓/挂单人工核对。
 
+### 3.5 台账权威源（P3-5 收尾）
+
+`system.exec_ledger_authoritative`（默认 `false`）：
+
+| 状态 | `GET /engine/orders` 行为 | `ledger_source` |
+|---|---|---|
+| 关闭 | 完全用本地 `orders` 表（原行为） | `local` |
+| 开启 + sidecar 可用 | `status/qty/price` 以 sidecar 台账覆盖 | `sidecar` |
+| 开启 + sidecar 不可用 | **自动回退本地表**，绝不 5xx | `local` |
+
+- 只影响**读取视图**，不写任何数据；关闭开关即刻恢复。
+- 本地有、sidecar 没有的单仍然返回（不会因权威源而消失）。
+- 推荐顺序：`reconcile.diff_count` 连续多日为 0 后再开启。
+
 ### 3.3 台账落库（P3-4）
 
 | 变量 | 默认 | 说明 |

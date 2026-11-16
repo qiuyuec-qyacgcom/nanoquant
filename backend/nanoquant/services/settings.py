@@ -421,6 +421,12 @@ class SystemSettings(BaseModel):
     exec_place_protection: bool = Field(
         default=False, description="允许 sidecar 代发保护单（需 sidecar 侧 EXEC_PLACE_MODE=enabled）"
     )
+    #: P3-5 收尾：把 sidecar 台账作为**读取权威源**（只影响面板/接口视图，不写任何数据）。
+    #: 默认 False。开启后订单列表的 state/filled_qty/avg_price 以 sidecar 为准；
+    #: sidecar 不可用时自动回退本地表，返回里带 `ledger_source` 标识来源。
+    exec_ledger_authoritative: bool = Field(
+        default=False, description="订单台账以 sidecar 为权威源（只读视图；sidecar 不可用自动回退）"
+    )
     api_rate_limit_per_min: int = Field(
         default=0, ge=0, le=10000, description="每 IP 每分钟 API 请求上限, 0=关闭（防爆破/刷接口）"
     )

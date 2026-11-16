@@ -1394,6 +1394,20 @@
   - 端到端（真实 sidecar + 伪造本地表）：`checked=3 / sidecar_total=3 / diff_count=3 / aligned=false`，三类差异分类**全部命中**（`onlylocal` 缺于 sidecar、`onlyremote` 缺于本地、`statediff` 状态 `ACKED vs FILLED`）。
   - `pytest tests -q` → **508 passed**（新增 `tests/test_ledger_reconcile.py` 3 条：sidecar 失败降级、完全对齐、四类差异）。
 
+### 100. P3-5 收尾：订单台账以 sidecar 为权威源（默认关，可一键回退）
+- **状态**：✅ 已完成
+- **背景**：`reconcile` 提供差异量化后，才谈得上把权威源交给 sidecar。本步只改**读取视图**，不写任何数据、不动写权，风险可控且可即时回退。
+- **过程要点**：
+  - 新增 `system.exec_ledger_authoritative`（默认 `false`）。
+  - `order_ledger.authoritative_orders()`：拉 `order_snapshot`，只取状态类字段（`state/filled_qty/avg_price`），其余元数据仍以本地为准。
+  - `GET /engine/orders` 改 async：开关开启时用 sidecar 值覆盖 `status/qty/price` 并加 `ledger_state`，响应新增 `ledger_source`（`sidecar` / `local`）。
+  - **自动回退**：sidecar 不可用或异常时返回 `None` → 接口保留本地值且 `ledger_source=local`，绝不 5xx。
+  - 本地有、sidecar 没有的单**仍然返回**（不会因权威源而消失）。
+- **验证**：
+  - E2E 三态：`off → local/ACKED`；`on → sidecar/FILLED, qty 0.02, price 74000.5`；`on+sidecar_down → local/ACKED`（自动回退）；本地独有单 `localonly` 全程保留。
+  - `pytest tests -q` → **513 passed**（新增 `tests/test_ledger_authoritative.py` 5 条）。
+  - `vue-tsc --noEmit` 0 error。
+
 ---
 
 ## 二、未开始
@@ -1411,10 +1425,11 @@
   - **P3-4**：`src/store.rs`（单写线程 + 批量事务，先只落 sidecar 自有台账），见 TASKS #97。
   - **P3-3 收尾**：`protection_place` 代发（双重闸门，默认关闭），见 TASKS #98。
   - **对账前置**：`GET /system/exec-sidecar/reconcile` 双向差异对账，见 TASKS #99。
+  - **P3-5 收尾**：`exec_ledger_authoritative` 读取权威源（默认关），见 TASKS #100。
 - **待办**：
   - 开启代发前：先积累一段 `protect_counts.mismatched == 0`，再置 `exec_place_protection=true` + `EXEC_PLACE_MODE=enabled`。
-  - P3-5 收尾：`reconcile.diff_count` 长期为 0 后，才可把 sidecar 台账升为权威源。
-  - P3-4 收尾：Python 主表写权迁到 Rust（依赖上一条，风险最高）。
+  - 开启权威源前：`reconcile.diff_count` 连续多日为 0，再置 `exec_ledger_authoritative=true`。
+  - P3-4 收尾：Python 主表**写权**迁到 Rust（依赖上一条长期稳定，风险最高）。
   - `enforce` 24h 灰度观察（`mismatched` 必须恒为 0）。
 - **VPS 踩坑记录**（已确认，供复盘）：
   - `exec.env` 的 `EXEC_SECRET` 若带尖括号 `<...>`：systemd 会把括号当值的一部分 → sidecar 与 Python 签名不一致；且 shell `source` 会因 `<` 触发重定向语法错误。
