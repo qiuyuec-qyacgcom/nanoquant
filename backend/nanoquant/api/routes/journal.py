@@ -78,17 +78,20 @@ def retrieve_preview(
     rsi: float | None = Query(default=None, ge=0, le=100),
     adx: float | None = Query(default=None, ge=0, le=100),
     atr_pct: float | None = Query(default=None, ge=0, le=50),
+    direction: str = Query(default="", description="long / short；同向经验加权，留空=不区分"),
     user: str = Depends(current_user),
 ) -> dict[str, Any]:
     """预览某标的在给定场景下会检索到哪些经验（与决策注入同一套打分）。"""
     snapshot = {k: v for k, v in {"rsi": rsi, "adx": adx, "atr_pct": atr_pct}.items() if v is not None}
-    tags = derive_tags(symbol, snapshot)
+    direction = direction if direction in ("long", "short") else ""
+    tags = derive_tags(symbol, snapshot, direction)
     scenario = derive_scenario(snapshot)
     return {
         "symbol": symbol,
+        "direction": direction,
         "tags": tags,
         "scenario": scenario,
-        "items": retrieve_top_k(symbol, scenario, tags),
+        "items": retrieve_top_k(symbol, scenario, tags, direction=direction),
     }
 
 

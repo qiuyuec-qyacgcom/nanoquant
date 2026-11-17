@@ -2138,7 +2138,7 @@ class TradingEngine:
             if outcome.ok:
                 # 决策留痕: 记录 AI 的方向判断快照（日志 → 打标 → 经验库 闭环第一步）。
                 # 只记 open_long/open_short；hold 由 record_decision 内部忽略（不参与对赌）。
-                journal_record(
+                journal_id = journal_record(
                     symbol=sig.symbol,
                     action=d.action,
                     confidence=d.confidence,
@@ -2150,6 +2150,12 @@ class TradingEngine:
                     injected_experience_ids=ctx.get("injected_experience_ids"),
                     mode=broker.mode,
                 )
+                # 可观测性：把「这次决策看了哪些经验、是否被记进日志」写进 ai_meta，
+                # 它会随事件与持仓 features 落库。否则"经验模块有没有参与"只能靠猜。
+                exp_ids = [int(x) for x in (ctx.get("injected_experience_ids") or [])]
+                ai_meta["injected_experience_ids"] = exp_ids
+                ai_meta["experience_hits"] = len(exp_ids)
+                ai_meta["journal_id"] = journal_id or 0
             if not outcome.ok:
                 self._update_signal_reject(signal_id, f"AI 不可用({outcome.error[:80]}), 按 fail-closed 跳过")
                 return
@@ -2339,7 +2345,8 @@ class TradingEngine:
         injected_experience_ids: list[int] = []
         try:
             experiences_text, injected_experience_ids, _ = journal_injection(
-                sig.symbol, self._journal_snapshot(sig, ticker)
+                # 带上方向：同向经验加权排在前面（反向经验仍保留，不硬过滤）
+                sig.symbol, self._journal_snapshot(sig, ticker), sig.direction
             )
             if experiences_text:
                 experiences_text = (

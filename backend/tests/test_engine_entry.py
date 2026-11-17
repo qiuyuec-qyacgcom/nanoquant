@@ -470,3 +470,43 @@ def test_flat_signal_goes_scan_to_ai_to_order(monkeypatch):
 
 async def _no_book():
     return {}
+
+
+def test_open_records_experience_usage_for_audit(monkeypatch):
+    """开仓决策必须留痕「这次看了哪些经验、有没有被记进决策日志」。
+
+    以前 ai_meta 只带心法 id，经验注入既不进事件也不进持仓 features，
+    于是"经验模块到底有没有参与"在面板上完全看不出来 —— 只能靠猜。
+    """
+    monkeypatch.setattr(worker_mod.symbol_service, "filters_for", lambda symbol: _filters())
+    monkeypatch.setattr("nanoquant.ai.client.providers_available", lambda: 1)
+    prev_spread = get_strategy().max_spread_bps
+    prev_ai = get_ai()
+    update_group("strategy", {"max_spread_bps": 0.0})
+    update_group("ai", {"enabled": True})
+    update_group("journal", {"enabled": True, "min_record_confidence": 0.45})
+
+    async def _decide(_ctx):
+        return DecisionOutcome(
+            decision=AiDecision(action="open_long", confidence=0.7, reason="结构偏多"),
+            ok=True, agreement=1.0,
+        )
+
+    monkeypatch.setattr(worker_mod, "decide", _decide)
+    eng = worker_mod.TradingEngine()
+    eng._build_ai_context = lambda *a, **k: {
+        "injected_mantra_ids": [], "injected_experience_ids": [11, 12],
+    }
+    broker = _Broker()
+    try:
+        sid = _run(eng, broker)
+    finally:
+        update_group("strategy", {"max_spread_bps": prev_spread})
+        update_group("ai", {"enabled": prev_ai.enabled})
+
+    assert _reject_reason(sid) == ""
+    assert len(broker.calls) == 1
+    ai_meta = broker.calls[0]["features"]["ai"]
+    assert ai_meta["experience_hits"] == 2
+    assert ai_meta["injected_experience_ids"] == [11, 12]
+    assert ai_meta["journal_id"], "方向性决策必须写入 decision_journal（闭环第一步）"

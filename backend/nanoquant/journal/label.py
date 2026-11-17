@@ -12,7 +12,7 @@ from typing import Any
 from ..db import session_scope
 from ..logging_setup import get_logger
 from ..models import DecisionJournal
-from ..services.settings import get_journal
+from ..services.settings import get_engine, get_journal, normalize_mode
 
 log = get_logger("journal.label")
 
@@ -39,26 +39,32 @@ async def label_due() -> dict[str, Any]:
     """回访所有到期的 pending 方向性决策并打标.
 
     按 symbol 分组取一次价，减少 REST 调用；单个标的取价失败不阻塞其余。
+
+    **只标当前交易环境**（demo / live）的记录：entry_price 是某个环境的价格，
+    用另一个环境的价格去算收益会把经验库污染成噪声（测试网价格与主网差几个点）。
+    另一环境的 pending 保持原状，等切回该环境再标 —— 它不是过期，只是排队。
     """
     cfg = get_journal()
     if not cfg.enabled:
         return {"ok": False, "error": "决策日志已关闭", "labeled": 0}
+    mode = normalize_mode(get_engine().mode)
     now = int(time.time())
     cutoff = now - cfg.label_after_sec
     with session_scope() as s:
-        rows = (
+        due = (
             s.query(DecisionJournal)
             .filter(
                 DecisionJournal.status == "pending",
                 DecisionJournal.direction.in_(_DIRECTIONAL),
                 DecisionJournal.ts <= cutoff,
             )
-            .limit(200)
             .all()
         )
+        rows = [r for r in due if normalize_mode(r.mode) == mode]
         ids = [(r.id, r.symbol) for r in rows]
+        deferred = len(due) - len(rows)
     if not ids:
-        return {"ok": True, "labeled": 0, "due": 0}
+        return {"ok": True, "labeled": 0, "due": 0, "deferred": deferred}
 
     from ..exchange import client as binance_client
 
@@ -87,4 +93,6 @@ async def label_due() -> dict[str, Any]:
             row.labeled_at = now
             row.status = "labeled"
             labeled += 1
-    return {"ok": True, "labeled": labeled, "due": len(ids)}
+    if deferred and labeled:
+        log.info("另有 %d 条到期决策属于另一交易环境，暂不打标", deferred)
+    return {"ok": True, "labeled": labeled, "due": len(ids), "deferred": deferred}

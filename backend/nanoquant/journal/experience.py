@@ -74,7 +74,13 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def _similarity(query_symbol: str, query_scenario: dict, query_tags: list[str], exp: Experience) -> float:
+def _similarity(
+    query_symbol: str,
+    query_scenario: dict,
+    query_tags: list[str],
+    exp: Experience,
+    query_direction: str = "",
+) -> float:
     score = 0.0
     if exp.symbol == query_symbol:
         score += 0.35
@@ -90,7 +96,17 @@ def _similarity(query_symbol: str, query_scenario: dict, query_tags: list[str], 
             count += 1
     if count:
         score += 0.2 * (num_score / count)
-    return round(min(1.0, score), 4)
+    # 同向经验更有参考价值（同一段行情里做反了的那条，结论不能照搬）；
+    # 只是加权、不做硬过滤 —— 反向经验仍有信息量（说明这个位置反向才赚）。
+    exp_direction = next(
+        (str(t).split(":", 1)[1] for t in (exp.tags or []) if str(t).startswith("dir:")), ""
+    )
+    if query_direction in ("long", "short"):
+        if exp_direction == query_direction:
+            score += 0.08
+        elif exp_direction in ("long", "short"):
+            score -= 0.05
+    return round(max(0.0, min(1.0, score)), 4)
 
 
 def serialize(r: Experience) -> dict[str, Any]:
@@ -235,6 +251,7 @@ def retrieve_top_k(
     scenario: dict[str, Any] | None = None,
     tags: list[str] | None = None,
     limit: int | None = None,
+    direction: str = "",
 ) -> list[dict[str, Any]]:
     """按相似场景检索 Top-k 条经验（确定性打分，无 embedding）。"""
     cfg = get_journal()
@@ -245,7 +262,7 @@ def retrieve_top_k(
         rows = s.query(Experience).filter(Experience.enabled.is_(True)).all()
     scored: list[tuple[float, Experience]] = []
     for r in rows:
-        sc = _similarity(symbol, scenario or {}, tags or [], r)
+        sc = _similarity(symbol, scenario or {}, tags or [], r, direction)
         if sc < cfg.min_similarity:
             continue
         scored.append((sc, r))
@@ -253,14 +270,20 @@ def retrieve_top_k(
     return [serialize(r) for _, r in scored[:limit]]
 
 
-def injection(symbol: str, snapshot: dict[str, Any]) -> tuple[str, list[int], list[dict[str, Any]]]:
-    """返回 (注入文本, 注入 id 列表, 明细)，供 AI 决策上下文使用。"""
+def injection(
+    symbol: str, snapshot: dict[str, Any], direction: str = ""
+) -> tuple[str, list[int], list[dict[str, Any]]]:
+    """返回 (注入文本, 注入 id 列表, 明细)，供 AI 决策上下文使用。
+
+    ``direction`` 是量化/信号层的方向提示：非 flat 时按方向给经验加权，
+    让"同向经验"排在"反向经验"前面（反向经验仍保留，不硬过滤）。
+    """
     cfg = get_journal()
     if not cfg.enabled or not cfg.inject_experiences or cfg.retrieve_top_k <= 0:
         return "", [], []
-    tags = derive_tags(symbol, snapshot)
+    tags = derive_tags(symbol, snapshot, direction)
     scenario = derive_scenario(snapshot)
-    items = retrieve_top_k(symbol, scenario, tags, cfg.retrieve_top_k)
+    items = retrieve_top_k(symbol, scenario, tags, cfg.retrieve_top_k, direction)
     if not items:
         return "", [], []
     # 头部：固定装饰符号化 + 一行符号图例（自解释，避免每个字段重复中文）

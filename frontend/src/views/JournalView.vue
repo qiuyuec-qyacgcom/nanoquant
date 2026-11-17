@@ -23,6 +23,27 @@ const busy = ref(false)
 
 const accuracy = computed(() => journalStats.value?.accuracy ?? 0)
 
+/**
+ * 闭环状态说明：这条链最常见的困惑是"经验库一直是空的，是不是没接上"。
+ * 空库有两种完全不同的原因（AI 没参与 / 还没到回访时间），必须在这里说清楚，
+ * 否则只能靠翻 ai_call_logs 猜。
+ */
+const loopHint = computed(() => {
+  const total = journalStats.value?.total ?? 0
+  const pending = journalStats.value?.pending ?? 0
+  const enabled = expStats.value?.enabled ?? 0
+  const topk = expStats.value?.retrieve_top_k ?? 5
+  if (total === 0) {
+    return '闭环尚未启动：这里没有任何决策日志，说明还没有一次「AI 给出方向」的决策。' +
+      '如果 AI 已开启却长期是 0，问题在决策链而不在这里 —— 去「信号审计」看 flat 行是否从未被 AI 复核。'
+  }
+  if (enabled === 0) {
+    return `已有 ${total} 条决策日志、${pending} 条待回访，但经验库仍为空：` +
+      '经验要等决策满「回访窗口」后打标，且只有判对/判错才归档（partial 不入库）。'
+  }
+  return `闭环运行中：${enabled} 条经验会在相似场景下注入 AI 决策上下文（每次最多 ${topk} 条）。`
+})
+
 const DIR_LABEL: Record<string, string> = { long: '做多', short: '做空', flat: '观望' }
 const OUTCOME_LABEL: Record<string, string> = { correct: '判断正确', wrong: '判断错误', partial: '部分正确' }
 const STATUS_LABEL: Record<string, string> = { pending: '待回访', labeled: '已打标', skipped: '留痕' }
@@ -88,6 +109,7 @@ onMounted(load)
 
 <template>
   <div class="stack">
+    <div class="hint">{{ loopHint }}</div>
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-label">决策总数</div>

@@ -46,6 +46,7 @@ const groups = [
   { id: 'data', label: '数据源', hint: '行情源、网络与密钥' },
   { id: 'news', label: '资讯', hint: '抓取与情绪' },
   { id: 'evolution', label: '自进化', hint: '复盘与心法' },
+  { id: 'journal', label: '决策经验', hint: '决策留痕、回访打标与场景化经验注入' },
   { id: 'backup', label: '备份', hint: '保留与加密' },
   { id: 'security', label: '安全', hint: '登录与会话' },
   { id: 'system', label: '系统', hint: '日志与保留' },
@@ -95,6 +96,13 @@ const BASE_META: Record<string, FieldMeta> = {
     hint: '实测两者样本外均为负收益（见 docs/EVIDENCE.md），切换前先跑 walk-forward',
   },
   auto_entry: { label: '自动开仓', hint: '关闭后只落库信号供观察，不下单；跟单不受此开关影响' },
+  label_after_sec: { label: '回访窗口', unit: '秒', hint: '决策满这么久才回访打标；86400=24h。超短线可调到 3600-14400，让经验更快产生' },
+  inject_experiences: { label: '注入经验', hint: '关闭后经验库照常积累，但不会进入 AI 决策上下文' },
+  retrieve_top_k: { label: '注入条数', unit: '条', hint: '每次决策最多注入几条相似经验（经验库是 evolution 心法之外的场景化补充，不宜过多）' },
+  correct_threshold_pct: { label: '判对阈值', unit: '%', hint: '方向收益超过该值才算判对，低于视为 partial（partial 不归档成经验）' },
+  min_record_confidence: { label: '记录门槛', hint: 'AI 置信度低于该值的方向判断不留痕（journal），避免用低质量判断训练经验库' },
+  min_similarity: { label: '相似度阈值', unit: '', hint: '低于该相似度的经验不注入；调低=注入更多但相关性更弱' },
+  max_experiences: { label: '经验上限', unit: '条', hint: '超出后停用最旧条目（不删除）' },
   ai_review_flat: { label: '无方向也送 AI', hint: '量化模型本轮无方向、但通过风险闸门时，仍作为候选交给 AI 定性；关闭则退回"量化一 flat 就静默"的旧行为' },
   ai_review_max_per_cycle: { label: '候选额度', unit: '个/轮', hint: '每轮最多送几个无方向候选给 AI，按离触发距离排序；0=不限（受 AI 调用频率上限兜底）' },
   mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
@@ -354,6 +362,9 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   evolution: {
     min_confidence: { label: '心法最低置信度', hint: '低于该值的复盘结论不进入心法库' },
   },
+  journal: {
+    enabled: { label: '启用决策经验闭环', hint: '关闭后不再记录决策、不打标、不归档、不注入' },
+  },
   news: {
     proxy: { label: '资讯代理', hint: '留空则复用「数据源 → HTTP 代理」；资讯要走单独出口时才填' },
     request_timeout_sec: { label: '资讯抓取超时', unit: '秒', hint: '只作用于资讯源，不影响行情请求' },
@@ -447,6 +458,18 @@ const SECTIONS: Record<string, SectionDef[]> = {
   evolution: [
     { title: '复盘', fields: ['enabled', 'review_on_close', 'global_review_every_trades'] },
     { title: '心法库', hint: '心法入库前会经过防污染审计', fields: ['max_injected', 'ttl_days', 'min_confidence', 'max_rule_chars', 'guard_strict', 'auto_disable_negative'] },
+  ],
+  journal: [
+    {
+      title: '决策经验闭环',
+      hint: 'AI 方向性判断 → 回访打标 → 经验库 → 相似场景注入。经验库为空时 AI 上下文不会注入任何经验',
+      fields: ['enabled', 'label_after_sec', 'inject_experiences', 'retrieve_top_k'],
+    },
+    {
+      title: '打标口径',
+      hint: '回访窗口越短，经验产生越快，但越贴近「分钟级判断」而非「持仓结果」；判定阈值决定多小的方向收益才算判对',
+      fields: ['correct_threshold_pct', 'min_record_confidence', 'min_similarity', 'max_experiences'],
+    },
   ],
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
   security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit', 'login_fail_window_sec'] }],
