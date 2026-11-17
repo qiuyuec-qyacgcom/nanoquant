@@ -32,7 +32,7 @@ def _sig(direction: str = "long", sl_pct: float = 1.0, tp_pct: float = 0.0) -> S
 def _run(monkeypatch, candles, **kwargs):
     """固定产出 1% 止损的多头信号；滑点/手续费/资金费置 0，便于精确断言成交价。"""
     monkeypatch.setattr(bt, "score_signal", lambda *a, **k: _sig())
-    cfg = StrategySettings(trailing_pct=0.0, partial_tp_at_r=0.0, roi_table=[], max_hold_minutes=2880)
+    cfg = StrategySettings(trailing_pct=0.0, partial_tp_at_r=0.0, roi_table=[])
     defaults = dict(
         symbol="TESTUSDT", fee_bps=0.0, slippage_bps=0.0, spread_bps=0.0, funding_bps_8h=0.0,
         risk_per_trade_pct=1.0, margin_pct=100.0,

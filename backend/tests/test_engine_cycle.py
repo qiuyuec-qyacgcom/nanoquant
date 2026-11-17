@@ -15,7 +15,7 @@ import pytest
 from nanoquant.db import init_db, session_scope
 from nanoquant.engine import risk as risk_mod
 from nanoquant.engine import worker as worker_mod
-from nanoquant.models import EngineEvent, PositionRecord
+from nanoquant.models import EngineEvent, PositionRecord, TradeRecord
 from nanoquant.services import state
 from nanoquant.services.settings import get_engine, update_group
 
@@ -212,6 +212,13 @@ def test_reconcile_closes_local_position_missing_on_venue(monkeypatch, clean_sta
         row = s.get(PositionRecord, pid)
         assert row.status == "closed"
         assert row.exit_reason == "venue_sync"
+        assert row.trade_id
+        trade = s.get(TradeRecord, row.trade_id)
+        assert trade is not None
+        assert trade.symbol == "GHOSTUSDT"
+        assert trade.exit_reason == "venue_sync"
+        assert trade.qty == 1.0
+        s.delete(trade)
         s.delete(row)
 
 

@@ -73,7 +73,6 @@ const PLAIN_HINTS: Record<string, string> = {
   sl_atr_mult: '止损距离 = ATR 的几倍；越小止损越紧',
   tp_atr_mult: '止盈距离 = ATR 的几倍',
   trailing_pct: '从浮盈高点回撤这么多就离场；0=关闭',
-  max_hold_minutes: '持仓超过这个时间强制离场',
   breakeven_at_r: '浮盈达到初始止损距离的几倍时，把止损移到开仓价',
   partial_tp_at_r: '浮盈达到初始止损距离的几倍时，先平掉一部分仓位；0=关闭',
   partial_tp_ratio: '部分止盈先平掉几成仓位（0.5 = 平一半）',
@@ -217,7 +216,6 @@ const BASE_META: Record<string, FieldMeta> = {
   trailing_pct: { label: '移动止损回撤', unit: '%', hint: '0 表示关闭' },
   trailing_arm_r: { label: '移动止损激活', unit: 'R', hint: '浮盈先走到 N 倍风险才让移动止损接管，否则会在止损前被噪声扫掉（实盘 24 笔全亏的根因）' },
   breakeven_at_r: { label: '保本触发', unit: 'R', hint: '浮盈达到该 R 倍数后止损上移到开仓价' },
-  max_hold_minutes: { label: '最长持仓', unit: '分钟', hint: '超时强制离场' },
   partial_tp_at_r: { label: '部分止盈触发', unit: 'R', hint: '浮盈达到该 R 倍数先平一部分；0=关闭' },
   partial_tp_ratio: { label: '部分止盈比例', unit: '比例', hint: '0.5 = 平一半，剩余交给移动止损' },
   max_spread_bps: { label: '盘口点差上限', unit: 'bps', hint: '买一卖一价差超过该值就放弃开仓；0=关闭。短线建议 5–12bps' },
@@ -425,12 +423,12 @@ const SECTIONS: Record<string, SectionDef[]> = {
     {
       title: '出场规则',
       hint: 'min_risk_reward 是止盈/止损的硬底线：2.0 意味着只需 33% 胜率即可正期望；1.1 则要 48% 以上，扣手续费基本是负期望',
-      fields: ['sl_atr_mult', 'tp_atr_mult', 'min_risk_reward', 'trailing_pct', 'trailing_arm_r', 'breakeven_at_r', 'max_hold_minutes'],
+      fields: ['sl_atr_mult', 'tp_atr_mult', 'min_risk_reward', 'trailing_pct', 'trailing_arm_r', 'breakeven_at_r'],
     },
     {
       title: '体制自适应',
       hint: '震荡市入场时提前释放资金；RSI 按趋势体制分区解读（上涨趋势里 65 是健康、80 才是过热）',
-      fields: ['max_hold_minutes_chop', 'chop_ema_gap_pct', 'rsi_adaptive'],
+      fields: ['chop_ema_gap_pct', 'rsi_adaptive'],
     },
     { title: '部分止盈', hint: '先落袋一部分，剩余仓位用移动止损奔跑', fields: ['partial_tp_at_r', 'partial_tp_ratio'] },
     {

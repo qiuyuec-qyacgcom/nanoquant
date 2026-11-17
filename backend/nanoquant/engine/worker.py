@@ -437,6 +437,26 @@ class TradingEngine:
                     unrealized=vp.unrealized, sl_price=sl, tp_price=tp,
                 )
                 reason = "本系统挂单已成交，已接管入账" if ours else "外部/手动仓位，已接管入账"
+                if ours:
+                    # 挂单已在交易所撮合成交：将此标的最近处于 pending 状态的开仓信号转为 opened
+                    try:
+                        with session_scope() as s:
+                            pending_sig = (
+                                s.query(Signal)
+                                .filter(
+                                    Signal.symbol == symbol,
+                                    Signal.mode == mode,
+                                    Signal.decision.in_(("pending", "rejected")),
+                                    Signal.reject_reason.like("挂单待成交%"),
+                                )
+                                .order_by(Signal.id.desc())
+                                .first()
+                            )
+                            if pending_sig:
+                                pending_sig.decision = "opened"
+                                pending_sig.reject_reason = ""
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("回写信号开仓状态失败: %s", exc)
                 events.record(
                     "warn", "engine",
                     f"{symbol} 发现交易所仓位 {vp.side} {vp.qty}（{reason}）",
@@ -507,14 +527,107 @@ class TradingEngine:
                         row.venue_ts = now
         for symbol, lp in local_map.items():
             if symbol not in venue_map:
-                with session_scope() as s:
-                    row = s.get(PositionRecord, lp.id)
-                    if row:
-                        row.status = "closed"
-                        row.closed_at = int(time.time())
-                        row.exit_price = lp.mark_price or lp.entry_price
-                        row.exit_reason = "venue_sync"
-                events.record("warn", "engine", f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭", {"symbol": symbol})
+                # 保护单在交易所成交时，系统没走过 close_position，这里只改状态会让
+                # 成交表和复盘都漏掉这笔。补记必须在同一条对账路径上完成。
+                exit_price = await self._venue_exit_price(lp) or lp.mark_price or lp.entry_price
+                trade_id, pnl = self._record_venue_close(lp.id, exit_price)
+                events.record(
+                    "warn", "engine",
+                    f"{symbol} 本地有仓但交易所已无持仓, 已按同步关闭",
+                    {"symbol": symbol, "trade_id": trade_id, "pnl": round(pnl, 8)},
+                )
+                if trade_id:
+                    risk_mod.register_close(pnl, symbol, get_risk(), "venue_sync")
+                    evo_cfg = get_evolution()
+                    if evo_cfg.enabled and evo_cfg.review_on_close:
+                        asyncio.create_task(self._review_trade(trade_id))
+
+    @staticmethod
+    async def _venue_exit_price(position: PositionRecord) -> float:
+        """用交易所成交回补出场价；查不到或失败时返回 0，由调用方退回标记价."""
+        opened_ms = int(position.opened_at or 0) * 1000
+        close_side = "SELL" if position.side == "long" else "BUY"
+        try:
+            fills = await binance_client.user_trades(position.symbol, limit=50)
+        except Exception:  # noqa: BLE001  取价失败不能挡住对账关仓
+            return 0.0
+        qty = notional = 0.0
+        for fill in fills:
+            is_buyer = bool(fill.get("buyer"))
+            if (close_side == "BUY") != is_buyer:
+                continue
+            if int(fill.get("time") or 0) < opened_ms:
+                continue
+            fill_qty = float(fill.get("qty") or 0)
+            fill_price = float(fill.get("price") or 0)
+            if fill_qty <= 0 or fill_price <= 0:
+                continue
+            qty += fill_qty
+            notional += fill_qty * fill_price
+            if qty >= float(position.qty or 0) - 1e-12:
+                break
+        return notional / qty if qty > 0 else 0.0
+
+    @staticmethod
+    def _record_venue_close(position_id: int, mark: float) -> tuple[int, float]:
+        """交易所已无持仓时补记成交，返回 (trade_id, pnl).
+
+        只处理仍是 open 且还没挂过成交的仓位；对账重入或系统平仓在途时直接跳过，
+        避免和 _persist_close 各写一笔。
+        """
+        from ..exchange.broker import _CLOSING, _entry_fee_rate
+
+        if position_id in _CLOSING:
+            return 0, 0.0
+        with session_scope() as s:
+            row = s.get(PositionRecord, position_id)
+            if row is None or row.status != "open" or row.trade_id:
+                return 0, 0.0
+            exit_price = float(mark or row.mark_price or row.entry_price or 0.0)
+            qty = float(row.qty or 0.0)
+            direction = 1 if row.side == "long" else -1
+            risk = get_risk()
+            entry_fee = qty * float(row.entry_price or 0.0) * _entry_fee_rate(risk)
+            exit_fee = qty * exit_price * float(risk.fee_rate_taker or 0.0)
+            gross = (exit_price - float(row.entry_price or 0.0)) * qty * direction
+            pnl = round(gross - entry_fee - exit_fee, 8)
+            closed_at = int(time.time())
+            row.status = "closed"
+            row.closed_at = closed_at
+            row.exit_price = exit_price
+            row.exit_reason = "venue_sync"
+            row.realized_pnl = (row.realized_pnl or 0.0) + pnl
+            row.fees = (row.fees or 0.0) + entry_fee + exit_fee
+            trade = TradeRecord(
+                symbol=row.symbol,
+                side=row.side,
+                qty=qty,
+                entry_price=row.entry_price,
+                exit_price=exit_price,
+                leverage=row.leverage,
+                notional=qty * float(row.entry_price or 0.0),
+                pnl=pnl,
+                pnl_pct=(
+                    round((exit_price / row.entry_price - 1) * 100 * direction, 6)
+                    if row.entry_price else 0.0
+                ),
+                roi_pct=round(pnl / max(1e-9, row.margin) * 100, 4),
+                fees=round(entry_fee + exit_fee, 8),
+                opened_at=row.opened_at,
+                closed_at=closed_at,
+                hold_seconds=max(0, closed_at - int(row.opened_at or closed_at)),
+                exit_reason="venue_sync",
+                ai_confidence=row.ai_confidence,
+                ai_reason=row.ai_reason,
+                signal_score=row.signal_score,
+                slippage_bps=row.entry_slippage_bps,
+                mode=row.mode,
+                features=row.features,
+            )
+            s.add(trade)
+            s.flush()
+            row.trade_id = trade.id
+            return int(trade.id), pnl
 
     async def _sync_orders_if_due(self) -> None:
         """把非终态委托与交易所对齐（60s 一次）.
@@ -1222,10 +1335,13 @@ class TradingEngine:
         }
 
     def _update_signal_reject(self, signal_id: int, reason: str) -> None:
+        self._update_signal_decision(signal_id, "rejected", reason[:250])
+
+    def _update_signal_decision(self, signal_id: int, decision: str, reason: str = "") -> None:
         with session_scope() as s:
             row = s.get(Signal, signal_id)
             if row:
-                row.decision = "rejected"
+                row.decision = decision
                 row.reject_reason = reason[:250]
 
     # ------------------------------------------------------- 外部信号跟单
@@ -2189,7 +2305,14 @@ class TradingEngine:
                     return
                 direction = ai_dir
                 if quant_flat:
-                    # 量化本就没有方向，AI 给出方向不是"反向覆盖"，是一条正常的新决策
+                    # 量化本就没有方向，AI 给出方向不是"反向覆盖"，是一条正常的新决策；
+                    # 同步回写信号的主方向与置信度得分，避免审计页面显示无方向与 0 分
+                    with session_scope() as s:
+                        row = s.get(Signal, signal_id)
+                        if row:
+                            row.direction = direction
+                            if not row.score and d.confidence:
+                                row.score = round(d.confidence, 2)
                     events.record(
                         "info", "ai",
                         f"{sig.symbol} 量化无方向，AI 定性为 {direction}（置信度 {d.confidence:.2f}）",
@@ -2283,9 +2406,8 @@ class TradingEngine:
             # 成交前失败 → 归还预留额度；成交后保留到下一轮 begin_cycle
             await self._margin.settle(rid, opened=False)
             if res.pending:
-                # 挂单已提交、仅等待成交：不是失败。记为 info，避免误导与误告警。
-                # 成交后由 _reconcile_live 接管仓位，止损止盈已预挂在交易所。
-                self._update_signal_reject(signal_id, f"挂单待成交: {res.message}"[:200])
+                # 挂单已提交、仅等待成交：不是失败。置为 pending 状态，成交后由对账接管并标记为 opened。
+                self._update_signal_decision(signal_id, "pending", f"挂单待成交: {res.message}"[:200])
                 events.record(
                     "info", "trade",
                     f"{sig.symbol} {direction} 挂单已提交，等待成交；止损止盈已预挂"[:250],

@@ -35,10 +35,33 @@ const DECISION_LABELS: Record<string, { text: string; cls: string }> = {
   opened: { text: '已开仓', cls: 'tag-long' },
   rejected: { text: '被拒', cls: 'tag-warn' },
   flat: { text: '平盘', cls: 'tag-dim' },
-  pending: { text: '待定', cls: 'tag-blue' },
+  pending: { text: '挂单中', cls: 'tag-blue' },
 }
 
 const DIRECTION_LABELS: Record<string, string> = { long: '多', short: '空', flat: '—' }
+
+function displayDirection(row: SignalRow): { text: string; cls: string } {
+  if (row.direction && row.direction !== 'flat') {
+    return {
+      text: DIRECTION_LABELS[row.direction] || row.direction,
+      cls: row.direction === 'long' ? 'up' : 'down',
+    }
+  }
+  if (row.ai_action === 'open_long') return { text: '多(AI)', cls: 'up' }
+  if (row.ai_action === 'open_short') return { text: '空(AI)', cls: 'down' }
+  if (row.ai_action === 'hold') return { text: '观望', cls: 'flat' }
+  return { text: '—', cls: 'flat' }
+}
+
+function displayScore(row: SignalRow): { text: string; cls: string } {
+  if (row.score > 0) {
+    return { text: row.score.toFixed(2), cls: numClass(row.score) }
+  }
+  if (row.ai_confidence > 0) {
+    return { text: `${(row.ai_confidence * 100).toFixed(0)}%`, cls: 'up' }
+  }
+  return { text: '0.00', cls: 'flat' }
+}
 
 function feat(row: SignalRow, key: string): string {
   const v = row.features?.[key]
@@ -145,7 +168,7 @@ onMounted(load)
               <option value="opened">已开仓</option>
               <option value="rejected">被拒</option>
               <option value="flat">平盘</option>
-              <option value="pending">待定</option>
+              <option value="pending">挂单中</option>
             </select>
             <button class="btn btn-sm" :disabled="loading" @click="load">筛选</button>
           </div>
@@ -173,10 +196,10 @@ onMounted(load)
                   <span v-if="(row.repeats ?? 1) > 1" class="tag tag-dim" title="同状态重复扫描已合并">×{{ row.repeats }}</span>
                 </td>
                 <td class="mono">{{ row.symbol }}</td>
-                <td :class="row.direction === 'long' ? 'up' : row.direction === 'short' ? 'down' : 'flat'">
-                  {{ DIRECTION_LABELS[row.direction] || row.direction }}
+                <td :class="displayDirection(row).cls">
+                  {{ displayDirection(row).text }}
                 </td>
-                <td class="mono" :class="numClass(row.score)">{{ row.score.toFixed(2) }}</td>
+                <td class="mono" :class="displayScore(row).cls">{{ displayScore(row).text }}</td>
                 <td class="mono muted" style="font-size: 10.5px">{{ featureLine(row) }}</td>
                 <td>
                   <div class="stack" style="gap: 2px">

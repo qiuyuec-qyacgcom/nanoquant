@@ -227,7 +227,7 @@ def test_manage_positions_closes_on_take_profit(monkeypatch):
     _patch_market(monkeypatch, _candles(), price=110.0)
 
     old = get_strategy()
-    update_group("strategy", {"roi_table": [], "trailing_pct": 0.0, "partial_tp_at_r": 0.0, "max_hold_minutes": 2880})
+    update_group("strategy", {"roi_table": [], "trailing_pct": 0.0, "partial_tp_at_r": 0.0})
     try:
         asyncio.run(worker_mod.engine._manage_positions(_broker(calls), get_strategy(), EngineSettings()))
         assert calls.get("close"), "止盈应当触发平仓"

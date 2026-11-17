@@ -19,7 +19,7 @@ GRID_KEYS = (
     "entry_threshold", "sl_atr_mult", "tp_atr_mult", "trailing_pct",
     # 模型选择与均值回归参数也要能扫，否则"换假设"这件事无法验证
     "mode", "mr_z_entry", "mr_min_risk_reward", "min_risk_reward",
-    "roi_min_r", "max_hold_minutes_chop",
+    "roi_min_r",
 )
 MAX_RUNS = 48
 

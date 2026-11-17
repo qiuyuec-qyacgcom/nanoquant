@@ -126,13 +126,13 @@ def test_detect_exit_trailing_stop():
     assert hit and reason == "trailing_stop"
 
 
-def test_detect_exit_timeout():
+def test_detect_exit_ignores_hold_time():
     cfg = _cfg(roi_table=[], trailing_pct=0)
     hit, reason = detect_exit(
         side="long", entry_price=100, mark_price=100, peak_price=100,
-        sl_price=90, tp_price=120, opened_at=0, now_ts=181 * 60, cfg=cfg, score=0.0,
+        sl_price=90, tp_price=120, opened_at=0, now_ts=24 * 60 * 60, cfg=cfg, score=0.0,
     )
-    assert hit and reason == "timeout"
+    assert not hit and reason == ""
 
 
 # ------------------------------------------------------------------ 配置校验
@@ -1273,7 +1273,7 @@ def test_funding_charges_long_and_pays_short(monkeypatch):
         _force_signal(monkeypatch, direction=side)
         res = run_backtest(
             candles,
-            StrategySettings(roi_table=[], trailing_pct=0.0, max_hold_minutes=5),
+            StrategySettings(roi_table=[], trailing_pct=0.0),
             fee_bps=0.0,
             slippage_bps=0.0,
             spread_bps=0.0,

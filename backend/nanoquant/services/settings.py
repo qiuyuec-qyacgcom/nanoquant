@@ -177,10 +177,6 @@ class StrategySettings(BaseModel):
     #: 都会在 ATR 止损之前被噪声扫掉 —— 实盘 24 笔 trailing_stop 全亏，这是元凶。
     trailing_arm_r: float = Field(default=1.0, ge=0.0, le=20)
     breakeven_at_r: float = Field(default=1.0, ge=0.1, le=10)
-    max_hold_minutes: int = Field(default=180, ge=1, le=2880)
-    #: 震荡市入场的时间止损(分钟)。震荡市里 3 小时不突破就该释放资金，
-    #: 空耗到 max_hold_minutes 只会让资金占着不动。0=沿用 max_hold_minutes
-    max_hold_minutes_chop: int = Field(default=90, ge=0, le=2880)
     #: 判定"震荡市"的均线间距阈值(%), |EMA 间距| 小于它即视为无趋势
     chop_ema_gap_pct: float = Field(default=0.08, ge=0.0, le=5.0)
     #: 行情完整性闸门：最近 20 根内允许的 K 线缺口次数（0 = 一根都不许断）。
@@ -361,7 +357,7 @@ class EvolutionSettings(BaseModel):
     #: 入库硬门槛：支持该结论的独立平仓样本数，低于此值一律拒收（单笔偶发事件不写长期心法）
     min_lesson_sample: int = Field(default=2, ge=1, le=50)
     #: 批量复盘：攒够 N 笔未复盘成交才调模型，避免逐笔编故事
-    batch_review_size: int = Field(default=10, ge=2, le=100)
+    batch_review_size: int = Field(default=5, ge=2, le=100)
     #: 健康分重算所需样本；不足返回「未知」，不改分、不归档
     min_health_sample: int = Field(default=10, ge=2, le=200)
     #: 健康分低于此值且样本达标才归档（0-1）
@@ -577,6 +573,9 @@ def _migrate_legacy_group(name: str, data: dict[str, Any]) -> dict[str, Any]:
         # 由 1 分钟级升级为 15–60 分钟短线: 旧主周期 1m/3m/5m 统一迁到 15m
         if out.get("timeframe") in {"1m", "3m", "5m"}:
             out["timeframe"] = "15m"
+        # 最长持仓已从参数页移除：不再按时间强制平仓，旧库里的值直接丢掉
+        out.pop("max_hold_minutes", None)
+        out.pop("max_hold_minutes_chop", None)
     elif name == "system":
         # 老库里 system.timezone_offset 是个死开关：交易时段只认 engine 那份。
         # 直接丢弃而不是搬到 engine —— 搬过去会突然改变已运行的交易时段。

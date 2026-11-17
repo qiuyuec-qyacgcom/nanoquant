@@ -150,7 +150,7 @@ def run_backtest(
     funding_total = 0.0
     partial_count = 0
     liquidations = 0
-    hold_limit = max_bars_hold or cfg.max_hold_minutes
+    hold_limit = max_bars_hold or 0
     at_r = float(cfg.partial_tp_at_r or 0.0)
     ratio = float(cfg.partial_tp_ratio or 0.0)
 
@@ -305,13 +305,8 @@ def run_backtest(
                         close_pos(bar.close, i, "roi")
                         continue
 
-            # 7) 超时
-            chop_limit = cfg.max_hold_minutes_chop if state.get("chop") else 0
-            if chop_limit > 0:
-                hold_limit_eff = min(hold_limit, cfg.max_hold_minutes, chop_limit)
-            else:
-                hold_limit_eff = min(hold_limit, cfg.max_hold_minutes)
-            if cfg.max_hold_minutes > 0 and held_bars * bar_minutes >= hold_limit_eff:
+            # 7) 超时：只接受调用方显式传入的持仓根数上限，参数配置不再提供最长持仓
+            if hold_limit and held_bars * bar_minutes >= hold_limit:
                 close_pos(bar.close, i, "timeout")
                 continue
             continue

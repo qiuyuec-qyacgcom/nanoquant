@@ -36,7 +36,7 @@ _FP_KEYS = (
     "entry_threshold", "exit_threshold", "volume_ratio_min",
     "atr_pct_min", "atr_pct_max", "min_24h_quote_volume",
     "sl_atr_mult", "tp_atr_mult", "min_risk_reward", "roi_min_r",
-    "trailing_pct", "trailing_arm_r", "breakeven_at_r", "max_hold_minutes", "max_hold_minutes_chop",
+    "trailing_pct", "trailing_arm_r", "breakeven_at_r",
     "chop_ema_gap_pct", "rsi_adaptive", "partial_tp_at_r", "partial_tp_ratio",
     "roi_table", "adx_filter", "adx_period", "adx_min",
     "mr_window", "mr_z_entry", "mr_min_risk_reward", "mr_block_in_trend", "mr_trend_gap_pct",
@@ -675,10 +675,9 @@ def detect_exit(
     score: float,
     entry_regime: str = "",
 ) -> tuple[bool, str]:
-    """本地出场判断: 硬止损 / 止盈 / 阶梯止盈 / 移动止损 / 信号反转 / 超时.
+    """本地出场判断: 硬止损 / 止盈 / 阶梯止盈 / 移动止损 / 信号反转.
 
-    `entry_regime` 传入入场时的体制（`chop` / `trend`）：
-    震荡市的时间止损调紧，避免资金空耗在不会突破的仓位上。
+    不再按持仓时长强制离场。`entry_regime` 仍随仓位传入，供调用方记录入场体制。
     """
     direction = 1 if side == "long" else -1
     if sl_price > 0 and ((direction == 1 and mark_price <= sl_price) or (direction == -1 and mark_price >= sl_price)):
@@ -710,11 +709,6 @@ def detect_exit(
                 return True, "trailing_stop"
             if direction == -1 and mark_price >= peak_price * (1 + cfg.trailing_pct / 100):
                 return True, "trailing_stop"
-    hold_limit = cfg.max_hold_minutes
-    if entry_regime == "chop" and cfg.max_hold_minutes_chop > 0:
-        hold_limit = min(hold_limit, cfg.max_hold_minutes_chop)
-    if (now_ts - opened_at) >= hold_limit * 60:
-        return True, "timeout"
     if direction == 1 and score <= -cfg.exit_threshold:
         return True, "signal_flip"
     if direction == -1 and score >= cfg.exit_threshold:

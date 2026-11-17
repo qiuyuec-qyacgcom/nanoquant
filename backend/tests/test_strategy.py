@@ -209,16 +209,15 @@ def test_entry_regime_detects_chop():
     assert entry_regime({}, cfg) == ""
 
 
-def test_chop_shortens_time_stop():
-    cfg = StrategySettings(roi_table=[], trailing_pct=0, max_hold_minutes=180,
-                           max_hold_minutes_chop=90)
+def test_hold_time_never_forces_exit():
+    """最长持仓已从参数配置移除，持仓多久都不再按时间平仓。"""
+    cfg = StrategySettings(roi_table=[], trailing_pct=0)
     common = dict(
         side="long", entry_price=100, mark_price=100, peak_price=100,
-        sl_price=90, tp_price=200, opened_at=0, now_ts=100 * 60, cfg=cfg, score=0.0,
+        sl_price=90, tp_price=200, opened_at=0, now_ts=24 * 60 * 60, cfg=cfg, score=0.0,
     )
     assert detect_exit(**common, entry_regime="trend")[0] is False
-    hit, reason = detect_exit(**common, entry_regime="chop")
-    assert hit and reason == "timeout"
+    assert detect_exit(**common, entry_regime="chop")[0] is False
 
 
 # ------------------------------------------------------------------ 版本指纹

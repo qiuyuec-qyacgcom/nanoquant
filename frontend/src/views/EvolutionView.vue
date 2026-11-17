@@ -179,7 +179,7 @@ onMounted(load)
       <div class="kpi">
         <div class="kpi-label">注入上限</div>
         <div class="kpi-value">{{ stats?.max_injected ?? 8 }}</div>
-        <div class="kpi-foot">实际注入 {{ injection?.report?.injected ?? injection?.count ?? 0 }} 条 · 批量 {{ stats?.batch_review_size ?? 10 }} 笔</div>
+        <div class="kpi-foot">实际注入 {{ injection?.report?.injected ?? injection?.count ?? 0 }} 条 · 批量 {{ stats?.batch_review_size ?? 5 }} 笔</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">分类分布</div>
