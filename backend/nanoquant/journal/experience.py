@@ -258,8 +258,13 @@ def retrieve_top_k(
     limit = limit if limit is not None else cfg.retrieve_top_k
     if limit <= 0:
         return []
+    # 先按标的收窄，方向只参与打分、不做硬过滤（反向经验仍要留）。
+    # 全表加载会把无关标的也拉进来；单标的仍设上限，避免一条币种堆满后拖慢决策。
     with session_scope() as s:
-        rows = s.query(Experience).filter(Experience.enabled.is_(True)).all()
+        q = s.query(Experience).filter(Experience.enabled.is_(True))
+        if symbol:
+            q = q.filter(Experience.symbol == symbol)
+        rows = q.order_by(Experience.id.desc()).limit(2000).all()
     scored: list[tuple[float, Experience]] = []
     for r in rows:
         sc = _similarity(symbol, scenario or {}, tags or [], r, direction)

@@ -4,6 +4,7 @@ fail-closed 原则: 解析不出来就当 hold, 绝不"猜"一个仓.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -181,18 +182,33 @@ async def decide(ctx: dict[str, Any], *, purpose: str = "decision") -> DecisionO
         total_cost = 0.0
         provider = ""
         model = ""
-        for persona in cfg.personas:
-            if not persona.enabled or persona.weight <= 0:
-                continue
-            messages = build_decision_messages(ctx, version=cfg.decision_schema_version, persona=persona.name, focus=persona.focus)
-            result = await ai_client.chat_with_fallback(
-                messages,
-                purpose=f"{purpose}:{persona.name}",
-                provider_id=cfg.provider_id,
-                fallback_ids=cfg.fallback_provider_ids,
-                temperature=cfg.temperature,
+        seats = [p for p in cfg.personas if p.enabled and p.weight > 0]
+
+        async def _vote(persona) -> dict[str, Any]:
+            messages = build_decision_messages(
+                ctx, version=cfg.decision_schema_version, persona=persona.name, focus=persona.focus
             )
-            total_latency += result.latency_ms
+            try:
+                result = await ai_client.chat_with_fallback(
+                    messages,
+                    purpose=f"{purpose}:{persona.name}",
+                    provider_id=cfg.provider_id,
+                    fallback_ids=cfg.fallback_provider_ids,
+                    temperature=cfg.temperature,
+                )
+            except Exception as exc:  # noqa: BLE001  单席失败不能拖垮整场议会
+                return {"persona": persona, "error": str(exc)[:200]}
+            return {"persona": persona, "result": result}
+
+        # 席位之间没有依赖。串行 await 的墙钟是各席位之和，并发后是最慢的那一席。
+        gathered = await asyncio.gather(*(_vote(p) for p in seats))
+        for item in gathered:
+            persona = item["persona"]
+            if item.get("error"):
+                meta.append({"persona": persona.name, "weight": persona.weight, "error": item["error"]})
+                continue
+            result = item["result"]
+            total_latency = max(total_latency, int(result.latency_ms or 0))
             total_cost += result.cost_usd
             if result.ok:
                 provider = result.provider or provider

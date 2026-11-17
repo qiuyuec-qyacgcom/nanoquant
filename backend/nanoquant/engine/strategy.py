@@ -37,7 +37,7 @@ _FP_KEYS = (
     "atr_pct_min", "atr_pct_max", "min_24h_quote_volume",
     "sl_atr_mult", "tp_atr_mult", "min_risk_reward", "roi_min_r",
     "trailing_pct", "trailing_arm_r", "breakeven_at_r",
-    "chop_ema_gap_pct", "rsi_adaptive", "partial_tp_at_r", "partial_tp_ratio",
+    "rsi_adaptive", "partial_tp_at_r", "partial_tp_ratio",
     "roi_table", "adx_filter", "adx_period", "adx_min",
     "mr_window", "mr_z_entry", "mr_min_risk_reward", "mr_block_in_trend", "mr_trend_gap_pct",
     "mr_exhaustion_confirm",
@@ -296,18 +296,6 @@ def rsi_zone_score(rsi: float, ema_gap_pct: float) -> float:
     return ta.clamp((rsi - 50.0) / 30.0)
 
 
-def entry_regime(features: dict[str, Any], cfg: StrategySettings) -> str:
-    """入场时的体制：`chop` = 无趋势，`trend` = 顺势。
-
-    用于把时间止损与保本门槛调紧：震荡市里 3 小时不突破就该释放资金，
-    空耗到统一上限只会让资金占着不动。
-    """
-    if not features:
-        return ""
-    gap = abs(float(features.get("ema_gap_pct") or 0.0))
-    return "chop" if gap < cfg.chop_ema_gap_pct else "trend"
-
-
 def risk_gate_reason(
     features: dict[str, Any], cfg: StrategySettings, *, volume_ok: bool | None = None
 ) -> str:
@@ -433,6 +421,12 @@ def _score_trend(
     score = sum(v * w for _, v, w in active) / total_w
     res.score = round(ta.clamp(score), 4)
     res.used_factors = [name for name, _, _ in active]
+    # 方向在闸门之前就定下来。后面任何拒绝只拦开仓，不再把方向改回 flat：
+    # 审计页要能回答「这笔被拒的信号当时偏多还是偏空、分数是多少」。
+    if res.score >= cfg.entry_threshold:
+        res.direction = "long"
+    elif res.score <= -cfg.entry_threshold:
+        res.direction = "short"
 
     res.reasons = [
         f"EMA 结构 {features['ema_gap_pct']:+.3f}%",
@@ -472,34 +466,29 @@ def _score_trend(
         )
         return res
 
-    if res.score >= cfg.entry_threshold:
-        res.direction = "long"
-    elif res.score <= -cfg.entry_threshold:
-        res.direction = "short"
-    else:
-        res.direction = "flat"
+    # 没到开仓阈值就是观望，不是被拒。
+    if res.direction == "flat":
+        return res
 
     # 趋势强度过滤: 方向分再高，没有趋势支撑就是震荡里的假突破。
     # 短线趋势跟随的亏损绝大多数来自这里（模拟盘 24 笔 trailing 全亏的深一层原因）。
-    if res.direction != "flat" and cfg.adx_filter and avail("adx"):
-        if features["adx"] < cfg.adx_min:
-            res.blocked = f"趋势强度不足 ADX {features['adx']:.1f} < {cfg.adx_min}"
-            res.direction = "flat"
-            return res
+    # 拦住后保留方向和分数，只标记 blocked，审计才能看到被拒的是多还是空。
+    if cfg.adx_filter and avail("adx") and features["adx"] < cfg.adx_min:
+        res.blocked = f"趋势强度不足 ADX {features['adx']:.1f} < {cfg.adx_min}"
+        return res
 
     # 结构确认: 趋势方向必须与分数一致, 避免逆势抄底
     if res.direction == "long" and features["ema_fast"] <= features["ema_slow"]:
         res.blocked = "多头信号缺少均线结构确认"
-        res.direction = "flat"
+        return res
     if res.direction == "short" and features["ema_fast"] >= features["ema_slow"]:
         res.blocked = "空头信号缺少均线结构确认"
-        res.direction = "flat"
+        return res
     # 高周期过滤：只做与 HTF 趋势同向的信号
     htf = features.get("htf_trend") or ""
-    if htf in ("up", "down") and res.direction != "flat":
+    if htf in ("up", "down"):
         if (htf == "up" and res.direction == "short") or (htf == "down" and res.direction == "long"):
             res.blocked = f"逆高周期趋势(HTF {htf})"
-            res.direction = "flat"
     return res
 
 
@@ -568,17 +557,18 @@ def _score_meanrev(
         res.blocked = "带宽为 0（横盘无波动），无法定位回归空间"
         return res
 
+    # 方向在衰竭确认之前就定：被拦下的单审计里仍要看到「当时想做多还是做空」。
+    res.direction = "long" if z < 0 else "short"
+
     # 动能衰竭二次确认：放量仍在把极值往外推，回归条件不成立
     if cfg.mr_exhaustion_confirm and vol_ratio >= 1.0:
         res.blocked = f"动能未衰竭 量比 {vol_ratio:.2f} ≥ 1.0，放量可能继续而非回归"
-        res.direction = "flat"
         return res
 
     # 放量突破不算超买超卖：置信度打折，但不停用（有些放量确实是衰竭）
     follow_through = 1.0 if vol_ratio <= 1.2 else 0.6
     strength = ta.clamp(-ta.tanh_norm(z, cfg.mr_z_entry) * follow_through)
     res.score = round(strength, 4)
-    res.direction = "long" if z < 0 else "short"
 
     # 止损放在极值之外，止盈回到中轨。|z|·σ 就是"当前价到中轨"的精确距离，
     # 所以这里直接用 full 距离（不再打 0.9 折），让止盈落在真实中轨上。
@@ -592,7 +582,6 @@ def _score_meanrev(
             f"盈亏比不足 {res.rr:.2f}R < {cfg.mr_min_risk_reward}R "
             f"(偏离 {abs(z):.2f}σ 时回到中轨的空间小于止损距离)"
         )
-        res.direction = "flat"
         return res
     return res
 
@@ -673,11 +662,11 @@ def detect_exit(
     now_ts: int,
     cfg: StrategySettings,
     score: float,
-    entry_regime: str = "",
 ) -> tuple[bool, str]:
     """本地出场判断: 硬止损 / 止盈 / 阶梯止盈 / 移动止损 / 信号反转.
 
-    不再按持仓时长强制离场。`entry_regime` 仍随仓位传入，供调用方记录入场体制。
+    不再按持仓时长强制离场。``score`` 必须是当轮重算的方向分：
+    开仓时写入的分数不会随行情反转，拿它做 signal_flip 等于这个条件永不触发。
     """
     direction = 1 if side == "long" else -1
     if sl_price > 0 and ((direction == 1 and mark_price <= sl_price) or (direction == -1 and mark_price >= sl_price)):

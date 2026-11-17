@@ -54,7 +54,7 @@ function displayDirection(row: SignalRow): { text: string; cls: string } {
 }
 
 function displayScore(row: SignalRow): { text: string; cls: string } {
-  if (row.score > 0) {
+  if (row.score) {
     return { text: row.score.toFixed(2), cls: numClass(row.score) }
   }
   if (row.ai_confidence > 0) {

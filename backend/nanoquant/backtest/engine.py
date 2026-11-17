@@ -18,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..engine.strategy import build_features, entry_regime, score_signal
+from ..engine.indicators import IncrementalIndicators
+from ..engine.strategy import score_signal
 from ..services.settings import StrategySettings
 
 WARMUP = 60
@@ -158,6 +159,10 @@ def run_backtest(
     state: dict[str, Any] = {}
     entry_idx = 0
     trail_peak = 0.0
+    # 指标按收盘递推。旧实现每根都把最近 60 根重算一遍 EMA/MACD/ADX。
+    ind = IncrementalIndicators(cfg)
+    for candle in candles[:WARMUP]:
+        ind.update(candle)
 
     def book(amount: float) -> None:
         """把一笔已实现盈亏记入权益, 并维护回撤."""
@@ -219,6 +224,7 @@ def run_backtest(
 
     for i in range(WARMUP, len(candles) - 1):
         bar = candles[i]
+        ind.update(bar)
 
         # ---------------- 持仓管理 ----------------
         if pos is not None:
@@ -312,9 +318,8 @@ def run_backtest(
             continue
 
         # ---------------- 开仓判断 ----------------
-        window = candles[max(0, i - WARMUP + 1) : i + 1]
         qv_24h = cum[i + 1] - cum[max(0, i + 1 - window_bars)]
-        features = build_features(window, cfg, quote_volume=qv_24h)
+        features = ind.features(qv_24h)
         sig = score_signal(symbol, features, cfg)
         if sig.direction == "flat" or abs(sig.score) < cfg.entry_threshold:
             continue
@@ -358,8 +363,6 @@ def run_backtest(
             "realized": 0.0,
             "funding": 0.0,
             "partial": False,
-            # 入场时的体制：震荡市提前释放资金，与实盘同一条规则
-            "chop": entry_regime(features, cfg) == "chop",
         }
         pos.stop_price = entry * (1 - direction * sl_pct / 100)
         # 强平价：逐仓近似 entry × (1 ∓ (1/杠杆 − 维持保证金率))

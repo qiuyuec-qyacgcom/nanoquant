@@ -414,9 +414,8 @@ def test_flat_signal_goes_scan_to_ai_to_order(monkeypatch):
     from nanoquant.engine.strategy import SignalResult
 
     def _flat_score(sym, feat, cfg):
-        sig = SignalResult(symbol=sym, direction="flat", score=0.0, features=dict(feat))
-        sig.blocked = "偏离不足"
-        return sig
+        # 偏离不足是「没有方向」，不是策略拒绝。blocked 非空时扫描不再送 AI。
+        return SignalResult(symbol=sym, direction="flat", score=0.0, features=dict(feat))
 
     monkeypatch.setattr(worker_mod, "score_signal", _flat_score)
 

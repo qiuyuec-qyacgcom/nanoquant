@@ -15,7 +15,6 @@ from nanoquant.engine.strategy import (
     candidate_eligible,
     candidate_strength,
     detect_exit,
-    entry_regime,
     risk_gate_reason,
     rsi_zone_score,
     score_signal,
@@ -182,7 +181,7 @@ def test_rr_impossible_blocks_instead_of_taking_bad_trade():
     f = build_features(candles, cfg, funding=0.0, oi_change_pct=0.0, quote_volume=5e7)
     sig = score_signal("X", f, cfg)
     if sig.sl_pct >= 3.0:
-        assert sig.direction == "flat"
+        assert sig.blocked
         assert "盈亏比" in sig.blocked
 
 
@@ -202,13 +201,6 @@ def test_overheated_rsi_is_not_a_buy_signal():
     assert rsi_zone_score(82, +0.5) < 0
 
 
-def test_entry_regime_detects_chop():
-    cfg = StrategySettings(chop_ema_gap_pct=0.08)
-    assert entry_regime({"ema_gap_pct": 0.02}, cfg) == "chop"
-    assert entry_regime({"ema_gap_pct": 0.9}, cfg) == "trend"
-    assert entry_regime({}, cfg) == ""
-
-
 def test_hold_time_never_forces_exit():
     """最长持仓已从参数配置移除，持仓多久都不再按时间平仓。"""
     cfg = StrategySettings(roi_table=[], trailing_pct=0)
@@ -216,8 +208,7 @@ def test_hold_time_never_forces_exit():
         side="long", entry_price=100, mark_price=100, peak_price=100,
         sl_price=90, tp_price=200, opened_at=0, now_ts=24 * 60 * 60, cfg=cfg, score=0.0,
     )
-    assert detect_exit(**common, entry_regime="trend")[0] is False
-    assert detect_exit(**common, entry_regime="chop")[0] is False
+    assert detect_exit(**common)[0] is False
 
 
 # ------------------------------------------------------------------ 版本指纹

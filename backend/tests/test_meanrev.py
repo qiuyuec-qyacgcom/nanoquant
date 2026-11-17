@@ -70,7 +70,9 @@ def test_meanrev_refuses_counter_trend_in_strong_uptrend():
                               low=price * 0.996, close=price, volume=100.0))
     f = _fed(cfg, candles)
     sig = score_signal("X", f, cfg)
+    # 强趋势里逆势回归必须拦下；方向尚未形成，分数保持空。
     assert sig.direction == "flat"
+    assert sig.score == 0
     assert "趋势中" in sig.blocked
 
 

@@ -177,8 +177,6 @@ class StrategySettings(BaseModel):
     #: 都会在 ATR 止损之前被噪声扫掉 —— 实盘 24 笔 trailing_stop 全亏，这是元凶。
     trailing_arm_r: float = Field(default=1.0, ge=0.0, le=20)
     breakeven_at_r: float = Field(default=1.0, ge=0.1, le=10)
-    #: 判定"震荡市"的均线间距阈值(%), |EMA 间距| 小于它即视为无趋势
-    chop_ema_gap_pct: float = Field(default=0.08, ge=0.0, le=5.0)
     #: 行情完整性闸门：最近 20 根内允许的 K 线缺口次数（0 = 一根都不许断）。
     #: 断档时指标仍会算出"看起来正常"的数值，必须在打分前拦掉。
     max_data_gaps: int = Field(default=0, ge=0, le=20)

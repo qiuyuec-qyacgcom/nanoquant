@@ -336,10 +336,11 @@ function onVisible() {
 onMounted(() => {
   bootstrap()
   clockTimer = window.setInterval(tickCountdown, 1000)
-  // 轻量安全兜底 (每 20 秒一次, 权重 2)：WS 已负责秒级更新最后一根蜡烛,
-  // REST 只用于切标的/切周期或偶发失败后收敛；5s 轮询在限频期间纯属浪费权重。
+  // REST 只在推送断开时兜底。连接正常时最后一根由 WS 更新，
+  // 每 20 秒再拉一整窗历史只会重复消耗权重。
   refreshTimer = window.setInterval(() => {
     if (document.hidden || !selected.value) return
+    if (wsState.value === 'live' && socket && socket.readyState === WebSocket.OPEN) return
     reloadChart()
   }, 20000)
   // 24h 快照权重 40, 60 秒一次足够

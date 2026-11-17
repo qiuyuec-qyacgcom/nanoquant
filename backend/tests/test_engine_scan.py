@@ -389,9 +389,8 @@ def _run_scan_with_candidates(monkeypatch, symbols: list[str], *, dispatch_quota
     monkeypatch.setattr(worker_mod, "build_features", lambda *a, **k: dict(features))
 
     def _fake_score(symbol, feat, cfg):
-        sig = SignalResult(symbol=symbol, direction="flat", score=0.0, features=dict(feat))
-        sig.blocked = "模拟: 量化无方向"
-        return sig
+        # 无方向是观望，不是拒绝。blocked 非空会被扫描当成「已拒绝，不再送 AI」。
+        return SignalResult(symbol=symbol, direction="flat", score=0.0, features=dict(feat))
 
     monkeypatch.setattr(worker_mod, "score_signal", _fake_score)
 

@@ -35,7 +35,9 @@ def test_adx_filter_blocks_weak_trend():
     f["adx"] = 10.0  # 注入低 ADX，与是否真能构造出低 ADX 解耦
     f["ok"]["adx"] = True
     sig = score_signal("X", f, cfg)
-    assert sig.direction == "flat"
+    # 拦住开仓，但方向和分数要留下，审计页才能看到这笔被拒信号偏哪边。
+    assert sig.direction == "long"
+    assert sig.score != 0
     assert "趋势强度不足" in sig.blocked
 
 
@@ -59,7 +61,8 @@ def test_htf_filter_blocks_counter_trend():
     f2 = _fed(cfg, candles)
     f2["htf_trend"] = "down"
     sig2 = score_signal("X", f2, cfg)
-    assert sig2.direction == "flat"
+    assert sig2.direction == "long"
+    assert sig2.score != 0
     assert "逆高周期趋势" in sig2.blocked
 
 
@@ -77,7 +80,7 @@ def test_meanrev_exhaustion_confirm_blocks_high_volume():
     f["close"] = 100.0
     f["ok"]["meanrev"] = True
     sig = score_signal("X", f, cfg)
-    assert sig.direction == "flat"
+    assert sig.direction == "short"
     assert "动能未衰竭" in sig.blocked
 
 

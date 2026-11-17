@@ -61,7 +61,6 @@ from .strategy import (
     candidate_eligible,
     candidate_strength,
     detect_exit,
-    entry_regime,
     partial_close_qty,
     partial_tp_r,
     score_signal,
@@ -74,6 +73,16 @@ log = get_logger("engine")
 MAX_TASKS = 2
 #: 同一标的、同一方向/拒绝原因的 flat 信号在这个窗口内合并成一行 (repeats 计数)
 SIGNAL_DEDUP_SEC = 60
+_TIMEFRAME_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+}
 #: AI 议会一致度下限：低于该值视为分歧，`ai.require_agreement` 打开时直接观望
 AGREEMENT_MIN = 0.6
 #: flat 信号（扫描到了但没有方向）只保留审计需要的字段。
@@ -163,6 +172,11 @@ class TradingEngine:
         self._last_health_check = 0.0
         self._last_halt_flatten = 0.0
         self._last_order_sync = 0.0
+        #: 空仓对账节流。无持仓、无挂单时仓位和账户几乎不变，不必跟着 15 秒扫描节奏打 REST。
+        self._last_reconcile = 0.0
+        #: 高周期趋势缓存: (symbol, timeframe) -> (该根收盘时间 ms, up/down/flat)。
+        #: 1h 趋势在 15 秒循环里不会变，按收盘时间失效而不是每轮重拉。
+        self._htf_cache: dict[tuple[str, str], tuple[int, str]] = {}
         self._last_ws_warn = 0.0
         self._margin = MarginLedger()
         self._sem = asyncio.Semaphore(MAX_TASKS)
@@ -346,8 +360,12 @@ class TradingEngine:
         self._last_account = account.as_dict()
         self._last_equity = account.equity
 
-        # 模拟盘与实盘都是交易所账户, 都需要与交易所对账
-        await timed("reconcile", self._reconcile_live(broker))
+        # 模拟盘与实盘都是交易所账户, 都需要与交易所对账。
+        # 空仓且没有待确认挂单时，仓位和账户几秒内不会变，降到 45 秒一次；
+        # 有持仓或挂单仍每轮对账，成交和强平不能等。
+        if self._reconcile_due(broker):
+            await timed("reconcile", self._reconcile_live(broker))
+            self._last_reconcile = time.time()
         # 委托状态收敛: 挂单回执只会返回 NEW, 成交/撤销要回查才知道（60s 节流，无待查单时零请求）
         await timed("orders_sync", self._sync_orders_if_due())
 
@@ -852,6 +870,26 @@ class TradingEngine:
         return sl, tp
 
     # ------------------------------------------------------------- positions
+    async def _fresh_score(self, symbol: str, cfg: StrategySettings) -> float | None:
+        """用当轮已收盘 K 线重算方向分，供 signal_flip 使用。
+
+        返回 None 表示这轮算不出来（取数失败、K 线不够），调用方应退回开仓时的分数，
+        而不是把"没算出来"当成 0 分去触发反转。
+        """
+        try:
+            candles = await binance_client.klines(symbol, cfg.timeframe, _scan_bars())
+        except (BinanceError, NoCredentials) as exc:
+            log.debug("%s 出场重算取 K 线失败: %s", symbol, str(exc)[:120])
+            return None
+        if len(candles) < 30:
+            return None
+        try:
+            features = build_features(candles, cfg, now=time.time())
+            return float(score_signal(symbol, features, cfg).score)
+        except Exception as exc:  # noqa: BLE001  重算失败不能挡住止损止盈
+            log.debug("%s 出场重算分数失败: %s", symbol, str(exc)[:120])
+            return None
+
     async def _manage_positions(self, broker: Broker, cfg: StrategySettings, engine_cfg: EngineSettings) -> None:
         mode = normalize_mode(getattr(broker, "mode", engine_cfg.mode))
         with session_scope() as s:
@@ -896,7 +934,13 @@ class TradingEngine:
                 initial_sl = row.initial_sl_price or 0.0
                 partial_at = row.partial_taken_at or 0
                 live_qty = row.qty
-                entry_feats = dict(row.features or {})
+
+            # 信号反转必须看当轮方向分。开仓时写入的 signal_score 不会变，
+            # 行情反过来之后 signal_flip 永远等不到。K 线取失败就退回开仓分数，
+            # 止损、止盈、移动止损这些不依赖分数的出场照常判断。
+            fresh = await self._fresh_score(pos.symbol, cfg)
+            if fresh is not None:
+                score = fresh
 
             # ---- 部分止盈: 浮盈达到 N 倍初始风险时先平掉一部分 ----
             # 放在硬止损/止盈判断之前, 触发后本轮直接 continue, 避免同轮重复平仓。
@@ -928,8 +972,6 @@ class TradingEngine:
             exit_now, reason = detect_exit(
                 side=side, entry_price=entry, mark_price=mark, peak_price=peak,
                 sl_price=sl, tp_price=tp, opened_at=opened, now_ts=now, cfg=cfg, score=score,
-                # 用**入场时**的体制判断震荡：震荡市里资金不该空耗在不会突破的仓位上
-                entry_regime=entry_regime(entry_feats, cfg),
             )
             if exit_now:
                 await self._close(broker, pos.id, reason, mark)
@@ -1152,19 +1194,9 @@ class TradingEngine:
                 except (BinanceError, NoCredentials) as exc:
                     log.warning("%s K线取数失败: %s", symbol, str(exc)[:120])
                     return None
-                # 高周期趋势：只做与 HTF 同向的信号（默认关闭，开启时每标的每轮多一次 REST）
-                htf_trend = ""
-                if strat_cfg.htf_timeframe:
-                    try:
-                        htf_candles = await binance_client.klines(symbol, strat_cfg.htf_timeframe, 60)
-                        htf_closes = [c.close for c in htf_candles]
-                        htf_fast = ta.ema(htf_closes, strat_cfg.ema_fast)
-                        htf_slow = ta.ema(htf_closes, strat_cfg.ema_slow)
-                        htf_trend = "up" if htf_fast > htf_slow else ("down" if htf_fast < htf_slow else "flat")
-                    except (BinanceError, NoCredentials):
-                        htf_trend = ""
-            if len(candles) < 30:
-                return None
+                htf_trend = await self._htf_trend(symbol, strat_cfg)
+                if len(candles) < 30:
+                    return None
             features = build_features(
                 candles, strat_cfg,
                 # 取不到就是 None（缺失），不能塞 0.0 冒充"费率中性 / OI 没变"
@@ -1200,7 +1232,18 @@ class TradingEngine:
         ai_cfg = get_ai()
         review_flat = bool(strat_cfg.ai_review_flat and ai_cfg.enabled and strat_cfg.auto_entry)
         review_quota = max(0, int(strat_cfg.ai_review_max_per_cycle or 0))
-        flat_candidates: list[tuple[float, dict[str, Any], Any, dict[str, Any]]] = []
+        # 一轮扫描一次提交。原先每个标的各开一个事务，再为拒绝原因另开一次。
+        # 闸门不写库：拒绝原因先记在 pending 里，事务末尾和信号行一起落下去。
+        pending: list[tuple[Any, Any, str]] = []
+        # 通过闸门、等 signal_id 才能发起的入场：(下标, sig, ticker)
+        entries: list[tuple[int, Any, Any]] = []
+        flat_candidates: list[tuple[float, dict[str, Any], Any, int]] = []
+        mode = normalize_mode(engine_cfg.mode)
+        now = int(time.time())
+
+        def _reject(reason: str) -> None:
+            sig, ticker, _prev = pending[-1]
+            pending[-1] = (sig, ticker, reason)
 
         for item in analyzed:
             if item is None:
@@ -1211,10 +1254,11 @@ class TradingEngine:
             sig = score_signal(symbol, features, strat_cfg)
             per_symbol_min = min_scores.get(symbol, 0.0)
             if sig.direction != "flat" and per_symbol_min > 0 and abs(sig.score) < per_symbol_min:
+                # 只拦开仓，方向和分数留给审计页。改成 flat 会让这条被拒信号看起来既没方向也没分。
                 sig.blocked = f"信号分 {sig.score:.3f} 低于该标的最低要求 {per_symbol_min:.2f}"
-                sig.direction = "flat"
-            rec = self._record_signal(sig, ticker, "scan")
-            results.append(rec)
+            pending.append((sig, ticker, sig.blocked if sig.direction != "flat" else ""))
+            if sig.blocked:
+                continue
             if sig.direction == "flat":
                 # 只收「风险闸门通过」的：ATR 爆表 / 没量 / 没深度 / 数据停更的，
                 # 送 AI 也是白花一次调用，而且 AI 很可能看不出坏数据而误判。
@@ -1222,13 +1266,13 @@ class TradingEngine:
                     eligible, _why = candidate_eligible(features, strat_cfg)
                     if eligible:
                         flat_candidates.append(
-                            (candidate_strength(features, strat_cfg), item, sig, rec)
+                            (candidate_strength(features, strat_cfg), item, sig, len(pending) - 1)
                         )
                 continue
             # 只观察不交易：信号照常落库供人眼对照，但不下单。
             # 与 engine.enabled 的区别是那个连跟单一起停，这个是"只看不做"。
             if not strat_cfg.auto_entry:
-                self._update_signal_reject(rec["signal_id"], "自动开仓已关闭(仅观察)")
+                _reject("自动开仓已关闭(仅观察)")
                 continue
             if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
                 continue
@@ -1236,93 +1280,185 @@ class TradingEngine:
                 symbol, account, engine_cfg, risk_cfg, prices=prices, side=sig.direction
             )
             if not gate.ok:
-                self._update_signal_reject(rec["signal_id"], gate.reason)
+                _reject(gate.reason)
                 continue
+            entries.append((len(pending) - 1, sig, ticker))
+
+        if flat_candidates:
+            flat_candidates.sort(key=lambda row: row[0], reverse=True)
+            if review_quota > 0:
+                flat_candidates = flat_candidates[:review_quota]
+            kept: list[tuple[float, dict[str, Any], Any, int]] = []
+            for strength, item, sig, idx in flat_candidates:
+                symbol = item["symbol"]
+                if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
+                    continue
+                gate = risk_mod.symbol_gates(
+                    symbol, account, engine_cfg, risk_cfg, prices=prices, side=""
+                )
+                if not gate.ok:
+                    _sig, _ticker, _prev = pending[idx]
+                    pending[idx] = (_sig, _ticker, gate.reason)
+                    continue
+                log.info("%s 量化无方向(离触发 %.2f)，按候选送 AI 定性", symbol, strength)
+                kept.append((strength, item, sig, idx))
+            flat_candidates = kept
+
+        results = self._persist_scan_signals(pending, mode, now)
+
+        def _spawn(idx: int, sig, ticker) -> None:
+            rec = results[idx] if 0 <= idx < len(results) else None
+            if rec is None or not rec.get("signal_id"):
+                return
+            symbol = sig.symbol
             self._entry_tasks[symbol] = asyncio.create_task(
                 self._open_entry_guarded(
                     broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, rec["signal_id"]
                 )
             )
-            # partial 绑定 symbol: 用 lambda 默认参数也行, 但闭包捕获循环变量是经典坑
             self._entry_tasks[symbol].add_done_callback(partial(self._drop_entry_task, symbol))
 
-        # 无方向候选：按「离触发还差多远」排序，只送前 N 个（控 AI 成本）
-        if flat_candidates:
-            flat_candidates.sort(key=lambda row: row[0], reverse=True)
-            if review_quota > 0:
-                flat_candidates = flat_candidates[:review_quota]
-            for strength, item, sig, rec in flat_candidates:
-                symbol = item["symbol"]
-                if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
-                    continue
-                # 方向未知，这里只过「与方向无关」的持仓/敞口/冷却闸门
-                gate = risk_mod.symbol_gates(
-                    symbol, account, engine_cfg, risk_cfg, prices=prices, side=""
-                )
-                if not gate.ok:
-                    self._update_signal_reject(rec["signal_id"], gate.reason)
-                    continue
-                log.info(
-                    "%s 量化无方向(离触发 %.2f)，按候选送 AI 定性", symbol, strength
-                )
-                self._entry_tasks[symbol] = asyncio.create_task(
-                    self._open_entry_guarded(
-                        broker, sig, item["ticker"], account, engine_cfg, risk_cfg,
-                        strat_cfg, rec["signal_id"],
-                    )
-                )
-                self._entry_tasks[symbol].add_done_callback(partial(self._drop_entry_task, symbol))
+        for idx, sig, ticker in entries:
+            _spawn(idx, sig, ticker)
+        for _strength, item, sig, idx in flat_candidates:
+            _spawn(idx, sig, item["ticker"])
         return results
+
+    async def _htf_trend(self, symbol: str, cfg: StrategySettings) -> str:
+        """高周期趋势，按那根 K 线的收盘时间缓存。
+
+        1h/4h 的均线方向在 15 秒扫描里不会变。缓存命中就不再打 REST；
+        没配高周期、取数失败或根数不够都返回空串，调用方按「未启用」处理。
+        """
+        tf = cfg.htf_timeframe
+        if not tf:
+            return ""
+        key = (symbol, tf)
+        bar_ms = _TIMEFRAME_MS.get(tf, 0)
+        now_ms = int(time.time() * 1000)
+        cached = self._htf_cache.get(key)
+        if cached is not None and bar_ms > 0 and now_ms < cached[0]:
+            return cached[1]
+        try:
+            candles = await binance_client.klines(symbol, tf, 60)
+        except (BinanceError, NoCredentials) as exc:
+            log.debug("%s 高周期取数失败: %s", symbol, str(exc)[:120])
+            return cached[1] if cached is not None else ""
+        if len(candles) < max(cfg.ema_slow, 14):
+            return cached[1] if cached is not None else ""
+        closes = [c.close for c in candles]
+        fast = ta.ema(closes, cfg.ema_fast)
+        slow = ta.ema(closes, cfg.ema_slow)
+        if fast > slow:
+            trend = "up"
+        elif fast < slow:
+            trend = "down"
+        else:
+            trend = "flat"
+        close_ms = int(getattr(candles[-1], "open_time", 0) or 0)
+        if bar_ms > 0 and close_ms > 0:
+            self._htf_cache[key] = (close_ms + bar_ms, trend)
+        return trend
+
+    def _reconcile_due(self, broker: Broker) -> bool:
+        """空仓且没有在途开仓时，45 秒才对一次账；有仓或有挂单任务则每轮都对。"""
+        if self._entry_tasks or time.time() - self._last_reconcile >= 45.0:
+            return True
+        mode = normalize_mode(getattr(broker, "mode", get_engine().mode))
+        with session_scope() as s:
+            open_pos = (
+                s.query(PositionRecord.id)
+                .filter(PositionRecord.status == "open", PositionRecord.mode == mode)
+                .first()
+            )
+            if open_pos is not None:
+                return True
+            pending = (
+                s.query(OrderRecord.id)
+                .filter(
+                    OrderRecord.mode == mode,
+                    OrderRecord.purpose == "entry",
+                    OrderRecord.status.in_(("new", "NEW", "pending", "PARTIALLY_FILLED")),
+                )
+                .first()
+            )
+        return pending is not None
 
     def _drop_entry_task(self, symbol: str, _task: asyncio.Task) -> None:
         """入场任务收尾后清掉登记."""
         self._entry_tasks.pop(symbol, None)
 
     def _record_signal(self, sig, ticker, source: str) -> dict[str, Any]:
-        # 先取环境再开事务: 避免在写事务里再嵌套一次配置读取
+        """单条落库。扫描走 ``_persist_scan_signals``，这里留给跟单等单点入口。"""
         mode = normalize_mode(get_engine().mode)
         now = int(time.time())
-        features = {**sig.features, "price": ticker.last, "source": source}
-        if sig.direction == "flat":
-            features = _flat_features(features)
-        reason = sig.blocked or ""
-        decision = "pending" if sig.direction != "flat" else "flat"
-        key = (mode, sig.symbol, sig.direction, decision, reason)
+        rows = self._persist_scan_signals([(sig, ticker, sig.blocked or "")], mode, now, source)
+        return rows[0] if rows else self._signal_view_bare(sig, sig.blocked or "")
 
+    def _persist_scan_signals(
+        self,
+        pending: list[tuple[Any, Any, str]],
+        mode: str,
+        now: int,
+        source: str = "scan",
+    ) -> list[dict[str, Any]]:
+        """一轮扫描的信号插入、flat 去重和拒绝原因，一次提交。"""
+        if not pending:
+            return []
+        out: list[dict[str, Any]] = []
         with session_scope() as s:
-            # flat 信号每轮都写会把信号表撑到 2 万行/天；同状态的在 60s 内合并为一行,
-            # 用 repeats 保留真实扫描次数，审计页的密度图按 repeats 加权。
-            if sig.direction == "flat":
-                cached_id = self._signal_dedup.get(key)
-                if cached_id:
-                    row = s.get(Signal, cached_id)
-                    first_ts = int((row.features or {}).get("first_ts", row.ts)) if row else 0
-                    if row is not None and now - first_ts < SIGNAL_DEDUP_SEC:
-                        # 只更新计数与时间戳：特征快照几乎逐轮相同，重写它纯粹是放大 WAL
-                        row.repeats = int(row.repeats or 1) + 1
-                        row.ts = now
-                        row.score = sig.score
-                        s.flush()
-                        return self._signal_view(row, sig, reason)
+            for sig, ticker, reject in pending:
+                features = {**sig.features, "price": ticker.last, "source": source}
+                if sig.direction == "flat":
+                    features = _flat_features(features)
+                reason = (reject or sig.blocked or "")[:250]
+                if sig.direction == "flat":
+                    decision = "flat"
+                elif reason:
+                    decision = "rejected"
+                else:
+                    decision = "pending"
+                key = (mode, sig.symbol, sig.direction, decision, reason)
+                if sig.direction == "flat":
+                    cached_id = self._signal_dedup.get(key)
+                    if cached_id:
+                        row = s.get(Signal, cached_id)
+                        first_ts = int((row.features or {}).get("first_ts", row.ts)) if row else 0
+                        if row is not None and now - first_ts < SIGNAL_DEDUP_SEC:
+                            row.repeats = int(row.repeats or 1) + 1
+                            row.ts = now
+                            row.score = sig.score
+                            out.append(self._signal_view(row, sig, reason))
+                            continue
+                row = Signal(
+                    ts=now,
+                    symbol=sig.symbol,
+                    direction=sig.direction,
+                    score=sig.score,
+                    features={**features, "first_ts": now},
+                    decision=decision,
+                    reject_reason=reason,
+                    mode=mode,
+                    repeats=1,
+                )
+                s.add(row)
+                s.flush()
+                if sig.direction == "flat":
+                    self._signal_dedup[key] = row.id
+                    if len(self._signal_dedup) > 256:
+                        self._signal_dedup.clear()
+                out.append(self._signal_view(row, sig, reason))
+        return out
 
-            row = Signal(
-                ts=now,
-                symbol=sig.symbol,
-                direction=sig.direction,
-                score=sig.score,
-                features={**features, "first_ts": now},
-                decision=decision,
-                reject_reason=reason,
-                mode=mode,
-                repeats=1,
-            )
-            s.add(row)
-            s.flush()
-            if sig.direction == "flat":
-                self._signal_dedup[key] = row.id
-                if len(self._signal_dedup) > 256:
-                    self._signal_dedup.clear()
-            return self._signal_view(row, sig, reason)
+    @staticmethod
+    def _signal_view_bare(sig, reason: str) -> dict[str, Any]:
+        return {
+            "signal_id": 0,
+            "symbol": sig.symbol,
+            "direction": sig.direction,
+            "score": sig.score,
+            "blocked": reason,
+        }
 
     @staticmethod
     def _signal_view(row: Signal, sig, reason: str) -> dict[str, Any]:

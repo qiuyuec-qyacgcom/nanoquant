@@ -427,8 +427,8 @@ const SECTIONS: Record<string, SectionDef[]> = {
     },
     {
       title: '体制自适应',
-      hint: '震荡市入场时提前释放资金；RSI 按趋势体制分区解读（上涨趋势里 65 是健康、80 才是过热）',
-      fields: ['chop_ema_gap_pct', 'rsi_adaptive'],
+      hint: 'RSI 按趋势体制分区解读（上涨趋势里 65 是健康、80 才是过热）',
+      fields: ['rsi_adaptive'],
     },
     { title: '部分止盈', hint: '先落袋一部分，剩余仓位用移动止损奔跑', fields: ['partial_tp_at_r', 'partial_tp_ratio'] },
     {
