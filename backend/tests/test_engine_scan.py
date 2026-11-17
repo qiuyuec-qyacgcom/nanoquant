@@ -333,3 +333,129 @@ def test_scan_survives_one_symbol_failing(monkeypatch):
     scanned = [r["symbol"] for r in out]
     assert "PARA6USDT" in scanned, "一个标的取数失败不该拖垮整轮扫描"
     assert "PARA5USDT" not in scanned
+
+
+# --------------------------------------------------- 量化无方向 → AI 候选复审
+# 事故背景：量化 flat 时旧实现直接 continue，AI 永远拿不到标的。
+# 线上表现为「AI 已开启、模型可用，但一整晚 ai_call_logs 一条 decision 都没有」，
+# 系统实际由 docs/EVIDENCE.md 里已被证伪的纯量化模型在跑。
+
+
+def _seed_candidates(symbols: list[str]) -> None:
+    for i, symbol in enumerate(symbols):
+        _cleanup(symbol)
+        with session_scope() as s:
+            s.add(
+                TradingSymbol(
+                    symbol=symbol, enabled=True, max_leverage=50, precision=3,
+                    tick_sz="0.01", min_sz="0.001", min_notional=5.0, sort_order=700 + i,
+                )
+            )
+
+
+def _features(atr_pct: float = 0.8, vol_ratio: float = 1.3, band_z: float = 0.6,
+              quote_volume: float = 1e9) -> dict:
+    return {
+        "close": 100.0, "price": 100.0, "atr_pct": atr_pct, "vol_ratio": vol_ratio,
+        "band_z": band_z, "quote_volume": quote_volume, "rsi": 50.0, "ema_gap_pct": 0.1,
+        "data_ok": True, "ok": {"trend": True, "momentum": True, "volume": True},
+    }
+
+
+def _run_scan_with_candidates(monkeypatch, symbols: list[str], *, dispatch_quota: int,
+                              atr_pct: float = 0.8, ai_enabled: bool = True):
+    """跑一轮扫描，返回实际被送去 AI 复核的标的（按派发顺序）.
+
+    `build_features` 被整体替换成统一特征：一轮里所有标的共用同一份行情，
+    这样"风险闸门是否放行""候选额度"这类链路逻辑可以独立于指标计算来验证。
+    """
+    _seed_candidates(symbols)
+    # 标的池是全池扫描的，别的用例会留下启用标的：本用例的断言只看自己这几个，
+    # 所以临时把其余标的停用（用 enabled 开关而不是删数据，退出时原样恢复）。
+    with session_scope() as s:
+        muted = [
+            (row.symbol, row.enabled)
+            for row in s.query(TradingSymbol).all()
+            if row.symbol not in symbols and row.enabled
+        ]
+        for row in s.query(TradingSymbol).all():
+            if row.symbol not in symbols:
+                row.enabled = False
+
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: SimpleNamespace(mode="demo"))
+    _patch_market(monkeypatch, _candles(), price=100.0)
+
+    features = _features(atr_pct=atr_pct)
+    monkeypatch.setattr(worker_mod, "build_features", lambda *a, **k: dict(features))
+
+    def _fake_score(symbol, feat, cfg):
+        sig = SignalResult(symbol=symbol, direction="flat", score=0.0, features=dict(feat))
+        sig.blocked = "模拟: 量化无方向"
+        return sig
+
+    monkeypatch.setattr(worker_mod, "score_signal", _fake_score)
+
+    sent: list[str] = []
+
+    async def _fake_entry(broker, sig, ticker, account, engine_cfg, risk_cfg, strat_cfg, signal_id):
+        sent.append(sig.symbol)
+
+    engine = worker_mod.TradingEngine()
+    monkeypatch.setattr(engine, "_open_entry_guarded", _fake_entry)
+
+    prev_ai = worker_mod.get_ai()
+    prev_strat = get_strategy()
+    try:
+        update_group("ai", {"enabled": ai_enabled})
+        update_group("strategy", {"auto_entry": True, "ai_review_flat": True,
+                                  "ai_review_max_per_cycle": dispatch_quota})
+        engine._margin.begin_cycle(900.0)
+
+        async def _run():
+            out = await engine._scan(
+                SimpleNamespace(mode="demo"), _account(), EngineSettings(max_symbols_per_cycle=60),
+                get_risk(), get_strategy(),
+            )
+            await asyncio.sleep(0.05)  # 让 create_task 派发出去的开仓任务跑起来
+            return out
+
+        asyncio.run(_run())
+    finally:
+        update_group("ai", {"enabled": prev_ai.enabled})
+        update_group("strategy", {
+            "auto_entry": prev_strat.auto_entry,
+            "ai_review_flat": prev_strat.ai_review_flat,
+            "ai_review_max_per_cycle": prev_strat.ai_review_max_per_cycle,
+        })
+        with session_scope() as s:
+            for symbol, was_enabled in muted:
+                row = s.get(TradingSymbol, symbol)
+                if row is not None:
+                    row.enabled = was_enabled
+    return sent
+
+
+def test_flat_signal_still_reaches_ai_when_risk_gate_passes(monkeypatch):
+    """量化无方向但通过风险闸门 → 必须送 AI，不能再被 flat 提前 continue 掉."""
+    sent = _run_scan_with_candidates(monkeypatch, ["CAND1USDT"], dispatch_quota=2)
+    assert sent == ["CAND1USDT"], "量化 flat 的标的应作为候选进入 AI 决策链"
+
+
+def test_flat_candidates_are_capped_per_cycle(monkeypatch):
+    """额度有限时只送前 N 个：无方向候选不能把每小时 AI 调用额度全吃光."""
+    sent = _run_scan_with_candidates(
+        monkeypatch, ["CANDAUSDT", "CANDBUSDT", "CANDCUSDT"], dispatch_quota=1,
+    )
+    assert len(sent) == 1, f"每轮额度 1，实际派发 {sent}"
+
+
+def test_flat_signal_skips_ai_when_risk_gate_fails(monkeypatch):
+    """ATR 超出可交易区间（坏数据/不可交易）时不浪费 AI 调用."""
+    sent = _run_scan_with_candidates(monkeypatch, ["CANDDUSDT"], dispatch_quota=2, atr_pct=99.0)
+    assert sent == [], "风险闸门不过的标的不能占用 AI 额度"
+
+
+def test_flat_signal_does_not_reach_ai_when_ai_disabled(monkeypatch):
+    """AI 关闭时保持旧行为：只有量化给出方向的信号才开仓，flat 只落库观察."""
+    sent = _run_scan_with_candidates(monkeypatch, ["CANDEUSDT"], dispatch_quota=2, ai_enabled=False)
+    assert sent == []

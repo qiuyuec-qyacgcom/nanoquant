@@ -58,6 +58,8 @@ from . import risk as risk_mod
 from .margin import MarginLedger
 from .strategy import (
     build_features,
+    candidate_eligible,
+    candidate_strength,
     detect_exit,
     entry_regime,
     partial_close_qty,
@@ -1002,7 +1004,11 @@ class TradingEngine:
         try:
             tickers = await binance_client.tickers(symbols)
             funding = await binance_client.funding_rates(symbols)
-            oi = await binance_client.open_interest(symbols[:6])
+            # OI 必须覆盖**全池**。旧实现只取前 6 个（client 侧还会再截到 10），
+            # 于是池里后半段标的的 oi_change_pct 永远缺失 —— 而 AI 的决策协议里
+            # 写着"关键数据缺失 -> hold"，等于把这些标的永久判死，AI 开了也开不了仓。
+            # 每个标的 1 权重且有 60s 缓存，12 个标的一轮只多几次请求。
+            oi = await binance_client.open_interest(symbols)
         except (BinanceError, NoCredentials) as exc:
             events.record("warn", "engine", f"行情取数失败, 本轮跳过扫描: {str(exc)[:160]}")
             return []
@@ -1071,6 +1077,18 @@ class TradingEngine:
 
         # 第二阶段（串行）：落库 + 闸门 + 起任务。写库留在单线程里，避免 SQLite 写竞争；
         # gather 保序，所以信号顺序与标的池顺序一致，排查时好对照。
+        #
+        # 「量化无方向」的被弃用模型不得再当全系统闸门：
+        # 旧实现 `if sig.direction == "flat": continue` 意味着量化一 flat，AI 就永远
+        # 不被调用（实测：连续 7 小时 2028 条信号 0 次 AI 调用）。现在的分工是
+        #   量化 = 候选来源（给出方向就直送 AI 复核）
+        #   风险闸门 = 拦坏数据/不可交易标的（与方向无关）
+        #   AI = 唯一决策者（无方向候选也由它定性，数量按 ai_review_max_per_cycle 限流）
+        ai_cfg = get_ai()
+        review_flat = bool(strat_cfg.ai_review_flat and ai_cfg.enabled and strat_cfg.auto_entry)
+        review_quota = max(0, int(strat_cfg.ai_review_max_per_cycle or 0))
+        flat_candidates: list[tuple[float, dict[str, Any], Any, dict[str, Any]]] = []
+
         for item in analyzed:
             if item is None:
                 continue
@@ -1085,6 +1103,14 @@ class TradingEngine:
             rec = self._record_signal(sig, ticker, "scan")
             results.append(rec)
             if sig.direction == "flat":
+                # 只收「风险闸门通过」的：ATR 爆表 / 没量 / 没深度 / 数据停更的，
+                # 送 AI 也是白花一次调用，而且 AI 很可能看不出坏数据而误判。
+                if review_flat:
+                    eligible, _why = candidate_eligible(features, strat_cfg)
+                    if eligible:
+                        flat_candidates.append(
+                            (candidate_strength(features, strat_cfg), item, sig, rec)
+                        )
                 continue
             # 只观察不交易：信号照常落库供人眼对照，但不下单。
             # 与 engine.enabled 的区别是那个连跟单一起停，这个是"只看不做"。
@@ -1106,6 +1132,33 @@ class TradingEngine:
             )
             # partial 绑定 symbol: 用 lambda 默认参数也行, 但闭包捕获循环变量是经典坑
             self._entry_tasks[symbol].add_done_callback(partial(self._drop_entry_task, symbol))
+
+        # 无方向候选：按「离触发还差多远」排序，只送前 N 个（控 AI 成本）
+        if flat_candidates:
+            flat_candidates.sort(key=lambda row: row[0], reverse=True)
+            if review_quota > 0:
+                flat_candidates = flat_candidates[:review_quota]
+            for strength, item, sig, rec in flat_candidates:
+                symbol = item["symbol"]
+                if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
+                    continue
+                # 方向未知，这里只过「与方向无关」的持仓/敞口/冷却闸门
+                gate = risk_mod.symbol_gates(
+                    symbol, account, engine_cfg, risk_cfg, prices=prices, side=""
+                )
+                if not gate.ok:
+                    self._update_signal_reject(rec["signal_id"], gate.reason)
+                    continue
+                log.info(
+                    "%s 量化无方向(离触发 %.2f)，按候选送 AI 定性", symbol, strength
+                )
+                self._entry_tasks[symbol] = asyncio.create_task(
+                    self._open_entry_guarded(
+                        broker, sig, item["ticker"], account, engine_cfg, risk_cfg,
+                        strat_cfg, rec["signal_id"],
+                    )
+                )
+                self._entry_tasks[symbol].add_done_callback(partial(self._drop_entry_task, symbol))
         return results
 
     def _drop_entry_task(self, symbol: str, _task: asyncio.Task) -> None:
@@ -2035,6 +2088,9 @@ class TradingEngine:
 
         ai_cfg = get_ai()
         direction = sig.direction
+        #: 量化这一轮**没有方向**（候选模式）。此时方向只能由 AI 给，
+        #: 止损锚点也要另找 —— 见下方 ATR 兜底，绝不能拿 0 止损进定仓。
+        quant_flat = direction not in ("long", "short")
         leverage = risk_mod.choose_leverage(
             sig.symbol, engine_cfg, risk_cfg, filters,
             strategy_range=(strat_cfg.leverage_min, strat_cfg.leverage_max),
@@ -2056,6 +2112,11 @@ class TradingEngine:
                     "ai",
                     "AI 已开启但未配置可用模型, 当前回退为纯量化决策 (可在「AI 模型」中接入)",
                 )
+        if quant_flat and not (ai_cfg.enabled and ai_ready):
+            # 无方向候选的全部依据就是 AI 的判断。AI 不在线时"回退纯量化"没有意义：
+            # 这单本来就没有方向，硬走旧链路等于凭一个已证伪的模型开仓。
+            self._update_signal_reject(signal_id, "量化无方向且 AI 不可用, 跳过该候选")
+            return
 
         if ai_cfg.enabled and ai_ready:
             ctx = self._build_ai_context(sig, ticker, account, engine_cfg, risk_cfg, filters)
@@ -2117,11 +2178,19 @@ class TradingEngine:
                 )
                 return
             if ai_dir != direction:
-                if not ai_cfg.allow_ai_override:
+                if not quant_flat and not ai_cfg.allow_ai_override:
                     self._update_signal_reject(signal_id, f"AI 方向({ai_dir})与量化信号({direction})冲突")
                     return
                 direction = ai_dir
-                events.record("warn", "ai", f"{sig.symbol} AI 反向覆盖量化信号 -> {direction}", ai_meta)
+                if quant_flat:
+                    # 量化本就没有方向，AI 给出方向不是"反向覆盖"，是一条正常的新决策
+                    events.record(
+                        "info", "ai",
+                        f"{sig.symbol} 量化无方向，AI 定性为 {direction}（置信度 {d.confidence:.2f}）",
+                        ai_meta,
+                    )
+                else:
+                    events.record("warn", "ai", f"{sig.symbol} AI 反向覆盖量化信号 -> {direction}", ai_meta)
             if d.confidence < ai_cfg.min_confidence:
                 self._update_signal_reject(
                     signal_id, f"AI 置信度 {d.confidence:.2f} < {ai_cfg.min_confidence}"
@@ -2138,6 +2207,26 @@ class TradingEngine:
                 sl_pct = min(max(0.12, d.sl_pct), 3.0)
             if d.tp_pct > 0:
                 tp_pct = min(max(sl_pct * 1.05, d.tp_pct), 8.0)
+
+        # 止损锚点兜底：量化无方向时 sig.sl_pct 为 0（它压根没算出进场位），
+        # AI 也可能只给方向不给止损。0 止损会让 plan_position 按"零风险"把仓位放到
+        # 保证金极限——这是资金安全底线，宁可拒单也不能带着 0 止损进场。
+        if direction not in ("long", "short"):
+            self._update_signal_reject(signal_id, "AI 未给出方向, 跳过该候选")
+            return
+        if sl_pct <= 0:
+            atr_pct = float(sig.features.get("atr_pct") or 0.0)
+            if atr_pct <= 0:
+                self._update_signal_reject(signal_id, "缺少止损锚点(无方向且 ATR 不可用), 拒绝开仓")
+                return
+            sl_pct = round(min(3.0, max(0.18, atr_pct * strat_cfg.sl_atr_mult)), 4)
+            events.record(
+                "info", "trade",
+                f"{sig.symbol} 无量化止损锚点, 按 ATR {atr_pct:.2f}% × {strat_cfg.sl_atr_mult} 兜底止损 {sl_pct:.2f}%",
+            )
+        if tp_pct <= 0:
+            # AI 没给止盈时按 1.5R 兜底，仍受 8% 上限约束
+            tp_pct = round(min(8.0, max(sl_pct * 1.5, sl_pct + 0.1)), 4)
 
         # 波动率目标: ATR% 高于目标就缩仓, 反之放大 (关闭时 risk_scale=1)
         risk_scale = risk_mod.vol_risk_scale(
@@ -2281,6 +2370,13 @@ class TradingEngine:
             "price": ticker.last,
             "score": sig.score,
             "side_hint": sig.direction,
+            # 量化无方向时的显式说明：模型必须知道"这轮方向由它自己判断"，
+            # 否则会把 flat 当成否决票而一律 hold（线上曾连续 7 小时 0 次有效决策）。
+            "quant_note": (
+                "量化模型本轮无方向（仅通过风险闸门），方向与是否入场由你独立判断"
+                if sig.direction not in ("long", "short")
+                else ""
+            ),
             "quant_reasons": sig.reasons,
             "features": sig.features,
             "klines": sig.features.get("_bars", []),

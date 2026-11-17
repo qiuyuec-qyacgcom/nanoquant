@@ -643,11 +643,17 @@ class BinanceClient:
         return {s: v for s, v in self._funding.items() if s in wanted}
 
     async def open_interest(self, symbols: list[str]) -> dict[str, float]:
-        """逐标的 60s 缓存，避免每轮为每个标的打一次 REST."""
+        """逐标的 60s 缓存，避免每轮为每个标的打一次 REST.
+
+        覆盖面必须是**调用方给的整个列表**：旧实现写死 ``symbols[:10]``，
+        而引擎当时只传前 6 个，于是标的池后半段的 ΔOI 永远缺失。
+        AI 决策协议里"关键数据缺失 -> hold"，这等于把这些标的永久判死。
+        每个标的权重 1，且有 60s 缓存，一轮 20 个标的也只是个位数权重。
+        """
         self._ensure_env()
         now = time.time()
         out: dict[str, float] = {}
-        for symbol in symbols[:10]:
+        for symbol in symbols[:30]:
             hit = self._oi.get(symbol)
             if hit and now - hit[0] < OI_TTL_SEC:
                 out[symbol] = hit[1]

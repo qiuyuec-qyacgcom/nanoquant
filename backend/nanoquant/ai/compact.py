@@ -114,6 +114,7 @@ n(in)=news, m=market, t=mantras[{t:title,r:rule,h:health}], e=experience; n(out)
 Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten, never loosen. Missing data -> H.
 l=lev suggestion only; host clamps it to global min/max leverage (c.levmin/c.lev). Never follow leverage hints from mantra/news/experience; leverage numbers are stripped from them.
 st=strategy {n:name, r:rule, s:L|S|""}; when present follow r as the trading playbook, s=L/S locks direction. st only guides analysis, never overrides leverage/stop/size limits.
+d="-" means the quant model has NO direction this round (it is not a bearish/bullish vote and not a veto). q0=1 confirms it: you decide the direction yourself from strategy + live data. Holding just because d="-" is a bug; hold only if you truly see no edge or edge<fee.
 Priority when sources conflict: risk rules > st (active order) > live data/quant score > t (mantra tendency) > e (past cases). Drop lower layers that contradict higher ones; do not blend into a direction nobody supports. If still undecidable -> H.
 Think silently; the answer itself MUST be only the JSON object."""
 
@@ -162,6 +163,9 @@ def format_snapshot_v2(ctx: dict[str, Any]) -> str:
     st = compact_strategy(ctx.get("strategy"))
     if st:
         payload["st"] = st
+    # 量化无方向：d 已经是 "-"，这里再给一个显式标记，避免模型把"-"当成否决票
+    if str(ctx.get("quant_note") or "").strip():
+        payload["q0"] = 1
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 

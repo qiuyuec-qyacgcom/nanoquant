@@ -25,6 +25,10 @@ DECISION_SYSTEM = """你是「NanoQuant」系统的合约交易决策官, 服务
    - experiences「场景化经验」= 相似场景的**历史对错参考**，权重最低，仅当与实时数据一致时采纳。
    冲突时按 风控铁律 > 全局策略 > 实时行情/量化信号 > 心法 > 经验 逐级取舍；
    任一层与上层矛盾就舍弃下层，不得折中出一个两边都不满足的方向。信息互相矛盾且无法判断时输出 hold。
+9. quant.direction_hint 为 "flat" 表示**量化模型本轮没有方向**（不是反向信号，也不是否决票）：
+   此时 quant.note 会说明"方向由你判断"。你可以按策略与实时数据独立给出 open_long / open_short；
+   只有当你自己也看不出方向、或预期波动不足以覆盖手续费时才输出 hold。
+   direction_hint 为 "long"/"short" 时才适用"与量化同向"的要求。
 
 输出 JSON 字段:
 {
@@ -81,14 +85,21 @@ def format_snapshot(ctx: dict[str, Any]) -> str:
         }
         for m in (ctx.get("mantras") or [])[:4] if isinstance(m, dict)
     ]
+    quant: dict[str, Any] = {
+        "score": ctx.get("score"),
+        "direction_hint": ctx.get("side_hint"),
+        "reasons": ctx.get("quant_reasons") or [],
+    }
+    # 量化无方向时显式说明「这轮方向由你判断」：
+    # 否则模型会按铁律"信号矛盾/数据不足即 hold"把 direction_hint=flat 当成否决理由，
+    # 结果 AI 虽然被调用了，仍然一律 hold（线上正是这个表现）。
+    quant_note = str(ctx.get("quant_note") or "").strip()
+    if quant_note:
+        quant["note"] = quant_note
     payload = {
         "symbol": ctx.get("symbol"),
         "price": ctx.get("price"),
-        "quant": {
-            "score": ctx.get("score"),
-            "direction_hint": ctx.get("side_hint"),
-            "reasons": ctx.get("quant_reasons") or [],
-        },
+        "quant": quant,
         "features": clean_features(ctx.get("features")),
         "recent_bars_ohlc": bars,
         "market": {

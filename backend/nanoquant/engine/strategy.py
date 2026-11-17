@@ -308,19 +308,62 @@ def entry_regime(features: dict[str, Any], cfg: StrategySettings) -> str:
     return "chop" if gap < cfg.chop_ema_gap_pct else "trend"
 
 
+def risk_gate_reason(
+    features: dict[str, Any], cfg: StrategySettings, *, volume_ok: bool | None = None
+) -> str:
+    """**与方向无关**的风险闸门：数据完整性 / 波动率区间 / 量能 / 成交额.
+
+    返回空串表示"这个标的此刻可交易"——它只说明风险条件成立，**不代表有方向**。
+    与 ``score_signal`` 的方向判定分开，是因为二者角色不同：
+    - 风险闸门拦的是坏数据与不可交易的标的（ATR 爆表、没量、没深度）；
+    - 方向判定属于"策略观点"，纯量化模型已被实测证伪（见 docs/EVIDENCE.md），
+      不该再拿它当"要不要交给 AI 看"的闸门，否则量化一 flat，AI 就永远不被调用。
+    """
+    if not features.get("data_ok", True):
+        return str(features.get("data_note") or "行情数据不完整，已跳过")
+    atr_pct = float(features.get("atr_pct") or 0.0)
+    if atr_pct < cfg.atr_pct_min:
+        return f"波动率过低 {atr_pct:.3f}% < {cfg.atr_pct_min}%"
+    if atr_pct > cfg.atr_pct_max:
+        return f"波动率过高 {atr_pct:.3f}% > {cfg.atr_pct_max}%"
+    if volume_ok is None:
+        volume_ok = bool((features.get("ok") or {}).get("volume", True))
+    vol_ratio = float(features.get("vol_ratio") or 0.0)
+    if volume_ok and vol_ratio < cfg.volume_ratio_min:
+        return f"量能不足 {vol_ratio:.2f} < {cfg.volume_ratio_min}"
+    quote_volume = float(features.get("quote_volume") or 0.0)
+    if quote_volume < cfg.min_24h_quote_volume:
+        return f"24h 成交额偏低 {quote_volume / 1e6:.1f}M"
+    return ""
+
+
+def candidate_eligible(features: dict[str, Any], cfg: StrategySettings) -> tuple[bool, str]:
+    """该标的是否有资格作为「AI 复审候选」（只过风险闸门，不看方向）."""
+    reason = risk_gate_reason(features, cfg)
+    return (not reason, reason)
+
+
+def candidate_strength(features: dict[str, Any], cfg: StrategySettings) -> float:
+    """候选排序用：越接近"值得下注"，分越高。
+
+    量化模型本轮没有方向时，也可能离触发只差一点点（|z| 差 0.2、方向分差 0.05）。
+    每轮送给 AI 的额度有限（控成本），就按这个距离排序取前几个，
+    而不是拿到什么算什么——否则额度常年被最没机会的标的占掉。
+    """
+    if cfg.mode == "meanrev":
+        z = abs(float(features.get("band_z") or 0.0))
+        threshold = max(0.1, float(cfg.mr_z_entry))
+        return round(z / threshold, 4)
+    score = abs(float(features.get("score") or 0.0))
+    threshold = max(0.05, float(cfg.entry_threshold))
+    return round(score / threshold, 4)
+
+
 def _pass_gates(res: SignalResult, features: dict[str, Any], cfg: StrategySettings, volume_ok: bool) -> bool:
     """两种模式共用的准入闸门。不过就写 blocked 并返回 False。"""
-    if features["atr_pct"] < cfg.atr_pct_min:
-        res.blocked = f"波动率过低 {features['atr_pct']:.3f}% < {cfg.atr_pct_min}%"
-        return False
-    if features["atr_pct"] > cfg.atr_pct_max:
-        res.blocked = f"波动率过高 {features['atr_pct']:.3f}% > {cfg.atr_pct_max}%"
-        return False
-    if volume_ok and features["vol_ratio"] < cfg.volume_ratio_min:
-        res.blocked = f"量能不足 {features['vol_ratio']:.2f} < {cfg.volume_ratio_min}"
-        return False
-    if features.get("quote_volume", 0) < cfg.min_24h_quote_volume:
-        res.blocked = f"24h 成交额偏低 {features.get('quote_volume', 0) / 1e6:.1f}M"
+    reason = risk_gate_reason(features, cfg, volume_ok=volume_ok)
+    if reason:
+        res.blocked = reason
         return False
     return True
 

@@ -95,6 +95,8 @@ const BASE_META: Record<string, FieldMeta> = {
     hint: '实测两者样本外均为负收益（见 docs/EVIDENCE.md），切换前先跑 walk-forward',
   },
   auto_entry: { label: '自动开仓', hint: '关闭后只落库信号供观察，不下单；跟单不受此开关影响' },
+  ai_review_flat: { label: '无方向也送 AI', hint: '量化模型本轮无方向、但通过风险闸门时，仍作为候选交给 AI 定性；关闭则退回"量化一 flat 就静默"的旧行为' },
+  ai_review_max_per_cycle: { label: '候选额度', unit: '个/轮', hint: '每轮最多送几个无方向候选给 AI，按离触发距离排序；0=不限（受 AI 调用频率上限兜底）' },
   mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
   mr_min_risk_reward: { label: '回归盈亏比', unit: 'R', hint: '回归模型胜率高但 R 小，用比趋势更低的底线' },
   mr_block_in_trend: { label: '趋势中禁止逆势', hint: '顺势的极值通常是继续走，不是回归' },
@@ -391,6 +393,11 @@ const SECTIONS: Record<string, SectionDef[]> = {
       title: '信号模型',
       hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。auto_entry 关闭时只落库信号、不下单（与引擎总闸不同，跟单不受影响）',
       fields: ['mode', 'auto_entry', 'timeframe', 'htf_timeframe'],
+    },
+    {
+      title: 'AI 候选复审',
+      hint: '量化只提供候选，方向与是否入场由 AI 判断。候选额度控成本：12 标的 × 每 5 分钟一轮 = 144 次/小时',
+      fields: ['ai_review_flat', 'ai_review_max_per_cycle'],
     },
     {
       title: '策略杠杆区间',

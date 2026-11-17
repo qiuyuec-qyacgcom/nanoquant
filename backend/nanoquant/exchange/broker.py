@@ -18,6 +18,7 @@ from ..security import new_client_order_id
 from ..services.db_writer import db_writer
 from ..services.exec_metrics import exec_metrics
 from ..services.settings import get_engine, get_risk, normalize_mode
+from ..services import events
 from . import client as binance_client
 from .client import STAGE_SINK, BinanceError, NoCredentials, UncertainSubmission
 from .precision import SymbolFilters, ceil_to_step, floor_to_step

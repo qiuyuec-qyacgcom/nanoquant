@@ -12,8 +12,11 @@ import pytest
 
 from nanoquant.engine.strategy import (
     build_features,
+    candidate_eligible,
+    candidate_strength,
     detect_exit,
     entry_regime,
+    risk_gate_reason,
     rsi_zone_score,
     score_signal,
     strategy_fingerprint,
@@ -236,3 +239,36 @@ def test_fingerprint_in_features_flows_with_signal():
     f["strategy_fp"] = strategy_fingerprint(cfg)
     sig = score_signal("X", f, cfg)
     assert sig.as_dict()["features"]["strategy_fp"] == strategy_fingerprint(cfg)
+
+
+# ---------------------------------------------------- 风险闸门 vs 方向判定
+# 事故：纯量化 flat 曾被当成"不许进 AI"的闸门，导致 AI 一整晚 0 次调用。
+# 现在两者分工明确：风险闸门（与方向无关）决定"能不能交给 AI"，方向交给 AI 自己判断。
+
+def _feat(**kw):
+    base = {
+        "atr_pct": 0.8, "vol_ratio": 1.3, "quote_volume": 5e7,
+        "data_ok": True, "ok": {"trend": True, "momentum": True, "volume": True},
+    }
+    base.update(kw)
+    return base
+
+
+def test_risk_gate_ignores_direction_but_blocks_untradeable():
+    cfg = StrategySettings()
+    ok, why = candidate_eligible(_feat(), cfg)
+    assert ok and why == ""
+
+    # 坏数据 / 波动率爆表 / 没量 / 没深度 一律拦下（这些和"有没有方向"无关）
+    assert "行情停更" in risk_gate_reason(_feat(data_ok=False, data_note="行情停更 999s"), cfg)
+    assert "波动率过高" in risk_gate_reason(_feat(atr_pct=99.0), cfg)
+    assert "波动率过低" in risk_gate_reason(_feat(atr_pct=0.0), cfg)
+    assert "量能不足" in risk_gate_reason(_feat(vol_ratio=0.1), cfg)
+    assert "成交额" in risk_gate_reason(_feat(quote_volume=1.0), cfg)
+
+
+def test_candidate_strength_prefers_setups_closer_to_trigger():
+    cfg = StrategySettings(mode="meanrev", mr_z_entry=2.5)
+    near = candidate_strength(_feat(band_z=2.3), cfg)
+    far = candidate_strength(_feat(band_z=0.4), cfg)
+    assert near > far, "离触发更近的标的应该优先占用 AI 额度"

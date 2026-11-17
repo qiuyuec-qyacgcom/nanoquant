@@ -126,6 +126,19 @@ class StrategySettings(BaseModel):
     #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/EVIDENCE.md），
     #: 没有正期望的配置就不该默认拿真钱去试。信号照常落库供观察。
     auto_entry: bool = False
+    #: 量化模型**没有方向**时，是否仍把它当作「候选」交给 AI 复核。
+    #:
+    #: 为什么必须有这个开关（2026-11 线上事故）：纯量化的方向判定只该是「候选来源」，
+    #: 真正的决策者是 AI。可旧实现里 flat 直接 `continue`，量化一 flat 就永远不进
+    #: AI 决策链——实盘表现为"AI 开启且可用，但连续几小时 0 次调用"，
+    #: 整个系统实际由 docs/EVIDENCE.md 里已被证伪的量化模型在跑。
+    #: 开启后：flat 但**通过风险闸门**（数据/波动率/量能/成交额）的标的仍送 AI，
+    #: 由 AI 自己给方向；风险闸门照旧拦坏数据与不可交易标的，不放宽任何风控。
+    ai_review_flat: bool = True
+    #: 每轮最多送几个「无方向候选」给 AI（按离触发距离排序）。0=不限。
+    #: 控成本用：12 标的 × 每 5 分钟一轮 = 144 次/小时，全送既慢又贵；
+    #: 还有 ai.max_calls_per_hour 作为第二道兜底。
+    ai_review_max_per_cycle: int = Field(default=2, ge=0, le=20)
     #: 主周期。15–60 分钟短线系统，4h 为波段（全局策略转向波段后默认 4h）
     timeframe: Literal["15m", "30m", "1h", "4h"] = "4h"
     #: 策略目标杠杆区间 [min, max]（只约束策略自主开仓）。
@@ -202,8 +215,7 @@ class StrategySettings(BaseModel):
     #: 开启后更保守（更少但更稳），默认关闭。
     mr_exhaustion_confirm: bool = False
     #: 部分止盈: 浮盈达到 N 倍初始风险 (R) 时先平掉一部分, 剩余交给移动止损; 0=关闭
-    partial_tp_at_r: float = Field(default=1.0, ge=0, le=10)
-    #: 部分止盈比例 (0,1]; 0.5 = 平一半
+    partial_tp_at_r: float = Field(default=1.0, ge=0, le=10)    #: 部分止盈比例 (0,1]; 0.5 = 平一半
     partial_tp_ratio: float = Field(default=0.5, gt=0, le=1)
     #: 盘口点差闸门 (bps): 买一卖一价差超过该值就放弃开仓, 0=关闭.
     #: 短线的利润空间有限, 点差与滑点必须先扣掉.
