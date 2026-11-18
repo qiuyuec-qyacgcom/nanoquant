@@ -204,6 +204,8 @@ class Candle:
 class BinanceClient:
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
+        #: `_http` / `_lock` 绑定的 loop。跨 loop 复用会抛 "Event loop is closed"
+        self._http_loop: asyncio.AbstractEventLoop | None = None
         self._key = ""
         self._secret = ""
         self._time_offset = 0.0
@@ -263,7 +265,27 @@ class BinanceClient:
             self._algo_ts = 0.0
         return env
 
+    def _bind_loop(self) -> None:
+        """把连接池与锁绑到当前 running loop；loop 变了就丢弃旧对象。
+
+        httpx.AsyncClient 的连接池与 asyncio.Lock 都绑定创建它们的事件循环。
+        一次进程里出现多个 loop（测试/脚本多次 asyncio.run、uvicorn --reload 换 loop）时，
+        复用旧对象会抛 `RuntimeError: Event loop is closed`——表现为"随机某个用例失败"。
+        旧 loop 已关闭，不能 await aclose()，只能丢弃后按需重建。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 没有 running loop：无从校验，保持现状
+            return
+        if self._http_loop is loop:
+            return
+        if self._http_loop is not None:
+            self._http = None
+            self._lock = asyncio.Lock()
+        self._http_loop = loop
+
     async def _client(self) -> httpx.AsyncClient:
+        self._bind_loop()
         if self._http is not None:
             return self._http
         cfg = get_data()
@@ -281,6 +303,7 @@ class BinanceClient:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        self._http_loop = None
 
     def _credentials(self, *, required: bool) -> tuple[str, str]:
         cfg = get_data()
@@ -508,6 +531,7 @@ class BinanceClient:
         missing = [s for s in wanted if s not in cached] if wanted else []
         stale = now - self._tickers_ts >= cfg.ticker_ttl_sec
         if stale or missing:
+            self._bind_loop()  # 锁同样绑定 loop，跨 loop 复用会抛错
             async with self._lock:
                 cached = self._tickers or {}
                 missing = [s for s in wanted if s not in cached] if wanted else []
