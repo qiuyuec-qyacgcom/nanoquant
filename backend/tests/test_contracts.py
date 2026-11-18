@@ -1239,9 +1239,13 @@ def _flat(n: int, price: float = 100.0, start_ts: int = 0, step_ms: int = 300_00
 
 
 def _force_signal(monkeypatch, direction: str = "long", sl_pct: float = 1.0) -> None:
+    """强制回测信号方向/止损。
+
+    特征已由 `IncrementalIndicators` 递推（commit 075e7fb），`build_features` 不再属于
+    `backtest.engine` 的命名空间；这里只替换 `score_signal` 即可，指标计算照常跑。
+    """
     import nanoquant.backtest.engine as bt
 
-    monkeypatch.setattr(bt, "build_features", lambda *a, **k: None)
     monkeypatch.setattr(
         bt,
         "score_signal",

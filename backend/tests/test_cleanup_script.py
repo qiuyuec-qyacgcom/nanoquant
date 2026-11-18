@@ -46,11 +46,16 @@ def _make_db(path: Path, rows: int = 5) -> None:
 
 
 def _run(db: Path, *args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "NANOQUANT_DB": str(db)}
+    # 子进程输出是 UTF-8，但 text=True 默认按本地编码（Windows 中文机是 GBK）解码，
+    # 会在 reader 线程抛 UnicodeDecodeError，stdout/stderr 直接变成 None。
+    # 显式指定 UTF-8，两边口径一致，测试不再依赖机器 locale。
+    env = {**os.environ, "NANOQUANT_DB": str(db), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=120,
     )
