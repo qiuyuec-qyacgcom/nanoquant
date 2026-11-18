@@ -889,7 +889,7 @@ class BinanceBroker:
 
             if not order_ledger.place_enabled():
                 return False
-            key, _secret = binance_client.current_credentials()
+            key, _secret = binance_client.client.current_credentials()
             if not key:
                 return False
             res = await order_ledger.place_protection(
