@@ -528,6 +528,13 @@ def _score_meanrev(
     gap = float(features.get("ema_gap_pct") or 0.0)
     vol_ratio = float(features.get("vol_ratio") or 0.0)
     res.used_factors = ["meanrev", "volume"]
+    # 方向和分数在任何拒绝之前就算好。偏离不够、处在趋势里、量能没衰竭，
+    # 都只拦开仓；审计和 AI 仍然要看到「价格在中轨哪一侧、偏了多少」。
+    # 以前这些分支直接 return，方向永远是 flat，扫描就没有任何开仓候选。
+    if z != 0:
+        res.direction = "long" if z < 0 else "short"
+        follow_through = 1.0 if vol_ratio <= 1.2 else 0.6
+        res.score = round(ta.clamp(-ta.tanh_norm(z, cfg.mr_z_entry) * follow_through), 4)
 
     res.reasons = [
         f"标准分 z={z:+.2f}（偏离中轨 {abs(z):.2f}σ）",
@@ -557,18 +564,10 @@ def _score_meanrev(
         res.blocked = "带宽为 0（横盘无波动），无法定位回归空间"
         return res
 
-    # 方向在衰竭确认之前就定：被拦下的单审计里仍要看到「当时想做多还是做空」。
-    res.direction = "long" if z < 0 else "short"
-
     # 动能衰竭二次确认：放量仍在把极值往外推，回归条件不成立
     if cfg.mr_exhaustion_confirm and vol_ratio >= 1.0:
         res.blocked = f"动能未衰竭 量比 {vol_ratio:.2f} ≥ 1.0，放量可能继续而非回归"
         return res
-
-    # 放量突破不算超买超卖：置信度打折，但不停用（有些放量确实是衰竭）
-    follow_through = 1.0 if vol_ratio <= 1.2 else 0.6
-    strength = ta.clamp(-ta.tanh_norm(z, cfg.mr_z_entry) * follow_through)
-    res.score = round(strength, 4)
 
     # 止损放在极值之外，止盈回到中轨。|z|·σ 就是"当前价到中轨"的精确距离，
     # 所以这里直接用 full 距离（不再打 0.9 折），让止盈落在真实中轨上。

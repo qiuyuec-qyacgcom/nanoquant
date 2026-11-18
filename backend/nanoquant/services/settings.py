@@ -122,10 +122,6 @@ class StrategySettings(BaseModel):
     #: 信号模型。`trend` = 均线/动量趋势跟随；`meanrev` = 布林极值回归。
     #: 两者共用准入闸门与出场规则，只有打分与止损/止盈的定位方式不同。
     mode: Literal["trend", "meanrev"] = "meanrev"
-    #: 是否允许策略自主开仓。默认关闭——2026-11 的 walk-forward 实测里
-    #: trend / meanrev 在 5m~1h 全部是样本外负收益（见 docs/EVIDENCE.md），
-    #: 没有正期望的配置就不该默认拿真钱去试。信号照常落库供观察。
-    auto_entry: bool = False
     #: 量化模型**没有方向**时，是否仍把它当作「候选」交给 AI 复核。
     #:
     #: 为什么必须有这个开关（2026-11 线上事故）：纯量化的方向判定只该是「候选来源」，
@@ -138,7 +134,8 @@ class StrategySettings(BaseModel):
     #: 每轮最多送几个「无方向候选」给 AI（按离触发距离排序）。0=不限。
     #: 控成本用：12 标的 × 每 5 分钟一轮 = 144 次/小时，全送既慢又贵；
     #: 还有 ai.max_calls_per_hour 作为第二道兜底。
-    ai_review_max_per_cycle: int = Field(default=2, ge=0, le=20)
+    #: 默认 6：2 会让一轮里 10 个标的根本进不了 AI，表现就是「怎么都不给方向」。
+    ai_review_max_per_cycle: int = Field(default=6, ge=0, le=20)
     #: 主周期。15–60 分钟短线系统，4h 为波段（全局策略转向波段后默认 4h）
     timeframe: Literal["15m", "30m", "1h", "4h"] = "4h"
     #: 策略目标杠杆区间 [min, max]（只约束策略自主开仓）。
@@ -149,7 +146,7 @@ class StrategySettings(BaseModel):
     leverage_max: int = Field(default=30, ge=0, le=100)
     #: 高周期过滤（HTF）。非空时，只做与 HTF 趋势同向的信号；""=关闭。
     #: 短线趋势跟随输在震荡与逆势，HTF 用来定大方向、LTF 择时。
-    #: 默认关闭：开启会每标的每轮多一次 REST，先用 auto_entry=false 观察再开。
+    #: 默认关闭：开启会每标的每轮多一次 REST。
     htf_timeframe: Literal["", "15m", "30m", "1h", "2h", "4h"] = ""
     ema_fast: int = Field(default=9, ge=2, le=200)
     ema_slow: int = Field(default=21, ge=3, le=400)
@@ -177,9 +174,10 @@ class StrategySettings(BaseModel):
     #: 都会在 ATR 止损之前被噪声扫掉 —— 实盘 24 笔 trailing_stop 全亏，这是元凶。
     trailing_arm_r: float = Field(default=1.0, ge=0.0, le=20)
     breakeven_at_r: float = Field(default=1.0, ge=0.1, le=10)
-    #: 行情完整性闸门：最近 20 根内允许的 K 线缺口次数（0 = 一根都不许断）。
+    #: 行情完整性闸门：最近 20 根内允许的 K 线缺口次数。
     #: 断档时指标仍会算出"看起来正常"的数值，必须在打分前拦掉。
-    max_data_gaps: int = Field(default=0, ge=0, le=20)
+    #: 默认允许 1 处：交易所偶发漏一根不该把整池方向都打成空。
+    max_data_gaps: int = Field(default=1, ge=0, le=20)
     #: 最后一根已收盘 K 线超过 N 倍周期仍无更新 → 视为行情停更（只在实盘判断）
     data_stale_mult: float = Field(default=2.0, ge=1.0, le=20)
 

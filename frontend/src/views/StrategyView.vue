@@ -94,7 +94,6 @@ const BASE_META: Record<string, FieldMeta> = {
     ],
     hint: '实测两者样本外均为负收益（见 docs/EVIDENCE.md），切换前先跑 walk-forward',
   },
-  auto_entry: { label: '自动开仓', hint: '关闭后只落库信号供观察，不下单；跟单不受此开关影响' },
   label_after_sec: { label: '回访窗口', unit: '秒', hint: '决策满这么久才回访打标；86400=24h。超短线可调到 3600-14400，让经验更快产生' },
   inject_experiences: { label: '注入经验', hint: '关闭后经验库照常积累，但不会进入 AI 决策上下文' },
   retrieve_top_k: { label: '注入条数', unit: '条', hint: '每次决策最多注入几条相似经验（经验库是 evolution 心法之外的场景化补充，不宜过多）' },
@@ -400,8 +399,8 @@ const SECTIONS: Record<string, SectionDef[]> = {
   strategy: [
     {
       title: '信号模型',
-      hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。auto_entry 关闭时只落库信号、不下单（与引擎总闸不同，跟单不受影响）',
-      fields: ['mode', 'auto_entry', 'timeframe', 'htf_timeframe'],
+      hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。停整个引擎（含跟单）用引擎总闸',
+      fields: ['mode', 'timeframe', 'htf_timeframe'],
     },
     {
       title: 'AI 候选复审',

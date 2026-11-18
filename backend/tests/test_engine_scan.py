@@ -124,39 +124,6 @@ def _patch_market(monkeypatch, candles: list[Candle], price: float = 110.0):
     monkeypatch.setattr(worker_mod.binance_client, "klines", _klines)
 
 
-def test_scan_records_signal_but_does_not_trade_in_observe_mode(monkeypatch):
-    """auto_entry=False：信号照常落库供观察，但绝不下单。"""
-    _seed_symbol()
-    calls: dict = {}
-    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: _broker(calls))
-    _patch_market(monkeypatch, _candles())
-
-    features = {"close": 110.0, "data_ok": True}
-    strong = SignalResult(symbol=SYMBOL, direction="long", score=0.9, features=features, sl_pct=1.5, tp_pct=3.0)
-    monkeypatch.setattr(worker_mod, "score_signal", lambda *a, **k: strong)
-
-    old = get_strategy()
-    update_group("strategy", {"auto_entry": False})
-    try:
-        engine = worker_mod.engine
-        engine._margin.begin_cycle(900.0)
-        out = asyncio.run(
-            engine._scan(_broker(calls), SimpleNamespace(equity=1000.0, available=900.0),
-                         EngineSettings(), RiskSettings(), get_strategy())
-        )
-        # 标的池是全量扫描的，别的用例可能留下启用标的：只看自己这条
-        record = next(r for r in out if r["symbol"] == SYMBOL)
-        assert record["direction"] == "long"
-        assert "open" not in calls
-        with session_scope() as s:
-            row = s.query(Signal).filter(Signal.symbol == SYMBOL).order_by(Signal.ts.desc()).first()
-            assert row is not None
-            assert "自动开仓已关闭" in (row.reject_reason or "")
-    finally:
-        update_group("strategy", old.model_dump())
-        _cleanup()
-
-
 def test_scan_blocks_signal_when_klines_have_gap(monkeypatch):
     """坏数据必须在打分前被拦：缺口时信号记为 flat 并写明原因。"""
     _seed_symbol()
@@ -165,7 +132,7 @@ def test_scan_blocks_signal_when_klines_have_gap(monkeypatch):
     _patch_market(monkeypatch, _candles(gap=True))
 
     old = get_strategy()
-    update_group("strategy", {"auto_entry": False, "max_data_gaps": 0, "mode": "meanrev"})
+    update_group("strategy", {"max_data_gaps": 0, "mode": "meanrev"})
     try:
         engine = worker_mod.engine
         engine._margin.begin_cycle(900.0)
@@ -406,7 +373,7 @@ def _run_scan_with_candidates(monkeypatch, symbols: list[str], *, dispatch_quota
     prev_strat = get_strategy()
     try:
         update_group("ai", {"enabled": ai_enabled})
-        update_group("strategy", {"auto_entry": True, "ai_review_flat": True,
+        update_group("strategy", {"ai_review_flat": True,
                                   "ai_review_max_per_cycle": dispatch_quota})
         engine._margin.begin_cycle(900.0)
 
@@ -422,7 +389,6 @@ def _run_scan_with_candidates(monkeypatch, symbols: list[str], *, dispatch_quota
     finally:
         update_group("ai", {"enabled": prev_ai.enabled})
         update_group("strategy", {
-            "auto_entry": prev_strat.auto_entry,
             "ai_review_flat": prev_strat.ai_review_flat,
             "ai_review_max_per_cycle": prev_strat.ai_review_max_per_cycle,
         })

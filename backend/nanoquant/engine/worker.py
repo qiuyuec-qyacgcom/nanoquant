@@ -1230,7 +1230,7 @@ class TradingEngine:
         #   风险闸门 = 拦坏数据/不可交易标的（与方向无关）
         #   AI = 唯一决策者（无方向候选也由它定性，数量按 ai_review_max_per_cycle 限流）
         ai_cfg = get_ai()
-        review_flat = bool(strat_cfg.ai_review_flat and ai_cfg.enabled and strat_cfg.auto_entry)
+        review_flat = bool(strat_cfg.ai_review_flat and ai_cfg.enabled)
         review_quota = max(0, int(strat_cfg.ai_review_max_per_cycle or 0))
         # 一轮扫描一次提交。原先每个标的各开一个事务，再为拒绝原因另开一次。
         # 闸门不写库：拒绝原因先记在 pending 里，事务末尾和信号行一起落下去。
@@ -1256,10 +1256,14 @@ class TradingEngine:
             if sig.direction != "flat" and per_symbol_min > 0 and abs(sig.score) < per_symbol_min:
                 # 只拦开仓，方向和分数留给审计页。改成 flat 会让这条被拒信号看起来既没方向也没分。
                 sig.blocked = f"信号分 {sig.score:.3f} 低于该标的最低要求 {per_symbol_min:.2f}"
-            pending.append((sig, ticker, sig.blocked if sig.direction != "flat" else ""))
-            if sig.blocked:
-                continue
+            # 有方向时，策略自己的 blocked（偏离不够、ADX、逆高周期）只是「量化不愿开」。
+            # 它不再把这条从开仓链拿掉：方向留给 AI 复核，拒绝原因仍写入审计。
+            # 没方向才看 blocked——那是数据坏了或 K 线不够，送 AI 也判断不了。
+            pending.append((sig, ticker, ""))
             if sig.direction == "flat":
+                if sig.blocked:
+                    pending[-1] = (sig, ticker, sig.blocked)
+                    continue
                 # 只收「风险闸门通过」的：ATR 爆表 / 没量 / 没深度 / 数据停更的，
                 # 送 AI 也是白花一次调用，而且 AI 很可能看不出坏数据而误判。
                 if review_flat:
@@ -1269,10 +1273,9 @@ class TradingEngine:
                             (candidate_strength(features, strat_cfg), item, sig, len(pending) - 1)
                         )
                 continue
-            # 只观察不交易：信号照常落库供人眼对照，但不下单。
-            # 与 engine.enabled 的区别是那个连跟单一起停，这个是"只看不做"。
-            if not strat_cfg.auto_entry:
-                _reject("自动开仓已关闭(仅观察)")
+            if sig.blocked and not review_flat:
+                # AI 没开时，策略拒绝就是最终决定，不能拿一个被拦下的方向去下单。
+                _reject(sig.blocked)
                 continue
             if symbol in self._entry_tasks and not self._entry_tasks[symbol].done():
                 continue

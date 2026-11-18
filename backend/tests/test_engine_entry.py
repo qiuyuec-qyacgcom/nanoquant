@@ -437,7 +437,7 @@ def test_flat_signal_goes_scan_to_ai_to_order(monkeypatch):
     prev_strat = get_strategy()
     try:
         update_group("ai", {"enabled": True})
-        update_group("strategy", {"auto_entry": True, "ai_review_flat": True,
+        update_group("strategy", {"ai_review_flat": True,
                                   "ai_review_max_per_cycle": 1, "max_spread_bps": 0.0})
 
         async def _run():
@@ -451,7 +451,6 @@ def test_flat_signal_goes_scan_to_ai_to_order(monkeypatch):
     finally:
         update_group("ai", {"enabled": prev_ai.enabled})
         update_group("strategy", {
-            "auto_entry": prev_strat.auto_entry,
             "ai_review_flat": prev_strat.ai_review_flat,
             "ai_review_max_per_cycle": prev_strat.ai_review_max_per_cycle,
             "max_spread_bps": prev_strat.max_spread_bps,

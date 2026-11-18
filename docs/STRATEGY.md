@@ -178,7 +178,6 @@ if sig.direction == "flat":
 |---|---|---|
 | `mode` | 信号模型 | `meanrev` |
 | `timeframe` | 主周期 | `30m` / `4h` |
-| `auto_entry` | 是否自动开仓 | 观察期 `false`，实盘 `true` |
 | `ai_review_flat` | 量化无方向时仍送 AI 定性 | `true`（关掉=退回旧行为：一 flat 就静默） |
 | `ai_review_max_per_cycle` | 每轮候选额度（个） | 2（0=不限，受 `ai.max_calls_per_hour` 兜底） |
 | `mr_window` | 布林窗口 | 20 |

@@ -55,7 +55,10 @@ def test_meanrev_stays_flat_when_deviation_is_small(mr):
     f = _fed(mr, candles)
     sig = score_signal("X", f, mr)
     assert abs(f["band_z"]) < mr.mr_z_entry
-    assert sig.direction == "flat"
+    # 偏离不够只拦开仓。方向和分数留下，否则扫描没有任何候选可送 AI。
+    if f["band_z"] != 0:
+        assert sig.direction == ("long" if f["band_z"] < 0 else "short")
+        assert sig.score != 0
     assert "偏离不足" in sig.blocked
 
 
@@ -70,9 +73,9 @@ def test_meanrev_refuses_counter_trend_in_strong_uptrend():
                               low=price * 0.996, close=price, volume=100.0))
     f = _fed(cfg, candles)
     sig = score_signal("X", f, cfg)
-    # 强趋势里逆势回归必须拦下；方向尚未形成，分数保持空。
-    assert sig.direction == "flat"
-    assert sig.score == 0
+    # 强趋势里逆势回归必须拦下，但方向和分数要留下给审计。
+    assert sig.direction in ("long", "short")
+    assert sig.score != 0
     assert "趋势中" in sig.blocked
 
 
@@ -128,11 +131,6 @@ def test_grid_keys_cover_mode_and_meanrev_params():
 
 
 # ------------------------------------------------------------------ 默认值
-
-def test_auto_entry_is_off_by_default():
-    """样本外没有任何正期望配置时，默认不该自动开仓。"""
-    assert StrategySettings().auto_entry is False
-
 
 def test_default_mode_is_meanrev_with_4h_timeframe():
     """全局策略默认：均值回归 + 4h 波段（低杠杆波段策略信号层）。"""
