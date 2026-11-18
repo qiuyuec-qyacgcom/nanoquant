@@ -316,7 +316,7 @@ class OrderLedger:
                 .limit(limit)
                 .all()
             )
-            local = {
+            local: dict[str, dict[str, Any]] = {
                 str(r.client_order_id or ""): {
                     "symbol": r.symbol,
                     "status": str(r.status or "").strip().upper(),

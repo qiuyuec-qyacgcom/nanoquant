@@ -38,7 +38,7 @@ def summarize_news(news: list[dict[str, Any]] | None) -> dict[str, Any]:
     }
 
 
-def _tidy_text(text: str) -> str:
+def _tidy_text(text: object | None) -> str:
     """清理规则/标题里的 emoji 与控制字符，保留中文与常见标点（心法语义全在中文里）。"""
     return re.sub(r"\s+", " ", str(text or "")).strip()
 

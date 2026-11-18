@@ -1242,7 +1242,7 @@ class TradingEngine:
         now = int(time.time())
 
         def _reject(reason: str) -> None:
-            sig, ticker, _prev = pending[-1]
+            sig, ticker, _prev_reject = pending[-1]
             pending[-1] = (sig, ticker, reason)
 
         for item in analyzed:
@@ -1300,7 +1300,7 @@ class TradingEngine:
                     symbol, account, engine_cfg, risk_cfg, prices=prices, side=""
                 )
                 if not gate.ok:
-                    _sig, _ticker, _prev = pending[idx]
+                    _sig, _ticker, _prev_reject = pending[idx]
                     pending[idx] = (_sig, _ticker, gate.reason)
                     continue
                 log.info("%s 量化无方向(离触发 %.2f)，按候选送 AI 定性", symbol, strength)
