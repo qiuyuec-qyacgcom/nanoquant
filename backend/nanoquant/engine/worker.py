@@ -1363,6 +1363,52 @@ class TradingEngine:
             self._htf_cache[key] = (close_ms + bar_ms, trend)
         return trend
 
+    async def _adopt_filled_entries(
+        self, broker: Broker, mode: str, venue_map: dict[str, Any]
+    ) -> None:
+        """挂单已在交易所成交、本地还没有仓时，立刻入账。
+
+        只处理「本地无此仓」的标的，已有持仓的止损、保本、平仓对账仍走 ``_reconcile_live``。
+        没有未成交入场单时直接返回，避免持仓页每次刷新都扫库。
+        """
+        if not venue_map:
+            return
+        symbols = list(venue_map)
+        with session_scope() as s:
+            local = {
+                row.symbol
+                for row in s.query(PositionRecord.symbol)
+                .filter(
+                    PositionRecord.status == "open",
+                    PositionRecord.mode == mode,
+                    PositionRecord.symbol.in_(symbols),
+                )
+                .all()
+            }
+            missing = [sym for sym in symbols if sym not in local]
+            if not missing:
+                return
+            pending = (
+                s.query(OrderRecord.symbol)
+                .filter(
+                    OrderRecord.mode == mode,
+                    OrderRecord.purpose == "entry",
+                    OrderRecord.symbol.in_(missing),
+                    OrderRecord.status.in_(("new", "NEW", "pending", "PARTIALLY_FILLED")),
+                )
+                .first()
+            )
+        if pending is None:
+            return
+        await self._reconcile_live(broker)
+        # 这次请求前面可能已经有一份不含新仓的缓存。入账后作废，下一次刷新立刻看到。
+        try:
+            from ..api.routes.trade import invalidate_status_cache
+
+            invalidate_status_cache()
+        except Exception:  # noqa: BLE001
+            log.debug("作废状态缓存失败", exc_info=True)
+
     def _reconcile_due(self, broker: Broker) -> bool:
         """空仓且没有在途开仓时，45 秒才对一次账；有仓或有挂单任务则每轮都对。"""
         if self._entry_tasks or time.time() - self._last_reconcile >= 45.0:
@@ -2859,6 +2905,10 @@ class TradingEngine:
         venue_map: dict[str, Any] = {}
         if not isinstance(venue_res, BaseException):
             venue_map = {vp.symbol: vp for vp in venue_res}
+            # 持仓页 5 秒拉一次状态，但挂单成交只在引擎对账时入账。
+            # 空仓时对账还要再等 45 秒，页面上就是「成交了却迟迟不出现」。
+            # 这里只在「交易所有仓、本地没有」时补一次入账，不改已有仓的止损逻辑。
+            await self._adopt_filled_entries(broker, mode, venue_map)
         with session_scope() as s:
             # 只展示当前交易环境的仓位, 模拟盘与实盘互不串台
             positions = (

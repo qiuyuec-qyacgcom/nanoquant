@@ -15,7 +15,7 @@ import pytest
 from nanoquant.db import init_db, session_scope
 from nanoquant.engine import risk as risk_mod
 from nanoquant.engine import worker as worker_mod
-from nanoquant.models import EngineEvent, PositionRecord, TradeRecord
+from nanoquant.models import EngineEvent, OrderRecord, PositionRecord, TradeRecord
 from nanoquant.services import state
 from nanoquant.services.settings import get_engine, update_group
 
@@ -263,6 +263,63 @@ def test_reconcile_updates_qty_and_mark_for_known_position(clean_state):
         assert row.mark_price == pytest.approx(103.5)
         assert row.venue_unrealized == pytest.approx(8.75)
         s.delete(row)
+
+
+def test_status_adopts_filled_limit_without_waiting_for_cycle(monkeypatch, clean_state):
+    """挂单在交易所成交后，持仓页下一次刷新就要入账，不能再等 45 秒对账。"""
+    with session_scope() as s:
+        s.add(OrderRecord(
+            symbol="FILLUSDT", side="BUY", order_type="LIMIT", qty=0.0, price=100.0,
+            status="NEW", purpose="entry", client_order_id="cid-fill", mode=MODE,
+        ))
+    adopted: list[str] = []
+
+    def _fake_record(symbol, side, qty, entry, mark, lev, mode, **kw):
+        adopted.append(symbol)
+        with session_scope() as s:
+            s.add(PositionRecord(
+                symbol=symbol, side=side, qty=qty, entry_price=entry, mark_price=mark,
+                leverage=lev, margin=qty * entry / max(1.0, lev), status="open", mode=mode,
+                opened_at=int(time.time()),
+            ))
+
+    async def _algo(_symbol):
+        return 0.0, 0.0
+
+    async def _protect(*_a, **_k):
+        return {"ok": True}
+
+    eng = _engine(stub_reconcile=False)
+    eng._algo_sl_tp = _algo
+    eng.protect_position = _protect
+    monkeypatch.setattr(worker_mod, "record_external_position", _fake_record)
+    broker = _Broker(venue=[_venue("FILLUSDT", qty=1.5, entry=100.0, mark=101.0)])
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+
+    out = asyncio.run(eng.status())
+
+    assert adopted == ["FILLUSDT"]
+    assert any(p["symbol"] == "FILLUSDT" for p in out["positions"])
+    with session_scope() as s:
+        s.query(PositionRecord).filter(PositionRecord.symbol == "FILLUSDT").delete()
+        s.query(OrderRecord).filter(OrderRecord.symbol == "FILLUSDT").delete()
+
+
+def test_status_does_not_adopt_without_our_pending_order(monkeypatch, clean_state):
+    """交易所有仓但不是我们的挂单：状态刷新不能顺手建仓。"""
+    called = {"n": 0}
+
+    async def _boom(*_a, **_k):
+        called["n"] += 1
+
+    eng = _engine(stub_reconcile=False)
+    eng._reconcile_live = _boom
+    broker = _Broker(venue=[_venue("OTHERUSDT")])
+    monkeypatch.setattr(worker_mod, "get_broker", lambda mode: broker)
+
+    asyncio.run(eng.status())
+
+    assert called["n"] == 0
 
 
 def test_reconcile_survives_venue_error(clean_state):
