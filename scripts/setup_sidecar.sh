@@ -60,6 +60,7 @@ ensure_sidecar_deps() {
   command -v make >/dev/null 2>&1 || missing+=("make")
   command -v perl >/dev/null 2>&1 || missing+=("perl")
   command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+  command -v setfacl >/dev/null 2>&1 || missing+=("setfacl")
   [ "${#missing[@]}" -gt 0 ] || return 0
   [ -n "$pm" ] || die "缺少 ${missing[*]}，且未识别包管理器；无法自动安装 sidecar 构建依赖"
   info "自动安装 sidecar 构建依赖（$pm）：${missing[*]}"
@@ -80,6 +81,7 @@ ensure_sidecar_deps() {
   { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; } || die "自动安装后仍缺少 gcc"
   command -v make >/dev/null 2>&1 || die "自动安装后仍缺少 make"
   command -v perl >/dev/null 2>&1 || die "自动安装后仍缺少 perl"
+  command -v setfacl >/dev/null 2>&1 || die "自动安装后仍缺少 setfacl"
 }
 
 ensure_sidecar_deps

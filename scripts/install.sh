@@ -318,6 +318,7 @@ ensure_native_deps() {
   command -v make >/dev/null 2>&1 || missing+=("make")
   command -v perl >/dev/null 2>&1 || missing+=("perl")
   command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+  command -v setfacl >/dev/null 2>&1 || missing+=("setfacl")
   command -v git >/dev/null 2>&1 || missing+=("git")
   command -v tar >/dev/null 2>&1 || missing+=("tar")
   command -v gzip >/dev/null 2>&1 || missing+=("gzip")
@@ -330,6 +331,7 @@ ensure_native_deps() {
       command -v make >/dev/null 2>&1 || missing+=("make")
       command -v perl >/dev/null 2>&1 || missing+=("perl")
       command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+      command -v setfacl >/dev/null 2>&1 || missing+=("setfacl")
       command -v git >/dev/null 2>&1 || missing+=("git")
       command -v tar >/dev/null 2>&1 || missing+=("tar")
       command -v gzip >/dev/null 2>&1 || missing+=("gzip")
@@ -755,6 +757,41 @@ rollback_binary() {
   return 1
 }
 
+systemd_unit() {
+  printf '[Unit]\n'
+  printf 'Description=NanoQuant (Rust trading engine)\n'
+  printf 'After=network-online.target nanoquant-exec.service\n'
+  printf 'Wants=network-online.target\n\n'
+  printf '[Service]\n'
+  printf 'Type=simple\n'
+  printf 'User=%s\nGroup=%s\n' "$RUN_USER" "$RUN_GROUP"
+  printf 'WorkingDirectory=%s\n' "$ROOT"
+  printf 'Environment=NANOQUANT_HOME=%s\n' "$ROOT"
+  printf 'Environment=NANOQUANT_PORT=%s\n' "$PORT"
+  printf 'EnvironmentFile=-%s\n' "$ENV_FILE"
+  printf 'ExecStart=%s\n' "$BIN"
+  printf 'Restart=always\n'
+  printf 'RestartSec=5\n'
+  printf 'KillSignal=SIGINT\n'
+  printf 'TimeoutStopSec=30\n'
+  printf 'LimitNOFILE=65535\n'
+  printf 'UMask=0077\n'
+  printf 'NoNewPrivileges=true\n'
+  printf 'PrivateTmp=true\n'
+  printf 'ProtectSystem=strict\n'
+  printf 'ProtectKernelTunables=true\n'
+  printf 'ProtectKernelModules=true\n'
+  printf 'ProtectControlGroups=true\n'
+  printf 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n'
+  printf 'RestrictNamespaces=true\n'
+  printf 'LockPersonality=true\n'
+  printf 'RestrictRealtime=true\n'
+  printf 'RestrictSUIDSGID=true\n'
+  printf 'SystemCallArchitectures=native\n'
+  printf 'ReadWritePaths=%s/data %s/logs\n' "$ROOT" "$ROOT"
+  printf '\n[Install]\nWantedBy=multi-user.target\n'
+}
+
 install_systemd() {
   local unit="/etc/systemd/system/nanoquant.service"
   local env_dir="/etc/nanoquant"
@@ -782,40 +819,7 @@ install_systemd() {
     cp -a "$unit" "$BACKUP_UNIT"
     log INFO "已备份旧 unit: $BACKUP_UNIT"
   fi
-  {
-    printf '[Unit]\n'
-    printf 'Description=NanoQuant (Rust trading engine)\n'
-    printf 'After=network-online.target nanoquant-exec.service\n'
-    printf 'Wants=network-online.target\n\n'
-    printf '[Service]\n'
-    printf 'Type=simple\n'
-    printf 'User=%s\nGroup=%s\n' "$RUN_USER" "$RUN_GROUP"
-    printf 'WorkingDirectory="%s"\n' "$ROOT"
-    printf 'Environment="NANOQUANT_HOME=%s"\n' "$ROOT"
-    printf 'Environment="NANOQUANT_PORT=%s"\n' "$PORT"
-    printf 'EnvironmentFile=-%s\n' "$ENV_FILE"
-    printf 'ExecStart="%s"\n' "$BIN"
-    printf 'Restart=always\n'
-    printf 'RestartSec=5\n'
-    printf 'KillSignal=SIGINT\n'
-    printf 'TimeoutStopSec=30\n'
-    printf 'LimitNOFILE=65535\n'
-    printf 'UMask=0077\n'
-    printf 'NoNewPrivileges=true\n'
-    printf 'PrivateTmp=true\n'
-    printf 'ProtectSystem=strict\n'
-    printf 'ProtectKernelTunables=true\n'
-    printf 'ProtectKernelModules=true\n'
-    printf 'ProtectControlGroups=true\n'
-    printf 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n'
-    printf 'RestrictNamespaces=true\n'
-    printf 'LockPersonality=true\n'
-    printf 'RestrictRealtime=true\n'
-    printf 'RestrictSUIDSGID=true\n'
-    printf 'SystemCallArchitectures=native\n'
-    printf 'ReadWritePaths="%s/data" "%s/logs"\n' "$ROOT" "$ROOT"
-    printf '\n[Install]\nWantedBy=multi-user.target\n'
-  } >"$unit"
+  systemd_unit >"$unit"
   chmod 644 "$unit"
   log INFO "systemd unit: $unit（User=$RUN_USER）"
   systemctl daemon-reload

@@ -12,11 +12,11 @@ Wants=network-online.target
 Type=simple
 User=nanoquant
 Group=nanoquant
-WorkingDirectory="<REPO_ROOT>"
-Environment="NANOQUANT_HOME=<REPO_ROOT>"
-Environment="NANOQUANT_PORT=8899"
+WorkingDirectory=<REPO_ROOT>
+Environment=NANOQUANT_HOME=<REPO_ROOT>
+Environment=NANOQUANT_PORT=8899
 EnvironmentFile=-/etc/nanoquant/nanoquant.env
-ExecStart="<REPO_ROOT>/rust/nanoquant/target/release/nanoquant"
+ExecStart=<REPO_ROOT>/rust/nanoquant/target/release/nanoquant
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -35,7 +35,7 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-ReadWritePaths="<REPO_ROOT>/data" "<REPO_ROOT>/logs"
+ReadWritePaths=<REPO_ROOT>/data <REPO_ROOT>/logs
 
 [Install]
 WantedBy=multi-user.target
