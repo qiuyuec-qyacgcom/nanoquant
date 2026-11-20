@@ -53,11 +53,11 @@ C_WARN=""
 C_ERR=""
 C_INFO=""
 if [ -t 1 ]; then
-  C_RESET='\033[0m'
-  C_OK='\033[32m'
-  C_WARN='\033[33m'
-  C_ERR='\033[31m'
-  C_INFO='\033[36m'
+  C_RESET=$'\033[0m'
+  C_OK=$'\033[32m'
+  C_WARN=$'\033[33m'
+  C_ERR=$'\033[31m'
+  C_INFO=$'\033[36m'
 fi
 
 usage() {

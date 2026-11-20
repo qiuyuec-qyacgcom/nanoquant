@@ -7,11 +7,11 @@ INSTALL_DIR="./nanoquant"
 ALLOW_STALE=0
 FORWARD_ARGS=()
 
-C_RESET='\033[0m'
-C_OK='\033[32m'
-C_WARN='\033[33m'
-C_ERR='\033[31m'
-C_INFO='\033[36m'
+C_RESET=$'\033[0m'
+C_OK=$'\033[32m'
+C_WARN=$'\033[33m'
+C_ERR=$'\033[31m'
+C_INFO=$'\033[36m'
 info() { printf "${C_INFO}[INFO]${C_RESET} %s\n" "$*"; }
 ok() { printf "${C_OK}[OK]${C_RESET} %s\n" "$*"; }
 warn() { printf "${C_WARN}[WARN]${C_RESET} %s\n" "$*"; }
