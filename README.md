@@ -141,9 +141,10 @@ curl http://127.0.0.1:8899/api/v1/health
 
 默认账号 `admin`。密码按以下顺序确定：
 1. 安装/启动时传入的 `NANOQUANT_ADMIN_PASSWORD`（systemd 模式下临时 env 文件权限 0600，成功后删除）；
-2. 未传入时首次启动随机生成 16 位密码，写入启动日志并要求改密。
+2. 通过安装脚本部署且未传入时，安装脚本自动生成 20 位随机密码，成功后只在终端打印一次，不写入安装日志。
 
-随机密码登录后必须先改密；改密前除登录/改密/健康检查外接口返回 `403 password_change_required`。
+已有管理员密码时安装脚本不会覆盖；需要重置请使用 `nanoquant ops reset-password`。
+首次登录后必须先改密；改密前除登录/改密/健康检查外接口返回 `403 password_change_required`。
 忘记密码：`nanoquant ops reset-password`。
 
 ### 常用环境变量

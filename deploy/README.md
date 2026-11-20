@@ -75,6 +75,8 @@ bash install.sh --password-stdin --systemd < /root/nq-password
 | `--password <p>` | 首次启动管理员密码；建议改用 `--password-stdin` 或环境变量 |
 | `--password-stdin` | 从 stdin 读取密码，避免 shell 历史 |
 | `--password-file <f>` | 从文件首行读取密码，并收紧为 0600 |
+| 未提供密码 | 自动生成 20 位初始密码，安装成功后仅终端打印一次 |
+| 已有管理员 | 已有密码时不会覆盖；重置使用 `nanoquant ops reset-password` |
 | `--port <p>` | 覆盖端口；未指定时保留已有 `data/.port`，否则 8899 |
 | `--no-frontend` | 只处理后端；要求已有 `frontend/dist/index.html` |
 | `--force-frontend` | 即使 dist 已存在也重新构建前端 |

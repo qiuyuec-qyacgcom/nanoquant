@@ -13,6 +13,7 @@ PORT="${NANOQUANT_PORT:-$DEFAULT_PORT}"
 PORT_EXPLICIT=0
 ADMIN_PASSWORD="${NANOQUANT_ADMIN_PASSWORD:-}"
 PASSWORD_FLAG=0
+PASSWORD_GENERATED=0
 SYSTEMD_MODE="auto"
 SYSTEMD=0
 RUN_USER="${NANOQUANT_USER:-}"
@@ -85,6 +86,7 @@ Linux 专用安装脚本：构建并就地安装 NanoQuant Rust 内核与前端�
   --password <密码>     管理员初始密码；会进入 shell 历史，建议用 stdin/env
   --password-stdin      从 stdin 读取管理员初始密码
   --password-file <文件> 从文件首行读取管理员初始密码
+  未提供密码        自动生成 20 位初始密码，安装成功后打印一次
   --port <端口>         覆盖端口；默认保留已有 data/.port，否则 8899
   --no-frontend         只处理后端；要求已有 frontend/dist/index.html
   --force-frontend      即使 dist 已存在也重建前端
@@ -148,6 +150,43 @@ cleanup_password() {
   if [ "$ENV_FILE_CREATED" -eq 1 ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
     rm -f "$ENV_FILE" || true
   fi
+}
+
+generate_admin_password() {
+  local password=""
+  if command -v openssl >/dev/null 2>&1; then
+    password="$(openssl rand -base64 32 2>/dev/null | tr -d '\n/+=' | cut -c1-20 || true)"
+  fi
+  if [ -z "$password" ]; then
+    password="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-20 || true)"
+  fi
+  [ "${#password}" -ge 16 ] || die "无法生成管理员密码；请用 --password 手动指定"
+  printf '%s\n' "$password"
+}
+
+admin_password_state() {
+  [ -x "$BIN" ] || { printf 'unknown\n'; return; }
+  local db="$ROOT/data/nanoquant.db"
+  [ -f "$db" ] || { printf 'missing\n'; return; }
+  local output
+  output="$("$BIN" ops preflight --db "$db" 2>/dev/null || true)"
+  case "$output" in
+    *"密码哈希存在"*) printf 'present\n' ;;
+    *"缺少密码哈希"*) printf 'missing\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+print_generated_password() {
+  [ "$PASSWORD_GENERATED" -eq 1 ] || return 0
+  printf '\n'
+  printf '========================================\n'
+  printf ' NanoQuant 初始管理员账号\n'
+  printf ' 账号: admin\n'
+  printf ' 密码: %s\n' "$ADMIN_PASSWORD"
+  printf ' 首次登录后请立即修改密码。\n'
+  printf '========================================\n'
+  printf '\n'
 }
 
 on_error() {
@@ -975,6 +1014,7 @@ main() {
   if [ "$CHECK_ONLY" -eq 1 ]; then
     check_only
   fi
+
   if [ "$SKIP_DEPS" -eq 0 ]; then
     ensure_native_deps
     ensure_curl
@@ -994,6 +1034,21 @@ main() {
     grant_service_access
   fi
   prepare_dirs
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    case "$(admin_password_state)" in
+      present)
+        log OK "检测到已有管理员密码；跳过自动生成"
+        ;;
+      missing)
+        ADMIN_PASSWORD="$(generate_admin_password)"
+        PASSWORD_GENERATED=1
+        log INFO "未提供管理员密码，已自动生成；安装完成后会打印一次"
+        ;;
+      *)
+        log WARN "已有数据目录但无法确认管理员状态；本次不自动生成密码"
+        ;;
+    esac
+  fi
   if [ "$SYSTEMD" -eq 1 ]; then
     install_systemd
   else
@@ -1003,6 +1058,7 @@ main() {
   if [ -n "$BACKUP_BIN" ] && [ -f "$BACKUP_BIN" ]; then log INFO "回滚二进制: $BACKUP_BIN"; fi
   log INFO "端口: $PORT；模式: $([ "$SYSTEMD" -eq 1 ] && echo systemd || echo nohup)"
   log INFO "日志: ${LOG_FILE:-未写入（--check）}"
+  print_generated_password
 }
 
 main "$@"
