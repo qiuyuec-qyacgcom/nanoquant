@@ -27,8 +27,9 @@ usage() {
   -h, --help            显示帮助；代码已下载时转发 scripts/install.sh --help
 
 其余参数透传给 scripts/install.sh，例如:
-  --systemd --install-deps --password-stdin --port 8899 --no-start
+  --systemd --password-stdin --port 8899 --no-start
 
+缺失的 curl/git/tar/gzip/gcc/make/Rust/Node 会默认自动安装。
 仅支持 Linux。
 EOF
 }
@@ -62,30 +63,59 @@ detect_pm() {
   fi
 }
 
-install_fetch() {
-  [ "$(id -u)" -eq 0 ] || die "自动安装 curl 需要 root；请手动安装 curl"
-  local pm
-  pm="$(detect_pm)"
-  [ -n "$pm" ] || die "未找到 curl/wget，且无法识别包管理器；请手动安装 curl"
-  info "安装 curl（$pm）"
-  case "$pm" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates ;;
-    dnf) dnf install -y curl ca-certificates ;;
-    yum) yum install -y curl ca-certificates ;;
-    apk) apk add --no-cache curl ca-certificates ;;
-    zypper) zypper --non-interactive install curl ca-certificates ;;
-    pacman) pacman -Sy --needed --noconfirm curl ca-certificates ;;
-  esac
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    command -v sudo >/dev/null 2>&1 || die "自动安装基础工具需要 root 或 sudo"
+    sudo "$@"
+  fi
 }
 
-FETCH=""
+install_bootstrap_tools() {
+  local pm="$1"
+  info "自动安装基础工具（$pm）"
+  case "$pm" in
+    apt)
+      run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl ca-certificates git tar gzip xz-utils
+      ;;
+    dnf) run_root dnf install -y curl ca-certificates git tar gzip xz ;;
+    yum) run_root yum install -y curl ca-certificates git tar gzip xz ;;
+    apk) run_root apk add --no-cache curl ca-certificates git tar gzip xz ;;
+    zypper) run_root zypper --non-interactive install curl ca-certificates git tar gzip xz ;;
+    pacman) run_root pacman -Sy --needed --noconfirm curl ca-certificates git tar gzip xz ;;
+    *) die "无法识别包管理器，请手动安装 curl/git/tar/gzip" ;;
+  esac
+  hash -r 2>/dev/null || true
+}
+
+needs_bootstrap_tools() {
+  ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 \
+    || ! command -v tar >/dev/null 2>&1 \
+    || ! command -v gzip >/dev/null 2>&1
+}
+
+pm="$(detect_pm)"
+if needs_bootstrap_tools; then
+  [ -n "$pm" ] || die "缺少 curl/wget/tar/gzip，且未识别包管理器；请手动安装"
+  install_bootstrap_tools "$pm"
+fi
+if ! command -v git >/dev/null 2>&1 && [ -n "$pm" ]; then
+  install_bootstrap_tools "$pm"
+fi
+
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  die "自动安装后仍未找到 curl/wget"
+fi
+if ! command -v tar >/dev/null 2>&1 || ! command -v gzip >/dev/null 2>&1; then
+  die "自动安装后仍未找到 tar/gzip"
+fi
 if command -v curl >/dev/null 2>&1; then
   FETCH="curl"
-elif command -v wget >/dev/null 2>&1; then
-  FETCH="wget"
 else
-  install_fetch
-  FETCH="curl"
+  FETCH="wget"
 fi
 
 fetch_url() {

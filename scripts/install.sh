@@ -25,6 +25,13 @@ SKIP_DEPS=0
 INSTALL_DEPS=0
 INSTALL_RUST=0
 INSTALL_NODE=0
+AUTO_DEPS="${NANOQUANT_AUTO_DEPS:-1}"
+case "$AUTO_DEPS" in
+  1|true|TRUE|yes|YES|on|ON) AUTO_DEPS=1 ;;
+  *) AUTO_DEPS=0 ;;
+esac
+SUDO=""
+SYSTEM_DEPS_DONE=0
 SKIP_DISK_CHECK=0
 CHECK_ONLY=0
 OFFLINE=0
@@ -65,10 +72,12 @@ Linux 专用安装脚本：构建并就地安装 NanoQuant Rust 内核与前端�
   默认                   root 且 systemd 可用时自动 systemd，否则 nohup
 
 安装内容:
-  --install-deps        用系统包管理器安装 gcc/make/perl/curl 等构建依赖
-  --install-rust        缺少 Rust 时通过 rustup minimal 安装
-  --install-node        缺少 Node.js 20+ 时尝试通过系统源/NodeSource 安装
-  --offline             cargo/npm 使用离线模式（依赖需已缓存）
+  默认                   自动补齐 gcc/make/perl/git/curl/Rust/Node 等缺失工具
+  --install-deps        兼容旧参数；默认已自动安装
+  --install-rust        兼容旧参数；默认已自动安装
+  --install-node        兼容旧参数；默认已自动安装
+  --no-auto-deps        关闭自动安装；缺失依赖时直接报错
+  --offline             cargo/npm 使用离线模式（依赖需已缓存，且不联网装工具）
   --skip-deps           跳过工具链检查
   --skip-disk-check     跳过磁盘空间检查
 
@@ -89,7 +98,7 @@ Linux 专用安装脚本：构建并就地安装 NanoQuant Rust 内核与前端�
   -h, --help            显示帮助
 
 示例:
-  sudo bash scripts/install.sh --install-deps --systemd
+  sudo bash scripts/install.sh --systemd
   NANOQUANT_ADMIN_PASSWORD='***' sudo -E bash scripts/install.sh --systemd
   sudo bash scripts/install.sh --password-stdin --systemd < /root/nq-password
   bash scripts/install.sh --check
@@ -125,6 +134,16 @@ run_logged() {
   fi
 }
 
+run_root_logged() {
+  if [ "$(id -u)" -eq 0 ]; then
+    run_logged "$@"
+  elif [ -n "$SUDO" ]; then
+    run_logged "$SUDO" "$@"
+  else
+    die "自动安装系统依赖需要 root 或 sudo；请用 sudo 运行安装脚本"
+  fi
+}
+
 cleanup_password() {
   if [ "$ENV_FILE_CREATED" -eq 1 ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
     rm -f "$ENV_FILE" || true
@@ -154,9 +173,10 @@ parse_args() {
     case "$1" in
       --systemd) SYSTEMD_MODE="yes"; shift ;;
       --no-systemd) SYSTEMD_MODE="no"; shift ;;
-      --install-deps) INSTALL_DEPS=1; shift ;;
-      --install-rust) INSTALL_RUST=1; shift ;;
-      --install-node) INSTALL_NODE=1; shift ;;
+      --install-deps) INSTALL_DEPS=1; AUTO_DEPS=1; shift ;;
+      --install-rust) INSTALL_RUST=1; AUTO_DEPS=1; shift ;;
+      --install-node) INSTALL_NODE=1; AUTO_DEPS=1; shift ;;
+      --no-auto-deps) AUTO_DEPS=0; shift ;;
       --offline) OFFLINE=1; shift ;;
       --skip-deps) SKIP_DEPS=1; shift ;;
       --skip-disk-check) SKIP_DISK_CHECK=1; shift ;;
@@ -233,43 +253,61 @@ detect_pm() {
 
 dependency_hint() {
   case "$PM" in
-    apt) echo "apt-get update && apt-get install -y gcc libc6-dev make perl curl ca-certificates" ;;
-    dnf) echo "dnf install -y gcc glibc-devel make perl curl ca-certificates" ;;
-    yum) echo "yum install -y gcc glibc-devel make perl curl ca-certificates" ;;
-    apk) echo "apk add --no-cache gcc musl-dev make perl curl ca-certificates" ;;
-    zypper) echo "zypper --non-interactive install gcc glibc-devel make perl curl ca-certificates" ;;
-    pacman) echo "pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates" ;;
-    *) echo "请安装 gcc、make、perl、curl、ca-certificates" ;;
+    apt) echo "apt-get update && apt-get install -y gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils" ;;
+    dnf) echo "dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz" ;;
+    yum) echo "yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz" ;;
+    apk) echo "apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz" ;;
+    zypper) echo "zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz" ;;
+    pacman) echo "pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf git tar gzip xz" ;;
+    *) echo "请安装 gcc、make、perl、curl、git、tar、gzip、pkg-config" ;;
   esac
 }
 
 install_system_deps() {
-  [ "$(id -u)" -eq 0 ] || die "--install-deps 需要 root 权限，请使用 sudo"
+  [ "$SYSTEM_DEPS_DONE" -eq 1 ] && return
   detect_pm
-  [ -n "$PM" ] || die "未识别包管理器，无法自动安装构建依赖"
-  log INFO "安装系统构建依赖（$PM）"
+  [ -n "$PM" ] || die "未识别包管理器，无法自动安装系统依赖"
+  log INFO "自动安装系统依赖（$PM）"
   case "$PM" in
     apt)
-      export DEBIAN_FRONTEND=noninteractive
-      run_logged apt-get update -qq
-      run_logged apt-get install -y -qq gcc libc6-dev make perl curl ca-certificates
+      run_root_logged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      run_root_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils
       ;;
-    dnf) run_logged dnf install -y gcc glibc-devel make perl curl ca-certificates ;;
-    yum) run_logged yum install -y gcc glibc-devel make perl curl ca-certificates ;;
-    apk) run_logged apk add --no-cache gcc musl-dev make perl curl ca-certificates ;;
-    zypper) run_logged zypper --non-interactive install gcc glibc-devel make perl curl ca-certificates ;;
-    pacman) run_logged pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates ;;
+    dnf)
+      run_root_logged dnf install -y \
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz
+      ;;
+    yum)
+      run_root_logged yum install -y \
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz
+      ;;
+    apk)
+      run_root_logged apk add --no-cache \
+        gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz
+      ;;
+    zypper)
+      run_root_logged zypper --non-interactive install \
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz
+      ;;
+    pacman)
+      run_root_logged pacman -Sy --needed --noconfirm \
+        gcc make perl curl ca-certificates pkgconf git tar gzip xz
+      ;;
   esac
+  SYSTEM_DEPS_DONE=1
+  hash -r 2>/dev/null || true
 }
 
 ensure_curl() {
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    if [ "$INSTALL_DEPS" -eq 1 ]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
       install_system_deps
     else
-      die "缺少 curl/wget；可加 --install-deps 或手动安装"
+      die "缺少 curl；设置 NANOQUANT_AUTO_DEPS=1 或加 --install-deps，或手动安装"
     fi
   fi
+  command -v curl >/dev/null 2>&1 || die "自动安装后仍缺少 curl"
 }
 
 ensure_native_deps() {
@@ -279,15 +317,28 @@ ensure_native_deps() {
   fi
   command -v make >/dev/null 2>&1 || missing+=("make")
   command -v perl >/dev/null 2>&1 || missing+=("perl")
-  if [ "${#missing[@]}" -gt 0 ] && [ "$INSTALL_DEPS" -eq 1 ]; then
-    install_system_deps
-    missing=()
-    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then missing+=("gcc"); fi
-    command -v make >/dev/null 2>&1 || missing+=("make")
-    command -v perl >/dev/null 2>&1 || missing+=("perl")
+  command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+  command -v git >/dev/null 2>&1 || missing+=("git")
+  command -v tar >/dev/null 2>&1 || missing+=("tar")
+  command -v gzip >/dev/null 2>&1 || missing+=("gzip")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
+      log INFO "缺少基础工具: ${missing[*]}；自动安装"
+      install_system_deps
+      missing=()
+      if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then missing+=("gcc"); fi
+      command -v make >/dev/null 2>&1 || missing+=("make")
+      command -v perl >/dev/null 2>&1 || missing+=("perl")
+      command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+      command -v git >/dev/null 2>&1 || missing+=("git")
+      command -v tar >/dev/null 2>&1 || missing+=("tar")
+      command -v gzip >/dev/null 2>&1 || missing+=("gzip")
+    else
+      die "缺少构建依赖: ${missing[*]}；请执行: $(dependency_hint)"
+    fi
   fi
   if [ "${#missing[@]}" -gt 0 ]; then
-    die "缺少构建依赖: ${missing[*]}；请执行: $(dependency_hint)"
+    die "自动安装后仍缺少: ${missing[*]}；请执行: $(dependency_hint)"
   fi
   log OK "系统构建依赖就绪"
 }
@@ -348,17 +399,36 @@ ensure_rust() {
     fi
   fi
   if ! command -v cargo >/dev/null 2>&1; then
-    if [ "$INSTALL_RUST" -eq 1 ]; then
-      [ "$OFFLINE" -eq 0 ] || die "--offline 模式无法通过 rustup 安装 Rust"
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
       ensure_curl
       log INFO "通过 rustup 安装 minimal Rust 工具链"
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
+      fi
       export PATH="$HOME/.cargo/bin:$PATH"
+      hash -r 2>/dev/null || true
     else
-      die "缺少 cargo/rustc；请安装 Rust $RUST_MIN+ 或加 --install-rust"
+      die "缺少 cargo/rustc；请安装 Rust $RUST_MIN+，或联网运行安装脚本"
     fi
   fi
-  command -v rustc >/dev/null 2>&1 || die "缺少 rustc"
+  command -v rustc >/dev/null 2>&1 || {
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
+      ensure_curl
+      if command -v rustup >/dev/null 2>&1; then
+        rustup update stable
+        rustup default stable
+      else
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      fi
+      if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+      export PATH="$HOME/.cargo/bin:$PATH"
+      hash -r 2>/dev/null || true
+    else
+      die "缺少 rustc；请安装完整 Rust 工具链"
+    fi
+  }
 
   local version major minor req_major req_minor
   version="$(rustc --version | awk '{print $2}')"
@@ -367,26 +437,56 @@ ensure_rust() {
   minor="${minor%%.*}"
   IFS=. read -r req_major req_minor _ <<<"$RUST_MIN"
   if [ "$major" -lt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -lt "$req_minor" ]; }; then
-    die "Rust $version 过低，需要 $RUST_MIN+"
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
+      ensure_curl
+      log INFO "Rust $version 低于 $RUST_MIN，自动升级 stable"
+      if command -v rustup >/dev/null 2>&1; then
+        rustup update stable
+        rustup default stable
+      else
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      fi
+      if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+      export PATH="$HOME/.cargo/bin:$PATH"
+      hash -r 2>/dev/null || true
+      version="$(rustc --version | awk '{print $2}')"
+      major="${version%%.*}"
+      minor="${version#*.}"
+      minor="${minor%%.*}"
+    fi
+    if [ "$major" -lt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -lt "$req_minor" ]; }; then
+      die "Rust $version 过低，需要 $RUST_MIN+"
+    fi
   fi
   log OK "Rust $version（要求 $RUST_MIN+）"
 }
 
 install_node() {
-  [ "$(id -u)" -eq 0 ] || die "--install-node 需要 root 权限，请使用 sudo"
+  [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ] || die "自动安装 Node.js 需要 root 或 sudo"
   [ "$OFFLINE" -eq 0 ] || die "--offline 模式无法安装 Node.js"
   detect_pm
   ensure_curl
-  log INFO "安装 Node.js 20+（$PM）"
+  log INFO "自动安装 Node.js 20+（$PM）"
   case "$PM" in
     apt)
-      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-      run_logged apt-get install -y nodejs
+      if [ "$(id -u)" -eq 0 ]; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      else
+        curl -fsSL https://deb.nodesource.com/setup_20.x | "$SUDO" bash -
+      fi
+      run_root_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
       ;;
-    dnf|yum) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -; run_logged "$PM" install -y nodejs ;;
-    apk) run_logged apk add --no-cache nodejs npm ;;
-    pacman) run_logged pacman -Sy --needed --noconfirm nodejs npm ;;
-    zypper) run_logged zypper --non-interactive install nodejs20 npm20 || run_logged zypper --non-interactive install nodejs npm ;;
+    dnf|yum)
+      if [ "$(id -u)" -eq 0 ]; then
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+      else
+        curl -fsSL https://rpm.nodesource.com/setup_20.x | "$SUDO" bash -
+      fi
+      run_root_logged "$PM" install -y nodejs
+      ;;
+    apk) run_root_logged apk add --no-cache nodejs npm ;;
+    pacman) run_root_logged pacman -Sy --needed --noconfirm nodejs npm ;;
+    zypper) run_root_logged zypper --non-interactive install nodejs20 npm20 || run_root_logged zypper --non-interactive install nodejs npm ;;
     *) die "未识别的包管理器，无法自动安装 Node.js 20+" ;;
   esac
   hash -r 2>/dev/null || true
@@ -394,16 +494,17 @@ install_node() {
 
 ensure_node() {
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-    if [ "$INSTALL_NODE" -eq 1 ]; then
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
       install_node
     else
-      die "缺少 Node.js/npm；请安装 Node.js $MIN_NODE_MAJOR+ 或加 --install-node"
+      die "缺少 Node.js/npm；请安装 Node.js $MIN_NODE_MAJOR+，或联网运行安装脚本"
     fi
   fi
   local major
   major="$(node -p 'process.versions.node.split(".")[0]')"
   if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then
-    if [ "$INSTALL_NODE" -eq 1 ]; then
+    if [ "$AUTO_DEPS" -eq 1 ] && [ "$OFFLINE" -eq 0 ]; then
+      log INFO "Node.js $major 低于 $MIN_NODE_MAJOR，自动安装 Node.js $MIN_NODE_MAJOR"
       install_node
       major="$(node -p 'process.versions.node.split(".")[0]')"
     fi
@@ -789,10 +890,14 @@ check_only() {
 
 main() {
   parse_args "$@"
+  if [ "$CHECK_ONLY" -eq 1 ] || [ "$OFFLINE" -eq 1 ]; then
+    AUTO_DEPS=0
+  fi
   init_log
   detect_pm
-  if [ "$INSTALL_DEPS" -eq 1 ] && [ "$CHECK_ONLY" -eq 0 ]; then
-    install_system_deps
+  SUDO=""
+  if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
   fi
   if [ "$SYSTEMD_MODE" = "yes" ]; then
     SYSTEMD=1
@@ -818,9 +923,9 @@ main() {
     check_only
   fi
   if [ "$SKIP_DEPS" -eq 0 ]; then
-    ensure_rust
     ensure_native_deps
     ensure_curl
+    ensure_rust
   fi
   ensure_disk
   check_arch

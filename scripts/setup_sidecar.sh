@@ -45,6 +45,46 @@ die()  { printf '\033[1;31m[sidecar]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || die "需要 root：sudo bash scripts/setup_sidecar.sh ..."
 
+ensure_sidecar_deps() {
+  local missing=()
+  local pm=""
+  if command -v apt-get >/dev/null 2>&1; then pm=apt
+  elif command -v dnf >/dev/null 2>&1; then pm=dnf
+  elif command -v yum >/dev/null 2>&1; then pm=yum
+  elif command -v apk >/dev/null 2>&1; then pm=apk
+  elif command -v zypper >/dev/null 2>&1; then pm=zypper
+  elif command -v pacman >/dev/null 2>&1; then pm=pacman
+  fi
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then missing+=("gcc"); fi
+  command -v make >/dev/null 2>&1 || missing+=("make")
+  command -v perl >/dev/null 2>&1 || missing+=("perl")
+  command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+  [ "${#missing[@]}" -gt 0 ] || return 0
+  [ -n "$pm" ] || die "缺少 ${missing[*]}，且未识别包管理器；无法自动安装 sidecar 构建依赖"
+  info "自动安装 sidecar 构建依赖（$pm）：${missing[*]}"
+  case "$pm" in
+    apt)
+      env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        gcc libc6-dev make perl curl ca-certificates pkg-config
+      ;;
+    dnf) dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config ;;
+    yum) yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig ;;
+    apk) apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf ;;
+    zypper) zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config ;;
+    pacman) pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf ;;
+  esac
+  hash -r 2>/dev/null || true
+  command -v curl >/dev/null 2>&1 || die "自动安装后仍缺少 curl"
+  { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; } || die "自动安装后仍缺少 gcc"
+  command -v make >/dev/null 2>&1 || die "自动安装后仍缺少 make"
+  command -v perl >/dev/null 2>&1 || die "自动安装后仍缺少 perl"
+}
+
+ensure_sidecar_deps
+command -v systemctl >/dev/null 2>&1 || die "缺少 systemctl，无法注册 sidecar 服务"
+
 if [[ -z "$RUN_USER" ]] && id -u nanoquant >/dev/null 2>&1; then
   RUN_USER="nanoquant"
 fi

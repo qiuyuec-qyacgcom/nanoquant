@@ -8,7 +8,7 @@
 
 - 仅支持 Linux：Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE。
 - systemd 或 nohup 二选一；systemd 模式需要 root。
-- Rust 1.88+、Node.js 20+、gcc/make/perl/curl；可用 `--install-deps` 自动安装构建依赖。
+- Rust 1.88+、Node.js 20+、gcc/make/perl/curl/git；安装脚本会默认自动补齐缺失工具。
 - systemd 模式默认创建 `nanoquant` 系统用户；sidecar 必须使用同一用户。
 
 ## 已部署机器如何更新
@@ -41,7 +41,7 @@ sudo bash scripts/update.sh               # 拉代码 + 可选备份 + 构建 + 
 一条命令在线安装（`curl` 缺失自动改用 `wget`），无需先 clone：
 
 ```bash
-if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh -o install.sh;else wget --https-only -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --install-deps --password '你的密码' --systemd
+if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh -o install.sh;else wget --https-only -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password '你的密码' --systemd
 ```
 
 引导脚本 `install.sh` 下载代码后转交 `scripts/install.sh --systemd`：在 clone 目录里构建 Rust
@@ -56,7 +56,7 @@ if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 https://raw.g
 非交互场景用参数：
 
 ```bash
-bash install.sh --install-deps --systemd
+bash install.sh --systemd
 NANOQUANT_ADMIN_PASSWORD='***' bash install.sh --systemd
 bash install.sh --password-stdin --systemd < /root/nq-password
 ```
@@ -67,9 +67,10 @@ bash install.sh --password-stdin --systemd < /root/nq-password
 |---|---|
 | `--systemd` | 强制 systemd；创建 `nanoquant` 用户并启动服务（需要 root） |
 | `--no-systemd` | 强制 nohup；使用 `scripts/start.sh --daemon` |
-| `--install-deps` | 用系统包管理器安装 gcc/make/perl/curl 等构建依赖 |
-| `--install-rust` | 缺少 Rust 时用 rustup minimal 安装 |
-| `--install-node` | 缺少 Node.js 20+ 时尝试通过系统源/NodeSource 安装 |
+| `--install-deps` | 兼容旧参数；默认已自动安装系统依赖 |
+| `--install-rust` | 兼容旧参数；默认已自动安装 Rust |
+| `--install-node` | 兼容旧参数；默认已自动安装 Node.js 20+ |
+| `--no-auto-deps` | 关闭自动安装；缺失依赖时直接报错 |
 | `--password <p>` | 首次启动管理员密码；建议改用 `--password-stdin` 或环境变量 |
 | `--password-stdin` | 从 stdin 读取密码，避免 shell 历史 |
 | `--password-file <f>` | 从文件首行读取密码，并收紧为 0600 |

@@ -82,7 +82,7 @@
 | Rust | **1.88+** | 构建主服务与 sidecar；运行期不需要解释器 |
 | Node.js | **20+** | 仅构建前端时需要；已有 `frontend/dist` 时可用 `--no-frontend` |
 | 系统 | **Linux** | Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE |
-| 构建依赖 | gcc / make / perl / curl | 可用 `--install-deps` 自动安装 |
+| 构建依赖 | gcc / make / perl / curl / git / pkg-config | 默认自动安装；离线环境可预装 |
 | 磁盘 | ≥ 2 GB 可用 | SQLite、日志、备份均在 `data/` 下 |
 
 ### 方式一：一条命令在线安装
@@ -92,23 +92,23 @@ if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 \
   https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh -o install.sh;else \
   wget --https-only -O install.sh \
   https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi
-bash install.sh --install-deps --systemd
+bash install.sh --systemd
 ```
 
 首次管理员密码可用环境变量/标准输入传入，避免 shell 历史：
 
 ```bash
-NANOQUANT_ADMIN_PASSWORD='你的密码' sudo -E bash install.sh --install-deps --systemd
+NANOQUANT_ADMIN_PASSWORD='你的密码' sudo -E bash install.sh --systemd
 ```
 
-`install.sh` 下载代码后转交 `scripts/install.sh`：检查工具链、构建 Rust/前端、
-创建 `data/`、`logs/` 与权限、按需创建 `nanoquant` 系统用户并生成 systemd unit，
+`install.sh` 下载代码后转交 `scripts/install.sh`：自动安装缺失的构建工具、Rust 与 Node.js，
+检查工具链、构建 Rust/前端，创建 `data/`、`logs/` 与权限、按需创建 `nanoquant` 系统用户并生成 systemd unit，
 最后通过 `/api/v1/health` 验证。失败时会尝试恢复旧二进制/旧 unit。
 
 ### 方式二：本地脚本
 
 ```bash
-sudo bash scripts/install.sh --install-deps --systemd   # systemd：自动创建 nanoquant 用户
+sudo bash scripts/install.sh --systemd   # systemd：自动安装缺失工具并创建 nanoquant 用户
 bash scripts/install.sh --no-systemd                    # 无 systemd：nohup
 bash scripts/status.sh                                  # 查看状态
 bash scripts/stop.sh                                    # 停止
@@ -329,8 +329,8 @@ CI 覆盖 Rust 双 crate 的 fmt/clippy/test、前端 typecheck/test/build、Pla
 A：首次密码只允许登录与改密；登录后按提示改密即可。忘记密码用 `nanoquant ops reset-password`。
 
 **Q：构建失败？**
-A：确认 Rust 1.88+、Node.js 20+ 与 gcc/make/perl/curl 已安装；可重新执行
-`bash scripts/install.sh --install-deps --check`。
+A：确认 Rust 1.88+、Node.js 20+ 与 gcc/make/perl/curl 已安装；重新执行
+`sudo bash scripts/install.sh`，脚本会自动补齐缺失工具。
 
 **Q：加不进标的？**
 A：真实币安合约会在当前环境合约表中校验；模拟盘没有的中文合约会降级为仅记录的自定义标的。
