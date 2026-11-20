@@ -672,7 +672,7 @@ pub(crate) fn archive_table(
         .map_err(|error| error.to_string())?;
     let mut rows_stmt = conn
         .prepare(&format!(
-            "SELECT * FROM {table} WHERE ts < ?1 ORDER BY ts ASC LIMIT 5000"
+            "SELECT * FROM {table} WHERE ts < ?1 ORDER BY ts ASC, rowid ASC LIMIT 5000"
         ))
         .map_err(|error| error.to_string())?;
     let rows: Vec<Value> = rows_stmt
@@ -707,7 +707,13 @@ pub(crate) fn archive_table(
     }
     encoder.finish().map_err(|error| error.to_string())?;
     let deleted = conn
-        .execute(&format!("DELETE FROM {table} WHERE ts < ?1"), [before_ts])
+        .execute(
+            &format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE ts < ?1 ORDER BY ts ASC, rowid ASC LIMIT 5000)"
+            ),
+            [before_ts],
+        )
         .map_err(|error| error.to_string())?;
     Ok((deleted, name))
 }
@@ -2325,6 +2331,43 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body["detail"].as_str().unwrap().contains("不合法"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archive_deletes_only_the_rows_it_wrote() {
+        let path = std::env::temp_dir().join("nq-archive-cap.db");
+        let db = dead_fixture(&path);
+        let dir = std::env::temp_dir().join(format!("nq-archive-cap-{}", crate::now_millis()));
+        {
+            let conn = db.conn.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO engine_events(ts,level,category,message,payload) \
+                         VALUES(?1,'info','engine','old','{}')",
+                    )
+                    .unwrap();
+                for ts in 1..=5002i64 {
+                    stmt.execute([ts]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let (count, _) = archive_table(&db, "engine_events", "engine_events", 6000, &dir).unwrap();
+        assert_eq!(count, 5000, "单次最多归档 5000 行");
+        let (left, oldest): (i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*), MIN(ts) FROM engine_events", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(left, 2, "只删除实际写入归档的 5000 行");
+        assert_eq!(oldest, 5001, "未归档的旧行必须保留");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&path);
     }

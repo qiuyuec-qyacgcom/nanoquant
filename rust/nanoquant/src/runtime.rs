@@ -1781,11 +1781,11 @@ impl EngineRuntime {
         if mode != "live" {
             return Ok(Vec::new());
         }
-        let venue: std::collections::BTreeSet<&str> = snapshot
+        let venue: std::collections::BTreeSet<(&str, &str)> = snapshot
             .positions
             .iter()
             .filter(|position| position.qty > 0.0)
-            .map(|position| position.symbol.as_str())
+            .map(|position| (position.symbol.as_str(), position.side.as_str()))
             .collect();
         let locals: Vec<(String, String, f64)> = {
             let mut stmt = tx
@@ -1814,7 +1814,7 @@ impl EngineRuntime {
             .unwrap_or(0.0005);
         let mut closed = Vec::new();
         for (symbol, side, stored_mark) in locals {
-            if venue.contains(symbol.as_str()) {
+            if venue.contains(&(symbol.as_str(), side.as_str())) {
                 continue;
             }
             let mark = snapshot
@@ -2021,6 +2021,11 @@ impl EngineRuntime {
                 tp_price: 0.0,
             })
             .collect();
+        let exit_prices: Vec<(String, f64)> = snapshot
+            .markets
+            .iter()
+            .map(|market| (market.symbol.clone(), market.mark_price))
+            .collect();
         let mut report = crate::cycle::run_cycle(&crate::cycle::CycleInput {
             enabled: engine_enabled,
             mode,
@@ -2030,10 +2035,7 @@ impl EngineRuntime {
             venue: &venue,
             local: &local,
             fee_rate: risk_cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005),
-            exit_price: snapshot
-                .markets
-                .first()
-                .map_or(0.0, |market| market.mark_price),
+            exit_prices: &exit_prices,
             closing: &[],
             positions: &positions,
             manage_cfg: &Self::manage_config(strategy, &risk_cfg),
@@ -4357,6 +4359,38 @@ mod tests {
             entry_price: 51_000.0,
         });
         snapshot
+    }
+
+    #[tokio::test]
+    async fn hedge_opposite_side_closes_the_missing_local_side() {
+        use crate::providers::{DemoProvider, PositionSnapshot, SnapshotProvider};
+        let db = test_db();
+        seed_live_position(&db);
+        let mut snapshot = DemoProvider::with_mark_price(49_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        snapshot.positions.clear();
+        snapshot.positions.push(PositionSnapshot {
+            symbol: "BTCUSDT".into(),
+            side: "short".into(),
+            qty: 0.5,
+            entry_price: 49_000.0,
+        });
+        let conn = db.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let closed = EngineRuntime::close_missing_positions(&tx, "live", &snapshot).unwrap();
+        assert_eq!(closed.len(), 1, "交易所有空头不代表本地的多头还在");
+        assert_eq!(closed[0]["side"], "long");
+        let status: String = tx
+            .query_row(
+                "SELECT status FROM positions WHERE mode='live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        tx.rollback().unwrap();
     }
 
     #[tokio::test]

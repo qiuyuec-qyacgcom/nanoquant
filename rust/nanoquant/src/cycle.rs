@@ -30,8 +30,8 @@ pub struct CycleInput<'a> {
     pub venue: &'a [VenuePosition],
     pub local: &'a [LocalPosition],
     pub fee_rate: f64,
-    pub exit_price: f64,
-    pub closing: &'a [String],
+    pub exit_prices: &'a [(String, f64)],
+    pub closing: &'a [(String, String)],
     pub positions: &'a [ManagedPosition],
     pub manage_cfg: &'a ManageConfig,
     pub candidates: &'a [Candidate],
@@ -54,7 +54,7 @@ pub fn run_cycle(input: &CycleInput) -> CycleReport {
         input.venue,
         input.local,
         input.fee_rate,
-        input.exit_price,
+        input.exit_prices,
         input.closing,
     );
     let manage_actions: Vec<ManageAction> = input
@@ -164,7 +164,7 @@ mod tests {
             venue: &[],
             local: &[],
             fee_rate: 0.0004,
-            exit_price: 0.0,
+            exit_prices: &[],
             closing: &[],
             positions: &[],
             manage_cfg,
@@ -244,6 +244,7 @@ mod tests {
             qty: 1.0,
             entry_price: 100.0,
         }];
+        let exit_prices = vec![("ETHUSDT".to_string(), 110.0)];
         let candidates = vec![Candidate {
             symbol: "BTCUSDT".to_string(),
             data_ok: true,
@@ -254,7 +255,7 @@ mod tests {
             strength: 0.9,
         }];
         input.local = &local;
-        input.exit_price = 110.0;
+        input.exit_prices = &exit_prices;
         input.candidates = &candidates;
 
         let report = run_cycle(&input);

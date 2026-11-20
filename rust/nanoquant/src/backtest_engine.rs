@@ -841,10 +841,12 @@ pub fn run_walkforward(
     let started = std::time::Instant::now();
     let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
     let mut folds = requested_folds;
-    if bars.len() <= WARMUP * 2 {
+    // 训练窗最少 2×WARMUP，测试窗还要再留 2×WARMUP。少于 4×WARMUP 时
+    // clamp(min, max) 会因 min > max 直接 panic，必须先返回可读错误。
+    if bars.len() < WARMUP * 4 {
         return Err(format!(
             "K 线不足 (至少 {} 根才能切样本内/外)",
-            WARMUP * 2 + 1
+            WARMUP * 4 + 1
         ));
     }
     let train_bars = (train_bars as usize).clamp(WARMUP * 2, bars.len().saturating_sub(WARMUP * 2));
@@ -1295,5 +1297,22 @@ mod tests {
         assert!(result["aggregate"]["out_sample_avg_pct"].as_f64().is_some());
         assert!(result["aggregate"]["overfit_gap_pct"].as_f64().is_some());
         assert!(result["folds"].as_i64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn walkforward_with_a_window_shorter_than_four_warmups_returns_an_error() {
+        // 180 根：超过 2×WARMUP，但不足 4×WARMUP。
+        // 旧实现在 clamp(min=120, max=len-120=60) 处因 min > max 直接 panic。
+        let bars = trending_bars(WARMUP * 3);
+        let error = run_walkforward(
+            &bars,
+            &config(),
+            &[("entry_threshold", vec![0.05, 0.1])],
+            2,
+            (WARMUP * 2) as i64,
+            &AtomicBool::new(false),
+        )
+        .expect_err("窗口不足时必须返回错误，不能 panic");
+        assert!(error.contains("K 线不足"), "实际错误: {error}");
     }
 }

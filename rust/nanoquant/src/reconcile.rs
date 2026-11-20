@@ -48,14 +48,17 @@ pub fn reconcile(
     venue: &[VenuePosition],
     local: &[LocalPosition],
     fee_rate: f64,
-    exit_price: f64,
-    closing: &[String],
+    exit_prices: &[(String, f64)],
+    closing: &[(String, String)],
 ) -> Vec<ReconcileAction> {
     let mut actions = Vec::new();
     let mine: Vec<&LocalPosition> = local.iter().filter(|p| p.mode == mode).collect();
 
     for vp in venue {
-        match mine.iter().find(|p| p.symbol == vp.symbol) {
+        match mine
+            .iter()
+            .find(|p| p.symbol == vp.symbol && p.side == vp.side)
+        {
             None => actions.push(ReconcileAction::Adopt {
                 symbol: vp.symbol.clone(),
                 side: vp.side.clone(),
@@ -70,13 +73,23 @@ pub fn reconcile(
         }
     }
     for lp in &mine {
-        if venue.iter().any(|v| v.symbol == lp.symbol) {
+        if venue
+            .iter()
+            .any(|v| v.symbol == lp.symbol && v.side == lp.side)
+        {
             continue;
         }
         // 系统正在平这个仓：成交由平仓路径落库，对账再补一笔就是重复记账
-        if closing.iter().any(|s| s == &lp.symbol) {
+        if closing
+            .iter()
+            .any(|(symbol, side)| symbol == &lp.symbol && side == &lp.side)
+        {
             continue;
         }
+        let exit_price = exit_prices
+            .iter()
+            .find(|(symbol, _)| symbol == &lp.symbol)
+            .map_or(0.0, |(_, price)| *price);
         actions.push(ReconcileAction::CloseLocal {
             symbol: lp.symbol.clone(),
             pnl: realized_pnl(
@@ -130,7 +143,7 @@ mod tests {
 
     #[test]
     fn venue_position_missing_locally_is_adopted_and_flagged_when_naked() {
-        let actions = reconcile("live", &[venue("BTCUSDT", 0.5, 0.0)], &[], 0.0004, 0.0, &[]);
+        let actions = reconcile("live", &[venue("BTCUSDT", 0.5, 0.0)], &[], 0.0004, &[], &[]);
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             ReconcileAction::Adopt { symbol, naked, .. } => {
@@ -144,7 +157,14 @@ mod tests {
     #[test]
     fn local_position_absent_on_venue_is_closed_but_other_mode_is_untouched() {
         let local_rows = vec![local("ETHUSDT", "live"), local("SOLUSDT", "demo")];
-        let actions = reconcile("live", &[], &local_rows, 0.0004, 100.0, &[]);
+        let actions = reconcile(
+            "live",
+            &[],
+            &local_rows,
+            0.0004,
+            &[("ETHUSDT".to_string(), 100.0)],
+            &[],
+        );
         assert_eq!(actions.len(), 1, "模拟盘仓位不能被实盘对账关掉");
         match &actions[0] {
             ReconcileAction::CloseLocal { symbol, pnl } => {
@@ -162,7 +182,7 @@ mod tests {
             &[venue("BTCUSDT", 0.3, 90.0)],
             &[local("BTCUSDT", "live")],
             0.0004,
-            0.0,
+            &[],
             &[],
         );
         assert!(matches!(&actions[0], ReconcileAction::Update { qty, .. } if *qty == 0.3));
@@ -170,10 +190,44 @@ mod tests {
         let mut short = local("BTCUSDT", "live");
         short.side = "short".to_string();
         // 空头在 90 平仓：价差盈利 10，扣掉手续费后仍应盈利
-        let actions = reconcile("live", &[], &[short], 0.0004, 90.0, &[]);
+        let actions = reconcile(
+            "live",
+            &[],
+            &[short],
+            0.0004,
+            &[("BTCUSDT".to_string(), 90.0)],
+            &[],
+        );
         match &actions[0] {
             ReconcileAction::CloseLocal { pnl, .. } => assert!(*pnl > 0.0, "空头价格下跌应当盈利"),
             other => panic!("应为同步关闭，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_pnl_uses_each_symbols_own_exit_price() {
+        let local_rows = vec![local("BTCUSDT", "live"), local("ETHUSDT", "live")];
+        let actions = reconcile(
+            "live",
+            &[],
+            &local_rows,
+            0.0004,
+            &[
+                ("BTCUSDT".to_string(), 110.0),
+                ("ETHUSDT".to_string(), 90.0),
+            ],
+            &[],
+        );
+        assert_eq!(actions.len(), 2);
+        match (&actions[0], &actions[1]) {
+            (
+                ReconcileAction::CloseLocal { pnl: btc, .. },
+                ReconcileAction::CloseLocal { pnl: eth, .. },
+            ) => {
+                assert!(*btc > 0.0, "BTC 用 110 平仓应盈利");
+                assert!(*eth < 0.0, "ETH 用 90 平仓应亏损");
+            }
+            other => panic!("应为两笔同步关闭，得到 {other:?}"),
         }
     }
 
@@ -184,9 +238,32 @@ mod tests {
             &[],
             &[local("BTCUSDT", "live")],
             0.0004,
-            110.0,
-            &["BTCUSDT".to_string()],
+            &[("BTCUSDT".to_string(), 110.0)],
+            &[("BTCUSDT".to_string(), "long".to_string())],
         );
         assert!(actions.is_empty(), "平仓在途时对账再补记一笔就是重复成交");
+    }
+
+    #[test]
+    fn hedge_sides_are_matched_independently() {
+        let mut venue_short = venue("BTCUSDT", 2.0, 105.0);
+        venue_short.side = "short".to_string();
+        let actions = reconcile(
+            "live",
+            &[venue_short],
+            &[local("BTCUSDT", "live")],
+            0.0004,
+            &[("BTCUSDT".to_string(), 100.0)],
+            &[],
+        );
+        assert_eq!(actions.len(), 2, "同标的多空必须分别对账");
+        assert!(matches!(
+            &actions[0],
+            ReconcileAction::Adopt { side, .. } if side == "short"
+        ));
+        assert!(matches!(
+            &actions[1],
+            ReconcileAction::CloseLocal { symbol, .. } if symbol == "BTCUSDT"
+        ));
     }
 }

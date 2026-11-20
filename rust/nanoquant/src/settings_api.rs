@@ -103,7 +103,12 @@ async fn write_group(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         (&group, &payload, crate::now()),
     )
-    .expect("save settings");
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "detail": error.to_string() }).into(),
+        )
+    })?;
     let changes = diff(
         before.as_object().unwrap_or(&Map::new()),
         candidate.as_object().unwrap_or(&Map::new()),
@@ -352,12 +357,17 @@ pub(crate) fn defaults_of(name: &str) -> Value {
 }
 
 fn validate(group: &str, value: &Value) -> Result<(), String> {
-    let num = |key: &str| value.get(key).and_then(|v| v.as_f64());
+    // 字段缺失沿用默认值；字段存在却不是数字时必须拒绝：
+    // 否则 "max_leverage":"3" 也能通过校验，运行期 as_f64 拿不到值会回落默认上限，
+    // 风控参数被静默放宽，用户却以为已经收紧。
     let check = |key: &str, lo: f64, hi: f64| -> Result<(), String> {
-        match num(key) {
-            Some(n) if (lo..=hi).contains(&n) => Ok(()),
-            Some(_) => Err(format!("{key}: 超出取值范围")),
-            None => Ok(()),
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(()),
+            Some(Value::Number(number)) => match number.as_f64() {
+                Some(n) if (lo..=hi).contains(&n) => Ok(()),
+                _ => Err(format!("{key}: 超出取值范围")),
+            },
+            Some(_) => Err(format!("{key}: 必须是数字")),
         }
     };
     match group {
@@ -685,6 +695,76 @@ mod tests {
         assert_eq!(body["data"]["password_hash"], "hash");
         assert_eq!(body["data"]["token_version"], 7);
         assert_eq!(body["data"]["session_ttl_hours"], 12);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_risk_value_is_rejected_instead_of_silently_falling_back() {
+        let path = std::env::temp_dir().join("nq-settings-type.db");
+        let db = fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings/risk")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"patch":{"max_leverage":"3"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "字符串形式的风控参数不能绕过数值校验"
+        );
+        let stored: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            stored.contains("\"max_leverage\":50"),
+            "非法类型整体拒绝，库内保持原值: {stored}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_settings_write_returns_500_instead_of_panicking() {
+        let path = std::env::temp_dir().join("nq-settings-write-fail.db");
+        let db = fixture(&path);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings BEFORE UPDATE ON app_settings \
+                 BEGIN SELECT RAISE(ABORT, 'write rejected'); END;",
+            )
+            .unwrap();
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings/risk")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"patch":{"max_leverage":80}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "落库失败必须返回 500，不能用 expect 把请求打成 panic"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
