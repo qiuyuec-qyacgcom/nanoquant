@@ -46,12 +46,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
 
 <template>
   <div class="stack" style="gap: 18px">
-    <!-- K 线工作台 (前台首页): 标的池驱动, 公开数据源, 无需登录 -->
-    <section>
-      <KlineBoard />
-    </section>
-
-    <!-- Hero: 定位 + 实时状态卡 -->
+    <!-- Hero: 定位 + 实时状态终端 -->
     <section class="landing-hero panel">
       <div class="landing-grid">
         <div class="landing-copy">
@@ -60,7 +55,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <span class="tag tag-dim">5–30m 短线</span>
           </div>
           <h1 class="landing-title">
-            把极小资金跑成<br />一条可解释的超短线执行链
+            先活下来，<br />再谈<span>收益</span>。
           </h1>
           <p class="landing-desc">
             信号 → 五道风控闸门 → AI 复核 → 币安永续下单 → 自动复盘。
@@ -97,6 +92,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
           </router-link>
         </aside>
       </div>
+    </section>
+
+    <!-- K 线工作台 (前台首页): 标的池驱动, 公开数据源, 无需登录 -->
+    <section class="home-kline">
+      <KlineBoard />
     </section>
 
     <!-- 能力概览 -->
@@ -163,32 +163,35 @@ onBeforeUnmount(() => window.clearInterval(timer))
 .landing-hero {
   overflow: hidden;
   background:
-    radial-gradient(120% 140% at 0% 0%, rgba(240, 185, 11, 0.13), transparent 55%),
-    radial-gradient(90% 120% at 100% 0%, rgba(201, 148, 0, 0.08), transparent 60%),
-    #faf8f3;
+    radial-gradient(120% 140% at 0% 0%, rgba(77, 163, 255, 0.14), transparent 55%),
+    radial-gradient(90% 120% at 100% 0%, rgba(77, 163, 255, 0.07), transparent 60%),
+    #07101b;
 }
 .landing-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
-  gap: 26px;
-  padding: 30px 30px 26px;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 30px;
+  padding: 38px 34px 30px;
   align-items: center;
 }
 .landing-title {
-  margin: 14px 0 10px;
-  font-family: var(--serif);
-  font-size: 36px;
-  line-height: 1.18;
-  letter-spacing: -0.035em;
-  font-weight: 400;
-  color: #141518;
+  margin: 16px 0 12px;
+  font-family: var(--sans);
+  font-size: 46px;
+  line-height: 1.02;
+  letter-spacing: -0.055em;
+  font-weight: 600;
+  color: var(--text);
+}
+.landing-title span {
+  color: var(--accent);
 }
 .landing-desc {
   margin: 0 0 18px;
-  max-width: 560px;
+  max-width: 610px;
   font-size: 12.5px;
   line-height: 1.95;
-  color: #65625a;
+  color: var(--muted);
 }
 .landing-stats {
   display: flex;
@@ -203,24 +206,38 @@ onBeforeUnmount(() => window.clearInterval(timer))
 }
 .landing-stat b {
   font-family: var(--mono);
-  font-size: 19px;
-  font-weight: 600;
-  color: #141518;
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--text);
 }
 .landing-stat span {
-  font-size: 10.5px;
-  color: #878178;
+  font-size: 9.5px;
+  color: var(--muted);
+  font-family: var(--mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 .status-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 9px;
-  padding: 14px;
-  border: 1px solid rgba(240, 185, 11, 0.25);
+  padding: 16px;
+  border: 1px solid var(--line-strong);
   border-radius: 2px;
-  background: #0b0d11;
-  color: #f3f0e8;
-  box-shadow: 0 18px 42px rgba(74, 58, 24, 0.16);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  color: var(--text);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
+}
+.status-card::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  width: 14px;
+  height: 14px;
+  border-top: 1px solid var(--accent);
+  border-left: 1px solid var(--accent);
 }
 .status-line {
   display: flex;
@@ -228,18 +245,19 @@ onBeforeUnmount(() => window.clearInterval(timer))
   justify-content: space-between;
   font-size: 11.5px;
   padding: 5px 0;
-  border-bottom: 1px dashed rgba(255, 255, 255, 0.09);
+  border-bottom: 1px dashed var(--line);
 }
 .status-line span {
-  color: #8d9099;
+  color: var(--muted);
 }
 .status-line b {
   font-weight: 500;
-  color: #f3f0e8;
+  color: var(--text);
+  font-family: var(--mono);
 }
 .status-card .tag {
-  color: #b8b2a3;
-  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--muted);
+  border-color: var(--line);
   background: transparent;
 }
 .status-cta {
@@ -247,16 +265,17 @@ onBeforeUnmount(() => window.clearInterval(timer))
   align-items: center;
   justify-content: space-between;
   margin-top: 4px;
-  padding: 8px 10px;
+  padding: 9px 11px;
   border-radius: 2px;
-  background: rgba(240, 185, 11, 0.1);
-  border: 1px solid rgba(240, 185, 11, 0.3);
-  color: #f0b90b;
-  font-size: 11.5px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(77, 163, 255, 0.3);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
   text-decoration: none;
 }
 .status-cta:hover {
-  background: rgba(240, 185, 11, 0.16);
+  background: rgba(77, 163, 255, 0.15);
 }
 .entry {
   text-decoration: none;
@@ -264,7 +283,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
   transition: border-color 0.15s, transform 0.15s;
 }
 .entry:hover {
-  border-color: rgba(201, 148, 0, 0.38);
+  border-color: rgba(77, 163, 255, 0.42);
   transform: translateY(-1px);
 }
 .entry-ico {
@@ -273,28 +292,28 @@ onBeforeUnmount(() => window.clearInterval(timer))
   display: grid;
   place-items: center;
   border-radius: 2px;
-  background: rgba(201, 148, 0, 0.1);
-  color: #9b7b1d;
+  background: var(--accent-soft);
+  color: var(--accent);
   margin-bottom: 10px;
 }
 .entry-title {
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 6px;
-  color: #141518;
+  color: var(--text);
 }
 .entry-desc {
   font-size: 11.5px;
   line-height: 1.8;
-  color: #878178;
+  color: var(--muted);
 }
 @media (max-width: 900px) {
   .landing-grid {
     grid-template-columns: minmax(0, 1fr);
-    padding: 22px 18px;
+    padding: 24px 18px;
   }
   .landing-title {
-    font-size: 23px;
+    font-size: 32px;
   }
   .status-card {
     order: 2;

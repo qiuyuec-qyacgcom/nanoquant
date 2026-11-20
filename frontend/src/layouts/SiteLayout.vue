@@ -42,6 +42,17 @@ onMounted(async () => {
         </span>
       </router-link>
 
+      <nav class="site-nav">
+        <router-link
+          v-for="item in nav"
+          :key="item.path"
+          :to="item.path"
+          :class="{ active: isActive(item.path) }"
+        >
+          {{ item.label }}
+        </router-link>
+      </nav>
+
       <div class="site-actions">
         <span v-if="cfg" class="tag" :class="cfg.mode === 'live' ? 'tag-short' : 'tag-long'">
           {{ cfg.mode === 'live' ? 'LIVE 实盘' : 'DEMO 模拟盘' }}
@@ -51,29 +62,6 @@ onMounted(async () => {
     </header>
 
     <div class="site-body">
-      <aside class="site-side">
-        <div class="side-group">导航</div>
-        <router-link
-          v-for="item in nav"
-          :key="item.path"
-          :to="item.path"
-          :class="{ active: isActive(item.path) }"
-        >
-          <span class="side-ico">{{ item.ico }}</span>
-          <span>{{ item.label }}</span>
-        </router-link>
-
-        <div class="side-group">管理</div>
-        <router-link to="/admin/dashboard">
-          <span class="side-ico">⚙</span>
-          <span>交易后台</span>
-        </router-link>
-
-        <div class="side-foot">
-          <div v-if="cfg">v{{ cfg.version }} · {{ cfg.mode === 'live' ? '实盘' : '模拟盘' }}</div>
-          <div style="margin-top: 4px">数据仅供研究，不构成投资建议</div>
-        </div>
-      </aside>
 
       <main class="site-main">
         <div v-if="error" class="note error">

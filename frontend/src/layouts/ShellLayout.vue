@@ -6,6 +6,8 @@ import { useAuthStore } from '../stores/auth'
 import { wsUrl, getToken } from '../api/client'
 import { fmt, timeStr } from '../utils/format'
 import { useSilentRefresh } from '../composables/silentRefresh'
+import CommandPalette from '../components/CommandPalette.vue'
+import type { CommandItem } from '../components/commandPalette'
 
 const app = useAppStore()
 const auth = useAuthStore()
@@ -42,6 +44,27 @@ const title = computed(() => (route.meta.title as string) || 'NanoQuant')
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
+
+const commands: CommandItem[] = nav.flatMap((group) =>
+  group.items.map((item) => ({ label: item.label, path: item.path, ico: item.ico })),
+)
+const paletteOpen = ref(false)
+
+function openPalette() {
+  paletteOpen.value = true
+}
+
+function onCommandSelect(path: string) {
+  paletteOpen.value = false
+  router.push(path)
+}
+
+function onGlobalKey(event: KeyboardEvent) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+    event.preventDefault()
+    paletteOpen.value = !paletteOpen.value
+  }
+}
 
 /** 移动端抽屉：切换路由后自动收起，避免遮挡内容 */
 const navOpen = ref(false)
@@ -112,6 +135,7 @@ function logout() {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKey)
   await auth.check()
   if (!Object.keys(app.settings).length) {
     app.loadSettings().catch(() => undefined)
@@ -121,6 +145,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKey)
   window.clearTimeout(wsRetry)
   ws?.close()
   document.body.style.overflow = ''
@@ -178,6 +203,9 @@ onBeforeUnmount(() => {
           <div class="page-sub">小资金 · 币安 U 本位永续 · 超短线</div>
         </div>
         <div class="topbar-right">
+          <button class="command-trigger hide-sm" type="button" @click="openPalette">
+            搜索 / 命令 <kbd>⌘K</kbd>
+          </button>
           <span class="tag" :class="status?.mode === 'live' ? 'tag-short' : 'tag-long'">
             {{ status?.mode === 'live' ? 'LIVE 实盘' : 'DEMO 模拟盘' }}
           </span>
@@ -212,5 +240,11 @@ onBeforeUnmount(() => {
         </footer>
       </main>
     </div>
+    <CommandPalette
+      :open="paletteOpen"
+      :items="commands"
+      @close="paletteOpen = false"
+      @select="onCommandSelect"
+    />
   </div>
 </template>

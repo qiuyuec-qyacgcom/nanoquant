@@ -82,22 +82,22 @@ const equityOption = computed(() => {
     grid: { left: 54, right: 18, top: 22, bottom: 28 },
     tooltip: {
       trigger: 'axis',
-      backgroundColor: '#0b0d11',
-      borderColor: 'rgba(240,185,11,.28)',
-      textStyle: { color: '#f3f0e8', fontSize: 11 },
+      backgroundColor: '#0a111c',
+      borderColor: 'rgba(77,163,255,.28)',
+      textStyle: { color: '#e8f0fb', fontSize: 11 },
       valueFormatter: (v: number) => `${Number(v).toFixed(4)}`,
     },
     xAxis: {
       type: 'category',
       data: points.map((p) => timeStr(p.ts, false)),
-      axisLine: { lineStyle: { color: 'rgba(255,255,255,.08)' } },
-      axisLabel: { color: '#8d9099', fontSize: 10, interval: Math.ceil(points.length / 8) },
+      axisLine: { lineStyle: { color: 'rgba(104,160,255,.16)' } },
+      axisLabel: { color: '#8193ad', fontSize: 10, interval: Math.ceil(points.length / 8) },
     },
     yAxis: {
       type: 'value',
       scale: true,
-      splitLine: { lineStyle: { color: 'rgba(255,255,255,.06)' } },
-      axisLabel: { color: '#8d9099', fontSize: 10, formatter: (v: number) => v.toFixed(3) },
+      splitLine: { lineStyle: { color: 'rgba(104,160,255,.09)' } },
+      axisLabel: { color: '#8193ad', fontSize: 10, formatter: (v: number) => v.toFixed(3) },
     },
     series: [
       {
@@ -106,14 +106,14 @@ const equityOption = computed(() => {
         smooth: true,
         showSymbol: false,
         data: points.map((p) => Number((p.wallet + p.unrealized).toFixed(6))),
-        lineStyle: { width: 1.8, color: '#f0b90b' },
-        itemStyle: { color: '#f0b90b' },
+        lineStyle: { width: 1.8, color: '#4da3ff' },
+        itemStyle: { color: '#4da3ff' },
         areaStyle: {
           color: {
             type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
             colorStops: [
-              { offset: 0, color: 'rgba(240,185,11,0.24)' },
-              { offset: 1, color: 'rgba(240,185,11,0.015)' },
+              { offset: 0, color: 'rgba(77,163,255,0.24)' },
+              { offset: 1, color: 'rgba(77,163,255,0.015)' },
             ],
           },
         },

@@ -98,7 +98,7 @@ async function submit() {
   min-height: 100vh;
   display: grid;
   grid-template-columns: 57% 43%;
-  background: #07080a;
+  background: #05080d;
   color: var(--text);
   overflow: hidden;
 }
@@ -107,9 +107,9 @@ async function submit() {
   position: relative;
   padding: 46px 54px;
   background:
-    radial-gradient(circle at 78% 20%, rgba(240, 185, 11, 0.2), transparent 32%),
-    radial-gradient(circle at 20% 80%, rgba(240, 185, 11, 0.06), transparent 35%),
-    #08090b;
+    radial-gradient(circle at 78% 20%, rgba(77, 163, 255, 0.22), transparent 32%),
+    radial-gradient(circle at 20% 80%, rgba(77, 163, 255, 0.07), transparent 35%),
+    #060b14;
   overflow: hidden;
 }
 
@@ -117,9 +117,9 @@ async function submit() {
   content: '';
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgba(240, 185, 11, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(240, 185, 11, 0.045) 1px, transparent 1px);
-  background-size: 52px 52px;
+  background-image: linear-gradient(rgba(77, 163, 255, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(77, 163, 255, 0.055) 1px, transparent 1px);
+  background-size: 48px 48px;
 }
 
 .login-visual::after {
@@ -129,9 +129,9 @@ async function submit() {
   bottom: -280px;
   width: 620px;
   height: 620px;
-  border: 1px solid rgba(240, 185, 11, 0.12);
+  border: 1px solid rgba(77, 163, 255, 0.14);
   border-radius: 50%;
-  box-shadow: 0 0 0 70px rgba(240, 185, 11, 0.025), 0 0 0 140px rgba(240, 185, 11, 0.018);
+  box-shadow: 0 0 0 70px rgba(77, 163, 255, 0.025), 0 0 0 140px rgba(77, 163, 255, 0.018);
 }
 
 .login-brand,
@@ -154,12 +154,13 @@ async function submit() {
 }
 
 .login-brand-name {
-  font-family: var(--serif);
+  font-family: var(--sans);
   font-size: 18px;
+  font-weight: 600;
 }
 
 .login-brand-sub {
-  color: #7e8189;
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 8px;
   letter-spacing: 0.15em;
@@ -180,23 +181,23 @@ async function submit() {
 
 .login-quote h1 {
   margin: 17px 0 0;
-  font-family: var(--serif);
-  font-size: 48px;
-  line-height: 1.08;
-  font-weight: 400;
-  letter-spacing: -0.045em;
+  font-family: var(--sans);
+  font-size: 52px;
+  line-height: 1.04;
+  font-weight: 600;
+  letter-spacing: -0.055em;
 }
 
 .login-quote h1 em {
   color: var(--accent);
-  font-style: italic;
+  font-style: normal;
 }
 
 .login-quote p {
-  max-width: 440px;
+  max-width: 460px;
   margin: 19px 0 0;
-  color: #8f929a;
-  font-size: 11px;
+  color: var(--muted);
+  font-size: 11.5px;
   line-height: 1.9;
 }
 
@@ -206,13 +207,13 @@ async function submit() {
   right: 54px;
   bottom: 46px;
   display: flex;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 1px solid var(--line);
 }
 
 .login-stats > div {
   flex: 1;
   padding: 14px 0 0 18px;
-  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  border-left: 1px solid var(--line);
 }
 
 .login-stats > div:first-child {
@@ -225,12 +226,13 @@ async function submit() {
   font-family: var(--mono);
   font-size: 17px;
   font-weight: 500;
+  color: var(--text);
 }
 
 .login-stats span {
   display: block;
   margin-top: 5px;
-  color: #656870;
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 8px;
   letter-spacing: 0.12em;
@@ -243,8 +245,8 @@ async function submit() {
   align-items: center;
   justify-content: center;
   padding: 60px 80px;
-  background: #f1ede4;
-  color: #151619;
+  background: #07101b;
+  color: var(--text);
 }
 
 .login-panel::before {
@@ -265,21 +267,21 @@ async function submit() {
 }
 
 .login-form .eyebrow {
-  color: #9a7a1d;
+  color: var(--accent);
   font-size: 10px;
   letter-spacing: 0.18em;
 }
 
 .login-form h2 {
   margin: 13px 0 0;
-  font-family: var(--serif);
+  font-family: var(--sans);
   font-size: 34px;
-  font-weight: 400;
-  letter-spacing: -0.04em;
+  font-weight: 600;
+  letter-spacing: -0.045em;
 }
 
 .login-lead {
-  color: #7c7870;
+  color: var(--muted);
   font-size: 11px;
   margin: 8px 0 0;
 }
@@ -291,33 +293,37 @@ async function submit() {
 }
 
 .login-label {
-  color: #4f4c47;
-  font-size: 10px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
   margin-top: 8px;
+  text-transform: uppercase;
 }
 
 .login-input {
   width: 100%;
   height: 42px;
   padding: 0 13px;
-  border: 1px solid rgba(17, 17, 17, 0.16);
+  border: 1px solid var(--line);
   border-radius: 2px;
-  background: rgba(255, 255, 255, 0.35);
-  color: #17181b;
+  background: #08111d;
+  color: var(--text);
   font-size: 11px;
   outline: none;
 }
 
 .login-input:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.12);
 }
 
 .login-error {
   margin-top: 10px;
   padding: 8px 10px;
-  border: 1px solid rgba(214, 69, 69, 0.28);
-  background: rgba(214, 69, 69, 0.06);
-  color: #a32929;
+  border: 1px solid rgba(255, 95, 126, 0.28);
+  background: rgba(255, 95, 126, 0.06);
+  color: var(--down);
   font-size: 11px;
 }
 
@@ -327,15 +333,16 @@ async function submit() {
   margin-top: 10px;
   border: 0;
   border-radius: 2px;
-  background: #111;
-  color: #f6f1e5;
-  font-size: 12px;
-  font-weight: 600;
+  background: var(--accent);
+  color: #04101f;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
   letter-spacing: 0.02em;
 }
 
 .login-submit span {
-  color: var(--accent);
+  color: #04101f;
   margin-left: 8px;
 }
 
@@ -344,7 +351,7 @@ async function submit() {
 }
 
 .login-hint {
-  color: #8e897f;
+  color: var(--muted);
   font-size: 9px;
   line-height: 1.7;
   margin-top: 14px;
@@ -356,8 +363,8 @@ async function submit() {
   gap: 8px;
   margin-top: 22px;
   padding-top: 14px;
-  border-top: 1px solid rgba(17, 17, 17, 0.1);
-  color: #8c867c;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 8px;
   letter-spacing: 0.04em;
@@ -368,20 +375,21 @@ async function submit() {
   height: 5px;
   border-radius: 50%;
   background: var(--up);
+  box-shadow: 0 0 8px var(--up);
 }
 
 .login-links {
   display: flex;
   justify-content: space-between;
   margin-top: 42px;
-  color: #9b958a;
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 8px;
   letter-spacing: 0.05em;
 }
 
 .login-links a {
-  color: #7c5a00;
+  color: var(--accent-2);
 }
 
 @media (max-width: 900px) {
@@ -400,7 +408,7 @@ async function submit() {
   }
 
   .login-quote h1 {
-    font-size: 34px;
+    font-size: 36px;
   }
 
   .login-quote p {
