@@ -21,6 +21,7 @@ mod ai_analysis;
 mod ai_client;
 mod ai_market;
 mod ai_providers;
+mod ai_review;
 mod app_state;
 mod archive;
 mod auth;

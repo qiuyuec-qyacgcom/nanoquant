@@ -99,7 +99,7 @@ fn add_with_contracts(
     let raw = contracts
         .iter()
         .find(|row| row["symbol"].as_str() == Some(symbol));
-    let is_custom = raw.is_none() && symbol.chars().any(|c| !c.is_ascii());
+    let is_custom = raw.is_none() && !symbol.is_ascii();
     let row = match raw {
         Some(raw) => {
             if !valid_contract(raw, symbol) {
@@ -275,8 +275,7 @@ fn custom_pool_row(symbol: &str, leverage_cap: i64) -> Value {
 
 fn plausible_symbol(symbol: &str) -> bool {
     let length = symbol.chars().count();
-    length >= 6
-        && length <= 32
+    (6..=32).contains(&length)
         && symbol
             .strip_suffix("USDT")
             .is_some_and(|body| !body.is_empty() && body.chars().any(|c| c.is_alphabetic()))
@@ -462,7 +461,8 @@ async fn patch_symbol(
     if patch.enabled == Some(true) && tier == "custom" {
         return Err((
             StatusCode::BAD_REQUEST,
-            json!({ "detail": "自定义标的没有币安行情，不能启用交易；请添加对应的 ASCII 合约名" }).into(),
+            json!({ "detail": "自定义标的没有币安行情，不能启用交易；请添加对应的 ASCII 合约名" })
+                .into(),
         ));
     }
     if let Some(enabled) = patch.enabled {
@@ -888,7 +888,8 @@ mod tests {
         let path = std::env::temp_dir().join("nq-symbols-chinese-contract.db");
         let db = seed(&path);
         let contracts = vec![contract("牛来USDT", "PERPETUAL", "TRADING", "USDT")];
-        let added = add_with_contracts(&db, &contracts, "牛来USDT").expect("真实中文合约应正常加入");
+        let added =
+            add_with_contracts(&db, &contracts, "牛来USDT").expect("真实中文合约应正常加入");
         assert_eq!(added["added"]["symbol"], "牛来USDT");
         assert_eq!(added["added"]["custom"], false);
         assert_eq!(added["added"]["enabled"], true);
@@ -917,9 +918,7 @@ mod tests {
             row["symbol"] == "牛来USDT" && row["tier"] == "custom" && row["enabled"] == false
         }));
         assert!(rows.iter().any(|row| {
-            row["symbol"] == "币安人生USDT"
-                && row["tier"] == "custom"
-                && row["enabled"] == false
+            row["symbol"] == "币安人生USDT" && row["tier"] == "custom" && row["enabled"] == false
         }));
         let _ = std::fs::remove_file(&path);
     }

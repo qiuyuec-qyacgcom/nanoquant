@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -161,7 +159,7 @@ pub struct BinanceProvider {
     api_key: String,
     secret: String,
     timeframe: String,
-    previous_oi: Arc<Mutex<HashMap<String, f64>>>,
+
     /// demo 无凭证时，账户/持仓/订单从这里读本地账本。
     public_book: Option<crate::db::Db>,
 }
@@ -202,7 +200,7 @@ impl BinanceProvider {
             api_key,
             secret,
             timeframe: "4h".into(),
-            previous_oi: Arc::new(Mutex::new(HashMap::new())),
+
             public_book: None,
         })
     }
@@ -230,7 +228,7 @@ impl BinanceProvider {
             api_key: String::new(),
             secret: String::new(),
             timeframe: "4h".into(),
-            previous_oi: Arc::new(Mutex::new(HashMap::new())),
+
             public_book: Some(db),
         })
     }
@@ -447,25 +445,22 @@ impl SnapshotProvider for BinanceProvider {
                 let spread_bps = ((ask - bid) / mid * 10_000.0).max(0.0);
                 let open_interest_json = self
                     .get_json(
-                        "/fapi/v1/openInterest",
-                        &[("symbol".into(), symbol.clone())],
+                        "/futures/data/openInterestHist",
+                        &[
+                            ("symbol".into(), symbol.clone()),
+                            ("period".into(), self.timeframe.clone()),
+                            ("limit".into(), "2".into()),
+                        ],
                         false,
                     )
                     .await?;
-                let open_interest = number(&open_interest_json, "openInterest")?;
-                if !open_interest.is_finite() || open_interest < 0.0 {
-                    return Err(ProviderError::InvalidData(format!("{symbol} 持仓量无效")));
-                }
-                let open_interest_change_pct = {
-                    let mut previous = self
-                        .previous_oi
-                        .lock()
-                        .map_err(|_| ProviderError::Unavailable("持仓量缓存锁不可用".into()))?;
-                    match previous.insert(symbol.clone(), open_interest) {
-                        Some(old) if old > 0.0 => (open_interest - old) / old * 100.0,
-                        _ => 0.0,
-                    }
-                };
+                let rows = open_interest_json.as_array().ok_or_else(|| {
+                    ProviderError::InvalidData(format!("{symbol} 持仓量历史无效"))
+                })?;
+                let (open_interest, open_interest_change_pct) = parse_open_interest_history(rows)
+                    .ok_or_else(|| {
+                    ProviderError::InvalidData(format!("{symbol} 持仓量历史不足"))
+                })?;
                 let klines = self
                     .get_json(
                         "/fapi/v1/klines",
@@ -654,6 +649,21 @@ fn number(value: &Value, key: &str) -> Result<f64, ProviderError> {
         .ok_or_else(|| ProviderError::InvalidData(format!("账户字段 {key} 无效")))
 }
 
+fn parse_open_interest_history(rows: &[Value]) -> Option<(f64, f64)> {
+    let values: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| {
+            row.get("sumOpenInterest")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+        })
+        .collect();
+    let last = *values.last()?;
+    let previous = *values.get(values.len().checked_sub(2)?)?;
+    Some((last, (last - previous) / previous * 100.0))
+}
+
 fn parse_open_order(value: &Value) -> Result<OpenOrderSnapshot, ProviderError> {
     let text = |key: &str| {
         value[key]
@@ -796,8 +806,11 @@ mod tests {
             .route("/fapi/v1/ticker/bookTicker", axum::routing::get(|| async {
                 axum::Json(serde_json::json!({"symbol":"BTCUSDT","bidPrice":"99","askPrice":"101"}))
             }))
-            .route("/fapi/v1/openInterest", axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"symbol":"BTCUSDT","openInterest":"1000"}))
+            .route("/futures/data/openInterestHist", axum::routing::get(|| async {
+                axum::Json(serde_json::json!([
+                    {"sumOpenInterest":"1000"},
+                    {"sumOpenInterest":"1100"}
+                ]))
             }))
             .route("/fapi/v1/ticker/24hr", axum::routing::get(|| async {
                 axum::Json(serde_json::json!({"symbol":"BTCUSDT","quoteVolume":"5000000"}))
@@ -878,6 +891,20 @@ mod tests {
                     Json(json!({"symbol":symbol,"openInterest":"1000"}))
                 }),
             )
+            .route(
+                "/futures/data/openInterestHist",
+                get(|uri: Uri| async move {
+                    assert!(
+                        uri.query().unwrap().contains("period=15m"),
+                        "OI 历史周期必须与 K 线周期一致"
+                    );
+                    assert!(uri.query().unwrap().contains("limit=2"));
+                    Json(json!([
+                        {"sumOpenInterest":"1000"},
+                        {"sumOpenInterest":"1100"}
+                    ]))
+                }),
+            )
             .route("/fapi/v1/klines", get(|headers: HeaderMap, uri: Uri| async move {
                 assert!(!headers.contains_key("X-MBX-APIKEY"));
                 assert!(matches!(uri.query(), Some("symbol=BTCUSDT&interval=15m&limit=250" | "symbol=ETHUSDT&interval=15m&limit=250")));
@@ -931,6 +958,10 @@ mod tests {
         assert_eq!(market["quote_volume"], 5_000_000.0);
         assert_eq!(market["candles"].as_array().unwrap().len(), 1);
         assert_eq!(market["candles"][0]["close"], 105.0);
+        assert_eq!(
+            snapshot.markets[0].open_interest_change_pct, 10.0,
+            "新建 provider 也必须从 OI 历史算出变化，不能依赖进程内上一轮缓存"
+        );
         assert_eq!(
             snapshot
                 .markets

@@ -106,7 +106,14 @@ pub(crate) fn evaluate(
             0.0
         };
         let oi_factor = if features.open_interest_change_pct.is_finite() {
-            (features.open_interest_change_pct / 5.0).clamp(-1.0, 1.0)
+            let price_direction = if last > closes[closes.len() - 2] {
+                1.0
+            } else if last < closes[closes.len() - 2] {
+                -1.0
+            } else {
+                0.0
+            };
+            price_direction * (features.open_interest_change_pct / 5.0).clamp(-1.0, 1.0)
         } else {
             0.0
         };
@@ -303,6 +310,35 @@ mod tests {
             MarketFeatures::default()
         )
         .is_none());
+    }
+
+    #[test]
+    fn falling_price_with_rising_oi_confirms_short() {
+        let values: Vec<f64> = (0..50).map(|i| 100.0 - i as f64 * 0.25).collect();
+        let policy = TradePolicy {
+            weight_trend: 0.0,
+            weight_momentum: 0.0,
+            weight_volume: 0.0,
+            weight_funding: 0.0,
+            weight_oi: 1.0,
+            rsi_long_min: 0.0,
+            rsi_long_max: 100.0,
+            rsi_short_min: 0.0,
+            rsi_short_max: 100.0,
+            ..cfg()
+        };
+        let signal = evaluate(
+            &candles(&values),
+            *values.last().unwrap(),
+            1.0,
+            policy,
+            MarketFeatures {
+                funding_rate: 0.0,
+                open_interest_change_pct: 10.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(signal.side, "short", "价跌 + OI 增是空头确认，不是做多信号");
     }
 
     #[test]

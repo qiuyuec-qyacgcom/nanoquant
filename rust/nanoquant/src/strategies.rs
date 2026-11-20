@@ -353,6 +353,41 @@ fn pick<'a>(symbol: &str, profiles: &'a [Profile]) -> Option<&'a Profile> {
     })
 }
 
+pub(crate) fn profile_for(conn: &rusqlite::Connection, symbol: &str) -> Option<Value> {
+    let active: Vec<Profile> = load(conn).into_iter().filter(|row| row.enabled).collect();
+    pick(symbol, &active).map(serialize)
+}
+
+pub(crate) fn compact(profile: &Value) -> Value {
+    let side = match profile
+        .get("filters")
+        .and_then(|filters| filters.get("side"))
+        .and_then(Value::as_str)
+    {
+        Some("long") => "L",
+        Some("short") => "S",
+        _ => "",
+    };
+    json!({
+        "n": profile.get("name").and_then(Value::as_str).unwrap_or(""),
+        "r": profile.get("rule").and_then(Value::as_str).unwrap_or(""),
+        "s": side,
+    })
+}
+
+pub(crate) fn mark_applied(conn: &rusqlite::Connection, profile: &Value) {
+    let name = profile.get("name").and_then(Value::as_str).unwrap_or("");
+    if name.is_empty() {
+        return;
+    }
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) VALUES('strategy_applied',?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (name, crate::now()),
+    )
+    .ok();
+}
+
 fn engine_value(conn: &rusqlite::Connection, key: &str) -> String {
     conn.query_row(
         "SELECT value FROM engine_state WHERE key = ?1",

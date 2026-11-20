@@ -42,6 +42,38 @@ struct EntryTerms {
     score: f64,
 }
 
+struct EntryDraft {
+    symbol: String,
+    side: String,
+    leverage: f64,
+    stop_price: f64,
+    take_profit: f64,
+    score: f64,
+    mark_price: f64,
+    filter: crate::live::SymbolFilter,
+    scale: f64,
+    features_text: String,
+    journal_snapshot: Value,
+    client_id: String,
+}
+
+impl EntryDraft {
+    fn proposal(&self) -> crate::review::EntryProposal {
+        crate::review::EntryProposal {
+            symbol: self.symbol.clone(),
+            side: self.side.clone(),
+            leverage: self.leverage,
+            stop_price: self.stop_price,
+            mark_price: self.mark_price,
+        }
+    }
+}
+
+struct ReviewedDraft {
+    draft: EntryDraft,
+    result: Result<crate::review::ReviewedEntry, String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveCreds {
     base: String,
@@ -1120,10 +1152,15 @@ impl EngineRuntime {
         master_key: Vec<u8>,
         events: crate::events::EventBus,
     ) -> Self {
-        let ai = Some(crate::ai_providers::AiState::new(
-            db.clone(),
-            master_key.clone(),
-        ));
+        let ai = Some(
+            crate::ai_providers::AiState::new(db.clone(), master_key.clone()).with_market(
+                Arc::new(crate::ai_market::BinanceMarketSource::new(db.clone())),
+            ),
+        );
+        let reviewer = ai.as_ref().map(|state| {
+            Arc::new(crate::ai_review::EngineAiReviewer::new(state.clone()))
+                as Arc<dyn crate::review::AiReviewer>
+        });
         Self {
             db,
             _lock: lock,
@@ -1132,7 +1169,7 @@ impl EngineRuntime {
             cycle_signal: None,
             cycle_busy: Arc::new(AtomicBool::new(false)),
             runtime_active: Arc::new(AtomicBool::new(false)),
-            reviewer: None,
+            reviewer,
             ai,
             reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
@@ -1140,6 +1177,9 @@ impl EngineRuntime {
 
     /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP。
     pub(crate) fn with_ai(mut self, ai: crate::ai_providers::AiState) -> Self {
+        self.reviewer = Some(Arc::new(crate::ai_review::EngineAiReviewer::new(
+            ai.clone(),
+        )));
         self.ai = Some(ai);
         self
     }
@@ -1383,10 +1423,9 @@ impl EngineRuntime {
                 &crate::now().to_string(),
             )?;
         }
-        let mut executed = executed;
-        let mut entries = Vec::new();
-        if engine_is_enabled && !report.scanned.is_empty() {
-            executed.extend(Self::process_entries(
+        let ai_review_required = strategy["ai_review_enabled"].as_bool().unwrap_or(false);
+        let drafts = if engine_is_enabled && !report.scanned.is_empty() {
+            Self::collect_entries(
                 &tx,
                 mode,
                 &config,
@@ -1395,21 +1434,12 @@ impl EngineRuntime {
                 &metrics,
                 &report.scanned,
                 &order_differences,
-                &mut entries,
-                self.reviewer.as_deref(),
-                strategy["ai_review_enabled"].as_bool().unwrap_or(false),
-            )?);
-        }
-        preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
-        preview_value["executed"] = serde_json::json!(executed);
-        preview_value["venue_closed"] = serde_json::json!(venue_closed);
-        upsert_state(
-            &tx,
-            &format!("cycle_preview.{mode}"),
-            &serde_json::to_string(&preview_value).map_err(|e| e.to_string())?,
-        )?;
+            )?
+        } else {
+            Vec::new()
+        };
         // 实盘订单要离线发送：这里只给出计划，网络请求留给调用方在事务外做。
-        let plans = if mode == "live" && engine_is_enabled {
+        let mut plans = if mode == "live" && engine_is_enabled {
             // 上一轮没拿到结论的平仓单还挂着：再发一张就是重复平仓。
             let inflight: std::collections::BTreeSet<String> = {
                 let mut stmt = tx
@@ -1425,17 +1455,41 @@ impl EngineRuntime {
                 rows.collect::<Result<_, _>>()
                     .map_err(|error| error.to_string())?
             };
-            let mut plans = Self::live_plans(&symbols, &positions, &report, &inflight);
-            plans.extend(entries);
-            plans
+            Self::live_plans(&symbols, &positions, &report, &inflight)
         } else {
             Vec::new()
         };
         tx.commit().map_err(|error| error.to_string())?;
+        drop(conn);
+        let reviewed = Self::review_drafts(self.reviewer.as_deref(), drafts, ai_review_required);
+        let mut executed = executed;
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        plans.extend(Self::apply_entries(
+            &tx,
+            mode,
+            &config,
+            snapshot,
+            reviewed,
+            &mut executed,
+        )?);
+        preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
+        preview_value["executed"] = serde_json::json!(executed);
+        preview_value["venue_closed"] = serde_json::json!(venue_closed);
+        upsert_state(
+            &tx,
+            &format!("cycle_preview.{mode}"),
+            &serde_json::to_string(&preview_value).map_err(|e| e.to_string())?,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        drop(conn);
         // 事务提交后再推事件：没落库的账不能出现在前端。
         self.publish_cycle_events(mode, snapshot, &executed, &order_differences);
         self.spawn_reviews(&review_ids);
-        drop(conn);
         self.maybe_label_journal(mode, snapshot);
         Ok(plans)
     }
@@ -2027,6 +2081,7 @@ impl EngineRuntime {
         reviewer: Option<&dyn crate::review::AiReviewer>,
         ai_review_required: bool,
     ) -> Result<Vec<Value>, String> {
+        let reviewer = ai_review_required.then_some(reviewer).flatten();
         if mode == "live" {
             let pending: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='live' AND purpose='entry' AND status NOT IN ('FILLED','REJECTED','CANCELED','EXPIRED'))",
@@ -2269,6 +2324,325 @@ impl EngineRuntime {
             executed.push(serde_json::json!({"symbol": symbol, "side": side, "qty": qty, "price": price, "reason": "entry", "client_order_id": client_id}));
         }
         Ok(executed)
+    }
+
+    fn collect_entries(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        engine: &Value,
+        strategy: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+        scanned: &[String],
+        differences: &Value,
+    ) -> Result<Vec<EntryDraft>, String> {
+        if mode == "live" {
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='live' AND purpose='entry' AND status NOT IN ('FILLED','REJECTED','CANCELED','EXPIRED'))",
+                [], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if pending
+                || ["local_only", "venue_only", "quantity_mismatches"]
+                    .iter()
+                    .any(|key| {
+                        differences[*key]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty())
+                    })
+            {
+                return Ok(Vec::new());
+            }
+            for position in &snapshot.positions {
+                let matched: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM positions WHERE mode='live' AND status='open' AND symbol=?1 AND side=?2 AND abs(qty-?3)<1e-9)",
+                    (&position.symbol, &position.side, position.qty), |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                if !matched {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        let cfg = Self::risk_settings(tx)?;
+        let policy =
+            Self::trade_policy(strategy, &cfg, strategy["mode"].as_str().unwrap_or("trend"));
+        let filters = crate::live::load_filters(tx, scanned);
+        let now = crate::now();
+        let mut drafts = Vec::new();
+        for symbol in scanned {
+            let Some(filter) = filters.get(symbol) else {
+                continue;
+            };
+            if ["local_only", "venue_only"].iter().any(|key| {
+                differences[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|order| order["symbol"].as_str() == Some(symbol))
+            }) {
+                continue;
+            }
+            let Some(market) = snapshot
+                .markets
+                .iter()
+                .find(|market| market.symbol == *symbol)
+            else {
+                continue;
+            };
+            let Some(metric) = metrics.get(symbol.as_str()) else {
+                continue;
+            };
+            let price = market.mark_price;
+            let Some(signal) = crate::trade_policy::evaluate(
+                &market.candles,
+                price,
+                metric.atr,
+                policy,
+                crate::trade_policy::MarketFeatures {
+                    funding_rate: market.funding_rate,
+                    open_interest_change_pct: market.open_interest_change_pct,
+                },
+            ) else {
+                continue;
+            };
+            let Some(exchange_max): Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT max_leverage FROM trading_symbols WHERE symbol=?1 AND enabled!=0",
+                    [symbol],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            let mut upper = cfg["max_leverage"]
+                .as_i64()
+                .unwrap_or(100)
+                .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
+                .clamp(1, 100);
+            if let Some(limit) = strategy["leverage_max"].as_i64().filter(|v| *v > 0) {
+                upper = upper.min(limit);
+            }
+            let leverage = strategy["leverage_min"]
+                .as_i64()
+                .filter(|v| *v > 0)
+                .unwrap_or_else(|| cfg["default_leverage"].as_i64().unwrap_or(20))
+                .clamp(1, upper) as f64;
+            let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
+            let scale = if target > 0.0 && metric.atr_pct > 0.0 {
+                (target / metric.atr_pct).clamp(0.25, 2.0)
+            } else {
+                1.0
+            };
+            let journal_snapshot = serde_json::json!({
+                "atr_pct": metric.atr_pct,
+                "funding": market.funding_rate,
+            });
+            let evolution = crate::evolution_api::evolution_cfg(tx);
+            let (_mantra_text, injected_mantra_ids) =
+                crate::evolution_api::injection_payload(tx, &evolution);
+            let injected_experience_ids =
+                crate::journal::inject_ids(tx, symbol, &journal_snapshot, signal.side);
+            let features_text = serde_json::to_string(&serde_json::json!({
+                "injected_mantra_ids": injected_mantra_ids,
+                "injected_experience_ids": injected_experience_ids,
+                "journal_snapshot": journal_snapshot,
+            }))
+            .unwrap_or_else(|_| "{}".to_string());
+            let client_id = format!(
+                "demo-entry-{}-{symbol}",
+                market.candles.last().map_or(0, |c| c.close_time)
+            );
+            let (precheck_qty, _) = crate::risk::estimate_qty(
+                snapshot.account.equity,
+                price,
+                leverage,
+                &crate::risk::SizeParams {
+                    risk_per_trade_pct: cfg["risk_per_trade_pct"].as_f64().unwrap_or(10.0),
+                    margin_pct: cfg["margin_pct"].as_f64().unwrap_or(50.0),
+                    min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
+                },
+                (price - signal.stop_price).abs() / price,
+                filter,
+                scale,
+                Some(snapshot.account.available_balance),
+            );
+            if precheck_qty <= 0.0
+                || !Self::entry_allowed(
+                    tx,
+                    mode,
+                    engine,
+                    &cfg,
+                    snapshot,
+                    symbol,
+                    signal.side,
+                    precheck_qty * price,
+                    now,
+                )?
+            {
+                continue;
+            }
+            drafts.push(EntryDraft {
+                symbol: symbol.clone(),
+                side: signal.side.to_string(),
+                leverage,
+                stop_price: signal.stop_price,
+                take_profit: signal.take_profit,
+                score: signal.score,
+                mark_price: price,
+                filter: *filter,
+                scale,
+                features_text,
+                journal_snapshot,
+                client_id,
+            });
+        }
+        Ok(drafts)
+    }
+
+    fn review_drafts(
+        reviewer: Option<&dyn crate::review::AiReviewer>,
+        drafts: Vec<EntryDraft>,
+        required: bool,
+    ) -> Vec<ReviewedDraft> {
+        drafts
+            .into_iter()
+            .map(|draft| {
+                let proposal = draft.proposal();
+                let result = if required {
+                    crate::review::apply_review(&proposal, reviewer, true)
+                } else {
+                    crate::review::apply_review(&proposal, None, false)
+                };
+                ReviewedDraft { draft, result }
+            })
+            .collect()
+    }
+
+    fn apply_entries(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        engine: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        reviewed: Vec<ReviewedDraft>,
+        executed: &mut Vec<Value>,
+    ) -> Result<Vec<LivePlan>, String> {
+        let cfg = Self::risk_settings(tx)?;
+        let mut plans = Vec::new();
+        let mut available = snapshot.account.available_balance;
+        let now = crate::now();
+        for ReviewedDraft { draft, result } in reviewed {
+            let reviewed = match result {
+                Ok(reviewed) => reviewed,
+                Err(reason) => {
+                    let _ = tx.execute(
+                        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','ai',?2,?3)",
+                        (
+                            now,
+                            "AI 复核跳过开仓",
+                            serde_json::json!({"symbol": draft.symbol, "reason": reason}).to_string(),
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let leverage = reviewed.leverage;
+            let stop_price = reviewed.stop_price;
+            let (qty, _) = crate::risk::estimate_qty(
+                snapshot.account.equity,
+                draft.mark_price,
+                leverage,
+                &crate::risk::SizeParams {
+                    risk_per_trade_pct: cfg["risk_per_trade_pct"].as_f64().unwrap_or(10.0),
+                    margin_pct: cfg["margin_pct"].as_f64().unwrap_or(50.0),
+                    min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
+                },
+                (draft.mark_price - stop_price).abs() / draft.mark_price,
+                &draft.filter,
+                draft.scale,
+                Some(available),
+            );
+            if qty <= 0.0
+                || !Self::entry_allowed(
+                    tx,
+                    mode,
+                    engine,
+                    &cfg,
+                    snapshot,
+                    &draft.symbol,
+                    &draft.side,
+                    qty * draft.mark_price,
+                    now,
+                )?
+            {
+                continue;
+            }
+            let side = if draft.side == "long" { "BUY" } else { "SELL" };
+            let entry = EntryTerms {
+                leverage,
+                stop: stop_price,
+                take_profit: draft.take_profit,
+                score: draft.score,
+            };
+            if mode == "live" {
+                plans.push(LivePlan {
+                    symbol: draft.symbol.clone(),
+                    position_side: draft.side.clone(),
+                    side: side.into(),
+                    qty,
+                    purpose: "entry".into(),
+                    mark_price: draft.mark_price,
+                    entry: Some(entry),
+                    features: Some(draft.features_text.clone()),
+                });
+                break;
+            }
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='demo' AND client_order_id=?1)",
+                    [&draft.client_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if exists {
+                continue;
+            }
+            let margin = draft.mark_price * qty / leverage;
+            let fee_rate = cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+            tx.execute("INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) VALUES(?1,?2,?3,'MARKET',?4,?5,'FILLED','entry',?6,'',0,'demo',0)", (now, &draft.symbol, side, qty, draft.mark_price, &draft.client_id)).map_err(|e| e.to_string())?;
+            Self::insert_entry_position(
+                tx,
+                mode,
+                &draft.symbol,
+                &draft.side,
+                qty,
+                draft.mark_price,
+                &entry,
+                fee_rate,
+                now,
+                Some(&draft.features_text),
+            )?;
+            let target_pct = if draft.mark_price > 0.0 {
+                let pct = (draft.take_profit - draft.mark_price).abs() / draft.mark_price * 100.0;
+                (pct * 10_000.0).round() / 10_000.0
+            } else {
+                0.0
+            };
+            crate::journal::record_decision(
+                tx,
+                mode,
+                &draft.symbol,
+                &draft.side,
+                draft.score,
+                draft.mark_price,
+                target_pct,
+                "量化信号",
+                &draft.journal_snapshot,
+            );
+            available -= margin + draft.mark_price * qty * fee_rate;
+            executed.push(serde_json::json!({"symbol": draft.symbol, "side": side, "qty": qty, "price": draft.mark_price, "reason": "entry", "client_order_id": draft.client_id}));
+        }
+        Ok(plans)
     }
 
     fn insert_entry_position(
@@ -3645,6 +4019,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wires_production_ai_reviewer() {
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        assert!(
+            runtime.reviewer.is_some(),
+            "生产 runtime 必须注入 AiReviewer，不能保持 None"
+        );
+    }
+
+    #[test]
     fn engine_lock_rejects_second_owner_and_can_be_reacquired() {
         let dir = std::env::temp_dir().join(format!(
             "nanoquant-lock-{}-{}",
@@ -3914,6 +4298,14 @@ mod tests {
     #[tokio::test]
     async fn ai_reject_prevents_entry_and_leaves_no_order() {
         let (db, snapshot) = entry_fixture().await;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,0)",
+                [r#"{"ai_review_enabled":true}"#],
+            )
+            .unwrap();
         let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let orders: i64 = db

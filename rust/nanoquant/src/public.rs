@@ -468,8 +468,7 @@ async fn oi_signal(
         .json::<Vec<Value>>()
         .await
         .map_err(|_| market_unavailable())?;
-    let (open_interest, oi_change_pct) =
-        parse_oi_series(&rows).ok_or_else(market_unavailable)?;
+    let (open_interest, oi_change_pct) = parse_oi_series(&rows).ok_or_else(market_unavailable)?;
     let klines = fetch_klines(live, &symbol, &query.interval, 2, false).await?;
     let price_change_pct = parse_price_change(&klines).unwrap_or(0.0);
     let regime = crate::oi_regime::payload(price_change_pct, oi_change_pct);

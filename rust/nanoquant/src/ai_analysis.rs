@@ -133,7 +133,7 @@ fn interval_of(body_interval: &str) -> String {
     }
 }
 
-fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
+pub(crate) fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
     let candles = &market.candles;
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
     let metrics = candle_metrics(candles, 14);
@@ -180,7 +180,7 @@ fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
     features
 }
 
-fn recent_bars(candles: &[CandleSnapshot], limit: usize) -> Vec<Value> {
+pub(crate) fn recent_bars(candles: &[CandleSnapshot], limit: usize) -> Vec<Value> {
     candles
         .iter()
         .rev()
@@ -280,7 +280,7 @@ fn analyze_messages(symbol: &str, snapshot: &Value) -> Vec<ChatMessage> {
     ]
 }
 
-fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
+pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
     vec![
         ChatMessage::new(
             "system",
@@ -396,6 +396,18 @@ async fn decision_preview(
     if symbol.is_empty() {
         return Err(bad_request("symbol 不能为空"));
     }
+    let strategy_profile = {
+        let conn = state.db.conn.lock().expect("db");
+        let profile = crate::strategies::profile_for(&conn, &symbol);
+        if let Some(profile) = &profile {
+            crate::strategies::mark_applied(&conn, profile);
+        }
+        profile
+    };
+    let strategy_st = strategy_profile
+        .as_ref()
+        .map(crate::strategies::compact)
+        .unwrap_or(Value::Null);
     let strategy = strategy_config(&state);
     let strategy_timeframe = strategy
         .get("timeframe")
@@ -428,6 +440,8 @@ async fn decision_preview(
         "price": market.mark_price,
         "score": round4(ema_gap / 0.22),
         "side_hint": if fast > slow { "long" } else { "short" },
+        "strategy": strategy_profile,
+        "st": strategy_st,
         "quant_reasons": ["ema_gap_pct", "rsi", "vol_ratio", "funding", "oi_change_pct", "oi_regime", "atr_pct"],
         "features": features,
         "oi_regime": features["oi_regime"].clone(),
@@ -448,6 +462,7 @@ async fn decision_preview(
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_confidence": cfg.min_confidence,
         },
+
         "news": if body.include_news { news_digest(&state, 6) } else { Vec::new() },
         "mantras": top_mantras(&state, 5),
     });
@@ -459,7 +474,7 @@ async fn decision_preview(
             .collect::<Vec<_>>()
             .join(""),
     );
-    let prompt_preview: String = messages[1].content.chars().take(1200).collect();
+    let prompt_preview: String = messages[1].content.chars().take(4000).collect();
 
     if chain.is_empty() {
         return Ok(fail_closed(
@@ -702,10 +717,13 @@ mod tests {
              extra TEXT, created_at INTEGER, updated_at INTEGER); \
              CREATE TABLE news_items(id INTEGER PRIMARY KEY, ts INTEGER, source TEXT, title TEXT, url TEXT, \
              summary TEXT, sentiment REAL, symbols TEXT, dedupe TEXT, raw TEXT); \
-             CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, \
-             source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, \
-             enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, \
-             created_at INTEGER, updated_at INTEGER, expires_at INTEGER); \
+CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, \
+              source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, \
+              enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, \
+              created_at INTEGER, updated_at INTEGER, expires_at INTEGER); \
+             CREATE TABLE strategy_profiles(id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, rule TEXT, \
+              enabled INTEGER, priority INTEGER, filters TEXT, created_at INTEGER, updated_at INTEGER); \
+             INSERT INTO strategy_profiles VALUES(1,'突破追多','','放量突破后等回踩再进',1,10,'{{\"symbols\":[\"BTCUSDT\"],\"side\":\"long\"}}',1,1); \
              INSERT INTO app_settings VALUES('ai','{{\"enabled\":true,\"mode\":\"single\",\"provider_id\":1,\"fallback_provider_ids\":[],\"min_confidence\":0.45,\"max_calls_per_hour\":30,\"monthly_budget_usd\":3,\"temperature\":0.2,\"timeout_sec\":5,\"decision_schema_version\":2}}',0); \
              INSERT INTO app_settings VALUES('risk','{{\"max_leverage\":20}}',0); \
              INSERT INTO app_settings VALUES('strategy','{{\"timeframe\":\"15m\"}}',0); \
@@ -837,6 +855,17 @@ mod tests {
         assert_eq!(body["schema_version"], 2);
         assert!(body["reason"].as_str().unwrap().contains("趋势结构"));
         assert_eq!(body["votes"][0]["persona"], "single");
+        assert!(
+            body["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("突破追多"),
+            "决策预览必须把命中的全局策略正文注入 AI 上下文"
+        );
+        assert!(
+            body["prompt_preview"].as_str().unwrap().contains("\"st\""),
+            "紧凑策略 st 字段必须随上下文发给 AI"
+        );
 
         let no_ai_path = std::env::temp_dir().join("nq-ai-preview-noai.db");
         let no_ai = fixture(&no_ai_path, false);
