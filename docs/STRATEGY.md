@@ -67,7 +67,7 @@
 
 历史上这里踩过一次很贵的坑：旧代码在 `_scan` 里写的是
 
-```python
+```text
 if sig.direction == "flat":
     continue          # ← 量化一 flat，AI 连被调用一次的机会都没有
 ```

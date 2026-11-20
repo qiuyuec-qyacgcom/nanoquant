@@ -4,7 +4,8 @@
  * 文件通道 1s 增量读 + HTTP 直推零延迟；开仓走本系统风控/资金/执行层，
  * 与引擎 15s 轮询开仓共用同标的互斥和保证金账本。
  */
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import { http } from '../api/client'
 import { useAppStore } from '../stores/app'
 import { ago, fmt, px, timeStr } from '../utils/format'
@@ -220,13 +221,12 @@ function tagOf(s: string) {
   return (STATUS_LABELS[s] || { text: s, cls: 'tag-dim' })
 }
 
-let timer: number | undefined
 onMounted(async () => {
   await load()
   if (status.value) applySettings(status.value.settings)
-  timer = window.setInterval(load, 5000)
 })
-onBeforeUnmount(() => window.clearInterval(timer))
+
+useSilentRefresh(load, 5000)
 </script>
 
 <template>

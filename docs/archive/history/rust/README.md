@@ -1,3 +1,7 @@
+> 历史记录：已退役，不可执行
+> 源路径：rust/README.md
+> 归档时间：2026-11-20T09:17:25Z
+
 # exec-service（Rust 执行内核 sidecar）
 
 当前阶段：**P2 影子模式** —— 只签名、不回传订单，用于和 Python 逐字节比对。
@@ -9,13 +13,13 @@
 
 Linux / macOS / VPS：
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-source "$HOME/.cargo/env"
-cd rust/exec-service
-cargo test          # 3 个签名向量（与 Python 对齐）
-cargo build --release
-```
+~~~text
+# [已删除] curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+# [已删除] source "$HOME/.cargo/env"
+# [已删除] cd rust/exec-service
+# [已删除] cargo test          # 3 个签名向量（与 Python 对齐）
+# [已删除] cargo build --release
+~~~
 
 Windows 开发机（无需 MSVC，用 GNU 目标）：
 
@@ -73,14 +77,14 @@ RuntimeDirectory=nanoquant                # 顺便保证 /run/nanoquant 存在�
 
 ## 验证
 
-```bash
-# 自起 mock，协议 + 签名比对（无需真实 sidecar）
-python scripts/verify_sidecar.py
-
-# 对真实 sidecar：给出它实际使用的 Secret 才会做逐字节比对（否则只校验协议）
-EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock
-EXEC_SECRET=... python scripts/verify_sidecar.py --target tcp:127.0.0.1:9101
-```
+~~~text
+# [已删除] # 自起 mock，协议 + 签名比对（无需真实 sidecar）
+# [已删除] python scripts/verify_sidecar.py
+# [已删除] 
+# [已删除] # 对真实 sidecar：给出它实际使用的 Secret 才会做逐字节比对（否则只校验协议）
+# [已删除] EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock
+# [已删除] EXEC_SECRET=... python scripts/verify_sidecar.py --target tcp:127.0.0.1:9101
+~~~
 
 实测（Windows 回环 TCP，release，真实测试网 Ed25519 凭证）：
 
@@ -104,18 +108,18 @@ EXEC_SECRET=... python scripts/verify_sidecar.py --target tcp:127.0.0.1:9101
 
 ## 目录
 
-```
-exec-service/
-├── Cargo.toml
-└── src/
-    ├── main.rs    UDS/TCP 监听、JSON Lines 分发
-    ├── model.rs   请求/响应结构
-    ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
-    ├── order.rs   P3-2 订单状态机（幂等 clientOrderId，Planned→Filled）
-    ├── protection.rs  P3-3 保护单并行构造与签名（STOP + TP，只构造不发送）
-    ├── store.rs   P3-4 台账落库（单写线程 + 批量事务，独立 SQLite）
-    └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
-```
+~~~text
+# [已删除] exec-service/
+# [已删除] ├── Cargo.toml
+# [已删除] └── src/
+# [已删除]     ├── main.rs    UDS/TCP 监听、JSON Lines 分发
+# [已删除]     ├── model.rs   请求/响应结构
+# [已删除]     ├── http.rs    P3-1 HTTP/2 连接池 + 启动预热（reqwest + rustls）
+# [已删除]     ├── order.rs   P3-2 订单状态机（幂等 clientOrderId，Planned→Filled）
+# [已删除]     ├── protection.rs  P3-3 保护单并行构造与签名（STOP + TP，只构造不发送）
+# [已删除]     ├── store.rs   P3-4 台账落库（单写线程 + 批量事务，独立 SQLite）
+# [已删除]     └── sign.rs    HMAC + Ed25519 签名（含与 Python 对齐的向量测试）
+~~~
 
 ## 当前状态
 

@@ -1,6 +1,6 @@
 //! NanoQuant 执行内核 sidecar（P2：影子模式）
 //!
-//! 阶段目标：**只签名、不发单**。Python 侧把同一批 intent 同时送给 Rust，
+//! 阶段目标：**只签名、不发单**。legacy 内核（已退役） 侧把同一批 intent 同时送给 Rust，
 //! 逐字节比对 `query` 与 `signature`，一致后再进入真实下单。
 //!
 //! 运行（Linux / macOS，UDS）：
@@ -68,7 +68,9 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/nanoquant-exec.sock".into())
                 .into(),
             secret,
-            tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
+            tcp: std::env::var("EXEC_TCP")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             http: http::HttpConfig::from_env(),
             ledger_path: std::env::var("EXEC_LEDGER_DB")
                 .unwrap_or_default()
@@ -203,7 +205,7 @@ async fn dispatch(
             resp.order = Some(guard.snapshot());
             resp
         }
-        // P3-3：并行构造 STOP + TP 两笔保护单（只签名，不发送），供 Python 逐字节比对
+        // P3-3：并行构造 STOP + TP 两笔保护单（只签名，不发送），供 legacy 内核（已退役） 逐字节比对
         "protection_plan" => {
             if req.symbol.trim().is_empty() || req.close_side.trim().is_empty() {
                 return Response::err(&req.id, "symbol / close_side 不能为空");
@@ -244,7 +246,7 @@ async fn dispatch(
             resp.protections = Some(serde_json::json!([stop, take]));
             resp
         }
-        // 影子模式：签名并回显，供 Python 侧逐字节比对
+        // 影子模式：签名并回显，供 legacy 内核（已退役） 侧逐字节比对
         "plan" | "sign" => {
             if req.query.is_empty() {
                 return Response::err(&req.id, "query 不能为空");
@@ -305,8 +307,18 @@ async fn dispatch(
 
             // 两笔并行发送；任一「结果未知」都必须如实上报，调用方禁止重发
             let (sr, tr) = tokio::join!(
-                http.post_signed("/fapi/v1/algoOrder", &stop_req.query, &stop_req.signature, &req.api_key),
-                http.post_signed("/fapi/v1/algoOrder", &take_req.query, &take_req.signature, &req.api_key)
+                http.post_signed(
+                    "/fapi/v1/algoOrder",
+                    &stop_req.query,
+                    &stop_req.signature,
+                    &req.api_key
+                ),
+                http.post_signed(
+                    "/fapi/v1/algoOrder",
+                    &take_req.query,
+                    &take_req.signature,
+                    &req.api_key
+                )
             );
             let mut results = Vec::new();
             let mut unknown = false;
@@ -394,7 +406,10 @@ async fn main() -> std::io::Result<()> {
     // 回环 TCP：Windows 无 UDS，容器/联调也用这条；与 UDS 可并存
     if let Some(addr) = cfg.tcp.as_deref() {
         let listener = TcpListener::bind(addr).await?;
-        eprintln!("exec-service tcp listening on {addr} (algo={})", signer.algo());
+        eprintln!(
+            "exec-service tcp listening on {addr} (algo={})",
+            signer.algo()
+        );
         let signer_tcp = signer.clone();
         let http_tcp = http.clone();
         let book_tcp = book.clone();

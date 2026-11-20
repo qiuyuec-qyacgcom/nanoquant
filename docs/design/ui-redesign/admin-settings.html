@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NanoQuant — 参数配置概念稿</title>
+  <link rel="stylesheet" href="theme.css" />
+  <link rel="stylesheet" href="admin.css" />
+</head>
+<body class="dark">
+  <div class="app">
+    <aside class="sidebar">
+      <div class="side-brand"><div class="mark">N</div><div><div class="brand-name">NanoQuant</div><div class="brand-sub">trading terminal</div></div></div>
+      <div class="nav-group">
+        <div class="nav-label">概览</div>
+        <a class="nav-item" href="admin-dashboard.html"><span class="ico"></span>总览</a>
+        <a class="nav-item" href="#"><span class="ico"></span>系统诊断</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">交易</div>
+        <a class="nav-item" href="#"><span class="ico"></span>全局策略</a>
+        <a class="nav-item" href="#"><span class="ico"></span>标的池</a>
+        <a class="nav-item" href="#"><span class="ico"></span>信号审计</a>
+        <a class="nav-item" href="#"><span class="ico"></span>信号跟单</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">研究</div>
+        <a class="nav-item active" href="admin-settings.html"><span class="ico"></span>参数配置</a>
+        <a class="nav-item" href="#"><span class="ico"></span>回测</a>
+        <a class="nav-item" href="#"><span class="ico"></span>资讯情绪</a>
+        <a class="nav-item" href="#"><span class="ico"></span>AI 模型</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">运维</div>
+        <a class="nav-item" href="#"><span class="ico"></span>备份还原</a>
+        <a class="nav-item" href="#"><span class="ico"></span>落库补偿</a>
+      </div>
+      <div class="sidebar-foot"><div class="live-line"><i class="dot"></i> LIVE · BINANCE</div><div>参数变更写入审计</div></div>
+    </aside>
+
+    <section class="main">
+      <header class="topbar">
+        <div class="topbar-title">参数配置</div>
+        <div class="topbar-sub">风控 · 全局止盈止损</div>
+        <div class="topbar-right">
+          <span class="pill live"><i class="dot"></i> 已热生效</span>
+          <span class="pill">v3.0.0</span>
+          <div class="avatar">A</div>
+        </div>
+      </header>
+
+      <main class="content">
+        <div class="page-head">
+          <div>
+            <div class="eyebrow gold">SETTINGS / RISK</div>
+            <h1>风控</h1>
+            <div class="sub">仓位、杠杆、熔断与全局止盈止损</div>
+          </div>
+          <div class="page-actions">
+            <span class="tag gold">3 项未保存</span>
+            <button class="btn ghost sm">恢复默认</button>
+            <button class="btn gold sm">保存并生效</button>
+          </div>
+        </div>
+
+        <div class="settings-layout">
+          <nav class="card settings-nav">
+            <a href="#">交易执行</a>
+            <a href="#">策略</a>
+            <a class="on" href="#">风控</a>
+            <a href="#">交易所</a>
+            <a href="#">资讯</a>
+            <a href="#">通知与系统</a>
+            <a href="#">备份</a>
+            <a href="#">安全</a>
+            <div style="padding:18px 10px 6px;border-top:1px solid var(--line);margin-top:9px">
+              <div class="eyebrow" style="color:#5e616a">CURRENT PROFILE</div>
+              <div class="mono" style="font-size:10px;color:var(--muted-2);margin-top:7px">短线 · 小资金<br />3 仓位上限</div>
+            </div>
+          </nav>
+
+          <div style="display:grid;grid-template-columns:minmax(0,1fr) 248px;gap:12px;align-items:start">
+            <div class="stack">
+              <div class="card">
+                <div class="card-hd">
+                  <div class="card-title">全局止盈止损</div>
+                  <span class="tag gold">全局生效</span>
+                  <div class="right"><span class="tag">每仓</span></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">全局止损率</div><div class="field-hint">价格相对开仓价不利变动达到该比例，整仓平仓</div></div>
+                  <div><input class="input gold" value="2.0" /><div class="field-hint">% · 0 = 关闭</div></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">全局止盈率</div><div class="field-hint">价格相对开仓价有利变动达到该比例，整仓平仓</div></div>
+                  <div><input class="input gold" value="6.0" /><div class="field-hint">% · 0 = 关闭</div></div>
+                </div>
+                <div style="padding:0 16px 13px"><div class="savebar" style="padding:9px 11px"><span class="dot" style="color:var(--gold)"></span>按开仓价涨跌幅计算，优先于 ATR 止损与部分止盈</div></div>
+              </div>
+
+              <div class="card">
+                <div class="card-hd"><div class="card-title">仓位与杠杆</div><span class="tag">账户级</span></div>
+                <div class="field-row">
+                  <div><div class="field-label">单笔风险</div><div class="field-hint">止损打掉时的最大亏损占权益比例</div></div>
+                  <div><input class="input" value="1.0" /><div class="field-hint">% · 建议 0.5–2%</div></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">单仓保证金</div><div class="field-hint">与杠杆共同决定名义额</div></div>
+                  <div><input class="input" value="25" /><div class="field-hint">%</div></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">默认杠杆 / 上限</div><div class="field-hint">开仓按默认杠杆，超过上限直接拒绝</div></div>
+                  <div style="display:flex;gap:8px"><input class="input" value="10" /><input class="input" value="20" /><span class="mono" style="align-self:center;color:var(--muted);font-size:9px">x</span></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">总敞口上限</div><div class="field-hint">所有持仓名义额 / 权益</div></div>
+                  <div><input class="input" value="300" /><div class="field-hint">% · 3.0x</div></div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card-hd"><div class="card-title">熔断与冷却</div><span class="tag">只锁新开仓</span></div>
+                <div class="field-row">
+                  <div><div class="field-label">日内亏损上限</div><div class="field-hint">触发后当日停止开新仓</div></div>
+                  <div><input class="input" value="5.0" /><div class="field-hint">%</div></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">最大回撤</div><div class="field-hint">基于权益峰值；达到后全局停机</div></div>
+                  <div><input class="input" value="12.0" /><div class="field-hint">%</div></div>
+                </div>
+                <div class="field-row">
+                  <div><div class="field-label">连亏熔断 / 冷静期</div><div class="field-hint">连续亏损后暂停，再逐步恢复</div></div>
+                  <div style="display:flex;gap:8px"><input class="input" value="4" /><input class="input" value="15" /><span class="mono" style="align-self:center;color:var(--muted);font-size:9px">笔 / 分</span></div>
+                </div>
+              </div>
+
+              <div class="savebar">
+                <span><b style="color:var(--gold);font-weight:500">3 项</b> 未保存 · 保存后对下一轮扫描生效</span>
+                <div class="right"><button class="btn ghost sm">放弃</button><button class="btn gold sm">保存并生效</button></div>
+              </div>
+            </div>
+
+            <aside class="card">
+              <div class="card-hd"><div class="card-title">风险画像</div><span class="tag green">健康</span></div>
+              <div class="summary-card">
+                <div class="summary-line"><span>风险预算</span><b>68%</b></div>
+                <div class="summary-line"><span>全局止损 / 止盈</span><b>2% / 6%</b></div>
+                <div class="summary-line"><span>单笔风险</span><b>1.0%</b></div>
+                <div class="summary-line"><span>最大杠杆</span><b>20x</b></div>
+                <div class="summary-line"><span>总敞口上限</span><b>3.0x</b></div>
+                <div class="summary-line"><span>日亏余量</span><b class="gold">3.8%</b></div>
+                <div style="margin-top:12px;padding:12px;background:rgba(240,185,11,.055);border:1px solid rgba(240,185,11,.18);color:var(--muted);font-size:9px;line-height:1.7">
+                  当前参数下，单笔最大亏损约 <b style="color:var(--text);font-family:var(--mono)">$1,284</b>；全局止损会先于大多数 ATR 止损触发。
+                </div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </main>
+    </section>
+  </div>
+</body>
+</html>

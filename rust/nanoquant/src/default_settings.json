@@ -1,0 +1,278 @@
+{
+  "engine": {
+    "enabled": false,
+    "mode": "demo",
+    "cycle_interval_sec": 15,
+    "max_positions": 2,
+    "max_symbols_per_cycle": 12,
+    "scan_concurrency": 3,
+    "trading_windows": [
+      "00:00-24:00"
+    ],
+    "timezone_offset": 8,
+    "close_on_halt": false,
+    "order_type": "market",
+    "recv_window_ms": 5000
+  },
+  "risk": {
+    "risk_per_trade_pct": 10.0,
+    "max_leverage": 100,
+    "default_leverage": 20,
+    "margin_pct": 50.0,
+    "max_exposure_pct": 2000.0,
+    "max_same_direction": 0,
+    "category_exposure_limit_pct": 500.0,
+    "vol_target_atr_pct": 0.0,
+    "daily_loss_limit_pct": 25.0,
+    "max_drawdown_pct": 50.0,
+    "consecutive_loss_limit": 4,
+    "cooldown_minutes": 10,
+    "symbol_cooldown_minutes": 5,
+    "min_notional_buffer": 1.05,
+    "min_equity_usdt": 0.5,
+    "fee_rate_taker": 0.0005,
+    "fee_rate_maker": 0.0002,
+    "auto_protect_external": false,
+    "global_stop_loss_pct": 0.0,
+    "global_take_profit_pct": 0.0
+  },
+  "strategy": {
+    "mode": "meanrev",
+    "ai_review_flat": true,
+    "ai_review_max_per_cycle": 6,
+    "timeframe": "4h",
+    "leverage_min": 8,
+    "leverage_max": 30,
+
+    "ema_fast": 9,
+    "ema_slow": 21,
+    "rsi_period": 14,
+    "atr_period": 14,
+    "entry_threshold": 0.3,
+    "exit_threshold": 0.1,
+    "volume_ratio_min": 0.8,
+    "atr_pct_min": 0.05,
+    "atr_pct_max": 4.0,
+    "min_24h_quote_volume": 3000000,
+    "sl_atr_mult": 1.2,
+    "tp_atr_mult": 2.0,
+    "min_risk_reward": 2.0,
+    "roi_min_r": 1.0,
+    "trailing_pct": 0.8,
+    "trailing_arm_r": 1.0,
+    "breakeven_at_r": 1.0,
+    "max_data_gaps": 1,
+    "data_stale_mult": 2.0,
+    "adx_filter": true,
+    "adx_min": 20.0,
+    "mr_window": 20,
+    "mr_z_entry": 2.0,
+    "mr_min_risk_reward": 0.8,
+    "mr_block_in_trend": true,
+    "mr_trend_gap_pct": 0.35,
+    "mr_exhaustion_confirm": false,
+    "partial_tp_at_r": 1.0,
+    "partial_tp_ratio": 0.5,
+    "max_spread_bps": 8.0,
+    "roi_table": [
+      [
+        0,
+        0.8
+      ],
+      [
+        15,
+        0.6
+      ],
+      [
+        30,
+        0.45
+      ],
+      [
+        60,
+        0.3
+      ],
+      [
+        120,
+        0.2
+      ]
+    ],
+    "weight_trend": 0.32,
+    "weight_momentum": 0.26,
+    "weight_volume": 0.18,
+    "weight_funding": 0.12,
+    "weight_oi": 0.12
+  },
+  "ai": {
+    "enabled": true,
+    "mode": "single",
+    "provider_id": 0,
+    "fallback_provider_ids": [],
+    "min_confidence": 0.45,
+    "require_agreement": true,
+    "allow_ai_override": false,
+    "max_calls_per_hour": 30,
+    "monthly_budget_usd": 3.0,
+    "timeout_sec": 45,
+    "temperature": 0.2,
+    "inject_news": true,
+    "inject_mantras": true,
+    "personas": [
+      {
+        "name": "趋势研判官",
+        "weight": 0.35,
+        "focus": "多周期趋势与关键价位",
+        "enabled": true
+      },
+      {
+        "name": "动能量化官",
+        "weight": 0.35,
+        "focus": "量价背离、资金费率与持仓量变化",
+        "enabled": true
+      },
+      {
+        "name": "风险审计官",
+        "weight": 0.3,
+        "focus": "回撤、爆仓距离与流动性风险",
+        "enabled": true
+      }
+    ],
+    "decision_schema_version": 2
+  },
+  "data": {
+    "live_base_url": "https://fapi.binance.com",
+    "demo_base_url": "https://testnet.binancefuture.com",
+    "demo_backup_urls": [],
+    "backup_base_urls": [
+      "https://fapi1.binance.com",
+      "https://fapi2.binance.com",
+      "https://fapi3.binance.com"
+    ],
+    "proxy": "",
+    "kline_limit": 200,
+    "ticker_ttl_sec": 5,
+    "kline_ttl_sec": 20,
+    "request_timeout_sec": 12,
+    "max_pool_size": 20,
+    "demo_api_key_enc": "",
+    "demo_api_secret_enc": "",
+    "live_api_key_enc": "",
+    "live_api_secret_enc": ""
+  },
+  "news": {
+    "enabled": true,
+    "refresh_minutes": 10,
+    "sources": [
+      "cointelegraph",
+      "theblock",
+      "decrypt",
+      "bitcoinmagazine",
+      "newsbtc",
+      "beincrypto",
+      "utoday",
+      "binance_square",
+      "binance_announcement",
+      "coindesk"
+    ],
+    "keep_days": 7,
+    "ai_summary": true,
+    "sentiment_threshold": 0.35,
+    "max_items_per_source": 30,
+    "proxy": "",
+    "request_timeout_sec": 8,
+    "rsshub_base": ""
+  },
+  "evolution": {
+    "enabled": true,
+    "review_on_close": true,
+    "max_injected": 8,
+    "ttl_days": 7,
+    "min_confidence": 0.5,
+    "global_review_every_trades": 10,
+    "guard_strict": true,
+    "auto_disable_negative": true,
+    "max_rule_chars": 420,
+    "min_lesson_sample": 2,
+    "batch_review_size": 5,
+    "min_health_sample": 10,
+    "archive_health_threshold": 0.45,
+    "max_active_mantras": 40
+  },
+  "backup": {
+    "retention": 10,
+    "encrypt": true,
+    "auto_daily": true,
+    "include_logs": false,
+    "last_run_ts": 0
+  },
+  "security": {
+    "username": "admin",
+    "password_hash": "",
+    "session_ttl_hours": 12,
+    "require_login": true,
+    "login_fail_limit": 8,
+    "login_fail_window_sec": 900,
+    "token_version": 0,
+    "password_is_default": false
+  },
+  "system": {
+    "log_level": "INFO",
+    "event_retention_days": 14,
+    "signal_retention_days": 14,
+    "equity_retention_days": 30,
+
+    "risk_disclaimer_accepted": false,
+    "alert_enabled": false,
+    "alert_min_level": "warn",
+    "alert_webhook_url": "",
+    "alert_error_webhook_url": "",
+    "alert_telegram_token": "",
+    "alert_telegram_chat_id": "",
+    "alert_cooldown_sec": 120,
+    "alert_quiet_hours": "",
+    "alert_template": "",
+    "alert_digest_enabled": false,
+    "alert_digest_minutes": 60,
+    "exec_mode": "off",
+    "exec_socket": "",
+    "exec_sample_pct": 100,
+    "exec_timeout_ms": 500,
+    "exec_place_protection": false,
+    "exec_ledger_authoritative": false,
+    "api_rate_limit_per_min": 0,
+    "metrics_enabled": true
+  },
+  "public": {
+    "site_enabled": true,
+    "site_title": "NanoQuant",
+    "site_tagline": "小资金 · 币安 U 本位永续 · 超短线量化终端",
+    "hero_note": "",
+    "show_engine_status": true,
+    "show_mantras": true,
+    "show_performance": false
+  },
+  "signal_follow": {
+    "enabled": false,
+    "jsonl_path": "",
+    "poll_sec": 1,
+    "ingest_token": "",
+    "leverage_bonus": 10,
+    "max_age_sec": 180,
+    "max_per_hour": 6,
+    "auto_add_symbol": true,
+    "strict_events": false,
+    "default_sl_pct": 1.2,
+    "sizing_mode": "margin_pct",
+    "margin_pct_override": 0.0,
+    "dry_run": true
+  },
+  "journal": {
+    "enabled": true,
+    "min_record_confidence": 0.45,
+    "label_after_sec": 86400,
+    "correct_threshold_pct": 0.15,
+    "retrieve_top_k": 5,
+    "inject_experiences": true,
+    "max_experiences": 200,
+    "min_similarity": 0.15
+  }
+}

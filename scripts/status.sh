@@ -9,8 +9,8 @@ PID_FILE="$ROOT/data/nanoquant.pid"
 echo "== 进程 =="
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "运行中 (PID $(cat "$PID_FILE"))"
-elif pgrep -f "python -m nanoquant" >/dev/null 2>&1; then
-  echo "运行中 (pgrep): $(pgrep -f 'python -m nanoquant' | tr '\n' ' ')"
+elif pgrep -f "rust/nanoquant/target/release/nanoquant" >/dev/null 2>&1; then
+  echo "运行中 (pgrep): $(pgrep -f 'rust/nanoquant/target/release/nanoquant' | tr '\n' ' ')"
 else
   echo "未运行"
 fi

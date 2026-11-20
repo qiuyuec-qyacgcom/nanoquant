@@ -66,8 +66,14 @@ const deleting = ref(false)
 const requiredPhrase = computed(() => (pendingDelete.value ? `REMOVE ${pendingDelete.value.symbol}` : ''))
 const canDelete = computed(() => phrase.value.trim().toUpperCase() === requiredPhrase.value)
 const full = computed(() => count.value >= limits.maximum)
-const normalized = computed(() => keyword.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))
-const canAddDirect = computed(() => /^[A-Z0-9]{2,18}USDT$/.test(normalized.value))
+const normalized = computed(() => {
+  const cleaned = Array.from(keyword.value.trim())
+    .filter((ch) => /[\p{L}\p{N}]/u.test(ch))
+    .join('')
+  return cleaned.replace(/[a-z]/g, (ch) => ch.toUpperCase())
+})
+
+const canAddDirect = computed(() => /^[\p{L}\p{N}]{2,18}USDT$/u.test(normalized.value))
 
 async function loadPool() {
   loading.value = true
@@ -123,8 +129,12 @@ async function add(symbol: string) {
   if (!symbol || full.value) return
   adding.value = symbol
   try {
-    await http.post('/symbols', { symbol })
-    app.notify(`${symbol} 已加入标的池`, 'ok')
+    const res = await http.post('/symbols', { symbol })
+    const custom = res?.added?.custom === true
+    app.notify(
+      custom ? `${symbol} 已作为自定义标的加入（仅记录，不参与交易）` : `${symbol} 已加入标的池`,
+      'ok',
+    )
     await loadPool()
     if (searched.value) await search()
   } catch (err: any) {
@@ -213,18 +223,18 @@ onMounted(loadPool)
           <input
             v-model="keyword"
             class="input mono"
-            placeholder="输入合约名搜索，如 BTC / ETH / 1000PEPE"
+            placeholder="搜索币安合约，或输入中文合约名（如 牛来USDT）"
             style="flex: 1; min-width: 200px"
-            @keyup.enter="search"
+            @keyup.enter="canAddDirect ? add(normalized) : search()"
           />
           <button class="btn btn-sm" :disabled="!canAddDirect || full || !!adding" @click="add(normalized)">
             {{ adding === normalized ? '…' : '直接加入' }}
           </button>
         </div>
         <div class="hint">
-          添加前会用币安在线合约表校验：必须精确匹配、USDT 计价、在线可交易；支持加密永续与股票/商品类永续
-          （TRADIFI，休市状态也可先入池）。模拟盘只上线部分股票合约，找不到时可切到实盘。
-          规格（精度 / 最小下单 / 分层 / 杠杆）随合约落库，不依赖任何本地行情。
+          币安合约会实时校验（USDT 永续、可交易）；中文名也一样先查当前环境的币安合约表。
+          找到则正常启用；只有合约表里没有时，才保存为<b>自定义标的</b>（默认禁用、仅记录，不参与币安行情与下单）。
+          需要实盘交易时请确认当前环境有对应合约，模拟盘找不到可切到实盘。
         </div>
 
         <div class="table-scroll" style="max-height: 300px">
@@ -299,10 +309,14 @@ onMounted(loadPool)
               <td>
                 <b class="mono">{{ row.symbol }}</b>
                 <div class="muted" style="font-size: 10px">{{ row.name }} · ctVal {{ row.ct_val }}</div>
+                <div v-if="row.note" class="muted" style="font-size: 9px">{{ row.note }}</div>
               </td>
               <td>
-                <span class="tag" :class="row.tier === 'tier_1_bluechip' ? 'tag-blue' : 'tag-dim'">
-                  {{ row.tier === 'tier_1_bluechip' ? '蓝筹主流' : '高弹性动量' }}
+                <span
+                  class="tag"
+                  :class="row.tier === 'tier_1_bluechip' ? 'tag-blue' : row.tier === 'custom' ? 'tag-warn' : 'tag-dim'"
+                >
+                  {{ row.tier === 'tier_1_bluechip' ? '蓝筹主流' : row.tier === 'custom' ? '自定义 · 仅记录' : '高弹性动量' }}
                 </span>
               </td>
               <td class="mono">{{ row.max_leverage }}x</td>

@@ -27,7 +27,7 @@
 ## 2. 只读预检
 
 ```bash
-python scripts/mainnet_preflight.py --yes
+nanoquant ops preflight --yes
 ```
 
 它会用实盘凭证连主网，检查：连通性 / 账户可读 / 持仓模式 / 遗留挂单 / 每个标的的最小名义额与所需保证金。
@@ -70,7 +70,7 @@ python scripts/mainnet_preflight.py --yes
 
 - 若持仓跨过 UTC 00:00/08:00/16:00，记录 `income` 接口里的 `FUNDING_FEE`；
 - 与回测的 `funding_bps_8h` 假设（默认 1bp/8h）对比，偏差大就把实测值写进回测参数；
-- 运行 `python scripts/reconcile.py --mode live`（需 ≥10 笔成交），按输出的 `suggested_slippage_bps` 调整回测滑点。
+- 运行 `nanoquant ops reconcile --mode live`（需 ≥10 笔成交），按输出的 `suggested_slippage_bps` 调整回测滑点。
 
 ## 6. 成本与停止条件
 

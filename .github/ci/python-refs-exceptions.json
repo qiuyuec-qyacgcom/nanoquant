@@ -1,0 +1,131 @@
+{
+  "schema_version": "1.0",
+  "budget": {
+    "total": 12,
+    "per_grade": 6
+  },
+  "entries": [
+    {
+      "code": "EX-01",
+      "scopes": [
+        "rust/nanoquant/src/cli.rs",
+        "rust/nanoquant/src/interpreter_refs/"
+      ],
+      "rules": [
+        "exec",
+        "text",
+        "naming"
+      ],
+      "reason": "零解释器门禁的入口函数、规则字符串与自检夹具必须保留，否则门禁无法运行。",
+      "owner": "维护者",
+      "expires_when": "zero-python 命令下线时",
+      "verify": {
+        "kind": "contains",
+        "target": "rust/nanoquant/src/cli.rs",
+        "needle": "fn zero_python"
+      }
+    },
+    {
+      "code": "EX-02",
+      "scopes": [
+        ".github/ci/zero_python_gate.sh",
+        ".github/ci/zero-python-allowlist.txt",
+        ".github/workflows/ci.yml"
+      ],
+      "rules": [
+        "text",
+        "naming"
+      ],
+      "reason": "CI 门禁作业标识、包装器名称与清单说明必须可读可检索，删除会使门禁无法被定位。",
+      "owner": "维护者",
+      "expires_when": "门禁作业改名或包装器删除时",
+      "verify": {
+        "kind": "path_exists",
+        "target": ".github/ci/zero_python_gate.sh"
+      }
+    },
+    {
+      "code": "EX-03",
+      "scopes": [
+        "docs/archive/history/"
+      ],
+      "rules": [
+        "text"
+      ],
+      "reason": "历史迁移记录按需求保留，且已统一标注“已退役，不可执行”。",
+      "owner": "维护者",
+      "expires_when": "历史归档目录删除时",
+      "verify": {
+        "kind": "path_exists",
+        "target": "docs/archive/history/INDEX.md"
+      }
+    },
+    {
+      "code": "EX-04",
+      "scopes": [
+        "docs/RESEARCH.md"
+      ],
+      "rules": [
+        "text"
+      ],
+      "reason": "仅用于第三方项目名（外部生态命名），非本仓依赖，且须标注外部项目名说明。",
+      "owner": "维护者",
+      "expires_when": "该章节移除时",
+      "verify": {
+        "kind": "contains",
+        "target": "docs/RESEARCH.md",
+        "needle": "外部项目名，非本仓依赖"
+      }
+    },
+    {
+      "code": "EX-05",
+      "scopes": [
+        ".github/ci/python-refs-exceptions.json"
+      ],
+      "rules": [
+        "text",
+        "naming"
+      ],
+      "reason": "例外清单自身的路径、规则名与理由字段不可避免含门禁词汇。",
+      "owner": "维护者",
+      "expires_when": "例外清单机制下线时",
+      "verify": {
+        "kind": "path_exists",
+        "target": ".github/ci/python-refs-exceptions.json"
+      }
+    },
+    {
+      "code": "EX-06",
+      "scopes": [
+        "scripts/p2_linux_docker_probe.sh"
+      ],
+      "rules": [
+        "text"
+      ],
+      "reason": "该脚本做的是镜像内不存在解释器的负向断言，必须列举被禁解释器名才能检测。",
+      "owner": "维护者",
+      "expires_when": "该探针脚本删除时",
+      "verify": {
+        "kind": "contains",
+        "target": "scripts/p2_linux_docker_probe.sh",
+        "needle": "NO_INTERPRETER"
+      }
+    },
+    {
+      "code": "EX-07",
+      "scopes": [
+        "docs/archive/evidence/"
+      ],
+      "rules": [
+        "artifact"
+      ],
+      "reason": "过期扫描报告的带时间戳留档区，仅存放标记为过期报告的证据，不含可执行内容。",
+      "owner": "维护者",
+      "expires_when": "证据归档目录删除时",
+      "verify": {
+        "kind": "path_exists",
+        "target": "docs/archive/evidence"
+      }
+    }
+  ]
+}

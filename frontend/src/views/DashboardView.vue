@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
 import EChart from '../components/EChart.vue'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import EventFeed from '../components/EventFeed.vue'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
 
@@ -81,22 +82,22 @@ const equityOption = computed(() => {
     grid: { left: 54, right: 18, top: 22, bottom: 28 },
     tooltip: {
       trigger: 'axis',
-      backgroundColor: '#0d1727',
-      borderColor: '#1f3557',
-      textStyle: { color: '#dbe6f5', fontSize: 11 },
+      backgroundColor: '#0b0d11',
+      borderColor: 'rgba(240,185,11,.28)',
+      textStyle: { color: '#f3f0e8', fontSize: 11 },
       valueFormatter: (v: number) => `${Number(v).toFixed(4)}`,
     },
     xAxis: {
       type: 'category',
       data: points.map((p) => timeStr(p.ts, false)),
-      axisLine: { lineStyle: { color: '#1a2942' } },
-      axisLabel: { color: '#6b7c99', fontSize: 10, interval: Math.ceil(points.length / 8) },
+      axisLine: { lineStyle: { color: 'rgba(255,255,255,.08)' } },
+      axisLabel: { color: '#8d9099', fontSize: 10, interval: Math.ceil(points.length / 8) },
     },
     yAxis: {
       type: 'value',
       scale: true,
-      splitLine: { lineStyle: { color: 'rgba(26,41,66,0.55)' } },
-      axisLabel: { color: '#6b7c99', fontSize: 10, formatter: (v: number) => v.toFixed(3) },
+      splitLine: { lineStyle: { color: 'rgba(255,255,255,.06)' } },
+      axisLabel: { color: '#8d9099', fontSize: 10, formatter: (v: number) => v.toFixed(3) },
     },
     series: [
       {
@@ -105,14 +106,14 @@ const equityOption = computed(() => {
         smooth: true,
         showSymbol: false,
         data: points.map((p) => Number((p.wallet + p.unrealized).toFixed(6))),
-        lineStyle: { width: 1.8, color: '#3b82f6' },
-        itemStyle: { color: '#3b82f6' },
+        lineStyle: { width: 1.8, color: '#f0b90b' },
+        itemStyle: { color: '#f0b90b' },
         areaStyle: {
           color: {
             type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
             colorStops: [
-              { offset: 0, color: 'rgba(59,130,246,0.32)' },
-              { offset: 1, color: 'rgba(59,130,246,0.02)' },
+              { offset: 0, color: 'rgba(240,185,11,0.24)' },
+              { offset: 1, color: 'rgba(240,185,11,0.015)' },
             ],
           },
         },
@@ -180,15 +181,12 @@ async function closePosition(id: number) {
   }
 }
 
-let timer: number | undefined
+
 onMounted(async () => {
   await load()
-  // 总览一次要打 8 个接口。8 秒全量刷新 = 每个标签页每分钟 60 次请求，
-  // 而权益曲线/成交/信号/委托这些数据本身就以分钟为单位变化；
-  // 顶栏的实时状态由 ShellLayout 每 5s 单独轮询（后端有 2s 单飞缓存）。
-  timer = window.setInterval(load, 30000)
 })
-onBeforeUnmount(() => window.clearInterval(timer))
+
+useSilentRefresh(load, 30000)
 </script>
 
 <template>

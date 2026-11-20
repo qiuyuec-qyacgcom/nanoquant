@@ -14,6 +14,7 @@ import { http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
+import { HIDDEN_SETTINGS, SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
 
@@ -27,11 +28,6 @@ interface FieldMeta {
   max?: number
 }
 
-interface SectionDef {
-  title: string
-  hint?: string
-  fields: string[]
-}
 
 interface Row extends FieldMeta {
   key: string
@@ -39,19 +35,7 @@ interface Row extends FieldMeta {
   widget: Widget
 }
 
-const groups = [
-  { id: 'engine', label: '引擎', hint: '开关、节奏与时段' },
-  { id: 'risk', label: '风控', hint: '仓位、熔断与费用' },
-  { id: 'strategy', label: '策略', hint: '机器实际执行的信号与出场（不是「全局策略」）' },
-  { id: 'data', label: '数据源', hint: '行情源、网络与密钥' },
-  { id: 'news', label: '资讯', hint: '抓取与情绪' },
-  { id: 'evolution', label: '自进化', hint: '复盘与心法' },
-  { id: 'journal', label: '决策经验', hint: '决策留痕、回访打标与场景化经验注入' },
-  { id: 'backup', label: '备份', hint: '保留与加密' },
-  { id: 'security', label: '安全', hint: '登录与会话' },
-  { id: 'system', label: '系统', hint: '日志与保留' },
-  { id: 'public', label: '公开站点', hint: '前台展示' },
-]
+const groups = SETTINGS_GROUPS
 
 //: 面向普通用户的白话说明：覆盖原始技术描述（仅影响展示）
 const PLAIN_HINTS: Record<string, string> = {
@@ -92,7 +76,7 @@ const BASE_META: Record<string, FieldMeta> = {
       ['trend', 'trend 趋势跟随'],
       ['meanrev', 'meanrev 均值回归'],
     ],
-    hint: '实测两者样本外均为负收益（见 docs/EVIDENCE.md），切换前先跑 walk-forward',
+    hint: '实测两者样本外均为负收益（见 docs/archive/history/docs/EVIDENCE.md），切换前先跑 walk-forward',
   },
   label_after_sec: { label: '回访窗口', unit: '秒', hint: '决策满这么久才回访打标；86400=24h。超短线可调到 3600-14400，让经验更快产生' },
   inject_experiences: { label: '注入经验', hint: '关闭后经验库照常积累，但不会进入 AI 决策上下文' },
@@ -146,11 +130,11 @@ const BASE_META: Record<string, FieldMeta> = {
   recv_window_ms: { label: '签名有效窗口', unit: 'ms', hint: '建议 5000，系统时钟漂移时调大' },
   close_on_halt: { label: '熔断时平仓', hint: '关闭则只锁新开仓，不动已有持仓' },
 
-  risk_per_trade_pct: { label: '单笔风险', unit: '%', hint: '止损打掉时的最大亏损占权益比例' },
-  margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额' },
+  risk_per_trade_pct: { label: '单笔风险', unit: '%', hint: '止损打掉时的最大亏损占权益比例；与单仓保证金上限取更小值' },
+  margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额；与单笔风险同时约束仓位，取更小值' },
   default_leverage: {
-    label: '杠杆下限', unit: 'x', min: 1,
-    hint: '最低 1x；全局硬下限，AI 与外部信号给出的杠杆低于下限时自动抬到下限',
+    label: '默认杠杆', unit: 'x', min: 1,
+    hint: '开仓默认杠杆；仍受全局上限、策略区间与交易所上限约束',
   },
   max_leverage: {
     label: '杠杆上限', unit: 'x', max: 100,
@@ -168,7 +152,7 @@ const BASE_META: Record<string, FieldMeta> = {
   max_same_direction: {
     label: '同向持仓上限',
     unit: '个',
-    hint: '0=不限制；币种高度相关，小资金建议设 1，避免同涨同跌时吃双份风险',
+    hint: '0=不限制；与「最大持仓」同时生效，取更小值；币种高度相关，小资金建议设 1',
   },
   vol_target_atr_pct: {
     label: '波动率目标',
@@ -177,6 +161,8 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
+  global_stop_loss_pct: { label: '全局止损率', unit: '%', hint: '价格相对开仓价不利变动达到该比例就整仓平仓；0=关闭' },
+  global_take_profit_pct: { label: '全局止盈率', unit: '%', hint: '价格相对开仓价有利变动达到该比例就整仓平仓；0=关闭' },
   drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
   cooldown_minutes: { label: '熔断冷静期', unit: '分钟' },
@@ -212,6 +198,7 @@ const BASE_META: Record<string, FieldMeta> = {
   min_24h_quote_volume: { label: '24H 最小成交额', unit: 'USDT' },
   sl_atr_mult: { label: '止损 = ATR ×' },
   tp_atr_mult: { label: '止盈 = ATR ×' },
+  min_risk_reward: { label: '最小盈亏比', unit: 'R', hint: '止盈距离至少为止损的 N 倍；2.0=至少 2R，低于 1 扣费后通常为负期望' },
   trailing_pct: { label: '移动止损回撤', unit: '%', hint: '0 表示关闭' },
   trailing_arm_r: { label: '移动止损激活', unit: 'R', hint: '浮盈先走到 N 倍风险才让移动止损接管，否则会在止损前被噪声扫掉（实盘 24 笔全亏的根因）' },
   breakeven_at_r: { label: '保本触发', unit: 'R', hint: '浮盈达到该 R 倍数后止损上移到开仓价' },
@@ -304,7 +291,7 @@ const BASE_META: Record<string, FieldMeta> = {
   exec_mode: {
     label: '执行内核模式',
     widget: 'seg',
-    hint: 'off 只用 Python 签名；shadow 旁路比对只统计；enforce 不一致直接拒绝下单',
+    hint: 'off 只用内建签名；shadow 旁路比对只统计；enforce 不一致直接拒绝下单',
     options: [
       ['off', 'OFF'],
       ['shadow', 'SHADOW'],
@@ -313,7 +300,7 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   exec_socket: { label: 'sidecar 地址', hint: 'unix:/run/nanoquant/exec.sock 或 tcp:127.0.0.1:9101；留空读 EXEC_SOCKET' },
   exec_sample_pct: { label: '比对抽样', unit: '%', hint: '下单高峰时可只比对一部分，enforce 模式建议 100' },
-  exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为 Python 签名' },
+  exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为内建签名' },
   exec_place_protection: {
     label: '由 sidecar 代发保护单',
     hint: '默认关闭。开启后止损/止盈由 Rust 直接下发（还需 sidecar 侧 EXEC_PLACE_MODE=enabled）；结果未知时阻止重发，避免重复挂单',
@@ -371,144 +358,7 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   },
 }
 
-const SECTIONS: Record<string, SectionDef[]> = {
-  engine: [
-    { title: '运行与节奏', hint: '引擎每轮扫描标的池，节奏决定灵敏度', fields: ['cycle_interval_sec', 'max_symbols_per_cycle', 'scan_concurrency', 'max_positions'] },
-    { title: '交易时段', hint: '只在窗口内开新仓，持仓管理不受限', fields: ['trading_windows', 'timezone_offset'] },
-    { title: '模拟盘与下单', fields: ['order_type', 'recv_window_ms', 'close_on_halt'] },
-  ],
-  risk: [
-    {
-      title: '仓位与杠杆',
-      hint: '先由风险预算反推名义额，再被保证金、敞口与同向集中度截断；AI 开仓杠杆统一按下面的下限/上限钳制，不跟随心法',
-      fields: [
-        'risk_per_trade_pct',
-        'margin_pct',
-        'default_leverage',
-        'max_leverage',
-        'max_exposure_pct',
-        'max_same_direction',
-        'vol_target_atr_pct',
-      ],
-    },
-    { title: '熔断与冷却', hint: '触发后只锁新开仓', fields: ['daily_loss_limit_pct', 'max_drawdown_pct', 'drawdown_peak_window_days', 'consecutive_loss_limit', 'cooldown_minutes', 'symbol_cooldown_minutes', 'min_equity_usdt'] },
-    { title: '止损熔断', hint: '与上面的「熔断与冷却」是两套独立闸门，会同时生效；重复设置容易叠加停机时间', fields: ['stoploss_guard_count', 'stoploss_guard_window_min', 'stoploss_guard_pause_min'] },
-    { title: '尾部风险', hint: '「相关性组敞口」是在「仓位与杠杆 → 总敞口上限」之上的第二层约束，不是替代它', fields: ['liquidation_warn_pct', 'category_exposure_limit_pct', 'auto_protect_external'] },
-    { title: '撮合与手续费', fields: ['max_slippage_pct', 'min_notional_buffer', 'fee_rate_taker', 'fee_rate_maker'] },
-  ],
-  strategy: [
-    {
-      title: '信号模型',
-      hint: 'trend=均线动量趋势跟随；meanrev=布林极值回归。停整个引擎（含跟单）用引擎总闸',
-      fields: ['mode', 'timeframe', 'htf_timeframe'],
-    },
-    {
-      title: 'AI 候选复审',
-      hint: '量化只提供候选，方向与是否入场由 AI 判断。候选额度控成本：12 标的 × 每 5 分钟一轮 = 144 次/小时',
-      fields: ['ai_review_flat', 'ai_review_max_per_cycle'],
-    },
-    {
-      title: '策略杠杆区间',
-      hint: '只约束策略自主开仓，不碰风控分组的全局杠杆上下限；0=沿用全局',
-      fields: ['leverage_min', 'leverage_max'],
-    },
-    { title: '周期与指标', fields: ['ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
-    {
-      title: '趋势强度',
-      hint: 'ADX 低于下限不放行：短线趋势跟随的亏损主要来自震荡市假突破',
-      fields: ['adx_filter', 'adx_period', 'adx_min'],
-    },
-    { title: '开仓过滤', hint: '任一项不达标都不开仓', fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume'] },
-    {
-      title: '出场规则',
-      hint: 'min_risk_reward 是止盈/止损的硬底线：2.0 意味着只需 33% 胜率即可正期望；1.1 则要 48% 以上，扣手续费基本是负期望',
-      fields: ['sl_atr_mult', 'tp_atr_mult', 'min_risk_reward', 'trailing_pct', 'trailing_arm_r', 'breakeven_at_r'],
-    },
-    {
-      title: '体制自适应',
-      hint: 'RSI 按趋势体制分区解读（上涨趋势里 65 是健康、80 才是过热）',
-      fields: ['rsi_adaptive'],
-    },
-    { title: '部分止盈', hint: '先落袋一部分，剩余仓位用移动止损奔跑', fields: ['partial_tp_at_r', 'partial_tp_ratio'] },
-    {
-      title: '短线执行',
-      hint: '进场先扣点差，出场按持仓时长阶梯止盈：这两项决定 5–30 分钟级别的净收益',
-      fields: ['max_spread_bps', 'roi_table', 'roi_min_r'],
-    },
-    { title: '因子权重', hint: '加权求和后映射到 [-1, 1]；缺失因子会被剔除并把权重重新归一', fields: ['weight_trend', 'weight_momentum', 'weight_volume', 'weight_funding', 'weight_oi'] },
-    {
-      title: '均值回归（mode=meanrev 时生效）',
-      hint: '|z| 不到阈值不做；强趋势里禁止逆势；放量突破打折。回归模型胜率高但 R 小，所以用更低的盈亏比底线',
-      fields: ['mr_window', 'mr_z_entry', 'mr_min_risk_reward', 'mr_block_in_trend', 'mr_trend_gap_pct'],
-    },
-  ],
-  data: [
-    { title: '标的池规则', hint: '添加标的时用币安在线合约表校验；池内规格随添加落库', fields: ['max_pool_size'] },
-    { title: '交易所网络', hint: '模拟盘固定走测试网，实盘走主网；两者都需要各自的 API 凭证', fields: ['demo_base_url', 'live_base_url', 'backup_base_urls', 'proxy'] },
-    { title: '引擎取价', hint: '引擎内部直接读取币安公共接口，不对外提供行情接口', fields: ['ticker_ttl_sec', 'kline_ttl_sec', 'kline_limit', 'request_timeout_sec'] },
-  ],
-  news: [
-    { title: '抓取节奏', fields: ['enabled', 'refresh_minutes', 'max_items_per_source', 'keep_days'] },
-    { title: '内容与打分', fields: ['ai_summary', 'sentiment_threshold', 'sources'] },
-    { title: '网络', fields: ['proxy', 'request_timeout_sec', 'rsshub_base'] },
-  ],
-  evolution: [
-    { title: '复盘', fields: ['enabled', 'review_on_close', 'global_review_every_trades'] },
-    { title: '心法库', hint: '心法入库前会经过防污染审计', fields: ['max_injected', 'ttl_days', 'min_confidence', 'max_rule_chars', 'guard_strict', 'auto_disable_negative'] },
-  ],
-  journal: [
-    {
-      title: '决策经验闭环',
-      hint: 'AI 方向性判断 → 回访打标 → 经验库 → 相似场景注入。经验库为空时 AI 上下文不会注入任何经验',
-      fields: ['enabled', 'label_after_sec', 'inject_experiences', 'retrieve_top_k'],
-    },
-    {
-      title: '打标口径',
-      hint: '回访窗口越短，经验产生越快，但越贴近「分钟级判断」而非「持仓结果」；判定阈值决定多小的方向收益才算判对',
-      fields: ['correct_threshold_pct', 'min_record_confidence', 'min_similarity', 'max_experiences'],
-    },
-  ],
-  backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
-  security: [{ title: '登录与密钥', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit', 'login_fail_window_sec'] }],
-  system: [
-    { title: '运行与日志', hint: '交易时段用的时区偏移在「引擎 → 交易时段」里，系统组不再重复配置', fields: ['log_level', 'ui_refresh_sec'] },
-    { title: '数据保留', hint: '只管本组的事件/信号/权益；资讯条数在「资讯」，心法 TTL 在「自进化」，备份份数在「备份」', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days', 'risk_disclaimer_accepted'] },
-    {
-      title: '告警推送',
-      hint: '引擎停摆、账户异常、连续止损等事件推送到 Webhook / Telegram；保存后可用 POST /system/alerts/test 自测',
-      fields: [
-        'alert_enabled',
-        'alert_min_level',
-        'alert_webhook_url',
-        'alert_error_webhook_url',
-        'alert_telegram_token',
-        'alert_telegram_chat_id',
-        'alert_cooldown_sec',
-        'alert_quiet_hours',
-        'alert_template',
-        'alert_digest_enabled',
-        'alert_digest_minutes',
-      ],
-    },
-    {
-      title: '执行内核（sidecar）',
-      hint: 'Rust sidecar 只签名不下单：shadow 旁路比对不影响下单，enforce 不一致直接拒绝下单；sidecar 不可用时自动降级为 Python 签名',
-      fields: [
-        'exec_mode', 'exec_socket', 'exec_sample_pct', 'exec_timeout_ms',
-        'exec_place_protection', 'exec_ledger_authoritative',
-      ],
-    },
-    {
-      title: '安全与观测',
-      hint: 'API 限频按 IP 计，健康检查与 /metrics 不计数；指标仅含队列、死信与比对计数',
-      fields: ['api_rate_limit_per_min', 'metrics_enabled'],
-    },
-  ],
-  public: [
-    { title: '站点信息', fields: ['site_enabled', 'site_title', 'site_tagline', 'hero_note'] },
-    { title: '展示开关', hint: '公开页绝不展示账户余额、持仓与密钥', fields: ['show_engine_status', 'show_mantras', 'show_performance'] },
-  ],
-}
+const SECTIONS = SETTINGS_SECTIONS
 
 const SKIP: Record<string, string[]> = {
   engine: ['mode', 'enabled'],
@@ -579,7 +429,7 @@ function rowOf(group: string, key: string, value: any): Row {
 }
 
 function skippedKeys(): Set<string> {
-  return new Set([...PROTECTED, ...(SKIP[current.value] || []), 'symbols'])
+  return skipOf(current.value)
 }
 
 // ------------------------------------------------------------ 参数检索
@@ -608,17 +458,18 @@ interface Hit {
 
 /** 常用直达：出现频率最高的参数，跨分组一键定位 */
 const QUICK_LINKS: { label: string; group: string; key: string }[] = [
-  { label: '扫描间隔', group: 'engine', key: 'cycle_interval_sec' },
+  { label: '交易间隔', group: 'engine', key: 'cycle_interval_sec' },
   { label: '下单方式', group: 'engine', key: 'order_type' },
-  { label: '最多持仓', group: 'engine', key: 'max_positions' },
-  { label: '信号模式', group: 'strategy', key: 'mode' },
+  { label: '最大持仓', group: 'engine', key: 'max_positions' },
+  { label: '策略模式', group: 'strategy', key: 'mode' },
   { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
-  { label: '杠杆区间', group: 'strategy', key: 'leverage_min' },
-  { label: '止损止盈', group: 'strategy', key: 'sl_atr_mult' },
-  { label: '点差闸门', group: 'strategy', key: 'max_spread_bps' },
   { label: '单笔风险', group: 'risk', key: 'risk_per_trade_pct' },
-  { label: '回撤熔断', group: 'risk', key: 'max_drawdown_pct' },
+  { label: '最大杠杆', group: 'risk', key: 'max_leverage' },
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
+  { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },
+  { label: '止损 ATR', group: 'strategy', key: 'sl_atr_mult' },
+  { label: '止盈 ATR', group: 'strategy', key: 'tp_atr_mult' },
+  { label: '点差闸门', group: 'strategy', key: 'max_spread_bps' },
   { label: '手续费率', group: 'risk', key: 'fee_rate_taker' },
 ]
 
@@ -629,7 +480,7 @@ function sectionMapOf(group: string): Map<string, string> {
 }
 
 function skipOf(group: string): Set<string> {
-  return new Set([...PROTECTED, ...(SKIP[group] || []), 'symbols'])
+  return new Set([...PROTECTED, ...(SKIP[group] || []), ...(HIDDEN_SETTINGS[group] || []), 'symbols'])
 }
 
 /** 每个分组有多少可编辑参数（导航上显示，避免"点进去才知有没有"） */

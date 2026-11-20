@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=390, initial-scale=1" />
+  <title>NanoQuant — 移动端总览概念稿</title>
+  <link rel="stylesheet" href="theme.css" />
+  <style>
+    body { background:#050608; color:var(--text); overflow:hidden; }
+    .phone { width:390px; height:844px; overflow:hidden; background:
+      radial-gradient(circle at 90% -10%, rgba(240,185,11,.16), transparent 35%),
+      #07080a; padding:0 16px; display:flex; flex-direction:column; }
+    .status { height:28px; display:flex; align-items:center; justify-content:space-between; color:#c9c6bd; font-family:var(--mono); font-size:9px; padding-top:4px; }
+    .status .right { display:flex; gap:5px; align-items:center; color:#777a82; }
+    .m-head { height:47px; display:flex; align-items:center; gap:9px; border-bottom:1px solid var(--line); }
+    .m-head .mark { width:26px; height:26px; font-size:12px; }
+    .m-head .name { font-family:var(--serif); font-size:15px; }
+    .m-head .sub { color:#6f727b; font-family:var(--mono); font-size:7px; letter-spacing:.12em; margin-top:2px; }
+    .m-head .live { margin-left:auto; color:var(--green); font-family:var(--mono); font-size:8px; display:flex; align-items:center; gap:6px; }
+    .hero { margin-top:14px; padding:14px; border:1px solid rgba(240,185,11,.30); background:linear-gradient(180deg, rgba(240,185,11,.10), rgba(17,19,24,.92)); position:relative; overflow:hidden; }
+    .hero::after { content:""; position:absolute; right:-34px; top:-52px; width:150px; height:150px; border-radius:50%; background:radial-gradient(circle, rgba(240,185,11,.24), transparent 68%); }
+    .hero-label { color:#9d9a90; font-size:9px; display:flex; gap:7px; align-items:center; }
+    .hero-value { margin-top:5px; font-family:var(--mono); font-size:31px; letter-spacing:-.06em; }
+    .hero-value small { color:#8e9199; font-size:11px; }
+    .hero-foot { display:flex; align-items:center; gap:10px; margin-top:2px; font-family:var(--mono); font-size:9px; }
+    .hero-chart { margin-top:7px; }
+    .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:9px; }
+    .stat { border:1px solid var(--line); background:rgba(17,19,24,.8); padding:10px; }
+    .stat .label { color:#777a82; font-size:8px; }
+    .stat b { display:block; margin-top:5px; font-family:var(--mono); font-size:16px; font-weight:500; letter-spacing:-.03em; }
+    .stat span { display:block; margin-top:3px; color:#666a72; font-family:var(--mono); font-size:7px; }
+    .section { margin-top:14px; }
+    .section-head { display:flex; align-items:center; gap:8px; margin-bottom:7px; }
+    .section-head h2 { margin:0; font-family:var(--serif); font-size:15px; font-weight:400; letter-spacing:-.02em; }
+    .section-head span { margin-left:auto; color:#6f727b; font-family:var(--mono); font-size:8px; }
+    .pos { border:1px solid var(--line); background:rgba(17,19,24,.74); padding:9px 10px; display:grid; gap:6px; margin-bottom:6px; }
+    .pos-top { display:flex; align-items:center; gap:7px; }
+    .pos-top b { font-family:var(--mono); font-size:10px; font-weight:500; }
+    .pos-top .tag { min-height:17px; padding:0 5px; font-size:7px; }
+    .pos-top .pnl { margin-left:auto; font-family:var(--mono); font-size:10px; }
+    .pos-meta { display:flex; justify-content:space-between; color:#777a82; font-family:var(--mono); font-size:8px; }
+    .risk { margin-top:9px; border:1px solid rgba(46,189,133,.20); background:rgba(46,189,133,.045); padding:10px; display:flex; gap:9px; align-items:center; }
+    .risk .dot { color:var(--green); }
+    .risk b { display:block; font-size:9px; font-weight:500; }
+    .risk span { display:block; margin-top:3px; color:#7f838b; font-family:var(--mono); font-size:7px; }
+    .risk .right { margin-left:auto; color:var(--gold); font-family:var(--mono); font-size:10px; }
+    .nav { margin-top:auto; height:58px; border-top:1px solid var(--line); display:flex; align-items:center; justify-content:space-around; }
+    .nav a { color:#6c7078; font-family:var(--mono); font-size:8px; display:grid; place-items:center; gap:4px; }
+    .nav a.on { color:var(--gold); }
+    .nav i { width:15px; height:15px; border:1px solid currentColor; border-radius:2px; }
+  </style>
+</head>
+<body>
+  <main class="phone">
+    <div class="status"><span>09:41</span><span class="right">● ● ▰ 82%</span></div>
+    <header class="m-head">
+      <div class="mark">N</div>
+      <div><div class="name">NanoQuant</div><div class="sub">TRADING TERMINAL</div></div>
+      <div class="live"><i class="dot"></i> LIVE</div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-label"><span class="dot" style="color:var(--gold)"></span> 账户权益 · USDT</div>
+      <div class="hero-value">$128,420<small>.55</small></div>
+      <div class="hero-foot"><span class="up">+$1,284.20</span><span class="up">+1.02%</span><span class="muted">今日</span></div>
+      <div class="hero-chart">
+        <svg viewBox="0 0 330 54" width="100%" height="54" preserveAspectRatio="none">
+          <defs><linearGradient id="m-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#f0b90b" stop-opacity=".28" /><stop offset="100%" stop-color="#f0b90b" stop-opacity="0" /></linearGradient></defs>
+          <path d="M0 45 C20 43 31 39 48 41 S76 36 92 34 S118 38 136 28 S161 31 178 24 S205 29 224 19 S255 23 274 14 S308 17 330 7 L330 54 L0 54 Z" fill="url(#m-fill)" />
+          <path d="M0 45 C20 43 31 39 48 41 S76 36 92 34 S118 38 136 28 S161 31 178 24 S205 29 224 19 S255 23 274 14 S308 17 330 7" fill="none" stroke="#f0b90b" stroke-width="1.4" />
+          <circle cx="330" cy="7" r="3" fill="#f0b90b" />
+        </svg>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><div class="label">今日盈亏</div><b class="up">+$1,284</b><span>+1.02% · 3 笔</span></div>
+      <div class="stat"><div class="label">风险预算</div><b class="gold">68%</b><span>日内余量 3.8%</span></div>
+      <div class="stat"><div class="label">运行仓位</div><b>3 / 6</b><span>保证金 24.8%</span></div>
+      <div class="stat"><div class="label">全局止盈 / 止损</div><b>6% / 2%</b><span>每仓自动执行</span></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>当前持仓</h2><span>3 OPEN →</span></div>
+      <div class="pos">
+        <div class="pos-top"><b>BTCUSDT</b><span class="tag green">LONG 10x</span><span class="pnl up">+2.14%</span></div>
+        <div class="pos-meta"><span>66,420.10 → 67,842.10</span><span class="gold">强平 18.4%</span></div>
+      </div>
+      <div class="pos">
+        <div class="pos-top"><b>ETHUSDT</b><span class="tag green">LONG 8x</span><span class="pnl up">+0.68%</span></div>
+        <div class="pos-meta"><span>3,262.40 → 3,284.62</span><span class="gold">强平 22.1%</span></div>
+      </div>
+      <div class="pos">
+        <div class="pos-top"><b>SOLUSDT</b><span class="tag red">SHORT 5x</span><span class="pnl up">+0.70%</span></div>
+        <div class="pos-meta"><span>149.25 → 148.21</span><span class="gold">强平 26.8%</span></div>
+      </div>
+    </section>
+
+    <section class="risk">
+      <span class="dot"></span>
+      <div><b>风控闸门全部通过</b><span>日亏 1.2/5% · 回撤 8.6/12% · 连亏 0/4</span></div>
+      <span class="right">→</span>
+    </section>
+
+    <nav class="nav">
+      <a class="on" href="#"><i></i>总览</a>
+      <a href="#"><i></i>交易</a>
+      <a href="#"><i></i>策略</a>
+      <a href="#"><i></i>风控</a>
+      <a href="#"><i></i>我的</a>
+    </nav>
+  </main>
+</body>
+</html>

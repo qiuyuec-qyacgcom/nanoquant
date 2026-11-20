@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import { http } from '../api/client'
 import Modal from '../components/Modal.vue'
 import { useAppStore } from '../stores/app'
@@ -112,12 +113,11 @@ async function aiSummary() {
   }
 }
 
-let timer: number | undefined
 onMounted(async () => {
   await load()
-  timer = window.setInterval(load, 60000)
 })
-onBeforeUnmount(() => window.clearInterval(timer))
+
+useSilentRefresh(load, 60000)
 </script>
 
 <template>
@@ -157,8 +157,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
       以下源抓取失败:
       <b v-for="s in failedSources" :key="s.id" style="margin: 0 6px">{{ s.label }}</b>
       —— {{ failedSources[0].error }}
-      <a href="#/admin/strategy?group=news" style="margin-left: 6px">去配置代理</a>
-      <span class="muted">（「参数配置 → 资讯 → proxy」，留空则复用数据源代理）</span>
+      <a href="#/admin/strategy?group=data" style="margin-left: 6px">去配置全局代理</a>
+      <span class="muted">（在「参数配置 → 交易所 → proxy」配置全局代理，资讯会复用）</span>
     </div>
 
     <div class="panel">
@@ -266,7 +266,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         </table>
         <div class="hint">
           币安广场 / 币安公告 / CoinDesk 需要能访问 `www.binance.com`、`www.coindesk.com`；
-          若服务器在受限网络，请配置 HTTP 代理（参数配置 → 资讯 → proxy，或数据源 → proxy 全局复用）。
+          若服务器在受限网络，请配置 HTTP 代理（参数配置 → 交易所 → proxy，资讯会复用全局代理）。
         </div>
       </div>
     </Modal>

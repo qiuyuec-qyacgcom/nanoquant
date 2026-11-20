@@ -1,3 +1,7 @@
+> 历史记录：已退役，不可执行
+> 源路径：docs/TASKS.md
+> 归档时间：2026-11-20T09:17:25Z
+
 # NanoQuant 任务跟踪
 
 > 更新日期：2026-11-11
@@ -182,7 +186,7 @@
   - 全部**不联网、不碰数据库**，可在 CI 里裸跑。
   - 新增 `.github/workflows/ci.yml`：push/PR 触发；后端 `compileall + pytest`，前端 `npm ci && npm run build`；带 pip/npm 缓存与并发取消。
   - README 补充测试命令与 CI 说明；顺带把「持仓管理」链路描述更新为阶梯止盈 + 部分止盈。
-- **结果**：`python -m pytest tests/test_contracts.py -q` → **14 passed in 0.64s**。
+- **结果**：`pytest tests/test_contracts.py -q` → **14 passed in 0.64s**。
 
 ### 17. 信号表补 `mode` 维度（本次执行）
 - **状态**：✅ 已完成

@@ -1,3 +1,7 @@
+> 历史记录：已退役，不可执行
+> 源路径：docs/EVIDENCE.md
+> 归档时间：2026-11-20T09:17:25Z
+
 # 研究证据库
 
 > 按主题归档所有回测 / 验证 / 分析结论，供复查与复现。
@@ -383,22 +387,22 @@ alpha = 事件反应速度 + 方向判断，不是技术指标。
 
 ## 十一、复现命令
 
-```bash
-cd F:\cb\nanoquant\backend
+~~~text
+# [已删除] cd F:\cb\nanoquant\backend
+# [已删除] 
+# [已删除] # 统一的因子实验室（OHLCV 因子 + 资金费率 + 信号源）
+# [已删除] python -m nanoquant.backtest.factor_lab --mode all --symbols BTCUSDT,ETHUSDT,SOLUSDT
+# [已删除] 
+# [已删除] # 只看某类
+# [已删除] python -m nanoquant.backtest.factor_lab --mode factors --interval 15m --bars 25000
+# [已删除] python -m nanoquant.backtest.factor_lab --mode funding --interval 4h
+# [已删除] python -m nanoquant.backtest.factor_lab --mode signals
+# [已删除] 
+# [已删除] # trend vs meanrev 的 walk-forward 裁决（--interval 可选 5m/15m/30m/1h/4h）
+# [已删除] PYTHONPATH=. python ../scripts/final_verdict.py --interval 15m --bars 25000 --folds 4
+# [已删除] PYTHONPATH=. python ../scripts/final_verdict.py --interval 4h --bars 5000 --folds 3
+~~~
 
-# 统一的因子实验室（OHLCV 因子 + 资金费率 + 信号源）
-python -m nanoquant.backtest.factor_lab --mode all --symbols BTCUSDT,ETHUSDT,SOLUSDT
-
-# 只看某类
-python -m nanoquant.backtest.factor_lab --mode factors --interval 15m --bars 25000
-python -m nanoquant.backtest.factor_lab --mode funding --interval 4h
-python -m nanoquant.backtest.factor_lab --mode signals
-
-# trend vs meanrev 的 walk-forward 裁决（--interval 可选 5m/15m/30m/1h/4h）
-PYTHONPATH=. python ../scripts/final_verdict.py --interval 15m --bars 25000 --folds 4
-PYTHONPATH=. python ../scripts/final_verdict.py --interval 4h --bars 5000 --folds 3
-```
-
-> 旧命令 `python -m nanoquant.backtest.factor_ic ...` / `factor_ic_advanced` /
-> `signal_source_eval` 仍然可用（薄转发层），但新代码请用 `factor_lab`。
+> 旧入口（已退役，不可执行）：`nanoquant.backtest.factor_ic ...` / `factor_ic_advanced` /
+> `signal_source_eval` 曾以薄转发层提供，新代码请用 `factor_lab`。
 > 熬鹰原始数据：`data/aoying_raw.json`（持仓）、`data/aoying_orders.json`（成交）。

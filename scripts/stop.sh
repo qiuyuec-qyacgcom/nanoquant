@@ -19,6 +19,6 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
   echo "已停止"
 else
-  # 兜底: 按命令行匹配
-  pkill -f "python -m nanoquant" 2>/dev/null && echo "已停止匹配进程" || echo "未发现运行中的 NanoQuant"
+  # 兜底: 按 Rust 二进制路径匹配（不匹配解释器）
+  pkill -f "rust/nanoquant/target/release/nanoquant" 2>/dev/null && echo "已停止匹配进程" || echo "未发现运行中的 NanoQuant"
 fi

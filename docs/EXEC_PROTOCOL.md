@@ -1,6 +1,6 @@
 # 执行内核 sidecar 协议（v0.1 · 影子模式）
 
-> 目标：把「签名 + 下单 + 保护单 + 落库」从 Python 主循环搬到 Rust，
+> 目标：把「签名 + 下单 + 保护单 + 落库」从 legacy 内核（已退役）搬到 Rust，
 > 先只做**签名与预检**（影子模式），逐字节比对通过后再接管真实下单。
 
 ## 1. 传输
@@ -10,7 +10,7 @@
 | Linux / 生产 | `unix:/run/nanoquant/exec.sock` | AF_UNIX，低延迟、无端口暴露 |
 | Windows 开发 | `tcp:127.0.0.1:9101` | Windows 的 asyncio 不支持 unix socket，用回环 TCP 验证协议 |
 
-Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）或 `EXEC_TCP`（tcp）监听。
+legacy 内核通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）或 `EXEC_TCP`（tcp）监听。
 
 ## 2. 帧格式
 
@@ -45,7 +45,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 | `system.exec_place_protection` | 参数配置 → 系统 | `false` |
 | `EXEC_PLACE_MODE=enabled` | sidecar 环境变量 | 未设置（拒绝） |
 
-失败语义（决定能否回退 Python 重发）：
+失败语义（决定能否回退 legacy 内核重发）：
 
 | 结果 | 含义 | 能否回退重发 |
 |---|---|---|
@@ -75,8 +75,8 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 |---|---|---|
 | `EXEC_LEDGER_DB` | 空（纯内存） | sidecar 自己的台账库路径，如 `/var/lib/nanoquant/exec-ledger.db` |
 
-- **只写 sidecar 自己的两张表**（`exec_orders` / `exec_order_history`），**不动 Python 的 21 张主表**。
-- 单写线程 + 批量事务（每批 ≤64），与 Python `db_writer` 同取舍：关键路径只付一次入队。
+- **只写 sidecar 自己的两张表**（`exec_orders` / `exec_order_history`），**不动 legacy 内核的 21 张主表**。
+- 单写线程 + 批量事务（每批 ≤64），与 legacy 内核 `db_writer` 同取舍：关键路径只付一次入队。
 - 队列满（8192）**丢弃并计数**，绝不阻塞下单；`shutdown` 时 drain。
 - 打不开库就降级为纯内存，行为与 P3-2 完全一致。
 
@@ -106,7 +106,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 连接池失败或预热超时**不会影响** `sign`/`health`：P2 影子比对照常可用。
 
-## 4. 签名规则（必须与 Python 逐字节一致）
+## 4. 签名规则（必须与 legacy 内核逐字节一致）
 
 | 密钥类型 | 判定 | 签名 | 编码 |
 |---|---|---|---|
@@ -124,7 +124,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 | 模式 | 关键路径影响 | 行为 |
 |---|---|---|
-| `off`（默认） | 无 | 只用 Python 本地签名，不连 sidecar |
+| `off`（默认） | 无 | 只用内建签名，不连 sidecar |
 | `shadow` | 后台任务，**零阻塞** | 每次签名另送一份给 sidecar 比对，只统计 |
 | `enforce` | 同步，通常 +0.5–1ms | 不一致**立刻拒绝下单**（转 `-1022`） |
 
@@ -132,7 +132,7 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 1. `shadow` 下比对投递到后台（并发上限 32），抽样比例由 `exec_sample_pct` 控制；
 2. 比对内容 = `signature` 逐字节 + `query` 回显，任一不一致即计入 `mismatched`；
-3. **只有不一致 fail-closed**；sidecar 不可用（连接失败/超时）一律降级回 Python 签名，
+3. **只有不一致 fail-closed**；sidecar 不可用（连接失败/超时）一律降级为内建签名，
    并在 5s 静默期内不再投递，避免每个签名都付一次超时；
 4. `enforce` 的切流判据是 `mismatched == 0`，而不是"连上了"；
 5. 观测口径：`latency_ms` 是**锁内测得的 sidecar 往返**（不含排队），
@@ -159,6 +159,6 @@ Python 侧通过 `EXEC_SOCKET` 指定；Rust 侧通过 `EXEC_SOCKET`（unix）�
 
 ## 7. 风险控制
 
-- sidecar 不可用时 **降级回 Python 签名**（`exec_mode=off` 或自动降级 + 5s 静默），不阻塞交易；
+- sidecar 不可用时 **降级为内建签名**（`exec_mode=off` 或自动降级 + 5s 静默），不阻塞交易；
 - 幂等键仍用 `clientOrderId`，sidecar 崩溃重启后按 cid 向交易所查询收敛；
 - 任何签名不一致都必须**拒绝下单**，不能"猜"。

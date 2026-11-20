@@ -1,25 +1,41 @@
 # 参考模板：与 scripts/install.sh --systemd 动态生成的内容一致。
 # 就地部署：把 <REPO_ROOT> 换成 git clone 的仓库根目录（clone 时的实际路径）。
 # 正常部署请直接运行 scripts/install.sh --systemd，勿手抄本文件。
+# install.sh 会自动创建 nanoquant 系统用户；自定义用户请同时修改 User/Group 与目录属主。
 [Unit]
-Description=NanoQuant (FastAPI + trading engine)
+Description=NanoQuant (Rust trading engine)
 Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant
-After=network-online.target
+After=network-online.target nanoquant-exec.service
 Wants=network-online.target
-# exec sidecar 先起；sidecar 不在时主服务会自动降级，不会被拖死
-After=nanoquant-exec.service
 
 [Service]
 Type=simple
-WorkingDirectory=<REPO_ROOT>/backend
-Environment=NANOQUANT_HOME=<REPO_ROOT>
-Environment=NANOQUANT_PORT=8899
-ExecStart=<REPO_ROOT>/.venv/bin/python -m nanoquant
-
-# 崩溃自动拉起；停机时先 SIGINT 让 lifespan 排空写队列
+User=nanoquant
+Group=nanoquant
+WorkingDirectory="<REPO_ROOT>"
+Environment="NANOQUANT_HOME=<REPO_ROOT>"
+Environment="NANOQUANT_PORT=8899"
+EnvironmentFile=-/etc/nanoquant/nanoquant.env
+ExecStart="<REPO_ROOT>/rust/nanoquant/target/release/nanoquant"
 Restart=always
 RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
 LimitNOFILE=65535
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadWritePaths="<REPO_ROOT>/data" "<REPO_ROOT>/logs"
 
 [Install]
 WantedBy=multi-user.target

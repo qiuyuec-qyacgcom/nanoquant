@@ -5,6 +5,7 @@ import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { wsUrl, getToken } from '../api/client'
 import { fmt, timeStr } from '../utils/format'
+import { useSilentRefresh } from '../composables/silentRefresh'
 
 const app = useAppStore()
 const auth = useAuthStore()
@@ -12,26 +13,28 @@ const route = useRoute()
 const router = useRouter()
 
 const nav = [
-  { group: '交易', items: [
+  { group: '概览', items: [
     { path: '/admin/dashboard', label: '总览', ico: '◈' },
+    { path: '/admin/system', label: '系统诊断', ico: '⌁' },
+  ]},
+  { group: '交易', items: [
     { path: '/admin/onboarding', label: '开仓检查', ico: '⇥' },
     { path: '/admin/signals', label: '信号审计', ico: '▥' },
     { path: '/admin/signal-follow', label: '信号跟单', ico: '⇄' },
     { path: '/admin/strategies', label: '全局策略', ico: '⚑' },
     { path: '/admin/symbols', label: '标的池', ico: '☰' },
-    { path: '/admin/backtest', label: '回测', ico: '◇' },
   ]},
-  { group: '智能', items: [
+  { group: '研究', items: [
+    { path: '/admin/backtest', label: '回测', ico: '◇' },
     { path: '/admin/news', label: '资讯情绪', ico: '✦' },
     { path: '/admin/ai', label: 'AI 模型', ico: '◉' },
-    { path: '/admin/evolution', label: '自进化心法', ico: '✧' },
-    { path: '/admin/journal', label: '决策经验', ico: '◈' },
+    { path: '/admin/strategy', label: '参数配置', ico: '⚙' },
   ]},
   { group: '运维', items: [
-    { path: '/admin/strategy', label: '参数配置', ico: '⚙' },
     { path: '/admin/backup', label: '备份还原', ico: '⛁' },
     { path: '/admin/dead-letters', label: '落库补偿', ico: '⟳' },
-    { path: '/admin/system', label: '系统诊断', ico: '⌁' },
+    { path: '/admin/evolution', label: '自进化心法', ico: '✧' },
+    { path: '/admin/journal', label: '决策经验', ico: '◈' },
   ]},
 ]
 
@@ -53,13 +56,14 @@ watch(navOpen, (open) => {
   document.body.style.overflow = open ? 'hidden' : ''
 })
 
-let timer: number | undefined
 let ws: WebSocket | null = null
 let wsRetry: number | undefined
 
 async function refresh() {
   await app.loadStatus()
 }
+
+useSilentRefresh(refresh, 5000)
 
 async function toggleEngine() {
   if (!status.value) return
@@ -113,15 +117,10 @@ onMounted(async () => {
     app.loadSettings().catch(() => undefined)
   }
   await refresh()
-  // 隐藏标签页不轮询：多开几个后台 tab 就是成倍请求，还会打交易所状态聚合
-  timer = window.setInterval(() => {
-    if (!document.hidden) refresh()
-  }, 5000)
   connectWs()
 })
 
 onBeforeUnmount(() => {
-  window.clearInterval(timer)
   window.clearTimeout(wsRetry)
   ws?.close()
   document.body.style.overflow = ''
@@ -137,7 +136,7 @@ onBeforeUnmount(() => {
         <div class="brand-mark">N</div>
         <div>
           <div class="brand-name">NanoQuant</div>
-          <div class="brand-sub">micro capital</div>
+          <div class="brand-sub">trading terminal</div>
         </div>
       </div>
       <nav class="nav">

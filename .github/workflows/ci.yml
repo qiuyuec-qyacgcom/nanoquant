@@ -1,5 +1,19 @@
 name: CI
 
+# 验证门禁命令矩阵（设计 2.4.8，tasks.md 11.5 固化）：
+#   编译与静态检查   cargo fmt --check；cargo clippy --all-targets -- -D warnings   P1~P5
+#   Rust 单测        cargo test --release --locked（nanoquant / exec-service）      P1~P5
+#   前端             npm run typecheck / npm test / npm run build                   P1~P5
+#   契约对照         nanoquant ops contract-diff --baseline <file>                   P1~P5
+#   端到端           构建 Rust 二进制 → 启动 → Playwright                           P2~P5
+#   零 Python 仓库   nanoquant ops zero-python --scope repo                         P4~P5
+#   零 Python 运行时 nanoquant ops zero-python --scope runtime                      P2~P5
+#   零 Python 文本   nanoquant ops zero-python --scope text                         P4~P5
+#   零 Python 归档   nanoquant ops zero-python --scope docs                         P4~P5
+#   镜像断言         镜像清单检索解释器 / pip / Python 目录                          P4~P5
+# P4 之前 backend/、scripts/ 等退役范围内的 Python 残留由
+# .github/ci/zero-python-allowlist.txt 登记；清单外的新增残留会直接失败。
+
 on:
   push:
     branches: [main, master]
@@ -10,49 +24,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  backend:
-    name: backend (py${{ matrix.python }})
+  shell-lint:
+    name: shell (bash -n)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 覆盖下限 3.11 到当前 3.13；本地开发跑 3.13，CI 兜住最低支持版本
-        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n install.sh scripts/*.sh
+
+  rust-nanoquant:
+    name: rust (nanoquant)
+    runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: backend
+        working-directory: rust/nanoquant
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python }}
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
+          components: rustfmt, clippy
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Format check
+        run: cargo fmt --all --check
 
-      - name: Lint (ruff)
-        # 只开 F/E9：未定义名字、未使用导入、重复定义这类"几乎一定是 bug"的规则
-        run: python -m ruff check .
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Type check (mypy)
-        # 配置在 mypy.ini；当前基线是 0 错误，破了就说明引入了新的类型问题
-        run: python -m mypy
+      - name: Cargo test
+        # 逐域迁移中的主服务：每个域先用契约测试钉住响应形状再切换
+        run: cargo test --release --locked
 
-      - name: Byte-compile
-        run: python -m compileall -q nanoquant
-
-      - name: Tests + coverage
-        # 门槛只防"大幅倒退"：当前基线 68%，留 4 个点余量给跨平台差异。
-        # 改这里的数字时请同步改这行注释 —— 上一版注释还写着 52，早就和参数脱节了。
-        run: python -m pytest tests -q --cov=nanoquant --cov-report=term-missing --cov-fail-under=64
-
-  rust:
-    name: rust (sidecar)
+  rust-exec-service:
+    name: rust (exec-service)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -61,98 +65,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Cargo test
-        run: cargo test --release
-
-  docker:
-    name: docker (build)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build image
-        # 校验 Dockerfile 与 .dockerignore 没被改坏：能构建出来就算过，不推送。
-        # .dockerignore 挡住了 .venv/data/node_modules，构建上下文不再拖数据库与密钥。
-        run: docker build -t nanoquant:ci .
-
-  audit:
-    name: deps (pip-audit)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Audit runtime dependencies
-        # 基线已确认干净（2026-11-14：No known vulnerabilities found），
-        # 从今天起作为硬门禁；别再退回 continue-on-error，否则等于没查
-        run: |
-          python -m pip install --upgrade pip pip-audit
-          pip-audit -r requirements.txt --progress-spinner off
-
-  e2e:
-    name: e2e (smoke)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          cd frontend
-          npm ci
-          npx playwright install --with-deps chromium
-
-      - name: Build frontend
-        run: cd frontend && npm run build
-
-      - name: Start backend
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/logs" "$GITHUB_WORKSPACE/data"
-          cd backend
-          export NANOQUANT_HOME="$GITHUB_WORKSPACE"
-          export NANOQUANT_DATA_DIR="$GITHUB_WORKSPACE/data"
-          export NANOQUANT_LOG_DIR="$GITHUB_WORKSPACE/logs"
-          export NANOQUANT_DB="$GITHUB_WORKSPACE/data/e2e.db"
-          export NANOQUANT_FRONTEND="$GITHUB_WORKSPACE/frontend/dist"
-          # 首次启动的密码来源：不指定就是随机生成（打印在日志里）。
-          # e2e 需要一个可预期的密码，所以这里显式指定。
-          export NANOQUANT_ADMIN_PASSWORD="e2e-Pass-1234"
-          nohup python -m nanoquant > "$GITHUB_WORKSPACE/logs/stdout.log" 2>&1 &
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8899/api/v1/health > /dev/null; then exit 0; fi
-            sleep 1
-          done
-          cat "$GITHUB_WORKSPACE/logs/stdout.log"; exit 1
-
-      - name: Playwright smoke
-        env:
-          # 后端启动时用 NANOQUANT_ADMIN_PASSWORD 指定了这个密码
-          E2E_PASS: e2e-Pass-1234
-        run: cd frontend && npx playwright test
-
-      - name: Logs on failure
-        if: failure()
-        run: tail -100 "$GITHUB_WORKSPACE/logs/stdout.log"
+        run: cargo test --release --locked
 
   frontend:
     name: frontend (build)
@@ -181,3 +104,186 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  e2e-rust:
+    name: e2e (rust binary + playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build Rust binary
+        run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+
+      - name: Install frontend deps
+        run: |
+          cd frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        run: cd frontend && npm run build
+
+      - name: Start Rust service and mock exchange
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ci/data" "$GITHUB_WORKSPACE/.ci/logs"
+          export NANOQUANT_HOME="$GITHUB_WORKSPACE/.ci"
+          export NANOQUANT_DATA_DIR="$GITHUB_WORKSPACE/.ci/data"
+          export NANOQUANT_LOG_DIR="$GITHUB_WORKSPACE/.ci/logs"
+          export NANOQUANT_DB="$GITHUB_WORKSPACE/.ci/data/e2e.db"
+          export NANOQUANT_FRONTEND="$GITHUB_WORKSPACE/frontend/dist"
+          export NANOQUANT_PORT=8899
+          # e2e 需要可预期的管理员密码；首次启动不会本机随机生成后再改密。
+          export NANOQUANT_ADMIN_PASSWORD="e2e-Pass-1234"
+          BIN="$GITHUB_WORKSPACE/rust/nanoquant/target/release/nanoquant"
+          # scripts/mock_exchange.py 的 Rust 替代：ops mock-exchange，全程无解释器。
+          nohup "$BIN" ops mock-exchange --port 19090 --seconds 1800 \
+            > "$GITHUB_WORKSPACE/.ci/logs/mock-exchange.log" 2>&1 &
+          nohup "$BIN" > "$GITHUB_WORKSPACE/.ci/logs/stdout.log" 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8899/api/v1/health > /dev/null; then
+              curl -fsS http://127.0.0.1:19090/fapi/v1/time > /dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$GITHUB_WORKSPACE/.ci/logs/stdout.log"
+          exit 1
+
+      - name: Playwright smoke
+        env:
+          # 服务启动时用 NANOQUANT_ADMIN_PASSWORD 指定了这个密码
+          E2E_PASS: e2e-Pass-1234
+        run: cd frontend && npx playwright test
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          tail -100 "$GITHUB_WORKSPACE/.ci/logs/stdout.log" || true
+          tail -50 "$GITHUB_WORKSPACE/.ci/logs/mock-exchange.log" || true
+
+  zero-python-runtime:
+    name: gate (zero-python runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust binary
+        run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+
+      - name: Zero-python runtime gate
+        # P2~P5 硬门禁：进程列表只允许 Rust 主服务与 exec-service
+        run: |
+          export NANOQUANT_HOME="$GITHUB_WORKSPACE"
+          rust/nanoquant/target/release/nanoquant ops zero-python --scope runtime --format json
+
+  zero-python-repo:
+    name: gate (zero-python repo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust binary
+        run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+
+      - name: Zero-python repo gate
+        # 清单外出现新增可执行 Python 引用即失败；P4 后清单清空，退出码必须为 0
+        env:
+          NANOQUANT_HOME: ${{ github.workspace }}
+        run: |
+          bash .github/ci/zero_python_gate.sh \
+            rust/nanoquant/target/release/nanoquant \
+            .codeartsdoer/specs/python_refs_zero/evidence/zero-python-repo.json \
+            .github/ci/zero-python-allowlist.txt
+
+      - name: Zero-python text gate
+        # 文本级四级词法门禁：未登记命中退出 5，例外不合规退出 6
+        env:
+          NANOQUANT_HOME: ${{ github.workspace }}
+        run: |
+          mkdir -p .codeartsdoer/specs/python_refs_zero/evidence
+          set +e
+          rust/nanoquant/target/release/nanoquant ops zero-python --scope text --format json \
+            --out .codeartsdoer/specs/python_refs_zero/evidence/zero-python-text.json
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            rust/nanoquant/target/release/nanoquant ops zero-python --scope text --format text || true
+          fi
+          exit "$code"
+
+      - name: Zero-python docs gate
+        # 历史归档分层门禁：命令可执行退出 5，标注/分层不合规退出 7
+        env:
+          NANOQUANT_HOME: ${{ github.workspace }}
+        run: |
+          mkdir -p .codeartsdoer/specs/python_refs_zero/evidence
+          set +e
+          rust/nanoquant/target/release/nanoquant ops zero-python --scope docs --format json \
+            --out .codeartsdoer/specs/python_refs_zero/evidence/zero-python-docs.json
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            rust/nanoquant/target/release/nanoquant ops zero-python --scope docs --format text || true
+          fi
+          exit "$code"
+
+  contract-diff:
+    name: gate (contract diff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust binary
+        run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+
+      - name: Contract diff against P0 baseline
+        env:
+          NANOQUANT_HOME: ${{ github.workspace }}
+        run: |
+          rust/nanoquant/target/release/nanoquant ops contract-diff \
+            --baseline .codeartsdoer/specs/rust_full_migration/baseline/contract_baseline.json \
+            --format json
+
+  docker-image-assert:
+    name: docker (build + image assert)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust binary for manifest scan
+        run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+
+      - name: Build image
+        # 校验 Dockerfile 与 .dockerignore 没被改坏：能构建出来就算过，不推送。
+        run: docker build -t nanoquant:ci .
+
+      - name: Export image filesystem manifest
+        run: |
+          cid=$(docker create nanoquant:ci)
+          docker export "$cid" | tar -tf - > image-manifest.txt
+          docker rm "$cid" > /dev/null
+          wc -l image-manifest.txt
+
+      - name: Assert no interpreter / pip / Python dirs
+        # 0 命中才通过；注入 Python 层时本步失败（tasks.md 11.3）
+        env:
+          NANOQUANT_HOME: ${{ github.workspace }}
+        run: |
+          rust/nanoquant/target/release/nanoquant ops zero-python \
+            --scope image --manifest image-manifest.txt --format json

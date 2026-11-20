@@ -1,0 +1,80 @@
+﻿[
+  {
+    "file": "public-home.html",
+    "out": "01-public-home.png",
+    "width": 1440,
+    "height": 900,
+    "fullPage": true,
+    "metrics": {
+      "width": 1440,
+      "height": 900,
+      "viewportWidth": 1440,
+      "viewportHeight": 900
+    }
+  },
+  {
+    "file": "login.html",
+    "out": "02-login.png",
+    "width": 1440,
+    "height": 900,
+    "fullPage": true,
+    "metrics": {
+      "width": 1440,
+      "height": 900,
+      "viewportWidth": 1440,
+      "viewportHeight": 900
+    }
+  },
+  {
+    "file": "admin-dashboard.html",
+    "out": "03-admin-dashboard.png",
+    "width": 1440,
+    "height": 900,
+    "fullPage": true,
+    "metrics": {
+      "width": 1440,
+      "height": 933,
+      "viewportWidth": 1440,
+      "viewportHeight": 900
+    }
+  },
+  {
+    "file": "admin-settings.html",
+    "out": "04-admin-settings.png",
+    "width": 1440,
+    "height": 900,
+    "fullPage": true,
+    "metrics": {
+      "width": 1440,
+      "height": 1144,
+      "viewportWidth": 1440,
+      "viewportHeight": 900
+    }
+  },
+  {
+    "file": "admin-risk.html",
+    "out": "05-admin-risk.png",
+    "width": 1440,
+    "height": 900,
+    "fullPage": true,
+    "metrics": {
+      "width": 1440,
+      "height": 900,
+      "viewportWidth": 1440,
+      "viewportHeight": 900
+    }
+  },
+  {
+    "file": "mobile-dashboard.html",
+    "out": "06-mobile-dashboard.png",
+    "width": 390,
+    "height": 844,
+    "fullPage": false,
+    "metrics": {
+      "width": 390,
+      "height": 844,
+      "viewportWidth": 390,
+      "viewportHeight": 844
+    }
+  }
+]

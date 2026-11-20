@@ -5,7 +5,7 @@
  * 与 astra-quant-agent 的「统一交易环境」一致:
  * - 一个分段控件决定 demo(模拟盘) / live(实盘), 其余参数不再各自为政;
  * - 切实盘必须二次确认并输入确认短语 LIVE;
- * - 行情源/测试网只作为状态展示, 不在这里改 (由「参数配置 → 数据源」维护)。
+ * - 行情源/测试网只作为状态展示, 不在这里改 (由「参数配置 → 交易所」维护)。
  */
 import { computed, ref } from 'vue'
 import { useAppStore } from '../stores/app'

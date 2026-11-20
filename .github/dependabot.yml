@@ -1,19 +1,5 @@
 version: 2
 updates:
-  # 运行时依赖用 uv 锁定，Dependabot 只提 PR，重新锁仍然走
-  #   uv pip compile requirements.in ... （见 requirements.txt 头部注释）
-  - package-ecosystem: pip
-    directory: /backend
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "deps"
-    groups:
-      python-patch:
-        patterns: ["*"]
-        update-types: ["patch"]
 
   - package-ecosystem: npm
     directory: /frontend

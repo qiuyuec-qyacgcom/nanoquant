@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NanoQuant — 公开站点概念稿</title>
+  <link rel="stylesheet" href="theme.css" />
+  <style>
+    body {
+      background: var(--paper);
+      color: #141518;
+    }
+    .public {
+      width: 1440px;
+      min-height: 900px;
+      margin: 0 auto;
+      background:
+        radial-gradient(circle at 82% -8%, rgba(240, 185, 11, 0.2), transparent 34%),
+        radial-gradient(circle at 4% 70%, rgba(201, 148, 0, 0.08), transparent 28%),
+        var(--paper);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .top {
+      height: 74px;
+      padding: 0 50px;
+      display: flex;
+      align-items: center;
+      gap: 34px;
+      border-bottom: 1px solid rgba(17, 17, 17, 0.12);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      min-width: 190px;
+    }
+    .brand .mark {
+      width: 29px;
+      height: 29px;
+      font-size: 13px;
+    }
+    .brand-name {
+      font-family: var(--serif);
+      font-size: 18px;
+      letter-spacing: -0.03em;
+    }
+    .brand-sub {
+      color: #7f7a6d;
+      font-family: var(--mono);
+      font-size: 8px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      margin-top: 2px;
+    }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 27px;
+      color: #5e5b54;
+      font-size: 11px;
+    }
+    .nav a.on {
+      color: #111;
+      border-bottom: 1px solid var(--gold-2);
+      padding-bottom: 5px;
+    }
+    .top-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 17px;
+    }
+    .live {
+      color: #3f7f62;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.04em;
+    }
+    .live .dot {
+      color: #2ebd85;
+    }
+    .hero {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1.02fr 0.98fr;
+      gap: 52px;
+      padding: 43px 50px 30px;
+      align-items: center;
+    }
+    .hero-copy {
+      padding-left: 2px;
+    }
+    .eyebrow {
+      color: #9b7b1d;
+    }
+    .hero h1 {
+      margin: 18px 0 0;
+      max-width: 680px;
+      font-family: var(--serif);
+      font-size: 65px;
+      line-height: 1.02;
+      font-weight: 400;
+      letter-spacing: -0.055em;
+    }
+    .hero h1 em {
+      color: var(--gold-2);
+      font-style: italic;
+    }
+    .hero p {
+      max-width: 520px;
+      margin: 22px 0 0;
+      color: #65625a;
+      font-size: 12px;
+      line-height: 1.9;
+    }
+    .hero-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 28px;
+    }
+    .hero-actions .btn.dark {
+      height: 40px;
+      padding: 0 18px;
+    }
+    .hero-actions .btn.light-ghost {
+      height: 40px;
+    }
+    .hero-metrics {
+      display: flex;
+      gap: 34px;
+      margin-top: 40px;
+      padding-top: 17px;
+      border-top: 1px solid rgba(17, 17, 17, 0.12);
+    }
+    .metric b {
+      display: block;
+      color: #17181b;
+      font-family: var(--mono);
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: -0.04em;
+    }
+    .metric span {
+      display: block;
+      margin-top: 5px;
+      color: #878178;
+      font-family: var(--mono);
+      font-size: 8px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    .terminal {
+      position: relative;
+      min-height: 443px;
+      padding: 22px 24px;
+      background: #0a0c10;
+      color: var(--text);
+      border: 1px solid rgba(240, 185, 11, 0.3);
+      box-shadow: 0 28px 70px rgba(76, 58, 12, 0.18);
+      overflow: hidden;
+    }
+    .terminal::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: linear-gradient(rgba(240, 185, 11, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(240, 185, 11, 0.045) 1px, transparent 1px);
+      background-size: 44px 44px;
+      pointer-events: none;
+    }
+    .terminal::after {
+      content: "";
+      position: absolute;
+      right: -90px;
+      top: -110px;
+      width: 310px;
+      height: 310px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(240, 185, 11, 0.28), transparent 68%);
+      pointer-events: none;
+    }
+    .t-top {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: #8c8f97;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.09em;
+    }
+    .t-top .right {
+      margin-left: auto;
+    }
+    .t-title {
+      position: relative;
+      margin-top: 23px;
+      color: #8c8f97;
+      font-size: 10px;
+    }
+    .t-value {
+      position: relative;
+      margin-top: 8px;
+      display: flex;
+      align-items: baseline;
+      gap: 11px;
+      font-family: var(--mono);
+      font-size: 35px;
+      letter-spacing: -0.06em;
+    }
+    .t-value .up {
+      font-size: 11px;
+      letter-spacing: 0;
+    }
+    .t-chart {
+      position: relative;
+      margin-top: 19px;
+      height: 126px;
+    }
+    .t-rows {
+      position: relative;
+      display: grid;
+      gap: 7px;
+      margin-top: 16px;
+    }
+    .t-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 18px;
+      padding: 8px 0;
+      border-top: 1px solid rgba(255, 255, 255, 0.07);
+      color: #9b9da4;
+      font-family: var(--mono);
+      font-size: 9px;
+    }
+    .t-row b {
+      color: #e8e5dc;
+      font-weight: 500;
+    }
+    .t-row .up {
+      color: var(--green);
+    }
+    .ticker {
+      height: 50px;
+      display: flex;
+      align-items: center;
+      gap: 31px;
+      padding: 0 50px;
+      background: #0a0c10;
+      color: #a4a6ad;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.02em;
+    }
+    .ticker b {
+      color: var(--gold);
+      font-weight: 500;
+    }
+    .ticker .up {
+      color: var(--green);
+    }
+    .ticker .down {
+      color: var(--red);
+    }
+    .ticker .spacer {
+      margin-left: auto;
+      color: #62656d;
+    }
+    .capabilities {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0;
+      padding: 22px 50px 26px;
+      border-top: 1px solid rgba(17, 17, 17, 0.1);
+    }
+    .cap {
+      padding: 0 24px;
+      border-left: 1px solid rgba(17, 17, 17, 0.1);
+    }
+    .cap:first-child {
+      padding-left: 0;
+      border-left: 0;
+    }
+    .cap:last-child {
+      padding-right: 0;
+    }
+    .cap .no {
+      color: var(--gold-2);
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.12em;
+    }
+    .cap h3 {
+      margin: 9px 0 6px;
+      font-family: var(--serif);
+      font-size: 17px;
+      font-weight: 400;
+      letter-spacing: -0.02em;
+    }
+    .cap p {
+      margin: 0;
+      color: #777269;
+      font-size: 10px;
+      line-height: 1.65;
+    }
+    .foot {
+      height: 43px;
+      display: flex;
+      align-items: center;
+      padding: 0 50px;
+      border-top: 1px solid rgba(17, 17, 17, 0.1);
+      color: #908a80;
+      font-family: var(--mono);
+      font-size: 8px;
+      letter-spacing: 0.05em;
+    }
+    .foot .right {
+      margin-left: auto;
+    }
+  </style>
+</head>
+<body>
+  <main class="public">
+    <header class="top">
+      <div class="brand">
+        <div class="mark">N</div>
+        <div>
+          <div class="brand-name">NanoQuant</div>
+          <div class="brand-sub">micro capital · systematic</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <a class="on" href="#">首页</a>
+        <a href="#">行情</a>
+        <a href="#">观点</a>
+        <a href="#">关于</a>
+      </nav>
+      <div class="top-right">
+        <span class="live"><i class="dot"></i> 引擎运行中 · TESTNET</span>
+        <a class="btn dark sm" href="#">进入终端 <span style="color:var(--gold)">↗</span></a>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">BINANCE USDT-M · PERPETUAL · 5–30 MIN</div>
+        <h1>把<em>纪律</em><br />写进每一笔交易。</h1>
+        <p>小资金、币安 U 本位永续、超短线系统化执行。策略只负责提出候选，风控决定是否下单，执行内核负责把每一次进出变成可审计的记录。</p>
+        <div class="hero-actions">
+          <a class="btn dark" href="#">查看实时表现 <span style="color:var(--gold)">↗</span></a>
+          <a class="btn light-ghost" href="#">了解运行方式</a>
+        </div>
+        <div class="hero-metrics">
+          <div class="metric"><b>18<span style="font-size:10px;color:#8c8579"> 个月</span></b><span>系统化实盘</span></div>
+          <div class="metric"><b>2.41</b><span>Sharpe · 滚动 90D</span></div>
+          <div class="metric"><b>8.6<span style="font-size:10px;color:#8c8579">%</span></b><span>最大回撤 · 权益峰值</span></div>
+        </div>
+      </div>
+
+      <aside class="terminal">
+        <div class="t-top">
+          <span class="dot" style="color:var(--gold)"></span>
+          <span>NANOQUANT / LIVE VIEW</span>
+          <span class="right">09:41:22 UTC+8</span>
+        </div>
+        <div class="t-title">账户权益</div>
+        <div class="t-value">$128,420.55 <span class="up">+12.4%</span></div>
+        <div class="t-chart">
+          <svg viewBox="0 0 460 126" preserveAspectRatio="none" width="100%" height="126">
+            <defs>
+              <linearGradient id="pub-fill" x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0%" stop-color="#f0b90b" stop-opacity=".26" />
+                <stop offset="100%" stop-color="#f0b90b" stop-opacity="0" />
+              </linearGradient>
+            </defs>
+            <g stroke="rgba(255,255,255,.06)" stroke-width="1">
+              <path d="M0 20H460M0 52H460M0 84H460M0 116H460" />
+            </g>
+            <path d="M0 105 C24 102 42 92 65 96 S102 88 121 79 S160 91 184 70 S217 76 238 60 S275 68 298 48 S337 54 356 39 S404 45 460 18 L460 126 L0 126 Z" fill="url(#pub-fill)" />
+            <path d="M0 105 C24 102 42 92 65 96 S102 88 121 79 S160 91 184 70 S217 76 238 60 S275 68 298 48 S337 54 356 39 S404 45 460 18" fill="none" stroke="#f0b90b" stroke-width="1.6" />
+            <circle cx="460" cy="18" r="3.4" fill="#f0b90b" />
+          </svg>
+        </div>
+        <div class="t-rows">
+          <div class="t-row"><span>BTCUSDT · LONG</span><b>0.0842</b><span class="up">+3.18%</span></div>
+          <div class="t-row"><span>ETHUSDT · LONG</span><b>1.240</b><span class="up">+1.62%</span></div>
+          <div class="t-row"><span>SOLUSDT · SHORT</span><b>12.50</b><span class="down">−0.84%</span></div>
+        </div>
+      </aside>
+    </section>
+
+    <div class="ticker">
+      <span><b>BTC</b> 67,842.10 <span class="up">+2.41%</span></span>
+      <span><b>ETH</b> 3,284.62 <span class="up">+1.18%</span></span>
+      <span><b>SOL</b> 148.21 <span class="down">−0.62%</span></span>
+      <span><b>FUNDING</b> 0.0100% / 8H</span>
+      <span class="spacer">数据延迟 1.2s · 只读展示，不构成投资建议</span>
+    </div>
+
+    <section class="capabilities">
+      <div class="cap">
+        <div class="no">01 / EXECUTION</div>
+        <h3>先风控，再下单</h3>
+        <p>五道独立闸门：日内亏损、回撤、连亏冷却、敞口与交易时段。全局止盈止损按每仓价格变动自动执行。</p>
+      </div>
+      <div class="cap">
+        <div class="no">02 / RESEARCH</div>
+        <h3>可回测的纪律</h3>
+        <p>同一套管仓规则跑在回测与实盘：ATR 止损、移动止损、保本、部分止盈与时间阶梯止盈。</p>
+      </div>
+      <div class="cap">
+        <div class="no">03 / AUDIT</div>
+        <h3>每一步都留痕</h3>
+        <p>信号、参数变更、下单与平仓都可追溯；密钥不进入日志，执行侧车只签名不下单。</p>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <span>NANOQUANT / SYSTEMATIC MICRO CAPITAL</span>
+      <span class="right">PUBLIC BETA · 2026</span>
+    </footer>
+  </main>
+</body>
+</html>

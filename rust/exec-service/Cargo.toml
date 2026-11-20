@@ -2,7 +2,8 @@
 name = "exec-service"
 version = "0.1.0"
 edition = "2021"
-description = "NanoQuant 执行内核 sidecar（UDS，影子模式起步）"
+rust-version = "1.88"
+description = "NanoQuant 执行内核 sidecar（UDS，只签名不下单）"
 
 [[bin]]
 name = "exec-service"
@@ -19,7 +20,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8"] }
 # P3-1：HTTP/2 连接池。纯 Rust TLS（rustls），不依赖系统 OpenSSL，
 # 避免 VPS 上缺 libssl 或版本不匹配导致构建/运行失败。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip"] }
-# P3-4：sidecar 自己的台账持久化（独立库文件，不碰 Python 主库）。
+# P3-4：sidecar 自己的台账持久化（独立库文件，不碰 legacy 内核（已退役）主库）。
 # bundled 编译自带 SQLite C 源码，避免依赖系统 libsqlite3。
 rusqlite = { version = "0.32", features = ["bundled"] }
 

@@ -1,805 +1,849 @@
 #!/usr/bin/env bash
-# NanoQuant 一键安装脚本（依赖安装这一步）
-#
-# 免 clone 的一条命令在线安装请用仓库根目录的引导脚本 install.sh：
-#   if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;else wget -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password 'xxx'
-# 引导脚本下载代码后会转交到本脚本继续安装。
-#
-#   sudo bash scripts/install.sh                 # 默认端口 8899
-#   sudo bash scripts/install.sh --port 9000     # 指定端口（写进 data/.port，start.sh 沿用）
-#   sudo bash scripts/install.sh --systemd       # 注册 systemd 自启，并等健康检查通过
-#   sudo bash scripts/install.sh --no-frontend   # 跳过前端构建（已有 dist 或只跑后端）
-#   sudo bash scripts/install.sh --mirror cn     # 用国内 pip 镜像（清华源）
-#   sudo bash scripts/install.sh --password 'xxx' # 指定初始管理员密码
-#   sudo bash scripts/install.sh --force         # 强制重装依赖（默认按 requirements 哈希跳过）
-#   sudo bash scripts/install.sh --no-pyenv      # 不用 pyenv 兜底编译 Python（跳过自动编译）
-#   sudo bash scripts/install.sh --no-start      # 装完不自动后台启动（默认装完即后台运行）
-#   sudo bash scripts/install.sh --kernel python # 只用 Python 执行内核（不编译 Rust，默认）
-#   sudo bash scripts/install.sh --kernel rust   # 用 Rust 执行内核；需填 API Key/Secret，且会自动编译安装
-#   sudo bash scripts/install.sh --no-sidecar    # 等价 --kernel python（兼容旧参数）
-#
-# 内核选择：不给 --kernel 时会**交互询问**；非交互环境（无 TTY）默认 python。
-#
-# 密码：不指定时由安装脚本随机生成、装完直接打印，登录后必须改密。
-#
-# 设计取舍：
-# - 幂等：重复执行不会每次重装依赖/重建 venv，改完 requirements 再跑一次即可；
-# - 失败可见：任何一步失败都以非 0 退出并说明下一步，绝不打印"安装完成"；
-# - 尽量自动补齐：缺 Node 会自动装（apt → NodeSource 20 LTS），装不上才警告跳过；
-#   Python 缺 sqlite3 或版本不够会自动补（libsqlite3-dev / apt 3.11+），
-#   再不行用 pyenv 编译 3.11，还不行才中止。
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${NANOQUANT_PORT:-8899}"
-WITH_SYSTEMD=0
-WITH_FRONTEND=1
-FORCE=0
-MIRROR="${PIP_INDEX_URL:-}"
-ADMIN_PASSWORD="${NANOQUANT_ADMIN_PASSWORD:-}"
-NO_PYENV=0
-NO_START=0
-PYENV_MIRROR=""
-#: 执行内核: python（默认）| rust（需 API 凭证，会编译并安装 sidecar）
-KERNEL="${NANOQUANT_KERNEL:-}"
-SIDECAR_API_KEY="${NANOQUANT_API_KEY:-}"
-SIDECAR_API_SECRET="${NANOQUANT_API_SECRET:-}"
-SIDECAR_ENV="${NANOQUANT_CRED_ENV:-demo}"
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --port)
-      PORT="${2:-}"
-      [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "--port 需要一个数字"; exit 1; }
-      shift 2 ;;
-    --systemd) WITH_SYSTEMD=1; shift ;;
-    --kernel)
-      KERNEL="${2:-}"
-      case "$KERNEL" in
-        python|rust|py) [[ "$KERNEL" == "py" ]] && KERNEL="python"; shift 2 ;;
-        *) echo "--kernel 只支持 python / rust"; exit 1 ;;
-      esac ;;
-    --no-sidecar) KERNEL="python"; shift ;;
-    --no-frontend) WITH_FRONTEND=0; shift ;;
-    --mirror)
-      case "${2:-}" in
-        cn|tsinghua) MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"; PYENV_MIRROR="https://mirrors.huaweicloud.com/python" ;;
-        aliyun) MIRROR="https://mirrors.aliyun.com/pypi/simple"; PYENV_MIRROR="https://mirrors.huaweicloud.com/python" ;;
-        *) MIRROR="${2:-}" ;;
-      esac
-      shift 2 ;;
-    --no-pyenv) NO_PYENV=1; shift ;;
-    --no-start) NO_START=1; shift ;;
-    --password)
-      ADMIN_PASSWORD="${2:-}"
-      shift 2 ;;
-    --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "未知参数: $1（用 --help 查看用法）"; exit 1 ;;
-  esac
-done
-
-C_RESET='\033[0m'; C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'; C_DIM='\033[2m'
-#: 统一输出前缀；行宽对齐交给前缀本身，消息里不再各自拼空格
-info() { printf "${C_INFO}  · ${C_RESET}%s\n" "$*"; }
-ok()   { printf "${C_OK}  ✓ ${C_RESET}%s\n" "$*"; }
-warn() { printf "${C_WARN}  ⚠ ${C_RESET}%s\n" "$*"; }
-die()  { printf "${C_ERR}  ✗ ${C_RESET}%s\n" "$*" >&2; exit 1; }
-
-#: 阶段标题：进入一个新的安装阶段时调用，让长输出有清晰的分节。
-#: 注意：分隔线直接写进 printf 的**格式串**（转义才会生效），不能当 %s 参数传。
-stage() {
-  printf "\n${C_DIM}────────────────────────────────────────────────${C_RESET}\n"
-  printf "  ${C_INFO}▸ %s${C_RESET}\n" "$*"
-  printf "${C_DIM}────────────────────────────────────────────────${C_RESET}\n"
-}
-
-banner() {
-  cat <<'EOF'
-
-  ══════════════════════════════════════════════════
-    NanoQuant  安装程序
-    小资金 · 币安 U 本位永续 · 超短线量化终端
-  ══════════════════════════════════════════════════
-EOF
-}
-
-banner
-printf "  ${C_DIM}安装目录   %s\n  监听端口   %s${C_RESET}\n" "$ROOT" "$PORT"
-
-# ---------------------------------------------------------------- 执行内核选择
-# 交互式询问（无 TTY 或已用 --kernel 指定时跳过）。
-# 选 rust 必须提供 API Key/Secret：sidecar 的签名密钥与交易所 Secret 是同一把，
-# 且没有它 sidecar 根本起不来（见 rust/exec-service 的 EXEC_SECRET）。
-if [[ -z "$KERNEL" ]]; then
-  if [[ -t 0 && -t 1 ]]; then
-    echo
-    echo "请选择执行内核："
-    echo "  1) Python（默认；无需额外配置，装完即用）"
-    echo "  2) Rust（更低的签名延迟；需要填写币安 API Key 与 Secret）"
-    printf "输入 1 或 2 [1]: "
-    read -r _choice || _choice=""
-    case "${_choice:-1}" in
-      2|r|R|rust|RUST) KERNEL="rust" ;;
-      *) KERNEL="python" ;;
-    esac
-  else
-    KERNEL="python"
-  fi
-fi
-[[ -n "$KERNEL" ]] || KERNEL="python"
-
-if [[ "$KERNEL" == "rust" ]]; then
-  info "已选择 Rust 执行内核：需要交易所 API 凭证"
-  # 环境归属：sidecar 的 EXEC_SECRET 必须与**当前交易环境**的 Secret 一致
-  if [[ -z "${SIDECAR_ENV:-}" || "$SIDECAR_ENV" == "demo" ]]; then
-    if [[ -t 0 && -t 1 && -z "${NANOQUANT_CRED_ENV:-}" ]]; then
-      printf "凭证用于哪个环境？1) 模拟盘/测试网（默认）  2) 实盘/主网 [1]: "
-      read -r _env_choice || _env_choice=""
-      case "${_env_choice:-1}" in 2|l|L|live|LIVE) SIDECAR_ENV="live" ;; *) SIDECAR_ENV="demo" ;; esac
-    fi
-  fi
-  [[ "$SIDECAR_ENV" == "live" ]] || SIDECAR_ENV="demo"
-
-  # Key：普通输入；Secret：不回显（-s）
-  if [[ -z "$SIDECAR_API_KEY" && -t 0 ]]; then
-    printf "币安 API Key: "
-    read -r SIDECAR_API_KEY || SIDECAR_API_KEY=""
-  fi
-  if [[ -z "$SIDECAR_API_SECRET" && -t 0 ]]; then
-    printf "币安 API Secret（输入不回显）: "
-    read -rs SIDECAR_API_SECRET || SIDECAR_API_SECRET=""
-    echo
-  fi
-  # 容错：去掉误粘的首尾尖括号/引号/空白（真实场景踩过：把 <...> 一起粘进来）
-  clean_cred() {
-    printf '%s' "$1" | tr -d '[:space:]' | sed -e "s/^[<\"']//" -e "s/[>\"']\$//"
-  }
-  SIDECAR_API_KEY="$(clean_cred "$SIDECAR_API_KEY")"
-  SIDECAR_API_SECRET="$(clean_cred "$SIDECAR_API_SECRET")"
-
-  [[ -n "$SIDECAR_API_KEY" ]] || die "选择 Rust 内核时必须填写 API Key（可改用 --kernel python）"
-  [[ -n "$SIDECAR_API_SECRET" ]] || die "选择 Rust 内核时必须填写 API Secret（可改用 --kernel python）"
-  ok "已收到凭证：Key 长度 ${#SIDECAR_API_KEY}，Secret 长度 ${#SIDECAR_API_SECRET}（不打印内容）"
-fi
-if [[ -n "$ADMIN_PASSWORD" ]]; then
-  [[ ${#ADMIN_PASSWORD} -ge 8 ]] || die "--password 至少 8 位（这是唯一能进后台的凭据）"
-  info "初始管理员密码: 使用你指定的值（不回显，装完会打印）"
-else
-  info "初始管理员密码: 由安装脚本随机生成，装完打印"
-fi
-
-# Git Bash / Cygwin 不是真 Linux：venv 是 Scripts\ 布局、也没有 systemd/chmod，
-# 在这里"装成功了"只会在后面启动时炸；直接把 Windows 用户送到正确脚本
-case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*)
-    printf "${C_ERR}  ✗ ${C_RESET} 检测到 Git Bash / Cygwin。\n" >&2
-    echo "  Windows 请用: powershell -ExecutionPolicy Bypass -File scripts\\install.ps1" >&2
-    exit 1 ;;
-esac
-
-if [[ "$(id -u)" == "0" ]]; then
-  info "以 root 运行：生成的文件属主是 root，后续请用同一用户执行 start.sh"
-fi
-
-stage "阶段 1/8 · 环境检查（Python / 磁盘 / 系统包）"
-# SQLite / 备份 / 日志都在 data/ 下，空间不足会变成"盘中写入失败"，比启动失败更难查
-FREE_KB="$(df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
-if [[ -n "${FREE_KB:-}" && "$FREE_KB" -lt 2097152 ]]; then
-  warn "可用空间仅 $((FREE_KB / 1024)) MB（建议 ≥ 2 GB）：备份/日志/SQLite 都写在这里"
-fi
-
-# ---------------------------------------------------------------- 包管理器
-PKG=""
-if command -v apt-get >/dev/null 2>&1; then PKG="apt"
-elif command -v dnf >/dev/null 2>&1; then PKG="dnf"
-elif command -v yum >/dev/null 2>&1; then PKG="yum"
-elif command -v apk >/dev/null 2>&1; then PKG="apk"
-fi
-
-install_pkg() {
-  [[ -z "$PKG" ]] && return 1
-  case "$PKG" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
-    dnf) dnf install -y -q "$@" ;;
-    yum) yum install -y -q "$@" ;;
-    apk) apk add --no-cache "$@" ;;
-  esac
-}
-
-# 与 backend/requirements.txt（uv 按 3.11 编译）和 CI 矩阵保持一致：
-# 依赖元数据里 starlette 要求 >=3.11，所以 3.11 是最低可用版本（3.10 已被生态淘汰）。
-# 另外必须能 import sqlite3：源码编译的 Python 若缺 libsqlite3-dev，
-# _sqlite3 C 扩展会被静默跳过，版本看着够、装到一半才炸，这里提前揪出来。
-MIN_MINOR=11
-py_usable() {
-  "$1" -c "import sys, sqlite3; sys.exit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null
-}
-# 只判版本（不查 sqlite3），用来区分「版本不够」和「版本够但缺 sqlite3」
-py_version_ok() {
-  "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, $MIN_MINOR) else 1)" 2>/dev/null
-}
-# 找到第一个「版本够且能 import sqlite3」的解释器，写入全局 PY（始终返回 0，避免 set -e 误杀）
-scan_python() {
-  PY=""
-  local cand
-  for cand in python3.13 python3.12 python3.11 python3; do
-    command -v "$cand" >/dev/null 2>&1 || continue
-    if py_usable "$cand"; then PY="$cand"; return 0; fi
-  done
-  return 0
-}
-# 找「版本够但缺 sqlite3」的解释器，用于精准报错
-find_broken_sqlite() {
-  local cand
-  for cand in python3.13 python3.12 python3.11 python3; do
-    command -v "$cand" >/dev/null 2>&1 || continue
-    if py_version_ok "$cand" && ! py_usable "$cand"; then printf '%s\n' "$cand"; return 0; fi
-  done
-  return 1
-}
-
-# pyenv 兜底：apt 装不出 3.11+（更老的发行版源里只有 3.9/3.10）时，用 pyenv 编译一个完整版 3.11
-PYENV_BIN=""
-install_pyenv_python() {
-  local pyenv_root="${PYENV_ROOT:-$HOME/.pyenv}"
-  local ver="${NANOQUANT_PYENV_VERSION:-3.11.13}"
-  PYENV_BIN=""
-  # 已装过这个版本就直接复用
-  if [[ -x "$pyenv_root/versions/$ver/bin/python" ]]; then
-    PYENV_BIN="$pyenv_root/versions/$ver/bin/python"
-    ok "复用 pyenv 已装好的 Python $ver"
-    return 0
-  fi
-  # 1. pyenv 本体（git 优先，curl/wget 下载源码包兜底）
-  if [[ ! -x "$pyenv_root/bin/pyenv" ]]; then
-    if command -v git >/dev/null 2>&1; then
-      info "安装 pyenv（git clone -> $pyenv_root）"
-      git clone --depth 1 https://github.com/pyenv/pyenv.git "$pyenv_root" || return 1
-    elif command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
-      info "安装 pyenv（下载源码包 -> $pyenv_root）"
-      local tmpdir
-      tmpdir="$(mktemp -d)" || return 1
-      if command -v curl >/dev/null 2>&1; then
-        curl -fsSL https://github.com/pyenv/pyenv/archive/refs/heads/master.tar.gz -o "$tmpdir/pyenv.tar.gz" || return 1
-      else
-        wget -qO "$tmpdir/pyenv.tar.gz" https://github.com/pyenv/pyenv/archive/refs/heads/master.tar.gz || return 1
-      fi
-      tar -xzf "$tmpdir/pyenv.tar.gz" -C "$tmpdir" || return 1
-      mkdir -p "$(dirname "$pyenv_root")"
-      [[ "$pyenv_root" == */.pyenv ]] && rm -rf "$pyenv_root"
-      mv "$tmpdir/pyenv-master" "$pyenv_root" || return 1
-      rm -rf "$tmpdir"
-    else
-      return 1
-    fi
-  fi
-  [[ -x "$pyenv_root/bin/pyenv" ]] || return 1
-  ok "pyenv 就绪"
-
-  # 2. 编译 CPython 的构建依赖（apt 完整支持，其他包管理器尽力而为）
-  if [[ "$PKG" == "apt" ]]; then
-    info "安装编译 Python 的构建依赖"
-    apt-get update -qq || true
-    install_pkg build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
-      libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
-      libffi-dev liblzma-dev || true
-  else
-    warn "非 apt 系统：pyenv 编译依赖可能不全（主要支持 Debian/Ubuntu）"
-    install_pkg gcc make zlib-devel readline-devel sqlite-devel openssl-devel libffi-devel || true
-  fi
-
-  # 3. 编译（国内可走镜像加速下载 Python 源码）
-  export PYENV_ROOT="$pyenv_root"
-  [[ -n "$PYENV_MIRROR" ]] && export PYTHON_BUILD_MIRROR_URL="$PYENV_MIRROR"
-  info "pyenv 编译 Python $ver（首次约 3-5 分钟）"
-  "$pyenv_root/bin/pyenv" install -s "$ver" || return 1
-  [[ -x "$pyenv_root/versions/$ver/bin/python" ]] || return 1
-  PYENV_BIN="$pyenv_root/versions/$ver/bin/python"
-  ok "pyenv 编译完成：$($PYENV_BIN --version 2>&1)"
-  return 0
-}
-
-scan_python
-if [[ -z "$PY" ]]; then
-  BROKEN="$(find_broken_sqlite || true)"
-  if [[ -n "$BROKEN" ]]; then
-    warn "检测到 $BROKEN 版本满足要求，但缺少 sqlite3 模块（_sqlite3 C 扩展）"
-    info "尝试自动修复：装 libsqlite3-dev，并尽量用 apt 装一个完整版 Python 绕开"
-  else
-    warn "未找到 Python 3.11+，尝试自动安装"
-  fi
-  if [[ "$PKG" == "apt" ]]; then
-    apt-get update -qq || true
-    # 缺 sqlite3 时补上开发库（重编才能成功）；再显式试装 3.11/3.12/3.13（Debian 12 源里有 3.11）
-    [[ -n "$BROKEN" ]] && install_pkg libsqlite3-dev || true
-    install_pkg python3 python3-venv python3-pip || true
-    install_pkg python3.11 || true
-    install_pkg python3.12 || true
-    install_pkg python3.13 || true
-  else
-    install_pkg python3 python3-pip || true
-  fi
-  scan_python
-fi
-
-if [[ -z "$PY" ]]; then
-  # 兜底：apt 装不出 3.11+（更老的发行版源里只有 3.9/3.10）时，用 pyenv 编译一个完整版 3.11
-  if [[ "$NO_PYENV" == "1" ]]; then
-    die "未找到可用 Python 3.11+，且已用 --no-pyenv 跳过自动编译。请自行安装 3.11+ 后重试"
-  fi
-  warn "apt 装不出 Python 3.11+，改用 pyenv 编译"
-  if install_pyenv_python && py_usable "$PYENV_BIN"; then
-    PY="$PYENV_BIN"
-  else
-    warn "pyenv 自动编译未成功，下面给出手动指引"
-  fi
-fi
-
-if [[ -z "$PY" ]]; then
-  if [[ -n "$BROKEN" ]]; then
-    die "apt 与 pyenv 都未能给出可用 Python（$BROKEN 缺 sqlite3）。
-已装好 libsqlite3-dev，可手动重编一次补 sqlite3：
-  cd <你的 Python 源码目录> && ./configure --enable-optimizations && make -j\"\$(nproc)\" && make altinstall
-或检查网络后重试（pyenv 需访问 github / python.org）"
-  fi
-  die "apt 与 pyenv 都未能安装 Python 3.11+。请检查网络后重试，或手动装 deadsnakes / pyenv / 官方源码"
-fi
-ok "Python: $($PY --version 2>&1)"
-
-if ! "$PY" -c 'import venv' 2>/dev/null; then
-  warn "缺少 venv 模块，尝试安装"
-  [[ "$PKG" == "apt" ]] && install_pkg python3-venv
-  "$PY" -c 'import venv' 2>/dev/null || die "仍缺少 venv 模块，请安装 python3-venv 后重试"
-fi
-
-# ---------------------------------------------------------------- 虚拟环境
-stage "阶段 2/8 · 虚拟环境与后端依赖"
-VENV="$ROOT/.venv"
-# 兼容 Windows 布局（Scripts/python.exe）：仓库放在 Windows 盘上被 WSL 挂进来时
-# 常见这种 venv，直接判成"没有 venv"会把它重建一遍
-venv_python() {
-  if [[ -x "$VENV/bin/python" ]]; then printf '%s\n' "$VENV/bin/python"
-  elif [[ -x "$VENV/Scripts/python.exe" ]]; then printf '%s\n' "$VENV/Scripts/python.exe"
-  fi
-}
-VPY="$(venv_python)"
-if [[ -z "$VPY" ]]; then
-  info "创建虚拟环境 $VENV"
-  "$PY" -m venv "$VENV" || die "venv 创建失败（Debian/Ubuntu 需要 python3-venv 包）"
-  VPY="$(venv_python)"
-  [[ -n "$VPY" ]] || die "venv 创建后仍找不到解释器，请检查 $VENV 目录"
-else
-  info "复用已有虚拟环境 $VENV"
-fi
-
-# venv 自愈：Debian 的 python3-venv 常被裁剪成「有 python 没 pip」。
-# 复用旧 venv 或 ensurepip 被禁用时都会中招，安装前必须先把 pip 补上。
-ensure_pip() {
-  if "$VPY" -m pip --version >/dev/null 2>&1; then return 0; fi
-  warn "虚拟环境缺少 pip，尝试修复"
-  # 1) ensurepip（多数 venv 自带）
-  if "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 && "$VPY" -m pip --version >/dev/null 2>&1; then
-    ok "pip 已通过 ensurepip 恢复"
-    return 0
-  fi
-  # 2) 补装系统包（Debian/Ubuntu 的 python3-venv 提供 ensurepip）
-  if [[ "$PKG" == "apt" ]]; then
-    install_pkg python3-pip python3-venv >/dev/null 2>&1 || true
-    if "$VPY" -m ensurepip --upgrade >/dev/null 2>&1 && "$VPY" -m pip --version >/dev/null 2>&1; then
-      ok "pip 已通过系统包恢复"
-      return 0
-    fi
-  fi
-  # 3) get-pip.py 兜底（不依赖 ensurepip / 系统包）
-  local GETPIP
-  GETPIP="$(mktemp /tmp/get-pip.XXXXXX.py)"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$GETPIP" || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$GETPIP" https://bootstrap.pypa.io/get-pip.py || true
-  fi
-  if [[ -s "$GETPIP" ]] && "$VPY" "$GETPIP" --quiet >/dev/null 2>&1; then
-    rm -f "$GETPIP"
-    ok "pip 已通过 get-pip.py 恢复"
-    return 0
-  fi
-  rm -f "$GETPIP"
-  die "无法为虚拟环境恢复 pip。请手动执行：
-  curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && $VPY /tmp/get-pip.py
-  或：apt install -y python3-pip python3-venv"
-}
-ensure_pip
-
-# ---------------------------------------------------------------- 后端依赖
-REQ="$ROOT/backend/requirements.txt"
-HASH_FILE="$VENV/.requirements.sha256"
-NEW_HASH="$(sha256sum "$REQ" | awk '{print $1}')"
-PIP_ARGS=(-q)
-[[ -n "$MIRROR" ]] && PIP_ARGS+=(-i "$MIRROR")
-
-if [[ "$FORCE" == "0" && -f "$HASH_FILE" && "$(cat "$HASH_FILE" 2>/dev/null)" == "$NEW_HASH" ]]; then
-  info "依赖未变（requirements.txt 哈希一致），跳过安装；要强制重装加 --force"
-else
-  info "安装后端依赖（首次可能要几分钟）"
-  [[ -n "$MIRROR" ]] && info "pip 镜像: $MIRROR"
-  "$VPY" -m pip install --upgrade pip "${PIP_ARGS[@]}" >/dev/null 2>&1 || true
-  "$VPY" -m pip install "${PIP_ARGS[@]}" -r "$REQ" \
-    || die "后端依赖安装失败：可加 --mirror cn 换源重试，或检查网络/代理"
-  printf '%s\n' "$NEW_HASH" > "$HASH_FILE"
-  ok "后端依赖就绪"
-fi
-
-# 装完自检：能 import 才算真的齐（镜像包没下全的情况确实存在）
-( cd "$ROOT/backend" && "$VPY" -c "import nanoquant.main" ) \
-  || die "依赖装完但 import 失败，请把上面的报错贴出来"
-ok "后端可导入（nanoquant.main）"
-
-# ---------------------------------------------------------------- 前端构建
-stage "阶段 3/8 · 前端构建（自动补齐 Node.js 18+）"
-# 自动补齐 Node.js：前端要 18+，缺了或太旧就自动装（apt 优先，装不到走 NodeSource 20 LTS）
-node_ready() {
-  command -v node >/dev/null 2>&1 || return 1
-  local maj
-  maj="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-  [[ "${maj:-0}" -ge 18 ]]
-}
-ensure_node() {
-  node_ready && return 0
-  info "未检测到 Node.js 18+，尝试自动安装"
-  if [[ "$PKG" == "apt" ]]; then
-    apt-get update -qq || true
-    install_pkg nodejs npm || true
-    if node_ready; then ok "Node.js: $(node -v)"; return 0; fi
-    # apt 源里的 nodejs 偏老（Ubuntu 22.04 只有 12），换 NodeSource 装 20 LTS
-    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
-      warn "apt 的 nodejs 版本过旧（$(node -v 2>/dev/null || echo 无)），改用 NodeSource 装 Node 20 LTS"
-      install_pkg ca-certificates gnupg || true
-      if command -v curl >/dev/null 2>&1; then
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | sed 's/^/  /' || true
-      else
-        wget -qO- https://deb.nodesource.com/setup_20.x | bash - 2>&1 | sed 's/^/  /' || true
-      fi
-      install_pkg nodejs || true
-      node_ready && { ok "Node.js: $(node -v)"; return 0; }
-    fi
-    return 1
-  fi
-  install_pkg nodejs npm || true
-  node_ready && { ok "Node.js: $(node -v)"; return 0; }
-  return 1
-}
-
-if [[ "$WITH_FRONTEND" == "1" ]]; then
-  if [[ -f "$ROOT/frontend/dist/index.html" ]]; then
-    info "已存在前端产物，跳过构建（要重建请先删 frontend/dist）"
-  elif ensure_node; then
-    info "构建前端（npm ci + build）"
-    if [[ -f "$ROOT/frontend/package-lock.json" ]]; then
-      ( cd "$ROOT/frontend" && npm ci --no-audit --no-fund && npm run build ) || die "前端构建失败"
-    else
-      ( cd "$ROOT/frontend" && npm install --no-audit --no-fund && npm run build ) || die "前端构建失败"
-    fi
-    ok "前端构建完成（frontend/dist）"
-  else
-    warn "未能自动安装 Node.js 18+，跳过前端构建"
-    warn "面板打不开但 API 正常；手动装好 Node 18+ 后执行: cd frontend && npm ci && npm run build"
-  fi
-fi
-
-# ---------------------------------------------------------------- 执行内核 sidecar（Rust）
-if [[ "$KERNEL" == "rust" ]]; then
-  stage "阶段 4/8 · Rust 执行内核（编译 / 安装 / 配密钥）"
-else
-  info "执行内核: Python（跳过 Rust 编译）"
-fi
-# 仅当用户选择 rust 时执行：编译 → 装二进制 → 写密钥 → 注册 systemd。
-# 选 python 时这里完全跳过，不留任何 Rust 相关残留。
-SIDECAR_OK=0
-if [[ "$KERNEL" == "rust" && -d "$ROOT/rust/exec-service" ]]; then
-  info "准备 Rust 执行内核：编译并安装 sidecar"
-
-  # C 工具链：rusqlite 的 bundled SQLite 需要 cc/gcc
-  if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-    info "缺少 C 编译器（bundled SQLite 需要），尝试自动安装"
-    [[ "$PKG" == "apt" ]] && install_pkg build-essential || install_pkg gcc make || true
-  fi
-
-  if ! command -v cargo >/dev/null 2>&1; then
-    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
-      info "安装 Rust（rustup minimal，仅用于本次构建）"
-      if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal 2>&1 | sed 's/^/  /' || true
-      else
-        wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal 2>&1 | sed 's/^/  /' || true
-      fi
-      # shellcheck disable=SC1091
-      [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
-      [[ -f /root/.cargo/env ]] && source /root/.cargo/env
-    fi
-  fi
-
-  if command -v cargo >/dev/null 2>&1; then
-    info "编译 sidecar（cargo build --release，首次约 1~2 分钟）"
-    if ( cd "$ROOT/rust/exec-service" && cargo build --release ) 2>&1 | sed 's/^/  /'; then
-      SRC_BIN="$ROOT/rust/exec-service/target/release/exec-service"
-      if [[ -x "$SRC_BIN" ]]; then
-        install -m 0755 "$SRC_BIN" "$ROOT/exec-service"
-        SIDECAR_OK=1
-        ok "sidecar 二进制已安装：$ROOT/exec-service"
-      fi
-    fi
-  fi
-  if [[ "$SIDECAR_OK" != "1" ]]; then
-    warn "Rust 内核编译失败：本次将回退为 Python 内核（主服务不受影响）"
-    warn "排查后可重试：sudo bash scripts/setup_sidecar.sh --secret '<Secret>'"
-    KERNEL="python"
-  fi
-fi
-
-# ---------------------------------------------------------------- 运行目录
-stage "阶段 5/8 · 运行目录 / 管理员密码 / 交易所凭证"
-mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
-chmod 700 "$ROOT/data" 2>/dev/null || true
-# 端口持久化：--port 要真的被 start.sh 沿用，否则只是个"提示里好看"的参数
-printf '%s\n' "$PORT" > "$ROOT/data/.port" 2>/dev/null || true
-# 初始密码：安装阶段还没有数据库，只能留成文件让首次启动时读取并哈希入库，
-# 启动成功后该文件会被删掉（明文不留在盘上）。
-# 未指定 --password 时，脚本自己生成随机密码并留一个空标记文件，
-# 让首次启动知道「这是随机生成的，登录后仍需强制改密」。
-PASSWORD_GENERATED=0
-if [[ -n "$ADMIN_PASSWORD" ]]; then
-  GEN_PASSWORD="$ADMIN_PASSWORD"
-else
-  GEN_PASSWORD="$("$PY" -c "import secrets; a='abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; print(''.join(secrets.choice(a) for _ in range(16)))")"
-  PASSWORD_GENERATED=1
-fi
-umask 077
-printf '%s' "$GEN_PASSWORD" > "$ROOT/data/.admin_password"
-chmod 600 "$ROOT/data/.admin_password" 2>/dev/null || true
-if [[ "$PASSWORD_GENERATED" == "1" ]]; then
-  : > "$ROOT/data/.admin_password_generated"
-  chmod 600 "$ROOT/data/.admin_password_generated" 2>/dev/null || true
-fi
-ok "已暂存初始密码（首次启动写入数据库后自动删除）"
-ok "运行目录就绪（data/ logs/ data/backups/）"
-
-# ---------------------------------------------------------------- 凭证落盘
-# 凭证有两个去向，且条件不同（这是曾经的 bug：把它们绑在同一个 if 里，
-# Rust 编译失败回退 Python 时凭证直接被丢弃，用户还得在面板再填一遍）：
-#   1) data/.exchange_credentials —— 主服务首次启动时加密入库。
-#      只要用户填了凭证就**必须**落盘，与 sidecar 编译成败无关：
-#      凭证是交易所接入的配置，不是 sidecar 的附属品。
-#   2) /etc/nanoquant/exec.env —— sidecar 的 EXEC_SECRET（与交易所 Secret 同一把）。
-#      只在 sidecar 二进制真正装好时写；编译失败时写了也没人读。
-CRED_FILLED=0
-if [[ "$KERNEL" == "rust" || "$SIDECAR_OK" == "1" ]] && [[ -n "$SIDECAR_API_KEY" && -n "$SIDECAR_API_SECRET" ]]; then
-  CRED_FILLED=1
-  umask 077
-  printf '{"env":"%s","api_key":"%s","api_secret":"%s"}\n' \
-    "${SIDECAR_ENV:-demo}" "$SIDECAR_API_KEY" "$SIDECAR_API_SECRET" > "$ROOT/data/.exchange_credentials"
-  chmod 600 "$ROOT/data/.exchange_credentials" 2>/dev/null || true
-  ok "已暂存交易所凭证（首次启动加密入库后自动删除）"
-fi
-
-if [[ "$SIDECAR_OK" == "1" && "$CRED_FILLED" == "1" ]]; then
-  mkdir -p /etc/nanoquant
-  install -m 600 -o root -g root /dev/null /etc/nanoquant/exec.env
-  printf 'EXEC_SECRET=%s\n' "$SIDECAR_API_SECRET" > /etc/nanoquant/exec.env
-  # 连接池与台账：有值才生效，缺省不影响签名
-  {
-    echo "EXEC_BASE_URL=https://fapi.binance.com"
-    echo "EXEC_LEDGER_DB=/var/lib/nanoquant/exec-ledger.db"
-    echo "EXEC_API_KEY=$SIDECAR_API_KEY"
-  } >> /etc/nanoquant/exec.env
-  chmod 600 /etc/nanoquant/exec.env
-  mkdir -p /var/lib/nanoquant
-  chmod 700 /var/lib/nanoquant 2>/dev/null || true
-  umask 022
-  ok "已写入 /etc/nanoquant/exec.env（0600，含 EXEC_SECRET / EXEC_API_KEY）"
-fi
-if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" != "1" && "$CRED_FILLED" == "1" ]]; then
-  warn "sidecar 编译失败已回退 Python 内核；你填的凭证仍会在首次启动时入库，无需在面板重填"
-fi
+set -Eeuo pipefail
 umask 022
 
-# ---------------------------------------------------------------- systemd
-stage "阶段 6/8 · 服务注册与启动"
-if [[ "$WITH_SYSTEMD" == "1" ]]; then
-  if [[ ! -d /etc/systemd/system ]]; then
-    warn "当前系统没有 systemd，跳过服务注册"
-  else
-    SERVICE=/etc/systemd/system/nanoquant.service
-    cat > "$SERVICE" <<EOF
-[Unit]
-Description=NanoQuant 小资金合约量化终端
-After=network-online.target
-Wants=network-online.target
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$ROOT/rust/nanoquant/target/release/nanoquant"
+FRONTEND_DIST="$ROOT/frontend/dist"
+FRONTEND_INDEX="$FRONTEND_DIST/index.html"
+DEFAULT_PORT=8899
+MIN_NODE_MAJOR="${NANOQUANT_MIN_NODE_MAJOR:-20}"
+MIN_FREE_MB="${NANOQUANT_MIN_FREE_MB:-2048}"
+PORT="${NANOQUANT_PORT:-$DEFAULT_PORT}"
+PORT_EXPLICIT=0
+ADMIN_PASSWORD="${NANOQUANT_ADMIN_PASSWORD:-}"
+PASSWORD_FLAG=0
+SYSTEMD_MODE="auto"
+SYSTEMD=0
+RUN_USER="${NANOQUANT_USER:-}"
+RUN_GROUP=""
+CREATED_USER=0
+NO_FRONTEND=0
+FORCE_FRONTEND=0
+SKIP_BUILD=0
+SKIP_DEPS=0
+INSTALL_DEPS=0
+INSTALL_RUST=0
+INSTALL_NODE=0
+SKIP_DISK_CHECK=0
+CHECK_ONLY=0
+OFFLINE=0
+NO_START=0
+NO_RESTART=0
+LOG_DIR="$ROOT/logs"
+LOG_FILE=""
+ENV_FILE=""
+ENV_FILE_CREATED=0
+BACKUP_BIN=""
+BACKUP_UNIT=""
+PM=""
+RUST_MIN=""
+STEP=""
 
-[Service]
-Type=simple
-WorkingDirectory=$ROOT/backend
-Environment=NANOQUANT_HOME=$ROOT
-Environment=NANOQUANT_PORT=$PORT
-ExecStart=$VENV/bin/python -m nanoquant
-Restart=always
-RestartSec=5
-LimitNOFILE=65535
+C_RESET=""
+C_OK=""
+C_WARN=""
+C_ERR=""
+C_INFO=""
+if [ -t 1 ]; then
+  C_RESET='\033[0m'
+  C_OK='\033[32m'
+  C_WARN='\033[33m'
+  C_ERR='\033[31m'
+  C_INFO='\033[36m'
+fi
 
-[Install]
-WantedBy=multi-user.target
+usage() {
+  cat <<'EOF'
+用法: bash scripts/install.sh [选项]
+
+Linux 专用安装脚本：构建并就地安装 NanoQuant Rust 内核与前端。
+
+运行模式:
+  --systemd             强制 systemd；自动创建 nanoquant 系统用户
+  --no-systemd          强制 nohup；使用 scripts/start.sh --daemon
+  默认                   root 且 systemd 可用时自动 systemd，否则 nohup
+
+安装内容:
+  --install-deps        用系统包管理器安装 gcc/make/perl/curl 等构建依赖
+  --install-rust        缺少 Rust 时通过 rustup minimal 安装
+  --install-node        缺少 Node.js 20+ 时尝试通过系统源/NodeSource 安装
+  --offline             cargo/npm 使用离线模式（依赖需已缓存）
+  --skip-deps           跳过工具链检查
+  --skip-disk-check     跳过磁盘空间检查
+
+构建与产物:
+  --password <密码>     管理员初始密码；会进入 shell 历史，建议用 stdin/env
+  --password-stdin      从 stdin 读取管理员初始密码
+  --password-file <文件> 从文件首行读取管理员初始密码
+  --port <端口>         覆盖端口；默认保留已有 data/.port，否则 8899
+  --no-frontend         只处理后端；要求已有 frontend/dist/index.html
+  --force-frontend      即使 dist 已存在也重建前端
+  --skip-build          复用已编译的 Rust 二进制
+  --user <系统用户>     systemd 运行用户；需已存在，默认自动创建 nanoquant
+
+启动与检查:
+  --no-start            只安装，不启动服务
+  --no-restart          不重启已运行服务（新二进制不会生效）
+  --check               只检查环境与产物，不修改文件
+  -h, --help            显示帮助
+
+示例:
+  sudo bash scripts/install.sh --install-deps --systemd
+  NANOQUANT_ADMIN_PASSWORD='***' sudo -E bash scripts/install.sh --systemd
+  sudo bash scripts/install.sh --password-stdin --systemd < /root/nq-password
+  bash scripts/install.sh --check
 EOF
-    systemctl daemon-reload || die "systemctl daemon-reload 失败（注册服务需要 root）"
-    systemctl enable nanoquant >/dev/null 2>&1 || true
-    systemctl restart nanoquant || die "服务启动失败：journalctl -u nanoquant -n 50 --no-pager"
-    info "等待健康检查（最多 30s）"
-    HEALTHY=0
-    for _ in $(seq 1 30); do
-      if curl -fsS "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1; then HEALTHY=1; break; fi
-      sleep 1
-    done
-    if [[ "$HEALTHY" == "1" ]]; then
-      ok "systemd 服务已启动且健康检查通过（systemctl status nanoquant）"
+}
+
+log() {
+  local level="$1"
+  shift
+  local color=""
+  case "$level" in
+    INFO) color="$C_INFO" ;;
+    OK) color="$C_OK" ;;
+    WARN) color="$C_WARN" ;;
+    ERROR) color="$C_ERR" ;;
+  esac
+  printf '%s[%s]%s %s\n' "$color" "$level" "$C_RESET" "$*" >&2
+  if [ -n "$LOG_FILE" ]; then
+    printf '[%s] %s\n' "$level" "$*" >>"$LOG_FILE"
+  fi
+}
+
+die() {
+  log ERROR "$*"
+  exit 1
+}
+
+run_logged() {
+  if [ -n "$LOG_FILE" ]; then
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+  else
+    "$@"
+  fi
+}
+
+cleanup_password() {
+  if [ "$ENV_FILE_CREATED" -eq 1 ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+    rm -f "$ENV_FILE" || true
+  fi
+}
+
+on_error() {
+  local code="$1"
+  set +e
+  log ERROR "安装失败（退出码 $code）"
+  cleanup_password
+  exit "$code"
+}
+
+on_interrupt() {
+  set +e
+  log ERROR "安装被中断"
+  cleanup_password
+  exit 130
+}
+
+trap 'on_error $?' ERR
+trap on_interrupt INT TERM
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --systemd) SYSTEMD_MODE="yes"; shift ;;
+      --no-systemd) SYSTEMD_MODE="no"; shift ;;
+      --install-deps) INSTALL_DEPS=1; shift ;;
+      --install-rust) INSTALL_RUST=1; shift ;;
+      --install-node) INSTALL_NODE=1; shift ;;
+      --offline) OFFLINE=1; shift ;;
+      --skip-deps) SKIP_DEPS=1; shift ;;
+      --skip-disk-check) SKIP_DISK_CHECK=1; shift ;;
+      --password) [ -n "${2:-}" ] || die "--password 需要非空值"; ADMIN_PASSWORD="$2"; PASSWORD_FLAG=1; shift 2 ;;
+      --password=*) [ -n "${1#*=}" ] || die "--password 需要非空值"; ADMIN_PASSWORD="${1#*=}"; PASSWORD_FLAG=1; shift ;;
+      --password-stdin)
+        IFS= read -r ADMIN_PASSWORD || true
+        [ -n "$ADMIN_PASSWORD" ] || die "--password-stdin 未读到内容"
+        PASSWORD_FLAG=1
+        shift
+        ;;
+      --password-file)
+        [ -n "${2:-}" ] && [ -f "$2" ] || die "--password-file 需要可读文件"
+        ADMIN_PASSWORD="$(head -n 1 "$2")"
+        [ -n "$ADMIN_PASSWORD" ] || die "--password-file 首行为空"
+        chmod 600 "$2" 2>/dev/null || log WARN "无法将密码文件权限收紧为 0600: $2"
+        PASSWORD_FLAG=1
+        shift 2
+        ;;
+      --port) [ -n "${2:-}" ] || die "--port 需要非空值"; PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
+      --port=*) [ -n "${1#*=}" ] || die "--port 需要非空值"; PORT="${1#*=}"; PORT_EXPLICIT=1; shift ;;
+      --no-frontend) NO_FRONTEND=1; shift ;;
+      --force-frontend) FORCE_FRONTEND=1; shift ;;
+      --skip-build) SKIP_BUILD=1; shift ;;
+      --no-start) NO_START=1; shift ;;
+      --no-restart) NO_RESTART=1; shift ;;
+      --check) CHECK_ONLY=1; shift ;;
+      --user) [ -n "${2:-}" ] || die "--user 需要非空值"; RUN_USER="$2"; shift 2 ;;
+      --user=*) [ -n "${1#*=}" ] || die "--user 需要非空值"; RUN_USER="${1#*=}"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "未知参数: $1" ;;
+    esac
+  done
+  if [ "$NO_FRONTEND" -eq 1 ] && [ "$FORCE_FRONTEND" -eq 1 ]; then
+    die "--no-frontend 与 --force-frontend 不能同时使用"
+  fi
+  case "$PORT" in
+    ''|*[!0-9]*) die "端口必须是数字: $PORT" ;;
+  esac
+  if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "端口超出范围: $PORT"
+  fi
+}
+
+init_log() {
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    return
+  fi
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR" 2>/dev/null || true
+  find "$LOG_DIR" -maxdepth 1 -name 'install-*.log' -type f -mtime +14 -delete 2>/dev/null || true
+  LOG_FILE="$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log"
+  : >"$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  local commit distro arch
+  commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  arch="$(uname -m 2>/dev/null || echo unknown)"
+  distro="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || echo unknown)"
+  log INFO "安装日志: $LOG_FILE"
+  log INFO "系统: $distro / $(uname -srm 2>/dev/null || echo unknown) / commit $commit"
+  log INFO "仓库: $ROOT"
+}
+
+detect_pm() {
+  if command -v apt-get >/dev/null 2>&1; then PM="apt"
+  elif command -v dnf >/dev/null 2>&1; then PM="dnf"
+  elif command -v yum >/dev/null 2>&1; then PM="yum"
+  elif command -v apk >/dev/null 2>&1; then PM="apk"
+  elif command -v zypper >/dev/null 2>&1; then PM="zypper"
+  elif command -v pacman >/dev/null 2>&1; then PM="pacman"
+  else PM=""
+  fi
+}
+
+dependency_hint() {
+  case "$PM" in
+    apt) echo "apt-get update && apt-get install -y gcc libc6-dev make perl curl ca-certificates" ;;
+    dnf) echo "dnf install -y gcc glibc-devel make perl curl ca-certificates" ;;
+    yum) echo "yum install -y gcc glibc-devel make perl curl ca-certificates" ;;
+    apk) echo "apk add --no-cache gcc musl-dev make perl curl ca-certificates" ;;
+    zypper) echo "zypper --non-interactive install gcc glibc-devel make perl curl ca-certificates" ;;
+    pacman) echo "pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates" ;;
+    *) echo "请安装 gcc、make、perl、curl、ca-certificates" ;;
+  esac
+}
+
+install_system_deps() {
+  [ "$(id -u)" -eq 0 ] || die "--install-deps 需要 root 权限，请使用 sudo"
+  detect_pm
+  [ -n "$PM" ] || die "未识别包管理器，无法自动安装构建依赖"
+  log INFO "安装系统构建依赖（$PM）"
+  case "$PM" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      run_logged apt-get update -qq
+      run_logged apt-get install -y -qq gcc libc6-dev make perl curl ca-certificates
+      ;;
+    dnf) run_logged dnf install -y gcc glibc-devel make perl curl ca-certificates ;;
+    yum) run_logged yum install -y gcc glibc-devel make perl curl ca-certificates ;;
+    apk) run_logged apk add --no-cache gcc musl-dev make perl curl ca-certificates ;;
+    zypper) run_logged zypper --non-interactive install gcc glibc-devel make perl curl ca-certificates ;;
+    pacman) run_logged pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates ;;
+  esac
+}
+
+ensure_curl() {
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    if [ "$INSTALL_DEPS" -eq 1 ]; then
+      install_system_deps
     else
-      warn "服务已注册但健康检查未通过：journalctl -u nanoquant -n 50 --no-pager"
-      warn "常见原因：端口被占用 / 依赖缺失 / data 目录权限不足"
+      die "缺少 curl/wget；可加 --install-deps 或手动安装"
     fi
+  fi
+}
 
-    # ---------------- sidecar systemd（仅 Rust 内核）----------------
-    if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" && -f /etc/nanoquant/exec.env ]]; then
-      SIDECAR_SERVICE=/etc/systemd/system/nanoquant-exec.service
-      cat > "$SIDECAR_SERVICE" <<SIDECAR_EOF
-[Unit]
-Description=NanoQuant exec-service (Rust signing sidecar, sign-only)
-Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant/blob/main/docs/EXEC_PROTOCOL.md
-After=network-online.target
-Wants=network-online.target
-Before=nanoquant.service
-ConditionPathExists=/etc/nanoquant/exec.env
+ensure_native_deps() {
+  local missing=()
+  if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+    missing+=("gcc")
+  fi
+  command -v make >/dev/null 2>&1 || missing+=("make")
+  command -v perl >/dev/null 2>&1 || missing+=("perl")
+  if [ "${#missing[@]}" -gt 0 ] && [ "$INSTALL_DEPS" -eq 1 ]; then
+    install_system_deps
+    missing=()
+    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then missing+=("gcc"); fi
+    command -v make >/dev/null 2>&1 || missing+=("make")
+    command -v perl >/dev/null 2>&1 || missing+=("perl")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die "缺少构建依赖: ${missing[*]}；请执行: $(dependency_hint)"
+  fi
+  log OK "系统构建依赖就绪"
+}
 
-[Service]
-Type=simple
-RuntimeDirectory=nanoquant
-RuntimeDirectoryMode=0750
-Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
-EnvironmentFile=-/etc/nanoquant/exec.env
-ExecStart=$ROOT/exec-service
-RestartPreventExitStatus=78
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-UMask=0077
+ensure_disk() {
+  [ "$SKIP_DISK_CHECK" -eq 1 ] && return
+  local avail
+  avail="$(df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if [ -n "$avail" ] && [ "$avail" -lt $((MIN_FREE_MB * 1024)) ]; then
+    die "磁盘空间不足：$((avail / 1024)) MB 可用，至少需要 ${MIN_FREE_MB} MB"
+  fi
+}
 
-[Install]
-WantedBy=multi-user.target
-SIDECAR_EOF
-      systemctl daemon-reload || true
-      systemctl enable nanoquant-exec >/dev/null 2>&1 || true
-      if systemctl restart nanoquant-exec 2>/dev/null; then
-        sleep 1
-        if systemctl is-active nanoquant-exec >/dev/null 2>&1; then
-          ok "sidecar 已启动（systemctl status nanoquant-exec）"
-        else
-          warn "sidecar 未激活：journalctl -u nanoquant-exec -n 30 --no-pager"
-        fi
+check_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|aarch64|arm64) log OK "架构: $arch" ;;
+    *) log WARN "未验证的架构: $arch；仅测试 x86_64/aarch64" ;;
+  esac
+}
+
+resolve_port() {
+  if [ "$PORT_EXPLICIT" -eq 0 ] && [ -f "$ROOT/data/.port" ]; then
+    local existing
+    existing="$(tr -dc '0-9' <"$ROOT/data/.port" || true)"
+    if [ -n "$existing" ] && [ "$existing" -ge 1 ] && [ "$existing" -le 65535 ]; then
+      PORT="$existing"
+    else
+      log WARN "data/.port 内容无效，使用 $DEFAULT_PORT"
+    fi
+  fi
+}
+
+check_port() {
+  local pattern="[:.]$PORT$"
+  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "$pattern"; then
+    log WARN "端口 $PORT 已被监听；升级安装可忽略"
+  elif command -v netstat >/dev/null 2>&1 && netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "$pattern"; then
+    log WARN "端口 $PORT 已被监听；升级安装可忽略"
+  fi
+}
+
+read_rust_min() {
+  local from_cargo
+  from_cargo="$(awk -F'"' '/^rust-version[[:space:]]*=/{print $2; exit}' "$ROOT/rust/nanoquant/Cargo.toml" 2>/dev/null || true)"
+  RUST_MIN="${NANOQUANT_MIN_RUST:-${from_cargo:-1.88}}"
+}
+
+ensure_rust() {
+  read_rust_min
+  if ! command -v cargo >/dev/null 2>&1 && [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
+    local sudo_home=""
+    sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -n "$sudo_home" ] && [ -x "$sudo_home/.cargo/bin/cargo" ]; then
+      export PATH="$sudo_home/.cargo/bin:$PATH"
+      log INFO "复用 $SUDO_USER 的 Rust 工具链"
+    fi
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    if [ "$INSTALL_RUST" -eq 1 ]; then
+      [ "$OFFLINE" -eq 0 ] || die "--offline 模式无法通过 rustup 安装 Rust"
+      ensure_curl
+      log INFO "通过 rustup 安装 minimal Rust 工具链"
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      export PATH="$HOME/.cargo/bin:$PATH"
+    else
+      die "缺少 cargo/rustc；请安装 Rust $RUST_MIN+ 或加 --install-rust"
+    fi
+  fi
+  command -v rustc >/dev/null 2>&1 || die "缺少 rustc"
+
+  local version major minor req_major req_minor
+  version="$(rustc --version | awk '{print $2}')"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  IFS=. read -r req_major req_minor _ <<<"$RUST_MIN"
+  if [ "$major" -lt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -lt "$req_minor" ]; }; then
+    die "Rust $version 过低，需要 $RUST_MIN+"
+  fi
+  log OK "Rust $version（要求 $RUST_MIN+）"
+}
+
+install_node() {
+  [ "$(id -u)" -eq 0 ] || die "--install-node 需要 root 权限，请使用 sudo"
+  [ "$OFFLINE" -eq 0 ] || die "--offline 模式无法安装 Node.js"
+  detect_pm
+  ensure_curl
+  log INFO "安装 Node.js 20+（$PM）"
+  case "$PM" in
+    apt)
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      run_logged apt-get install -y nodejs
+      ;;
+    dnf|yum) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -; run_logged "$PM" install -y nodejs ;;
+    apk) run_logged apk add --no-cache nodejs npm ;;
+    pacman) run_logged pacman -Sy --needed --noconfirm nodejs npm ;;
+    zypper) run_logged zypper --non-interactive install nodejs20 npm20 || run_logged zypper --non-interactive install nodejs npm ;;
+    *) die "未识别的包管理器，无法自动安装 Node.js 20+" ;;
+  esac
+  hash -r 2>/dev/null || true
+}
+
+ensure_node() {
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    if [ "$INSTALL_NODE" -eq 1 ]; then
+      install_node
+    else
+      die "缺少 Node.js/npm；请安装 Node.js $MIN_NODE_MAJOR+ 或加 --install-node"
+    fi
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]')"
+  if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then
+    if [ "$INSTALL_NODE" -eq 1 ]; then
+      install_node
+      major="$(node -p 'process.versions.node.split(".")[0]')"
+    fi
+    if [ "$major" -lt "$MIN_NODE_MAJOR" ]; then
+      die "Node.js $major 过低，需要 $MIN_NODE_MAJOR+；建议用 nvm 安装"
+    fi
+  fi
+  [ -f "$ROOT/frontend/package-lock.json" ] || die "缺少 frontend/package-lock.json"
+  log OK "Node.js $(node --version), npm $(npm --version)"
+}
+
+frontend_stale() {
+  [ -f "$FRONTEND_INDEX" ] || return 0
+  if find "$ROOT/frontend/src" "$ROOT/frontend/index.html" "$ROOT/frontend/package.json" \
+    "$ROOT/frontend/package-lock.json" "$ROOT/frontend/vite.config.ts" "$ROOT/frontend/tsconfig.json" \
+    -newer "$FRONTEND_INDEX" -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+frontend_needs_build() {
+  [ "$NO_FRONTEND" -eq 1 ] && return 1
+  [ -f "$FRONTEND_INDEX" ] || return 0
+  [ "$FORCE_FRONTEND" -eq 1 ] && return 0
+  if frontend_stale; then
+    log WARN "前端源码比 dist 新，自动重建；可用 --no-frontend 跳过"
+    FORCE_FRONTEND=1
+    return 0
+  fi
+  return 1
+}
+
+backup_binary() {
+  if [ -x "$BIN" ]; then
+    mkdir -p "$ROOT/data/backups"
+    BACKUP_BIN="$ROOT/data/backups/nanoquant-$(date +%Y%m%d%H%M%S)"
+    cp -a "$BIN" "$BACKUP_BIN"
+    chmod 700 "$BACKUP_BIN" 2>/dev/null || true
+    log INFO "已备份旧二进制: $BACKUP_BIN"
+  fi
+}
+
+build_backend() {
+  if [ "$SKIP_BUILD" -eq 1 ]; then
+    [ -x "$BIN" ] || die "--skip-build 但未找到可执行二进制: $BIN"
+    log OK "复用已编译二进制"
+    return
+  fi
+  backup_binary
+  local args=(build --release --locked --manifest-path "$ROOT/rust/nanoquant/Cargo.toml")
+  if [ "$OFFLINE" -eq 1 ]; then args+=(--offline); fi
+  log INFO "构建 Rust 后端（release, locked）"
+  run_logged cargo "${args[@]}"
+  [ -x "$BIN" ] || die "构建后未找到二进制: $BIN"
+  chmod 755 "$BIN"
+  log OK "Rust 二进制已构建"
+}
+
+build_frontend() {
+  if [ "$NO_FRONTEND" -eq 1 ]; then
+    [ -f "$FRONTEND_INDEX" ] || die "--no-frontend 但 frontend/dist/index.html 不存在"
+    if frontend_stale; then
+      log WARN "--no-frontend：dist 可能落后于前端源码，继续使用现有 dist"
+    else
+      log OK "复用已有前端 dist"
+    fi
+    return
+  fi
+  if ! frontend_needs_build; then
+    log OK "复用已有前端 dist"
+    return
+  fi
+  ensure_node
+  local args=(--prefix "$ROOT/frontend" ci --no-audit --no-fund)
+  if [ "$OFFLINE" -eq 1 ]; then args+=(--offline); fi
+  log INFO "安装前端依赖（npm ci）"
+  run_logged npm "${args[@]}"
+  log INFO "构建前端"
+  run_logged npm --prefix "$ROOT/frontend" run build
+  [ -f "$FRONTEND_INDEX" ] || die "前端构建后未找到 frontend/dist/index.html"
+  chmod -R a+rX "$FRONTEND_DIST" 2>/dev/null || true
+  log OK "前端 dist 已构建"
+}
+
+create_service_user() {
+  if [ "$SYSTEMD" -eq 0 ]; then
+    if [ -n "$RUN_USER" ]; then
+      die "--user 仅支持 --systemd 模式"
+    fi
+    return
+  fi
+  if [ -z "$RUN_USER" ]; then
+    RUN_USER="nanoquant"
+    if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+      if command -v useradd >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$RUN_USER" \
+          || die "创建系统用户 $RUN_USER 失败"
+      elif command -v adduser >/dev/null 2>&1; then
+        adduser -S -D -H -h /nonexistent -s /sbin/nologin "$RUN_USER" \
+          || die "创建系统用户 $RUN_USER 失败"
       else
-        warn "sidecar 启动失败：journalctl -u nanoquant-exec -n 30 --no-pager"
+        die "无法创建系统用户 $RUN_USER；请手动创建或使用 --user"
+      fi
+      CREATED_USER=1
+      log OK "已创建系统用户 $RUN_USER"
+    fi
+  fi
+  id -u "$RUN_USER" >/dev/null 2>&1 || die "系统用户不存在: $RUN_USER"
+  RUN_GROUP="$(id -gn "$RUN_USER")"
+}
+
+prepare_dirs() {
+  mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
+  if ! chmod 700 "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups" 2>/dev/null; then
+    die "无法将 data/logs 权限收紧为 0700"
+  fi
+  local port_file="$ROOT/data/.port"
+  if [ "$(cat "$port_file" 2>/dev/null || true)" != "$PORT" ]; then
+    printf '%s\n' "$PORT" >"$port_file"
+  fi
+  chmod 600 "$port_file" 2>/dev/null || true
+  for file in "$ROOT/data/.master_key" "$ROOT/data/nanoquant.db"; do
+    if [ -f "$file" ]; then
+      chmod 600 "$file" 2>/dev/null || log WARN "无法收紧权限: $file"
+    fi
+  done
+  if [ -n "$RUN_USER" ]; then
+    chown -R "$RUN_USER:$RUN_GROUP" "$ROOT/data" "$ROOT/logs" || die "chown 数据目录失败"
+    if [ -x "$BIN" ]; then
+      chown "$RUN_USER:$RUN_GROUP" "$BIN"
+      chmod 755 "$BIN"
+    fi
+    if [ -d "$FRONTEND_DIST" ]; then
+      chown -R "$RUN_USER:$RUN_GROUP" "$FRONTEND_DIST"
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$RUN_USER" -- test -r "$BIN" >/dev/null 2>&1 \
+        || die "服务用户 $RUN_USER 无法读取 $BIN；请将仓库放到 /opt 等可读路径"
+      runuser -u "$RUN_USER" -- test -x "$ROOT" >/dev/null 2>&1 \
+        || die "服务用户 $RUN_USER 无法进入 $ROOT；请调整目录权限或改用 /opt"
+    fi
+  fi
+  log OK "数据目录就绪（端口 $PORT）"
+}
+
+healthcheck() {
+  local url="http://127.0.0.1:$PORT/api/v1/health"
+  local i
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    log ERROR "缺少 curl/wget，无法进行健康检查"
+    return 1
+  fi
+  for i in $(seq 1 30); do
+    if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v wget >/dev/null 2>&1 && wget -qO- --timeout=2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+align_sidecar_user() {
+  local unit="/etc/systemd/system/nanoquant-exec.service"
+  [ -f "$unit" ] || return 0
+  local current
+  current="$(awk -F= '/^User=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$unit")"
+  if [ -n "$current" ] && [ "$current" != "$RUN_USER" ] && [ "$current" != "root" ]; then
+    log WARN "sidecar 运行用户 $current 与主服务 $RUN_USER 不一致；请用 --user $RUN_USER 重新运行 setup_sidecar.sh"
+    return 0
+  fi
+  if [ -z "$current" ] || [ "$current" = "root" ]; then
+    cp -a "$unit" "$unit.bak.$(date +%Y%m%d%H%M%S)"
+    if grep -q '^User=' "$unit"; then
+      sed -i "s/^User=.*/User=$RUN_USER/" "$unit"
+    else
+      sed -i "/^\\[Service\\]/a User=$RUN_USER" "$unit"
+    fi
+    if grep -q '^Group=' "$unit"; then
+      sed -i "s/^Group=.*/Group=$RUN_GROUP/" "$unit"
+    else
+      sed -i "/^User=$RUN_USER$/a Group=$RUN_GROUP" "$unit"
+    fi
+    systemctl daemon-reload
+    systemctl restart nanoquant-exec 2>/dev/null || log WARN "nanoquant-exec 重启失败；请检查 journalctl -u nanoquant-exec"
+    log OK "已将 sidecar unit 运行用户对齐为 $RUN_USER"
+  fi
+}
+
+rollback_binary() {
+  if [ -n "$BACKUP_BIN" ] && [ -f "$BACKUP_BIN" ]; then
+    install -m 755 "$BACKUP_BIN" "$BIN" || return 1
+    log WARN "已恢复旧二进制"
+    return 0
+  fi
+  return 1
+}
+
+install_systemd() {
+  local unit="/etc/systemd/system/nanoquant.service"
+  local env_dir="/etc/nanoquant"
+  ENV_FILE="$env_dir/nanoquant.env"
+  [ "$(id -u)" -eq 0 ] || die "--systemd 需要 root 权限，请使用 sudo"
+  command -v systemctl >/dev/null 2>&1 || die "缺少 systemctl"
+  [ -d /run/systemd/system ] || die "当前系统未运行 systemd"
+
+  align_sidecar_user
+  if [ -n "$ADMIN_PASSWORD" ]; then
+    case "$ADMIN_PASSWORD" in
+      *$'\n'*) die "管理员密码不能包含换行" ;;
+    esac
+    mkdir -p "$env_dir"
+    chmod 700 "$env_dir"
+    ( umask 077; printf 'NANOQUANT_ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >"$ENV_FILE" )
+    chmod 600 "$ENV_FILE"
+    ENV_FILE_CREATED=1
+    log OK "管理员初始密码写入 $ENV_FILE（0600）"
+  elif [ -f "$ENV_FILE" ]; then
+    chmod 600 "$ENV_FILE" 2>/dev/null || log WARN "无法收紧 $ENV_FILE 权限"
+  fi
+  if [ -f "$unit" ]; then
+    BACKUP_UNIT="$unit.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$unit" "$BACKUP_UNIT"
+    log INFO "已备份旧 unit: $BACKUP_UNIT"
+  fi
+  {
+    printf '[Unit]\n'
+    printf 'Description=NanoQuant (Rust trading engine)\n'
+    printf 'After=network-online.target nanoquant-exec.service\n'
+    printf 'Wants=network-online.target\n\n'
+    printf '[Service]\n'
+    printf 'Type=simple\n'
+    printf 'User=%s\nGroup=%s\n' "$RUN_USER" "$RUN_GROUP"
+    printf 'WorkingDirectory="%s"\n' "$ROOT"
+    printf 'Environment="NANOQUANT_HOME=%s"\n' "$ROOT"
+    printf 'Environment="NANOQUANT_PORT=%s"\n' "$PORT"
+    printf 'EnvironmentFile=-%s\n' "$ENV_FILE"
+    printf 'ExecStart="%s"\n' "$BIN"
+    printf 'Restart=always\n'
+    printf 'RestartSec=5\n'
+    printf 'KillSignal=SIGINT\n'
+    printf 'TimeoutStopSec=30\n'
+    printf 'LimitNOFILE=65535\n'
+    printf 'UMask=0077\n'
+    printf 'NoNewPrivileges=true\n'
+    printf 'PrivateTmp=true\n'
+    printf 'ProtectSystem=strict\n'
+    printf 'ProtectKernelTunables=true\n'
+    printf 'ProtectKernelModules=true\n'
+    printf 'ProtectControlGroups=true\n'
+    printf 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n'
+    printf 'RestrictNamespaces=true\n'
+    printf 'LockPersonality=true\n'
+    printf 'RestrictRealtime=true\n'
+    printf 'RestrictSUIDSGID=true\n'
+    printf 'SystemCallArchitectures=native\n'
+    printf 'ReadWritePaths="%s/data" "%s/logs"\n' "$ROOT" "$ROOT"
+    printf '\n[Install]\nWantedBy=multi-user.target\n'
+  } >"$unit"
+  chmod 644 "$unit"
+  log INFO "systemd unit: $unit（User=$RUN_USER）"
+  systemctl daemon-reload
+  if [ "$NO_START" -eq 1 ]; then
+    log OK "unit 已写入；按要求未启动或启用。启动: systemctl enable --now nanoquant"
+    return
+  fi
+  if [ "$NO_RESTART" -eq 1 ]; then
+    log OK "unit 已写入；按要求未重启。应用新版本: systemctl restart nanoquant"
+    return
+  fi
+  systemctl enable nanoquant >/dev/null
+  if ! systemctl restart nanoquant; then
+    systemctl status nanoquant --no-pager -l 2>&1 | tee -a "${LOG_FILE:-/dev/null}" >&2 || true
+    journalctl -u nanoquant -n 80 --no-pager 2>&1 | tee -a "${LOG_FILE:-/dev/null}" >&2 || true
+    if [ -n "$BACKUP_UNIT" ] && [ -f "$BACKUP_UNIT" ]; then cp -a "$BACKUP_UNIT" "$unit"; fi
+    rollback_binary || true
+    systemctl daemon-reload
+    systemctl restart nanoquant 2>/dev/null || systemctl stop nanoquant 2>/dev/null || true
+    die "systemd 启动失败"
+  fi
+  if ! healthcheck; then
+    systemctl status nanoquant --no-pager -l 2>&1 | tee -a "${LOG_FILE:-/dev/null}" >&2 || true
+    journalctl -u nanoquant -n 80 --no-pager 2>&1 | tee -a "${LOG_FILE:-/dev/null}" >&2 || true
+    if [ -n "$BACKUP_UNIT" ] && [ -f "$BACKUP_UNIT" ]; then cp -a "$BACKUP_UNIT" "$unit"; fi
+    rollback_binary || true
+    systemctl daemon-reload
+    if systemctl restart nanoquant 2>/dev/null && healthcheck; then
+      log WARN "新版本失败，已回滚到旧版本"
+    else
+      systemctl stop nanoquant 2>/dev/null || true
+      log ERROR "回滚后仍未通过健康检查"
+    fi
+    die "健康检查失败"
+  fi
+  if [ -n "$ADMIN_PASSWORD" ] && [ -f "$ENV_FILE" ]; then
+    rm -f "$ENV_FILE"
+    ENV_FILE_CREATED=0
+    ENV_FILE=""
+    log OK "已移除一次性管理员密码文件"
+  fi
+  log OK "systemd 服务已启动并通过健康检查: http://127.0.0.1:$PORT"
+}
+
+install_nohup() {
+  [ -f "$ROOT/scripts/start.sh" ] || die "缺少 scripts/start.sh"
+  [ -f "$ROOT/scripts/stop.sh" ] || die "缺少 scripts/stop.sh"
+  if [ "$(id -u)" -eq 0 ]; then
+    log WARN "nohup 模式以 root 运行；建议在 systemd 环境使用 --systemd"
+  fi
+  if [ "$NO_START" -eq 1 ]; then
+    if [ -n "$ADMIN_PASSWORD" ]; then
+      log WARN "启动时请设置 NANOQUANT_ADMIN_PASSWORD 后执行 bash scripts/start.sh --daemon"
+    else
+      log OK "安装完成；按要求未启动。启动: bash scripts/start.sh --daemon"
+    fi
+    return
+  fi
+  local pid_file="$ROOT/data/nanoquant.pid"
+  if [ "$NO_RESTART" -eq 1 ] && [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    log OK "服务正在运行；按要求未重启，新二进制未生效"
+    return
+  fi
+  bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+  if [ -n "$ADMIN_PASSWORD" ]; then
+    export NANOQUANT_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+  fi
+  if ! bash "$ROOT/scripts/start.sh" --daemon; then
+    unset NANOQUANT_ADMIN_PASSWORD || true
+    rollback_binary || true
+    die "nohup 启动失败"
+  fi
+  unset NANOQUANT_ADMIN_PASSWORD || true
+  if ! healthcheck; then
+    bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+    if rollback_binary; then
+      if bash "$ROOT/scripts/start.sh" --daemon && healthcheck; then
+        log WARN "新版本失败，已回滚到旧版本"
+      else
+        bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+        log ERROR "回滚后仍未通过健康检查"
       fi
     fi
+    die "健康检查失败"
   fi
-fi
+  log OK "nohup 服务已启动并通过健康检查: http://127.0.0.1:$PORT"
+}
 
-# ---------------------------------------------------------------- 自动后台启动（非 systemd）
-if [[ "$WITH_SYSTEMD" != "1" ]]; then
-  stage "阶段 6/8 · 后台启动（无 systemd）"
-fi
-# 没走 systemd 时，装完直接后台拉起服务（等价 start.sh --daemon），省去手动敲启动命令。
-# 首次启动会顺带消费 data/.admin_password（哈希入库并删除），这里启动正好闭环。
-# --no-start 可跳过（只想装好环境、稍后自己启动）。
-if [[ "$WITH_SYSTEMD" != "1" && "$NO_START" != "1" ]]; then
-  info "后台启动服务（等价 start.sh --daemon）"
-  if bash "$ROOT/scripts/start.sh" --daemon; then
-    info "等待健康检查（最多 30s）"
-    HEALTHY=0
-    for _ in $(seq 1 30); do
-      if curl -fsS "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1; then HEALTHY=1; break; fi
-      sleep 1
-    done
-    if [[ "$HEALTHY" == "1" ]]; then
-      ok "服务已在后台运行（健康检查通过）"
-    else
-      warn "已后台启动但健康检查未通过，日志见 $ROOT/logs/stdout.log"
+check_only() {
+  ensure_disk
+  check_arch
+  resolve_port
+  check_port
+  if [ "$SKIP_DEPS" -eq 0 ]; then
+    ensure_rust
+    ensure_native_deps
+    if frontend_needs_build; then
+      ensure_node
     fi
-  else
-    warn "自动后台启动失败，请手动运行: bash scripts/start.sh --daemon"
   fi
-fi
-
-# ---------------------------------------------------------------- 非 systemd：后台拉起 sidecar
-if [[ "$WITH_SYSTEMD" != "1" && "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" && -f /etc/nanoquant/exec.env ]]; then
-  info "后台启动 sidecar（无 systemd）"
-  mkdir -p /run/nanoquant && chmod 750 /run/nanoquant 2>/dev/null || true
-  # shellcheck disable=SC1091
-  set -a; . /etc/nanoquant/exec.env; set +a
-  if EXEC_SOCKET=/run/nanoquant/exec.sock nohup "$ROOT/exec-service" \
-      >"$ROOT/logs/exec-service.log" 2>&1 & then
-    sleep 1
-    if [[ -S /run/nanoquant/exec.sock ]]; then
-      ok "sidecar 已在后台运行（socket=/run/nanoquant/exec.sock）"
-    else
-      warn "sidecar 未生成 socket，日志见 $ROOT/logs/exec-service.log"
+  if [ "$SYSTEMD_MODE" = "yes" ]; then
+    [ "$(id -u)" -eq 0 ] || die "--systemd 需要 root 权限"
+    command -v systemctl >/dev/null 2>&1 || die "缺少 systemctl"
+    [ -d /run/systemd/system ] || die "当前系统未运行 systemd"
+    if [ -z "$RUN_USER" ]; then RUN_USER="nanoquant"; fi
+    if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+      log WARN "systemd 用户 $RUN_USER 不存在；安装时将自动创建（仅默认 nanoquant）"
     fi
-  else
-    warn "sidecar 后台启动失败，日志见 $ROOT/logs/exec-service.log"
   fi
-fi
+  if [ "$SKIP_BUILD" -eq 1 ] && [ ! -x "$BIN" ]; then die "--skip-build 但二进制不存在"; fi
+  if [ "$NO_FRONTEND" -eq 1 ] && [ ! -f "$FRONTEND_INDEX" ]; then die "--no-frontend 但 dist 不存在"; fi
+  if [ -x "$BIN" ]; then log OK "二进制已存在"; else log WARN "二进制尚需构建"; fi
+  if [ -f "$FRONTEND_INDEX" ]; then
+    if [ "$NO_FRONTEND" -eq 0 ] && frontend_stale; then log WARN "前端 dist 落后于源码，安装时将重建"; else log OK "前端 dist 已存在"; fi
+  else
+    log WARN "前端 dist 尚需构建"
+  fi
+  log OK "环境检查通过；未修改任何文件"
+  exit 0
+}
 
-# hostname -I 不是所有发行版都支持（BusyBox / macOS 都没有），
-# set -o pipefail 下失败会直接把脚本整段带走，所以这里必须兜住
-IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-IP="${IP:-127.0.0.1}"
+main() {
+  parse_args "$@"
+  init_log
+  detect_pm
+  if [ "$INSTALL_DEPS" -eq 1 ] && [ "$CHECK_ONLY" -eq 0 ]; then
+    install_system_deps
+  fi
+  if [ "$SYSTEMD_MODE" = "yes" ]; then
+    SYSTEMD=1
+    [ "$(id -u)" -eq 0 ] || die "--systemd 需要 root 权限"
+    command -v systemctl >/dev/null 2>&1 || die "缺少 systemctl"
+    [ -d /run/systemd/system ] || die "当前系统未运行 systemd"
+  elif [ "$SYSTEMD_MODE" = "no" ]; then
+    SYSTEMD=0
+  else
+    if [ "$(id -u)" -eq 0 ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      SYSTEMD=1
+    else
+      SYSTEMD=0
+    fi
+  fi
+  if [ "$SYSTEMD" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    die "systemd 模式需要 root；请使用 sudo 或加 --no-systemd"
+  fi
+  if [ "$SYSTEMD" -eq 0 ] && [ -n "$RUN_USER" ]; then
+    die "--user 仅支持 systemd 模式"
+  fi
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    check_only
+  fi
+  if [ "$SKIP_DEPS" -eq 0 ]; then
+    ensure_rust
+    ensure_native_deps
+    ensure_curl
+  fi
+  ensure_disk
+  check_arch
+  resolve_port
+  check_port
+  if frontend_needs_build; then
+    ensure_node
+  fi
+  build_backend
+  build_frontend
+  if [ "$SYSTEMD" -eq 1 ]; then
+    create_service_user
+  fi
+  prepare_dirs
+  if [ "$SYSTEMD" -eq 1 ]; then
+    install_systemd
+  else
+    install_nohup
+  fi
+  log OK "安装完成"
+  if [ -n "$BACKUP_BIN" ] && [ -f "$BACKUP_BIN" ]; then log INFO "回滚二进制: $BACKUP_BIN"; fi
+  log INFO "端口: $PORT；模式: $([ "$SYSTEMD" -eq 1 ] && echo systemd || echo nohup)"
+  log INFO "日志: ${LOG_FILE:-未写入（--check）}"
+}
 
-if [[ "$PASSWORD_GENERATED" == "1" ]]; then
-  PASS_LINE="初始密码   $GEN_PASSWORD"
-  PASS_HINT="该密码由安装脚本随机生成，仅本次显示；登录后必须先改密。"
-else
-  PASS_LINE="初始密码   $GEN_PASSWORD"
-  PASS_HINT="登录后建议改成新的强口令（首次登录不强制）。"
-fi
-
-# 结尾「启动」一行按实际状态展示，避免误导
-if [[ "$WITH_SYSTEMD" == "1" ]]; then
-  START_LINE="systemd 已接管（开机自启）      手动重启 : systemctl restart nanoquant"
-elif [[ "$NO_START" == "1" ]]; then
-  START_LINE="本次按 --no-start 未自动启动    手动启动 : bash scripts/start.sh --daemon"
-else
-  START_LINE="已自动后台运行                  机器重启后 : bash scripts/start.sh --daemon"
-fi
-
-# 内核一行：明确本次装的是哪套执行内核
-if [[ "$KERNEL" == "rust" && "$SIDECAR_OK" == "1" ]]; then
-  SIDECAR_LINE="Rust sidecar 已启用（签名密钥与交易所 Secret 同一把）"
-  SIDECAR_NOTE="默认 exec_mode=off；到「参数配置 → 系统 → 执行内核」按 shadow → enforce 灰度开启"
-elif [[ "$KERNEL" == "rust" ]]; then
-  SIDECAR_LINE="Rust 编译失败，已回退 Python"
-  SIDECAR_NOTE="修复后执行 : sudo bash scripts/setup_sidecar.sh --from-settings"
-else
-  SIDECAR_LINE="Python（内置签名）"
-  SIDECAR_NOTE="如需 Rust : 重跑安装选 2，或 sudo bash scripts/setup_sidecar.sh --from-settings"
-fi
-
-stage "安装完成"
-
-cat <<EOF
-  $(printf "${C_INFO}访问地址${C_RESET}   http://$IP:$PORT")
-  $(printf "${C_INFO}默认账号${C_RESET}   admin")
-  $(printf "${C_INFO}$PASS_LINE${C_RESET}")
-
-  $(printf "${C_WARN}$PASS_HINT${C_RESET}")
-  改密前后台除登录/改密/健康检查外的接口一律 403。
-
-  $(printf "${C_INFO}服务${C_RESET}")
-    启动     $START_LINE
-    停止     bash scripts/stop.sh
-    查看状态 bash scripts/status.sh
-    健康检查 curl http://127.0.0.1:$PORT/api/v1/health
-
-  $(printf "${C_INFO}执行内核${C_RESET}")
-    当前     $SIDECAR_LINE
-    $(printf "${C_DIM}%s${C_RESET}" "$SIDECAR_NOTE")
-
-  $(printf "${C_INFO}目录${C_RESET}")
-    数据     $ROOT/data   （SQLite / 备份 / 缓存）
-    日志     $ROOT/logs
-    配置     全部在面板里，存于数据库，改完即时生效
-EOF
-
-stage "首次使用建议"
-cat <<EOF
-  1. 用初始密码登录，立即改成自己的强口令（随机密码首次登录会被强制）
-  2. 「参数配置 → 数据源」填币安 API Key（只开合约交易，关闭提币）
-  3. 「参数配置 → 系统 → 告警」配 Webhook / Telegram，否则出事只能在页面里看
-  4. 「AI 模型」接入 DeepSeek / Qwen / GPT 等 OpenAI 兼容模型并点「诊断」
-  5. 「标的池」添加合约 → 「总览」以 DEMO 模式启动 → 观察后再切 LIVE
-EOF
+main "$@"

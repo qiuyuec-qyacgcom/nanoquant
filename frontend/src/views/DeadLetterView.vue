@@ -3,7 +3,8 @@
  * 落库补偿面板: 查看异步落库最终失败的记录, 支持单条/批量重放与忽略.
  * 重放带幂等检查: 同 client_order_id 已落库时直接标记处理, 不会重复记账.
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import { http } from '../api/client'
 import { useAppStore } from '../stores/app'
 import { timeStr } from '../utils/format'
@@ -98,12 +99,11 @@ async function replayAll() {
   }
 }
 
-let timer: number | undefined
 onMounted(async () => {
   await load()
-  timer = window.setInterval(load, 20000)
 })
-onBeforeUnmount(() => window.clearInterval(timer))
+
+useSilentRefresh(load, 20000)
 </script>
 
 <template>

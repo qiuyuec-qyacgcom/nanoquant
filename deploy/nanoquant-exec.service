@@ -1,28 +1,38 @@
 # 参考模板：与 scripts/setup_sidecar.sh 动态生成的内容一致。
 # 就地部署：把 <REPO_ROOT> 换成 git clone 的仓库根目录（clone 时的实际路径）。
 # 正常部署请直接运行 scripts/setup_sidecar.sh，勿手抄本文件。
+# 默认运行用户 nanoquant；也可用 --user 指定，但必须与主服务一致才能访问 0600 的 UDS。
 [Unit]
 Description=NanoQuant exec-service (Rust signing sidecar, sign-only)
 Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant/blob/main/docs/EXEC_PROTOCOL.md
 After=network-online.target
 Wants=network-online.target
 Before=nanoquant.service
+ConditionPathExists=/etc/nanoquant/exec.env
 
 [Service]
 Type=simple
-# /run/nanoquant 由 systemd 创建，属主随运行用户（root）
+User=nanoquant
+Group=nanoquant
 RuntimeDirectory=nanoquant
 RuntimeDirectoryMode=0750
 Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
-# EXEC_SECRET=...；文件不存在也能起（二进制会明确报错），避免 unit 直接失败
 EnvironmentFile=-/etc/nanoquant/exec.env
 ExecStart=<REPO_ROOT>/exec-service
+RestartPreventExitStatus=78
 Restart=always
 RestartSec=3
-
 NoNewPrivileges=true
 PrivateTmp=true
-# 0077 → socket 文件 0600，只有同用户进程能连
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 UMask=0077
 
 [Install]

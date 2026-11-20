@@ -1,0 +1,3394 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-19T11:50:39.586546+00:00",
+  "source_db": "data\\nanoquant.db",
+  "source_db_size": 798720,
+  "source_db_mtime": 1795086879.0094707,
+  "source_db_sha256": "3ad959095b43b2fe35e33ba6a7d23d2192e3b5a66edbdd5fdc6009ea78f13f42",
+  "pragma": {
+    "user_version": 0,
+    "application_id": 0,
+    "app_settings_columns": [
+      "key",
+      "value",
+      "updated_at"
+    ],
+    "schema_version": null
+  },
+  "table_count": 23,
+  "model_table_count": 23,
+  "missing_in_db": [],
+  "extra_in_db": [],
+  "model_tables": [
+    "ai_call_logs",
+    "ai_providers",
+    "alert_logs",
+    "app_settings",
+    "backup_jobs",
+    "cooldowns",
+    "decision_journal",
+    "engine_events",
+    "engine_state",
+    "equity_points",
+    "evolution_runs",
+    "experiences",
+    "mantras",
+    "news_items",
+    "orders",
+    "positions",
+    "settings_audit",
+    "signal_follows",
+    "signals",
+    "strategy_profiles",
+    "trades",
+    "trading_symbols",
+    "write_failures"
+  ],
+  "tables": [
+    {
+      "name": "ai_call_logs",
+      "sql": "CREATE TABLE ai_call_logs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tprovider VARCHAR(64) NOT NULL, \n\tmodel VARCHAR(128) NOT NULL, \n\tpurpose VARCHAR(32) NOT NULL, \n\tok BOOLEAN NOT NULL, \n\tlatency_ms INTEGER NOT NULL, \n\tprompt_tokens INTEGER NOT NULL, \n\tcompletion_tokens INTEGER NOT NULL, \n\tcost_usd FLOAT NOT NULL, \n\terror VARCHAR(500) NOT NULL, \n\traw_text TEXT NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "provider",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "model",
+          "type": "VARCHAR(128)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "purpose",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "ok",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "latency_ms",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "prompt_tokens",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "completion_tokens",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "cost_usd",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "error",
+          "type": "VARCHAR(500)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "raw_text",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_ai_call_logs_purpose",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 4,
+              "name": "purpose"
+            }
+          ]
+        },
+        {
+          "name": "ix_ai_call_logs_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "ai_providers",
+      "sql": "CREATE TABLE ai_providers (\n\tid INTEGER NOT NULL, \n\tname VARCHAR(64) NOT NULL, \n\tprotocol VARCHAR(32) NOT NULL, \n\tbase_url VARCHAR(255) NOT NULL, \n\tapi_key_enc TEXT NOT NULL, \n\tmodel VARCHAR(128) NOT NULL, \n\ttemperature FLOAT NOT NULL, \n\tmax_tokens INTEGER NOT NULL, \n\treasoning_effort VARCHAR(16) NOT NULL, \n\ttimeout_sec INTEGER NOT NULL, \n\tjson_mode BOOLEAN NOT NULL, \n\tenabled BOOLEAN NOT NULL, \n\tpriority INTEGER NOT NULL, \n\trole VARCHAR(32) NOT NULL, \n\textra JSON, \n\tcreated_at INTEGER NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (name)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "name",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "protocol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "base_url",
+          "type": "VARCHAR(255)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "api_key_enc",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "model",
+          "type": "VARCHAR(128)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "temperature",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "max_tokens",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "reasoning_effort",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "timeout_sec",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "json_mode",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "enabled",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "priority",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "role",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "extra",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 16,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_ai_providers_1",
+          "unique": true,
+          "origin": "u",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "name"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "alert_logs",
+      "sql": "CREATE TABLE alert_logs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tlevel VARCHAR(8) NOT NULL, \n\tcategory VARCHAR(48) NOT NULL, \n\tmessage TEXT NOT NULL, \n\tchannels VARCHAR(64) NOT NULL, \n\tok BOOLEAN NOT NULL, \n\terror TEXT NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "level",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "category",
+          "type": "VARCHAR(48)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "message",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "channels",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "ok",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "error",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_alert_logs_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_alert_logs_level",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "level"
+            }
+          ]
+        },
+        {
+          "name": "ix_alert_logs_ok",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 6,
+              "name": "ok"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "app_settings",
+      "sql": "CREATE TABLE app_settings (\n\t\"key\" VARCHAR(64) NOT NULL, \n\tvalue TEXT NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (\"key\")\n)",
+      "row_count": 2,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "key",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "value",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_app_settings_1",
+          "unique": true,
+          "origin": "pk",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "key"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "backup_jobs",
+      "sql": "CREATE TABLE backup_jobs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tname VARCHAR(128) NOT NULL, \n\tscope JSON, \n\tfile_path VARCHAR(400) NOT NULL, \n\tsize INTEGER NOT NULL, \n\tsha256 VARCHAR(80) NOT NULL, \n\tencrypted BOOLEAN NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\tmessage TEXT NOT NULL, \n\tcreated_by VARCHAR(32) NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 2,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "name",
+          "type": "VARCHAR(128)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "scope",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "file_path",
+          "type": "VARCHAR(400)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "size",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "sha256",
+          "type": "VARCHAR(80)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "encrypted",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "message",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "created_by",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_backup_jobs_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "cooldowns",
+      "sql": "CREATE TABLE cooldowns (\n\tsymbol VARCHAR(32) NOT NULL, \n\tuntil_ts INTEGER NOT NULL, \n\treason VARCHAR(120) NOT NULL, \n\tkind VARCHAR(24) NOT NULL, \n\tPRIMARY KEY (symbol)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "until_ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "reason",
+          "type": "VARCHAR(120)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "kind",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_cooldowns_1",
+          "unique": true,
+          "origin": "pk",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "symbol"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "decision_journal",
+      "sql": "CREATE TABLE decision_journal (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tdirection VARCHAR(8) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\tentry_price FLOAT NOT NULL, \n\ttarget_pct FLOAT NOT NULL, \n\treason TEXT NOT NULL, \n\tsnapshot JSON, \n\tdecision VARCHAR(16) NOT NULL, \n\tsignal_id INTEGER NOT NULL, \n\tinjected_experience_ids JSON, \n\tstatus VARCHAR(16) NOT NULL, \n\toutcome VARCHAR(16) NOT NULL, \n\tactual_price FLOAT NOT NULL, \n\tactual_pct FLOAT NOT NULL, \n\tlabeled_at INTEGER NOT NULL, \n\tarchived BOOLEAN NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "direction",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "confidence",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "entry_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "target_pct",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "reason",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "snapshot",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "decision",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "signal_id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "injected_experience_ids",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "outcome",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "actual_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "actual_pct",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 16,
+          "name": "labeled_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 17,
+          "name": "archived",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 18,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_decision_journal_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 18,
+              "name": "mode"
+            }
+          ]
+        },
+        {
+          "name": "ix_journal_status_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 12,
+              "name": "status"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_decision_journal_status",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 12,
+              "name": "status"
+            }
+          ]
+        },
+        {
+          "name": "ix_decision_journal_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_decision_journal_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_decision_journal_archived",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 17,
+              "name": "archived"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "engine_events",
+      "sql": "CREATE TABLE engine_events (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tlevel VARCHAR(16) NOT NULL, \n\tcategory VARCHAR(32) NOT NULL, \n\tmessage TEXT NOT NULL, \n\tpayload JSON, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 157,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "level",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "category",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "message",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "payload",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_engine_events_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_engine_events_category",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 3,
+              "name": "category"
+            }
+          ]
+        },
+        {
+          "name": "ix_engine_events_level",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "level"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "engine_state",
+      "sql": "CREATE TABLE engine_state (\n\t\"key\" VARCHAR(64) NOT NULL, \n\tvalue TEXT NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (\"key\")\n)",
+      "row_count": 3,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "key",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "value",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_engine_state_1",
+          "unique": true,
+          "origin": "pk",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "key"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "equity_points",
+      "sql": "CREATE TABLE equity_points (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\twallet FLOAT NOT NULL, \n\tavailable FLOAT NOT NULL, \n\tunrealized FLOAT NOT NULL, \n\tmargin_used FLOAT NOT NULL, \n\tpositions INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "wallet",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "available",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "unrealized",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "margin_used",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "positions",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_equity_points_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_equity_points_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "mode"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "evolution_runs",
+      "sql": "CREATE TABLE evolution_runs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tkind VARCHAR(24) NOT NULL, \n\tinput_count INTEGER NOT NULL, \n\tproduced INTEGER NOT NULL, \n\treplaced INTEGER NOT NULL, \n\tok BOOLEAN NOT NULL, \n\tsummary TEXT NOT NULL, \n\traw JSON, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "kind",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "input_count",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "produced",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "replaced",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "ok",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "summary",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "raw",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_evolution_runs_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "experiences",
+      "sql": "CREATE TABLE experiences (\n\tid INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\ttags JSON, \n\tscenario JSON, \n\tlesson TEXT NOT NULL, \n\toutcome VARCHAR(8) NOT NULL, \n\tsource_decision_id INTEGER NOT NULL, \n\tsource VARCHAR(24) NOT NULL, \n\thits INTEGER NOT NULL, \n\twins INTEGER NOT NULL, \n\tlosses INTEGER NOT NULL, \n\tenabled BOOLEAN NOT NULL, \n\tcreated_at INTEGER NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "tags",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "scenario",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "lesson",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "outcome",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "source_decision_id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "source",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "hits",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "wins",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "losses",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "enabled",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_experiences_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_experiences_enabled",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 11,
+              "name": "enabled"
+            }
+          ]
+        },
+        {
+          "name": "ix_experiences_created_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 12,
+              "name": "created_at"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "mantras",
+      "sql": "CREATE TABLE mantras (\n\tid INTEGER NOT NULL, \n\ttitle VARCHAR(120) NOT NULL, \n\trule TEXT NOT NULL, \n\ttags JSON, \n\tcategory VARCHAR(32) NOT NULL, \n\tsource VARCHAR(32) NOT NULL, \n\tconfidence FLOAT NOT NULL, \n\thealth FLOAT NOT NULL, \n\thits INTEGER NOT NULL, \n\twins INTEGER NOT NULL, \n\tlosses INTEGER NOT NULL, \n\tenabled BOOLEAN NOT NULL, \n\tvisible BOOLEAN NOT NULL, \n\tversion INTEGER NOT NULL, \n\tsuperseded_by INTEGER NOT NULL, \n\tevidence JSON, \n\tcreated_at INTEGER NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\texpires_at INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "title",
+          "type": "VARCHAR(120)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "rule",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "tags",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "category",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "source",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "confidence",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "health",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "hits",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "wins",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "losses",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "enabled",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "visible",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "version",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "superseded_by",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "evidence",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 16,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 17,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 18,
+          "name": "expires_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_mantras_created_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 16,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "ix_mantras_enabled",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 11,
+              "name": "enabled"
+            }
+          ]
+        },
+        {
+          "name": "ix_mantras_category",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 4,
+              "name": "category"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "news_items",
+      "sql": "CREATE TABLE news_items (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tsource VARCHAR(48) NOT NULL, \n\ttitle VARCHAR(400) NOT NULL, \n\turl VARCHAR(800) NOT NULL, \n\tsummary TEXT NOT NULL, \n\tsentiment FLOAT NOT NULL, \n\tsymbols JSON, \n\tdedupe VARCHAR(64) NOT NULL, \n\traw JSON, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_news_dedupe UNIQUE (dedupe)\n)",
+      "row_count": 332,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "source",
+          "type": "VARCHAR(48)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "title",
+          "type": "VARCHAR(400)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "url",
+          "type": "VARCHAR(800)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "summary",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "sentiment",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "symbols",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "dedupe",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "raw",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_news_ts_source",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            },
+            {
+              "seqno": 1,
+              "cid": 2,
+              "name": "source"
+            }
+          ]
+        },
+        {
+          "name": "ix_news_items_source",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "source"
+            }
+          ]
+        },
+        {
+          "name": "ix_news_items_dedupe",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 8,
+              "name": "dedupe"
+            }
+          ]
+        },
+        {
+          "name": "ix_news_items_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_news_items_1",
+          "unique": true,
+          "origin": "u",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 8,
+              "name": "dedupe"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "orders",
+      "sql": "CREATE TABLE orders (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\torder_type VARCHAR(24) NOT NULL, \n\tqty FLOAT NOT NULL, \n\tprice FLOAT NOT NULL, \n\tstatus VARCHAR(24) NOT NULL, \n\tpurpose VARCHAR(24) NOT NULL, \n\tclient_order_id VARCHAR(64) NOT NULL, \n\texchange_order_id VARCHAR(64) NOT NULL, \n\treduce_only BOOLEAN NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\tlatency_ms INTEGER NOT NULL, \n\traw JSON, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "side",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "order_type",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "qty",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "status",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "purpose",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "client_order_id",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "exchange_order_id",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "reduce_only",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "latency_ms",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "raw",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_orders_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_orders_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_orders_client_order_id",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 9,
+              "name": "client_order_id"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "positions",
+      "sql": "CREATE TABLE positions (\n\tid INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tqty FLOAT NOT NULL, \n\tentry_price FLOAT NOT NULL, \n\tmark_price FLOAT NOT NULL, \n\tvenue_unrealized FLOAT NOT NULL, \n\tvenue_ts INTEGER NOT NULL, \n\tleverage FLOAT NOT NULL, \n\tmargin FLOAT NOT NULL, \n\tsl_price FLOAT NOT NULL, \n\ttp_price FLOAT NOT NULL, \n\tpeak_price FLOAT NOT NULL, \n\topened_at INTEGER NOT NULL, \n\tclosed_at INTEGER NOT NULL, \n\texit_price FLOAT NOT NULL, \n\texit_reason VARCHAR(32) NOT NULL, \n\trealized_pnl FLOAT NOT NULL, \n\tfees FLOAT NOT NULL, \n\tai_confidence FLOAT NOT NULL, \n\tai_reason TEXT NOT NULL, \n\tsignal_score FLOAT NOT NULL, \n\tfeatures JSON, \n\tentry_slippage_bps FLOAT NOT NULL, \n\tinitial_sl_price FLOAT NOT NULL, \n\tpartial_taken_at INTEGER NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\ttrade_id INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "side",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "qty",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "entry_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "mark_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "venue_unrealized",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "venue_ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "leverage",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "margin",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "sl_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "tp_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "peak_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "opened_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "closed_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "exit_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 16,
+          "name": "exit_reason",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 17,
+          "name": "realized_pnl",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 18,
+          "name": "fees",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 19,
+          "name": "ai_confidence",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 20,
+          "name": "ai_reason",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 21,
+          "name": "signal_score",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 22,
+          "name": "features",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 23,
+          "name": "entry_slippage_bps",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 24,
+          "name": "initial_sl_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 25,
+          "name": "partial_taken_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 26,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 27,
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 28,
+          "name": "trade_id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_positions_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 26,
+              "name": "mode"
+            }
+          ]
+        },
+        {
+          "name": "ix_positions_trade_id",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 28,
+              "name": "trade_id"
+            }
+          ]
+        },
+        {
+          "name": "ix_positions_status",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 27,
+              "name": "status"
+            }
+          ]
+        },
+        {
+          "name": "ix_positions_open",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 27,
+              "name": "status"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_positions_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_positions_opened_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 13,
+              "name": "opened_at"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "settings_audit",
+      "sql": "CREATE TABLE settings_audit (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tuser VARCHAR(64) NOT NULL, \n\tgroup_name VARCHAR(32) NOT NULL, \n\tchanges JSON NOT NULL, \n\tip VARCHAR(64) NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "user",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "group_name",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "changes",
+          "type": "JSON",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "ip",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_settings_audit_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_settings_audit_group_name",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 3,
+              "name": "group_name"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "signal_follows",
+      "sql": "CREATE TABLE signal_follows (\n\tid INTEGER NOT NULL, \n\tsignal_id VARCHAR(64) NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tchannel VARCHAR(64) NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\treason VARCHAR(240) NOT NULL, \n\tleverage INTEGER NOT NULL, \n\tqty FLOAT NOT NULL, \n\tprice FLOAT NOT NULL, \n\tmargin FLOAT NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\tpayload JSON, \n\tcreated_at INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "signal_id",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "side",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "channel",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "reason",
+          "type": "VARCHAR(240)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "leverage",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "qty",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "margin",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "payload",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_signal_follows_channel",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 4,
+              "name": "channel"
+            }
+          ]
+        },
+        {
+          "name": "ix_signal_follows_created_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 13,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "ix_signal_follows_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_signal_follows_status",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 5,
+              "name": "status"
+            }
+          ]
+        },
+        {
+          "name": "ix_signal_follows_signal_id",
+          "unique": true,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "signal_id"
+            }
+          ]
+        },
+        {
+          "name": "ix_signal_follows_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 11,
+              "name": "mode"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "signals",
+      "sql": "CREATE TABLE signals (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tdirection VARCHAR(8) NOT NULL, \n\tscore FLOAT NOT NULL, \n\tfeatures JSON, \n\tai_action VARCHAR(16) NOT NULL, \n\tai_confidence FLOAT NOT NULL, \n\tai_reason TEXT NOT NULL, \n\tdecision VARCHAR(16) NOT NULL, \n\treject_reason VARCHAR(255) NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\trepeats INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "direction",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "score",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "features",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "ai_action",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "ai_confidence",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "ai_reason",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "decision",
+          "type": "VARCHAR(16)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "reject_reason",
+          "type": "VARCHAR(255)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "repeats",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_signals_decision",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 9,
+              "name": "decision"
+            }
+          ]
+        },
+        {
+          "name": "ix_signals_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        },
+        {
+          "name": "ix_signals_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 11,
+              "name": "mode"
+            }
+          ]
+        },
+        {
+          "name": "ix_signals_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "symbol"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "strategy_profiles",
+      "sql": "CREATE TABLE strategy_profiles (\n\tid INTEGER NOT NULL, \n\tname VARCHAR(64) NOT NULL, \n\tdescription VARCHAR(200) NOT NULL, \n\trule TEXT NOT NULL, \n\tenabled BOOLEAN NOT NULL, \n\tpriority INTEGER NOT NULL, \n\tfilters JSON, \n\tcreated_at INTEGER NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "name",
+          "type": "VARCHAR(64)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "description",
+          "type": "VARCHAR(200)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "rule",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "enabled",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "priority",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "filters",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_strategy_profiles_enabled",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 4,
+              "name": "enabled"
+            }
+          ]
+        },
+        {
+          "name": "ix_strategy_profiles_priority",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 5,
+              "name": "priority"
+            }
+          ]
+        },
+        {
+          "name": "ix_strategy_profiles_name",
+          "unique": true,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "name"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "trades",
+      "sql": "CREATE TABLE trades (\n\tid INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tqty FLOAT NOT NULL, \n\tentry_price FLOAT NOT NULL, \n\texit_price FLOAT NOT NULL, \n\tleverage FLOAT NOT NULL, \n\tnotional FLOAT NOT NULL, \n\tpnl FLOAT NOT NULL, \n\tpnl_pct FLOAT NOT NULL, \n\troi_pct FLOAT NOT NULL, \n\tfees FLOAT NOT NULL, \n\topened_at INTEGER NOT NULL, \n\tclosed_at INTEGER NOT NULL, \n\thold_seconds INTEGER NOT NULL, \n\texit_reason VARCHAR(32) NOT NULL, \n\tai_confidence FLOAT NOT NULL, \n\tai_reason TEXT NOT NULL, \n\tsignal_score FLOAT NOT NULL, \n\tslippage_bps FLOAT NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\treviewed BOOLEAN NOT NULL, \n\treview_note TEXT NOT NULL, \n\tfeatures JSON, \n\tmantra_ids JSON, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "side",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "qty",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "entry_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "exit_price",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "leverage",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "notional",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "pnl",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "pnl_pct",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "roi_pct",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "fees",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "opened_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "closed_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "hold_seconds",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "exit_reason",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 16,
+          "name": "ai_confidence",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 17,
+          "name": "ai_reason",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 18,
+          "name": "signal_score",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 19,
+          "name": "slippage_bps",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 20,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 21,
+          "name": "reviewed",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 22,
+          "name": "review_note",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 23,
+          "name": "features",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 24,
+          "name": "mantra_ids",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_trades_mode",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 20,
+              "name": "mode"
+            }
+          ]
+        },
+        {
+          "name": "ix_trades_symbol",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "symbol"
+            }
+          ]
+        },
+        {
+          "name": "ix_trades_opened_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 12,
+              "name": "opened_at"
+            }
+          ]
+        },
+        {
+          "name": "ix_trades_reviewed",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 21,
+              "name": "reviewed"
+            }
+          ]
+        },
+        {
+          "name": "ix_trades_closed_at",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 13,
+              "name": "closed_at"
+            }
+          ]
+        },
+        {
+          "name": "ix_trades_mode_closed",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 20,
+              "name": "mode"
+            },
+            {
+              "seqno": 1,
+              "cid": 13,
+              "name": "closed_at"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "trading_symbols",
+      "sql": "CREATE TABLE trading_symbols (\n\tsymbol VARCHAR(32) NOT NULL, \n\tname VARCHAR(32) NOT NULL, \n\ttier VARCHAR(24) NOT NULL, \n\tsl_atr_mult FLOAT NOT NULL, \n\tenabled BOOLEAN NOT NULL, \n\tmax_leverage INTEGER NOT NULL, \n\tprecision INTEGER NOT NULL, \n\ttick_sz VARCHAR(32) NOT NULL, \n\tmin_sz VARCHAR(32) NOT NULL, \n\tmin_notional FLOAT NOT NULL, \n\tct_val FLOAT NOT NULL, \n\tmin_score FLOAT NOT NULL, \n\tnote VARCHAR(255) NOT NULL, \n\tsort_order INTEGER NOT NULL, \n\tcreated_at INTEGER NOT NULL, \n\tupdated_at INTEGER NOT NULL, \n\tPRIMARY KEY (symbol)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "symbol",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "name",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "tier",
+          "type": "VARCHAR(24)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "sl_atr_mult",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "enabled",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "max_leverage",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "precision",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "tick_sz",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 8,
+          "name": "min_sz",
+          "type": "VARCHAR(32)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 9,
+          "name": "min_notional",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 10,
+          "name": "ct_val",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 11,
+          "name": "min_score",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "note",
+          "type": "VARCHAR(255)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 13,
+          "name": "sort_order",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 14,
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 15,
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_trading_symbols_sort_order",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 13,
+              "name": "sort_order"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_trading_symbols_1",
+          "unique": true,
+          "origin": "pk",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "symbol"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "write_failures",
+      "sql": "CREATE TABLE write_failures (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tkind VARCHAR(48) NOT NULL, \n\tpayload JSON, \n\terror TEXT NOT NULL, \n\tattempts INTEGER NOT NULL, \n\tauto_attempts INTEGER NOT NULL, \n\tresolved BOOLEAN NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 2,
+          "name": "kind",
+          "type": "VARCHAR(48)",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "payload",
+          "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "error",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "attempts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "auto_attempts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "resolved",
+          "type": "BOOLEAN",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_write_failures_resolved",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 7,
+              "name": "resolved"
+            }
+          ]
+        },
+        {
+          "name": "ix_write_failures_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
+    }
+  ]
+}

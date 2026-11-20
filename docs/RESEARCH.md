@@ -53,7 +53,7 @@ Freqtrade、Jesse、OctoBot、Nautilus、hftbacktest、两个 LLM 多智能体�
 
 ## 3. 横向项目：采用的具体实现
 
-### 3.1 币安 U 本位 API（binance-futures-connector-python）
+### 3.1 币安 U 本位 API（binance-futures-connector-python，外部项目名，非本仓依赖）
 
 - 端点：`POST /fapi/v1/order`、`DELETE /fapi/v1/order`、`GET /fapi/v3/positionRisk`、
   `GET /fapi/v3/account`、`POST /fapi/v1/leverage`、`POST /fapi/v1/marginType`、

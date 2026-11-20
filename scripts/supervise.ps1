@@ -26,7 +26,7 @@ param(
   [int]$IntervalSec = 30,
   [int]$MaxLogMB = 20,
   [switch]$Once,
-  [string]$Python = ''
+  [string]$Binary = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,12 +45,11 @@ function Write-SupLog([string]$Message) {
   Write-Host $line
 }
 
-function Resolve-Python {
+function Resolve-Binary {
   $candidates = @()
-  if ($Python) { $candidates += $Python }
-  if ($env:NANOQUANT_VENV) { $candidates += (Join-Path $env:NANOQUANT_VENV 'Scripts\python.exe') }
-  $candidates += (Join-Path $Root '.venv\Scripts\python.exe')
-  $candidates += (Join-Path (Split-Path -Parent $Root) '.venvtest\Scripts\python.exe')
+  if ($Binary) { $candidates += $Binary }
+  $candidates += (Join-Path $Root 'rust\nanoquant\target\release\nanoquant.exe')
+  $candidates += (Join-Path $Root 'rust\nanoquant\target\release\nanoquant')
   return ($candidates | Where-Object { Test-Path $_ } | Select-Object -First 1)
 }
 
@@ -88,24 +87,22 @@ function Rotate-Log([string]$Path) {
   Write-SupLog "日志轮转: $(Split-Path $Path -Leaf) -> $(Split-Path $rotated -Leaf)"
 }
 
-function Start-Engine($VPython) {
+function Start-Engine($Bin) {
   Rotate-Log $OutLog
   Rotate-Log $ErrLog
   if (-not $env:NANOQUANT_HOME) { $env:NANOQUANT_HOME = $Root }
   $env:NANOQUANT_PORT = "$Port"
-  $backend = Join-Path $Root 'backend'
-  Write-SupLog "启动进程: $VPython -m nanoquant (port $Port, home $env:NANOQUANT_HOME)"
-  return Start-Process -FilePath $VPython `
-    -ArgumentList '-m', 'nanoquant' `
-    -WorkingDirectory $backend `
+  Write-SupLog "启动进程: $Bin (port $Port, home $env:NANOQUANT_HOME)"
+  return Start-Process -FilePath $Bin `
+    -WorkingDirectory $Root `
     -RedirectStandardOutput $OutLog `
     -RedirectStandardError $ErrLog `
     -PassThru -WindowStyle Hidden
 }
 
-$VPython = Resolve-Python
-if (-not $VPython) {
-  Write-SupLog "未找到 Python 解释器，退出"
+$Bin = Resolve-Binary
+if (-not $Bin) {
+  Write-SupLog "未找到 Rust 二进制，退出。请先执行: cargo build --release --manifest-path rust/nanoquant/Cargo.toml"
   exit 1
 }
 
@@ -115,7 +112,7 @@ if ($Once) {
   $alive = Test-Health
   Write-SupLog ("单次检查: health={0}, heartbeat={1}s" -f $alive, (Get-HeartbeatAgeSec))
   if (-not $alive) {
-    $p = Start-Engine $VPython
+    $p = Start-Engine $Bin
     Start-Sleep -Seconds 8
     $alive2 = Test-Health
     Write-SupLog ("已启动 PID {0}, health={1}" -f $p.Id, $alive2)
@@ -139,7 +136,7 @@ while ($true) {
     }
     [void]$restartTimes.Add($now)
     try {
-      [void](Start-Engine $VPython)
+      [void](Start-Engine $Bin)
     } catch {
       Write-SupLog "启动失败: $_"
     }

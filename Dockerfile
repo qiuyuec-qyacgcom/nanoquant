@@ -1,5 +1,8 @@
+# 全量 Rust 迁移后的唯一 Dockerfile（Rust 构建阶段 + Debian slim 运行阶段）。
+# 构建：docker build -t nanoquant:latest .
+# 运行阶段不包含解释器运行时、包管理器与解释器健康检查。
+
 # ---- 前端构建 ----
-# 用 npm ci（可复现）而非 npm install；基础镜像锁到具体 minor，避免"哪天 latest 变了"
 FROM node:20.18-alpine AS frontend
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
@@ -7,26 +10,35 @@ RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
+# ---- Rust 构建 ----
+# 依赖最大 MSRV 为 1.88（icu_* 2.4.0 等使用 edition 2024），1.83 无法编译本锁文件。
+FROM rust:1.90-slim AS backend
+WORKDIR /build
+# rusqlite/libsqlite3-sys (bundled) and ring need a C toolchain; rust:slim does not ship one.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev make perl \
+    && rm -rf /var/lib/apt/lists/*
+COPY rust/nanoquant/Cargo.toml rust/nanoquant/Cargo.lock ./
+COPY rust/nanoquant/src ./src
+RUN cargo build --release --locked
+
 # ---- 运行时 ----
-FROM python:3.12.7-slim
-ENV PYTHONUNBUFFERED=1 \
-    NANOQUANT_HOME=/app \
-    NANOQUANT_PORT=8899
+FROM debian:bookworm-slim
+ENV NANOQUANT_HOME=/app \
+    NANOQUANT_PORT=8899 \
+    NANOQUANT_DB=/app/data/nanoquant.db \
+    NANOQUANT_FRONTEND=/app/frontend/dist
 WORKDIR /app
 
-# 非 root 运行：容器内最小权限，万一应用被攻破不能直接读写宿主
 RUN useradd --create-home --uid 1000 nanoquant
 
-COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
-COPY backend/ /app/backend/
+COPY --from=backend /build/target/release/nanoquant /usr/local/bin/nanoquant
 COPY --from=frontend /build/dist /app/frontend/dist
 
 RUN mkdir -p /app/data /app/logs && chown -R nanoquant:nanoquant /app
 USER nanoquant
 
 EXPOSE 8899
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8899/api/v1/health', timeout=4).status==200 else 1)"
-WORKDIR /app/backend
-CMD ["python", "-m", "nanoquant"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD ["/usr/local/bin/nanoquant", "--healthcheck"]
+CMD ["nanoquant"]

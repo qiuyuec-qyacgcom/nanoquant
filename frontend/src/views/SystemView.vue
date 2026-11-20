@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import { http } from '../api/client'
 import EventFeed from '../components/EventFeed.vue'
 import { useAppStore } from '../stores/app'
@@ -102,13 +103,12 @@ async function loadLogs() {
   }
 }
 
-let timer: number | undefined
 onMounted(async () => {
   // 诊断涉及外部网络探测, 与基础信息并行, 避免页面长时间空白
   await Promise.allSettled([runDiagnostics(), load()])
-  timer = window.setInterval(load, 15000)
 })
-onBeforeUnmount(() => window.clearInterval(timer))
+
+useSilentRefresh(load, 15000)
 </script>
 
 <template>
@@ -314,7 +314,6 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <table class="table">
             <tbody>
               <tr><td class="muted" style="width: 120px">版本</td><td class="mono">{{ info?.app }} v{{ info?.version }}</td></tr>
-              <tr><td class="muted">Python</td><td class="mono">{{ info?.python }}</td></tr>
               <tr><td class="muted">平台</td><td class="mono" style="white-space: normal">{{ info?.platform }}</td></tr>
               <tr><td class="muted">启动时间</td><td class="mono">{{ timeStr(info?.started_at || 0) }}</td></tr>
               <tr><td class="muted">运行时长</td><td class="mono">{{ Math.floor((info?.uptime || 0) / 60) }} 分钟</td></tr>

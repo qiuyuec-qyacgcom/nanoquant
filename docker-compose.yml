@@ -9,12 +9,15 @@ services:
     environment:
       NANOQUANT_PORT: 8899
       NANOQUANT_HOME: /app
+
+      NANOQUANT_DB: /app/data/nanoquant.db
+      NANOQUANT_FRONTEND: /app/frontend/dist
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8899/api/v1/health', timeout=4).status==200 else 1)"]
+      test: ["CMD", "/usr/local/bin/nanoquant", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 10s

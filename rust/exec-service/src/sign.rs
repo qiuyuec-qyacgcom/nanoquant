@@ -1,6 +1,6 @@
 //! 币安签名：HMAC-SHA256（hex）与 Ed25519（base64）。
 //!
-//! 与 Python 侧 `exchange/client.py::sign_query` 保持**逐字节一致**：
+//! 与 legacy 内核（已退役） 侧 `exchange/client.py::sign_query` 保持**逐字节一致**：
 //! - HMAC  → 小写 hex
 //! - Ed25519 → 标准 base64（含 `=` 填充），拼 URL 时必须再 urlencode
 
@@ -24,7 +24,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// 去掉 PEM 头尾与空白；单行 PEM（`-----BEGIN...----- M... -----END...-----`）也要能处理。
 ///
-/// 与 Python 侧 `normalize_pem` 同口径：**按 `-----` 标记片段删除**，而不是按行过滤。
+/// 与 legacy 内核（已退役） 侧 `normalize_pem` 同口径：**按 `-----` 标记片段删除**，而不是按行过滤。
 /// 旧实现用 `skipping` 状态机，进入 BEGIN 后永远退出不了（单行/多行 PEM 都被清空），
 /// 结果 `detect()` 静默回落到 HMAC —— 签名自然是错的。
 pub fn normalize_pem(value: &str) -> String {
@@ -84,20 +84,21 @@ mod tests {
 
     const QUERY: &str = "symbol=BTCUSDT&side=BUY&type=MARKET&timestamp=1700000000000";
 
-    /// 固定种子 → 确定性签名，Python 侧已生成期望值
+    /// 固定种子 → 确定性签名，legacy 内核（已退役） 侧已生成期望值
     const ED_SECRET: &str = "MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
-    const ED_SIG: &str = "9Z7/7rbpsRx/V335rbIjgYZc73mgxDfAwdrSux8fheFxw4zb9ncQdI0rnNtyYTNFNhpkMNoOYSba0xJe+hb2Aw==";
+    const ED_SIG: &str =
+        "9Z7/7rbpsRx/V335rbIjgYZc73mgxDfAwdrSux8fheFxw4zb9ncQdI0rnNtyYTNFNhpkMNoOYSba0xJe+hb2Aw==";
     const HMAC_HEX: &str = "c5bee7ef23d0f08ff08fe04022f745e9ff389ec6ea2ad8203e0a096b238dcf36";
 
     #[test]
-    fn ed25519_matches_python() {
+    fn ed25519_matches_legacy() {
         let signer = Signer::detect(ED_SECRET);
         assert_eq!(signer.algo(), "ed25519");
         assert_eq!(signer.sign(QUERY), ED_SIG);
     }
 
     #[test]
-    fn hmac_matches_python() {
+    fn hmac_matches_legacy() {
         let signer = Signer::detect("secret");
         assert_eq!(signer.algo(), "hmac-sha256");
         assert_eq!(signer.sign(QUERY), HMAC_HEX);

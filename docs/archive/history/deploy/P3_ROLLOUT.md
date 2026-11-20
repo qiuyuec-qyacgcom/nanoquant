@@ -1,3 +1,7 @@
+> 历史记录：已退役，不可执行
+> 源路径：deploy/P3_ROLLOUT.md
+> 归档时间：2026-11-20T09:17:25Z
+
 # P3 启用与回滚手册（Rust 执行内核 sidecar）
 
 > 面向运维。**每一步都可单独回退**，任何一步数据不达标就停在那一步，不要往下走。
@@ -8,10 +12,10 @@
 确认 `exec_mode` 已是 `enforce` 且稳定（`mismatched == 0`）。若尚未完成，先按
 `deploy/README.md` 走完 P2（部署 → 验证 → shadow → enforce）。
 
-```bash
-curl -s -H "Authorization: Bearer <token>" \
-  http://127.0.0.1:8899/api/v1/system/exec-sidecar | python3 -m json.tool
-```
+~~~text
+# [已删除] curl -s -H "Authorization: Bearer <token>" \
+# [已删除]   http://127.0.0.1:8899/api/v1/system/exec-sidecar | python3 -m json.tool
+~~~
 
 必须看到：`mode="enforce"`、`connected=true`、`counts.mismatched=0`。
 
@@ -19,16 +23,16 @@ curl -s -H "Authorization: Bearer <token>" \
 
 ## 1. 部署 P3（一次性）
 
-```bash
-cd ~/nanoquant && git pull
-
-# sidecar：重编（首次含 SQLite bundled，约 +1.5 分钟）
-cd rust/exec-service && cargo test --release && cargo build --release
-sudo install -m 0755 target/release/exec-service ~/nanoquant/exec-service
-
-# 主服务：重启（Python 侧有改动）
-cd ~/nanoquant && sudo systemctl restart nanoquant-exec && sudo systemctl restart nanoquant
-```
+~~~text
+# [已删除] cd ~/nanoquant && git pull
+# [已删除] 
+# [已删除] # sidecar：重编（首次含 SQLite bundled，约 +1.5 分钟）
+# [已删除] cd rust/exec-service && cargo test --release && cargo build --release
+# [已删除] sudo install -m 0755 target/release/exec-service ~/nanoquant/exec-service
+# [已删除] 
+# [已删除] # 主服务：重启（Python 侧有改动）
+# [已删除] cd ~/nanoquant && sudo systemctl restart nanoquant-exec && sudo systemctl restart nanoquant
+~~~
 
 启动后应看到：
 
@@ -61,11 +65,11 @@ journalctl -u nanoquant-exec -n 20 --no-pager | grep -E 'ledger store|http pool'
 
 ### A1. 签名比对
 
-```bash
-curl -s -H "Authorization: Bearer <token>" \
-  http://127.0.0.1:8899/api/v1/system/exec-sidecar \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["counts"], d["protect_counts"], d["order_ledger"]["counts"])'
-```
+~~~text
+# [已删除] curl -s -H "Authorization: Bearer <token>" \
+# [已删除]   http://127.0.0.1:8899/api/v1/system/exec-sidecar \
+# [已删除]   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["counts"], d["protect_counts"], d["order_ledger"]["counts"])'
+~~~
 
 | 指标 | 目标 | 含义 |
 |---|---|---|
@@ -89,11 +93,11 @@ curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8899/api/v1/health >
 
 ### A3. 台账双向对账
 
-```bash
-curl -s -H "Authorization: Bearer <token>" \
-  'http://127.0.0.1:8899/api/v1/system/exec-sidecar/reconcile?lookback_hours=24' \
-  | python3 -m json.tool
-```
+~~~text
+# [已删除] curl -s -H "Authorization: Bearer <token>" \
+# [已删除]   'http://127.0.0.1:8899/api/v1/system/exec-sidecar/reconcile?lookback_hours=24' \
+# [已删除]   | python3 -m json.tool
+~~~
 
 | 字段 | 目标 | 处理 |
 |---|---|---|
@@ -121,11 +125,11 @@ curl -s -H "Authorization: Bearer <token>" \
 
 ### 验证
 
-```bash
-curl -s -H "Authorization: Bearer <token>" \
-  http://127.0.0.1:8899/api/v1/system/exec-sidecar \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["order_ledger"]["protect_counts"])'
-```
+~~~text
+# [已删除] curl -s -H "Authorization: Bearer <token>" \
+# [已删除]   http://127.0.0.1:8899/api/v1/system/exec-sidecar \
+# [已删除]   | python3 -c 'import json,sys; print(json.load(sys.stdin)["order_ledger"]["protect_counts"])'
+~~~
 
 | 指标 | 目标 |
 |---|---|
@@ -203,13 +207,13 @@ curl -s -H "Authorization: Bearer <token>" 'http://127.0.0.1:8899/api/v1/engine/
 
 ## 7. 每日巡检（一条命令）
 
-```bash
-TOKEN='<token>'
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8899/api/v1/system/exec-sidecar \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); l=d["order_ledger"]; print("mismatch",d["counts"]["mismatched"],"| protect",l["protect_counts"],"| ledger",l["counts"],"| auth",l["authoritative"],"| place",l["place_enabled"])'
-curl -s -H "Authorization: Bearer $TOKEN" \
-  'http://127.0.0.1:8899/api/v1/system/exec-sidecar/reconcile?lookback_hours=24' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("aligned",d["aligned"],"diff",d["diff_count"],"checked",d["checked"])'
-```
+~~~text
+# [已删除] TOKEN='<token>'
+# [已删除] curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8899/api/v1/system/exec-sidecar \
+# [已删除]   | python3 -c 'import json,sys; d=json.load(sys.stdin); l=d["order_ledger"]; print("mismatch",d["counts"]["mismatched"],"| protect",l["protect_counts"],"| ledger",l["counts"],"| auth",l["authoritative"],"| place",l["place_enabled"])'
+# [已删除] curl -s -H "Authorization: Bearer $TOKEN" \
+# [已删除]   'http://127.0.0.1:8899/api/v1/system/exec-sidecar/reconcile?lookback_hours=24' \
+# [已删除]   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("aligned",d["aligned"],"diff",d["diff_count"],"checked",d["checked"])'
+~~~
 
 目标：`mismatched=0`、`protect.mismatched=0`、`ledger.errors=0`、`aligned=True`、`diff=0`。

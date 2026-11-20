@@ -1,0 +1,5073 @@
+use crate::db::Db;
+use rusqlite::OptionalExtension;
+use serde_json::{json, Value};
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{watch, Notify};
+use tokio::time::{sleep, Duration};
+
+const MIN_INTERVAL_SEC: i64 = 15;
+const MAX_INTERVAL_SEC: i64 = 3600;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeConfig {
+    pub(crate) enabled: bool,
+    pub(crate) interval_sec: u64,
+}
+
+/// 实盘准备发送的一笔管仓单。网络请求必须在数据库事务之外发。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LivePlan {
+    pub(crate) symbol: String,
+    pub(crate) position_side: String,
+    /// 交易所方向：平多 SELL，平空 BUY。
+    pub(crate) side: String,
+    pub(crate) qty: f64,
+    pub(crate) purpose: String,
+    pub(crate) mark_price: f64,
+    entry: Option<EntryTerms>,
+    /// 开仓决策时的注入 ID，随成交回执写入持仓 features。
+    features: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct EntryTerms {
+    leverage: f64,
+    stop: f64,
+    take_profit: f64,
+    score: f64,
+}
+
+#[derive(Clone)]
+pub(crate) struct LiveCreds {
+    base: String,
+    api_key: String,
+    secret: String,
+    recv_window_ms: i64,
+}
+
+impl RuntimeConfig {
+    pub(crate) fn from_db(db: &Db) -> Self {
+        let value = db.setting("engine").ok().flatten().unwrap_or(Value::Null);
+        let interval = value["cycle_interval_sec"]
+            .as_i64()
+            .unwrap_or(MIN_INTERVAL_SEC)
+            .clamp(MIN_INTERVAL_SEC, MAX_INTERVAL_SEC) as u64;
+        let enabled = value["enabled"].as_bool().unwrap_or(false);
+        Self {
+            enabled,
+            interval_sec: interval,
+        }
+    }
+}
+
+pub(crate) struct EngineRuntime {
+    db: Db,
+    _lock: File,
+    master_key: Vec<u8>,
+    /// 事件总线：账户、持仓、订单的变化从这里推给前端。
+    events: crate::events::EventBus,
+    cycle_signal: Option<Arc<Notify>>,
+    cycle_busy: Arc<AtomicBool>,
+    runtime_active: Arc<AtomicBool>,
+    reviewer: Option<Arc<dyn crate::review::AiReviewer>>,
+    /// 平仓后自进化复盘用；与 HTTP 层共用同一套供应商选择逻辑。
+    ai: Option<crate::ai_providers::AiState>,
+    /// 同一笔成交的复盘可能被平仓与补扫同时命中，进程内去重。
+    reviewing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EngineControl {
+    db: Db,
+    master_key: Vec<u8>,
+    cycle_signal: Option<Arc<Notify>>,
+    cycle_busy: Arc<AtomicBool>,
+    runtime_active: Arc<AtomicBool>,
+    gateway: Arc<dyn crate::live::Gateway>,
+}
+
+#[derive(Debug)]
+pub(crate) enum TradeModeError {
+    Credentials(String),
+    Positions(Vec<String>),
+    Exchange(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum ProtectError {
+    NotFound,
+    Credentials(String),
+    Exchange(String),
+    Failed(Value),
+}
+
+#[derive(Debug)]
+pub(crate) enum CloseError {
+    NotFound,
+    Credentials(String),
+    Exchange(String),
+    Rejected(String),
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProtectionResult {
+    pub status: u16,
+    pub body: String,
+    pub degraded: bool,
+}
+
+impl EngineControl {
+    pub(crate) fn new(db: Db, master_key: Vec<u8>) -> Self {
+        Self::with_cycle(
+            db,
+            master_key,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn with_cycle(
+        db: Db,
+        master_key: Vec<u8>,
+        cycle_signal: Option<Arc<Notify>>,
+        cycle_busy: Arc<AtomicBool>,
+        runtime_active: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            db,
+            master_key,
+            cycle_signal,
+            cycle_busy,
+            runtime_active,
+            gateway: Arc::new(crate::live::HttpGateway::new()),
+        }
+    }
+
+    pub(crate) fn with_gateway(mut self, gateway: Arc<dyn crate::live::Gateway>) -> Self {
+        self.gateway = gateway;
+        self
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.runtime_active.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn trigger_cycle(&self) -> Result<i64, String> {
+        if !self.runtime_active.load(Ordering::SeqCst) {
+            return Err("引擎未运行".to_string());
+        }
+        if self.cycle_busy.load(Ordering::SeqCst) {
+            return Err("周期正在进行".to_string());
+        }
+        let Some(signal) = &self.cycle_signal else {
+            return Err("引擎未运行".to_string());
+        };
+        if self.mode() == "live" {
+            self.live_credentials()
+                .map_err(|error| format!("凭证不可用: {error}"))?;
+        }
+        signal.notify_one();
+        Ok(crate::now())
+    }
+
+    async fn exchange_request(
+        &self,
+        creds: &LiveCreds,
+        method: &str,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<(u16, String), String> {
+        let gate = self.ban_gate();
+        let now = crate::now_millis();
+        let request = crate::submit::prepare(
+            &gate,
+            now,
+            method,
+            &creds.base,
+            path,
+            params,
+            &creds.api_key,
+            &creds.secret,
+            now,
+            creds.recv_window_ms,
+        )?;
+        let reply = self.gateway.send(&request).await;
+        if reply.transport_failed {
+            return Err("交易所连接失败".to_string());
+        }
+        Ok((reply.status, reply.body))
+    }
+
+    pub(crate) async fn trade_mode_status(&self) -> Result<Value, TradeModeError> {
+        let creds = self
+            .live_credentials()
+            .map_err(TradeModeError::Credentials)?;
+        let (status, body) = self
+            .exchange_request(&creds, "GET", "/fapi/v1/positionSide/dual", &[])
+            .await
+            .map_err(TradeModeError::Exchange)?;
+        if !(200..300).contains(&status) {
+            return Err(TradeModeError::Exchange(format!(
+                "交易所返回 HTTP {status}: {}",
+                truncate_body(&body)
+            )));
+        }
+        let dual = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| value["dualSidePosition"].as_bool())
+            .ok_or_else(|| {
+                TradeModeError::Exchange("交易所持仓模式响应缺少 dualSidePosition".to_string())
+            })?;
+        let (status, body) = self
+            .exchange_request(&creds, "GET", "/fapi/v3/positionRisk", &[])
+            .await
+            .map_err(TradeModeError::Exchange)?;
+        if !(200..300).contains(&status) {
+            return Err(TradeModeError::Exchange(format!(
+                "交易所持仓查询失败 HTTP {status}: {}",
+                truncate_body(&body)
+            )));
+        }
+        let rows = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        let mut margin: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut with_positions = Vec::new();
+        for row in rows {
+            let Some(symbol) = row["symbol"].as_str() else {
+                continue;
+            };
+            margin.insert(
+                symbol.to_string(),
+                row["marginType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase(),
+            );
+            let amount = row["positionAmt"]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .or_else(|| row["positionAmt"].as_f64())
+                .unwrap_or(0.0);
+            if amount.abs() > 1e-12 {
+                with_positions.push(symbol.to_string());
+            }
+        }
+        with_positions.sort();
+        with_positions.dedup();
+        let pool = self.pool_symbols();
+        let pool = if pool.is_empty() {
+            with_positions.clone()
+        } else {
+            pool
+        };
+        let need_isolated: Vec<String> = pool
+            .iter()
+            .filter(|symbol| {
+                margin
+                    .get(*symbol)
+                    .map(|kind| kind == "cross")
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        let margin_known = pool
+            .iter()
+            .filter(|symbol| {
+                matches!(
+                    margin.get(*symbol).map(String::as_str),
+                    Some("cross") | Some("isolated")
+                )
+            })
+            .count();
+        let can_switch = with_positions.is_empty();
+        let hint = if dual && need_isolated.is_empty() {
+            "已是双向逐仓".to_string()
+        } else if !dual {
+            "账户为单向持仓：请先开启双向持仓（需无持仓、无挂单）".to_string()
+        } else if margin_known == 0 {
+            "无持仓；开仓时会自动把该标的切为逐仓".to_string()
+        } else {
+            format!("{} 个标的仍是全仓，建议切为逐仓", need_isolated.len())
+        };
+        let margin_json: serde_json::Map<String, Value> = pool
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.clone(),
+                    json!(margin
+                        .get(symbol)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string())),
+                )
+            })
+            .collect();
+        Ok(json!({
+            "hedge_mode": dual,
+            "need_hedge": !dual,
+            "need_isolated": need_isolated,
+            "margin_known": margin_known,
+            "with_positions": with_positions,
+            "can_switch": can_switch,
+            "margin": margin_json,
+            "hint": hint,
+        }))
+    }
+
+    pub(crate) async fn switch_trade_mode(
+        &self,
+        hedge: bool,
+        isolated: bool,
+    ) -> Result<Value, TradeModeError> {
+        let open = self.open_position_symbols();
+        if !open.is_empty() {
+            return Err(TradeModeError::Positions(open));
+        }
+        let status = self.trade_mode_status().await?;
+        if let Some(positions) = status["with_positions"].as_array() {
+            if !positions.is_empty() {
+                let symbols = positions
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect();
+                return Err(TradeModeError::Positions(symbols));
+            }
+        }
+        let dual = status["hedge_mode"].as_bool().unwrap_or(false);
+        let creds = self
+            .live_credentials()
+            .map_err(TradeModeError::Credentials)?;
+        let mut results = Vec::new();
+        let mut ok = true;
+        if hedge {
+            if dual {
+                results.push(json!({"target": "hedge", "ok": true, "detail": "已是双向持仓"}));
+            } else {
+                let params = vec![("dualSidePosition".to_string(), "true".to_string())];
+                match self
+                    .exchange_request(&creds, "POST", "/fapi/v1/positionSide/dual", &params)
+                    .await
+                {
+                    Ok((status, _)) if (200..300).contains(&status) => {
+                        results.push(
+                            json!({"target": "hedge", "ok": true, "detail": "已切换为双向持仓"}),
+                        );
+                    }
+                    Ok((status, body)) => {
+                        ok = false;
+                        results.push(json!({"target": "hedge", "ok": false, "detail": format!("切换失败 HTTP {status}: {}", truncate_body(&body))}));
+                    }
+                    Err(error) => {
+                        ok = false;
+                        results.push(json!({"target": "hedge", "ok": false, "detail": error}));
+                    }
+                }
+            }
+        }
+        if isolated {
+            if hedge && !ok {
+                results.push(json!({"target": "isolated", "ok": false, "detail": "上一步连接币安失败，已跳过逐仓切换以避免重复超时；稍后重试", "failed": []}));
+            } else {
+                let symbols = self.pool_symbols();
+                let mut failed = Vec::new();
+                for symbol in &symbols {
+                    let params = vec![
+                        ("symbol".to_string(), symbol.clone()),
+                        ("marginType".to_string(), "ISOLATED".to_string()),
+                    ];
+                    match self
+                        .exchange_request(&creds, "POST", "/fapi/v1/marginType", &params)
+                        .await
+                    {
+                        Ok((status, _)) if (200..300).contains(&status) => {}
+                        Ok((_, body)) if body.contains("-4046") => {}
+                        Ok((status, body)) => {
+                            failed.push(json!({"symbol": symbol, "detail": format!("HTTP {status}: {}", truncate_body(&body))}));
+                        }
+                        Err(error) => {
+                            failed.push(json!({"symbol": symbol, "detail": error}));
+                        }
+                    }
+                }
+                if !failed.is_empty() {
+                    ok = false;
+                }
+                results.push(json!({
+                    "target": "isolated",
+                    "ok": failed.is_empty(),
+                    "detail": if failed.is_empty() { format!("{} 个标的已切/已是逐仓", symbols.len()) } else { format!("{} 个标的逐仓切换失败", failed.len()) },
+                    "failed": failed,
+                }));
+            }
+        }
+
+        Ok(json!({"ok": ok, "results": results}))
+    }
+
+    pub(crate) async fn close_position(
+        &self,
+        position_id: i64,
+        reason: &str,
+    ) -> Result<Value, CloseError> {
+        let position: Option<(String, String, String, f64, f64)> = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| CloseError::Exchange("数据库锁不可用".to_string()))?;
+            conn.query_row(
+                "SELECT mode, symbol, side, qty, mark_price FROM positions WHERE id=?1 AND status='open'",
+                [position_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CloseError::Exchange(format!("读取仓位失败: {error}")))?
+        };
+        let Some((mode, symbol, side, qty, mark_price)) = position else {
+            return Err(CloseError::NotFound);
+        };
+        let creds = self
+            .credentials_for_mode(&mode)
+            .map_err(CloseError::Credentials)?;
+        let (cancelled, cancel_failures) = self
+            .cancel_all_orders(&mode, &symbol)
+            .await
+            .map_err(CloseError::Exchange)?;
+        if mode == "demo" {
+            crate::execution::close_position(&self.db, position_id, mark_price, reason, false)
+                .map_err(CloseError::Exchange)?;
+            return Ok(json!({
+                "ok": true,
+                "id": position_id,
+                "symbol": symbol,
+                "mode": mode,
+                "cancelled": cancelled,
+                "cancel_failures": cancel_failures,
+            }));
+        }
+        let dual = self
+            .query_dual_side(&creds)
+            .await
+            .map_err(CloseError::Exchange)?;
+        let filter = self.symbol_filter(&symbol);
+        let close_side = if side == "long" { "SELL" } else { "BUY" };
+        let mut params = vec![
+            ("symbol".to_string(), symbol.clone()),
+            ("side".to_string(), close_side.to_string()),
+            ("type".to_string(), "MARKET".to_string()),
+            ("quantity".to_string(), filter.format_qty(qty)),
+            ("reduceOnly".to_string(), "true".to_string()),
+            (
+                "newClientOrderId".to_string(),
+                crate::live::client_order_id("nx", "close", position_id as usize),
+            ),
+        ];
+        if dual {
+            params.push((
+                "positionSide".to_string(),
+                if side == "long" { "LONG" } else { "SHORT" }.to_string(),
+            ));
+        }
+        params.push(("recvWindow".to_string(), creds.recv_window_ms.to_string()));
+        let (status, body) = self
+            .exchange_request(&creds, "POST", crate::live::ORDER_PATH, &params)
+            .await
+            .map_err(CloseError::Exchange)?;
+        if !(200..300).contains(&status) {
+            if (400..500).contains(&status) {
+                return Err(CloseError::Rejected(format!(
+                    "平仓拒单 HTTP {status}: {}",
+                    truncate_body(&body)
+                )));
+            }
+            return Err(CloseError::Unknown(format!(
+                "平仓结果未知 HTTP {status}: {}",
+                truncate_body(&body)
+            )));
+        }
+        let avg = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value["avgPrice"]
+                    .as_str()
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .or_else(|| value["avgPrice"].as_f64())
+            })
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(mark_price);
+        crate::execution::close_position(&self.db, position_id, avg, reason, true)
+            .map_err(CloseError::Exchange)?;
+        Ok(json!({
+            "ok": true,
+            "id": position_id,
+            "symbol": symbol,
+            "mode": mode,
+            "exit_price": avg,
+            "cancelled": cancelled,
+            "cancel_failures": cancel_failures,
+        }))
+    }
+
+    pub(crate) async fn flatten(&self, stop_engine: bool) -> Result<Value, String> {
+        let mode = self.mode();
+        let rows: Vec<(i64, String, f64)> = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            let mut stmt = conn
+                .prepare("SELECT id, symbol, mark_price FROM positions WHERE status='open' AND mode=?1 ORDER BY id")
+                .map_err(|error| error.to_string())?;
+            let mapped = stmt
+                .query_map([&mode], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(|error| error.to_string())?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if stop_engine {
+            if let Ok(conn) = self.db.conn.lock() {
+                let _ = conn.execute(
+                    "INSERT INTO engine_state(key,value,updated_at) VALUES('enabled','false',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    [crate::now()],
+                );
+            }
+        }
+        let mut closed = Vec::new();
+        let mut failures = Vec::new();
+        for (id, symbol, _mark_price) in rows {
+            match self.close_position(id, "flatten").await {
+                Ok(value) => closed.push(value),
+                Err(error) => failures.push(json!({
+                    "id": id,
+                    "symbol": symbol,
+                    "error": format!("{error:?}"),
+                })),
+            }
+        }
+        Ok(json!({
+            "ok": failures.is_empty(),
+            "mode": mode,
+            "engine_stopped": stop_engine,
+            "closed": closed,
+            "failures": failures,
+        }))
+    }
+
+    async fn query_dual_side(&self, creds: &LiveCreds) -> Result<bool, String> {
+        let (status, body) = self
+            .exchange_request(creds, "GET", "/fapi/v1/positionSide/dual", &[])
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "无法读取交易所持仓模式 HTTP {status}: {}",
+                truncate_body(&body)
+            ));
+        }
+        serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| value["dualSidePosition"].as_bool())
+            .ok_or_else(|| "交易所持仓模式响应缺少 dualSidePosition".to_string())
+    }
+
+    fn symbol_filter(&self, symbol: &str) -> crate::live::SymbolFilter {
+        self.db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                let symbols = vec![symbol.to_string()];
+                crate::live::load_filters(&conn, &symbols)
+                    .get(symbol)
+                    .copied()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn cancel_all_orders(
+        &self,
+        mode: &str,
+        symbol: &str,
+    ) -> Result<(usize, Vec<String>), String> {
+        let creds = self.credentials_for_mode(mode)?;
+        let mut cancelled = 0usize;
+        let mut failures = Vec::new();
+        let params = vec![("symbol".to_string(), symbol.to_string())];
+        match self
+            .exchange_request(&creds, "GET", "/fapi/v1/openOrders", &params)
+            .await
+        {
+            Ok((status, body)) if (200..300).contains(&status) => {
+                let rows = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default();
+                for row in rows {
+                    let Some(order_id) = row["orderId"]
+                        .as_i64()
+                        .map(|value| value.to_string())
+                        .or_else(|| row["orderId"].as_str().map(str::to_string))
+                    else {
+                        continue;
+                    };
+                    let params = vec![
+                        ("symbol".to_string(), symbol.to_string()),
+                        ("orderId".to_string(), order_id.clone()),
+                    ];
+                    match self
+                        .exchange_request(&creds, "DELETE", "/fapi/v1/order", &params)
+                        .await
+                    {
+                        Ok((status, _)) if (200..300).contains(&status) => cancelled += 1,
+                        Ok((status, body)) => failures.push(format!(
+                            "撤单 {order_id} 失败 HTTP {status}: {}",
+                            truncate_body(&body)
+                        )),
+                        Err(error) => failures.push(format!("撤单 {order_id} 失败: {error}")),
+                    }
+                }
+            }
+            Ok((status, body)) => failures.push(format!(
+                "读取普通挂单失败 HTTP {status}: {}",
+                truncate_body(&body)
+            )),
+            Err(error) => failures.push(format!("读取普通挂单失败: {error}")),
+        }
+        match self
+            .exchange_request(&creds, "GET", "/fapi/v1/openAlgoOrders", &params)
+            .await
+        {
+            Ok((status, body)) if (200..300).contains(&status) => {
+                let rows = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .as_array()
+                            .cloned()
+                            .or_else(|| value["orders"].as_array().cloned())
+                            .or_else(|| value["data"].as_array().cloned())
+                    })
+                    .unwrap_or_default();
+                for row in rows {
+                    let Some(algo_id) = row["algoId"]
+                        .as_i64()
+                        .map(|value| value.to_string())
+                        .or_else(|| row["algoId"].as_str().map(str::to_string))
+                    else {
+                        continue;
+                    };
+                    let params = vec![("algoId".to_string(), algo_id.clone())];
+                    match self
+                        .exchange_request(&creds, "DELETE", "/fapi/v1/algoOrder", &params)
+                        .await
+                    {
+                        Ok((status, _)) if (200..300).contains(&status) => cancelled += 1,
+                        Ok((status, body)) => failures.push(format!(
+                            "撤保护单 {algo_id} 失败 HTTP {status}: {}",
+                            truncate_body(&body)
+                        )),
+                        Err(error) => failures.push(format!("撤保护单 {algo_id} 失败: {error}")),
+                    }
+                }
+            }
+            Ok((status, body)) => failures.push(format!(
+                "读取保护单失败 HTTP {status}: {}",
+                truncate_body(&body)
+            )),
+            Err(error) => failures.push(format!("读取保护单失败: {error}")),
+        }
+        Ok((cancelled, failures))
+    }
+
+    pub(crate) async fn protect_position(&self, position_id: i64) -> Result<Value, ProtectError> {
+        let position: Option<(String, String, String, f64, f64)> = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| ProtectError::Exchange("数据库锁不可用".to_string()))?;
+            conn.query_row(
+                "SELECT symbol, side, mode, sl_price, tp_price FROM positions WHERE id=?1 AND status='open'",
+                [position_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| ProtectError::Exchange(format!("读取仓位失败: {error}")))?
+        };
+        let Some((symbol, side, mode, sl_price, tp_price)) = position else {
+            return Err(ProtectError::NotFound);
+        };
+        let creds = self
+            .credentials_for_mode(&mode)
+            .map_err(ProtectError::Credentials)?;
+        let (status, body) = self
+            .exchange_request(&creds, "GET", "/fapi/v1/positionSide/dual", &[])
+            .await
+            .map_err(ProtectError::Exchange)?;
+        if !(200..300).contains(&status) {
+            return Err(ProtectError::Exchange(format!(
+                "无法读取交易所持仓模式 HTTP {status}: {}",
+                truncate_body(&body)
+            )));
+        }
+        let dual = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| value["dualSidePosition"].as_bool())
+            .ok_or_else(|| {
+                ProtectError::Exchange("交易所持仓模式响应缺少 dualSidePosition".to_string())
+            })?;
+        let filter = self
+            .db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                crate::live::load_filters(&conn, std::slice::from_ref(&symbol))
+                    .get(&symbol)
+                    .copied()
+            })
+            .unwrap_or_default();
+        let legs = crate::live::protection_legs_mode(
+            &symbol,
+            &side,
+            sl_price,
+            tp_price,
+            &filter,
+            creds.recv_window_ms,
+            position_id as usize,
+            dual,
+        );
+        if legs.is_empty() {
+            return Err(ProtectError::Failed(
+                json!({"ok": false, "reason": "仓位缺少有效止损/止盈价"}),
+            ));
+        }
+        let mut results = Vec::new();
+        let mut all_ok = true;
+        for leg in legs {
+            let mut gate = self.ban_gate();
+            let outcome = crate::live::place_protection_leg(
+                &mut gate,
+                self.gateway.as_ref(),
+                &creds.base,
+                &creds.api_key,
+                &creds.secret,
+                &leg,
+            )
+            .await;
+            let ok = outcome.failure.is_none();
+            if !ok {
+                all_ok = false;
+            }
+            results.push(json!({
+                "kind": leg.kind,
+                "ok": ok,
+                "unknown": outcome.unknown,
+                "detail": outcome.failure,
+            }));
+        }
+        if !all_ok {
+            let reason = results
+                .iter()
+                .find_map(|item| item["detail"].as_str())
+                .unwrap_or("补挂失败")
+                .to_string();
+            return Err(ProtectError::Failed(json!({
+                "ok": false,
+                "position_id": position_id,
+                "symbol": symbol,
+                "reason": reason,
+                "results": results,
+            })));
+        }
+        Ok(json!({
+            "ok": true,
+            "position_id": position_id,
+            "symbol": symbol,
+            "dual_side": dual,
+            "results": results,
+        }))
+    }
+
+    fn pool_symbols(&self) -> Vec<String> {
+        self.db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT symbol FROM trading_symbols WHERE enabled=1 ORDER BY sort_order ASC, symbol ASC")
+                    .ok()?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+                Some(rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_position_symbols(&self) -> Vec<String> {
+        self.db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT symbol FROM positions WHERE status='open' ORDER BY symbol",
+                    )
+                    .ok()?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+                Some(rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_trade_mode_event(&self, ok: bool, hedge: bool, isolated: bool, results: &[Value]) {
+        if let Ok(conn) = self.db.conn.lock() {
+            let payload = json!({"hedge": hedge, "isolated": isolated, "results": results});
+            let _ = conn.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,?2,'engine',?3,?4)",
+                (
+                    crate::now(),
+                    if ok { "info" } else { "warn" },
+                    "切换交易模式",
+                    payload.to_string(),
+                ),
+            );
+        }
+    }
+
+    fn live_credentials(&self) -> Result<LiveCreds, String> {
+        self.credentials_for_mode(&self.mode())
+    }
+
+    fn credentials_for_mode(&self, mode: &str) -> Result<LiveCreds, String> {
+        let (api_key, secret) = self.exchange_credentials(mode)?;
+        let engine = self
+            .db
+            .setting("engine")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        Ok(LiveCreds {
+            base: match mode {
+                "demo" => "https://testnet.binancefuture.com".to_string(),
+                _ => "https://fapi.binance.com".to_string(),
+            },
+            api_key,
+            secret,
+            recv_window_ms: engine["recv_window_ms"]
+                .as_i64()
+                .unwrap_or(5_000)
+                .clamp(1_000, 60_000),
+        })
+    }
+
+    fn mode(&self) -> String {
+        self.db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM engine_state WHERE key='mode'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+            .or_else(|| {
+                self.db.setting("engine").ok().flatten().and_then(|engine| {
+                    engine
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| "demo".to_string())
+    }
+
+    fn exchange_credentials(&self, mode: &str) -> Result<(String, String), String> {
+        let data = self
+            .db
+            .setting("data")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let key =
+            std::str::from_utf8(&self.master_key).map_err(|_| "主密钥格式无效".to_string())?;
+        let decrypt = |name: &str| {
+            let field = format!("{mode}_api_{name}_enc");
+            let legacy = format!("api_{name}_enc");
+            let encrypted = data.get(&field).or_else(|| {
+                if mode == "live" {
+                    data.get(&legacy)
+                } else {
+                    None
+                }
+            });
+            crate::secret::decrypt_secret(key, encrypted.and_then(Value::as_str).unwrap_or(""))
+        };
+        let credentials =
+            crate::sign::require_credentials(mode, &decrypt("key")?, &decrypt("secret")?)?;
+        Ok((credentials.api_key, credentials.secret))
+    }
+
+    fn ban_gate(&self) -> crate::submit::BanGate {
+        let until = self
+            .db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM engine_state WHERE key='execution_ban_until'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(0);
+        crate::submit::BanGate::with_until(until)
+    }
+
+    fn save_ban_gate(&self, gate: &crate::submit::BanGate) {
+        if let Ok(conn) = self.db.conn.lock() {
+            let _ = upsert_state(&conn, "execution_ban_until", &gate.until_ms().to_string());
+        }
+    }
+
+    pub(crate) async fn protection_request(
+        &self,
+        method: &str,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<ProtectionResult, String> {
+        let mut gate = self.ban_gate();
+        let credentials = self.live_credentials()?;
+        let now = crate::now_millis();
+        let request = crate::submit::prepare(
+            &gate,
+            now,
+            method,
+            &credentials.base,
+            path,
+            params,
+            &credentials.api_key,
+            &credentials.secret,
+            now,
+            credentials.recv_window_ms,
+        )?;
+        let reply = self.gateway.send(&request).await;
+        if reply.transport_failed {
+            return Err("交易所请求传输失败".to_string());
+        }
+        let (status, body) = (reply.status, reply.body);
+        let before = gate.until_ms();
+        gate.observe(&body, crate::now_millis());
+        if (200..300).contains(&status) {
+            gate.observe_success();
+        }
+        if gate.until_ms() != before {
+            self.save_ban_gate(&gate);
+        }
+        let degraded = status == 429 || body.contains("\"code\":-1003");
+        Ok(ProtectionResult {
+            status,
+            body,
+            degraded,
+        })
+    }
+}
+
+impl EngineRuntime {
+    pub(crate) fn manage_config(strategy: &Value, risk: &Value) -> crate::manage::ManageConfig {
+        crate::manage::ManageConfig {
+            partial_tp_at_r: strategy["partial_tp_at_r"].as_f64().unwrap_or(1.0),
+            partial_tp_ratio: strategy["partial_tp_ratio"].as_f64().unwrap_or(0.5),
+            trailing_pct: strategy["trailing_pct"].as_f64().unwrap_or(0.0),
+            trailing_arm_r: strategy["trailing_arm_r"].as_f64().unwrap_or(1.5),
+            exit_threshold: strategy["exit_threshold"].as_f64().unwrap_or(0.6),
+            breakeven_at_r: strategy["breakeven_at_r"].as_f64().unwrap_or(1.0),
+            global_stop_loss_pct: risk["global_stop_loss_pct"].as_f64().unwrap_or(0.0),
+            global_take_profit_pct: risk["global_take_profit_pct"].as_f64().unwrap_or(0.0),
+            qty_step: strategy["qty_step"].as_f64().unwrap_or(0.001),
+            min_qty: strategy["min_qty"].as_f64().unwrap_or(0.001),
+            roi_table: Self::roi_table(&strategy["roi_table"]),
+        }
+    }
+
+    fn roi_table(value: &Value) -> Vec<(f64, f64)> {
+        let mut rows: Vec<(f64, f64)> = value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|row| {
+                        let minutes = row.get(0)?.as_f64()?;
+                        let pct = row.get(1)?.as_f64()?;
+                        (minutes.is_finite() && pct.is_finite()).then_some((minutes, pct))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if rows.is_empty() {
+            rows = vec![
+                (0.0, 0.8),
+                (15.0, 0.6),
+                (30.0, 0.45),
+                (60.0, 0.3),
+                (120.0, 0.2),
+            ];
+        }
+        rows.sort_by(|left, right| left.0.total_cmp(&right.0));
+        rows
+    }
+
+    pub(crate) fn trade_policy(
+        strategy: &Value,
+        risk: &Value,
+        mode: &str,
+    ) -> crate::trade_policy::TradePolicy {
+        let mode = if mode == "meanrev" {
+            "meanrev"
+        } else {
+            "trend"
+        };
+        let num = |value: &Value, key: &str, default: f64| value[key].as_f64().unwrap_or(default);
+        crate::trade_policy::TradePolicy {
+            mode,
+            base_threshold: num(strategy, "entry_threshold", 0.3),
+            volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
+            rsi_long_min: num(risk, "rsi_long_min", 42.0),
+            rsi_long_max: num(risk, "rsi_long_max", 76.0),
+            rsi_short_min: num(risk, "rsi_short_min", 24.0),
+            rsi_short_max: num(risk, "rsi_short_max", 58.0),
+            adx_min: if strategy["adx_filter"].as_bool().unwrap_or(false) {
+                num(strategy, "adx_min", 20.0)
+            } else {
+                0.0
+            },
+            htf_enabled: risk["htf_enabled"].as_bool().unwrap_or(false),
+            htf_trend_pct: 0.0,
+            mr_window: num(strategy, "mr_window", 20.0) as usize,
+            mr_z_entry: num(strategy, "mr_z_entry", 2.0),
+            mr_min_risk_reward: num(strategy, "mr_min_risk_reward", 1.5),
+            sl_atr_mult: num(strategy, "sl_atr_mult", 1.2),
+            tp_atr_mult: num(strategy, "tp_atr_mult", 2.0),
+            min_risk_reward: num(strategy, "min_risk_reward", 2.0),
+            weight_trend: num(strategy, "weight_trend", 0.32),
+            weight_momentum: num(strategy, "weight_momentum", 0.26),
+            weight_volume: num(strategy, "weight_volume", 0.18),
+            weight_funding: num(strategy, "weight_funding", 0.12),
+            weight_oi: num(strategy, "weight_oi", 0.12),
+        }
+    }
+    fn engine_enabled(tx: &rusqlite::Transaction<'_>, config: &Value) -> Result<bool, String> {
+        let configured = config.get("enabled").and_then(Value::as_bool);
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(configured.unwrap_or(false) || raw.as_deref() == Some("true"))
+    }
+
+    fn engine_config(tx: &rusqlite::Transaction<'_>) -> Result<Value, String> {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='engine'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        raw.map(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .transpose()
+            .map(|value| value.unwrap_or(Value::Null))
+    }
+
+    pub(crate) fn new(
+        db: Db,
+        lock: File,
+        master_key: Vec<u8>,
+        events: crate::events::EventBus,
+    ) -> Self {
+        let ai = Some(crate::ai_providers::AiState::new(
+            db.clone(),
+            master_key.clone(),
+        ));
+        Self {
+            db,
+            _lock: lock,
+            master_key,
+            events,
+            cycle_signal: None,
+            cycle_busy: Arc::new(AtomicBool::new(false)),
+            runtime_active: Arc::new(AtomicBool::new(false)),
+            reviewer: None,
+            ai,
+            reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP。
+    pub(crate) fn with_ai(mut self, ai: crate::ai_providers::AiState) -> Self {
+        self.ai = Some(ai);
+        self
+    }
+
+    /// 平仓事务提交后再触发复盘：失败只告警，不能把整轮周期带崩。
+    fn spawn_reviews(&self, trade_ids: &[i64]) {
+        let Some(ai) = self.ai.clone() else {
+            return;
+        };
+        for trade_id in trade_ids {
+            let ai = ai.clone();
+            let reviewing = self.reviewing.clone();
+            let id = *trade_id;
+            tokio::spawn(async move {
+                crate::evolution_review::review_trade_and_record(ai, reviewing, id).await;
+            });
+        }
+    }
+
+    /// 周期结束后按当前环境的标记价回访到期决策；5 分钟节流，缺价的保持 pending。
+    fn maybe_label_journal(&self, mode: &str, snapshot: &crate::providers::TradingSnapshot) {
+        let now = crate::now();
+        {
+            let Ok(conn) = self.db.conn.lock() else {
+                return;
+            };
+            let last: Option<i64> = conn
+                .query_row(
+                    "SELECT value FROM engine_state WHERE key='journal_label_ts'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| value.parse().ok());
+            if last.is_some_and(|ts| now - ts < 300) {
+                return;
+            }
+            let _ = conn.execute(
+                "INSERT INTO engine_state(key,value,updated_at) VALUES('journal_label_ts',?1,?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (now.to_string(), now),
+            );
+        }
+        let mut prices = std::collections::BTreeMap::new();
+        for market in &snapshot.markets {
+            if market.mark_price.is_finite() && market.mark_price > 0.0 {
+                prices.insert(market.symbol.clone(), market.mark_price);
+            }
+        }
+        if prices.is_empty() {
+            return;
+        }
+        let result = crate::journal::label_due(&self.db, &prices, mode, now);
+        let labeled = result["labeled"].as_i64().unwrap_or(0);
+        if labeled > 0 {
+            tracing::info!(mode, labeled, "决策回访打标完成");
+        }
+    }
+
+    pub(crate) fn with_reviewer(mut self, reviewer: Arc<dyn crate::review::AiReviewer>) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
+    pub(crate) fn with_cycle(
+        mut self,
+        cycle_signal: Arc<Notify>,
+        cycle_busy: Arc<AtomicBool>,
+        runtime_active: Arc<AtomicBool>,
+    ) -> Self {
+        self.cycle_signal = Some(cycle_signal);
+        self.cycle_busy = cycle_busy;
+        self.runtime_active = runtime_active;
+        self
+    }
+
+    fn record_equity_point(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<(), String> {
+        let now = crate::now();
+        let last: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='equity_point_ts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| value.parse().ok());
+        if last.is_some_and(|ts| now - ts < 60) {
+            return Ok(());
+        }
+        if !snapshot.account.equity.is_finite() || snapshot.account.equity <= 0.0 {
+            return Ok(());
+        }
+        let margin_used: f64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(margin),0) FROM positions WHERE mode=?1 AND status='open'",
+                [mode],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        let open_positions: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE mode=?1 AND status='open'",
+                [mode],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO equity_points(ts,mode,wallet,available,unrealized,margin_used,positions) VALUES(?1,?2,?3,?4,0,?5,?6)",
+            (now, mode, snapshot.account.equity, snapshot.account.available_balance, margin_used, open_positions),
+        )
+        .map_err(|error| error.to_string())?;
+        upsert_state(tx, "equity_point_ts", &now.to_string())
+    }
+
+    fn persist_snapshot(
+        &self,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<Vec<LivePlan>, String> {
+        Self::validate_snapshot(mode, snapshot)?;
+        let payload = serde_json::to_string(snapshot).map_err(|error| error.to_string())?;
+        let strategy = self
+            .db
+            .setting("strategy")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let atr_period = match strategy.get("atr_period") {
+            None => 14,
+            Some(value) => value
+                .as_u64()
+                .filter(|period| (2..=100).contains(period))
+                .ok_or_else(|| "策略 ATR 周期必须是 2 到 100 的整数".to_string())?
+                as usize,
+        };
+        let metrics: std::collections::BTreeMap<_, _> = snapshot
+            .markets
+            .iter()
+            .map(|market| {
+                let metric = crate::providers::candle_metrics(&market.candles, atr_period)
+                    .ok_or_else(|| format!("{} K 线不足或无法计算 ATR/量比", market.symbol))?;
+                Ok::<_, String>((market.symbol.as_str(), metric))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        upsert_state(&tx, &format!("snapshot.{mode}"), &payload)?;
+        upsert_state(
+            &tx,
+            &format!("candle_metrics.{mode}"),
+            &serde_json::to_string(&metrics).map_err(|error| error.to_string())?,
+        )?;
+        upsert_state(
+            &tx,
+            &format!("snapshot_ts.{mode}"),
+            &crate::now().to_string(),
+        )?;
+        if let Err(error) = Self::record_equity_point(&tx, mode, snapshot) {
+            tracing::warn!(%error, "权益采样写入失败，不影响本轮周期");
+        }
+        upsert_state(
+            &tx,
+            &format!("open_orders.{mode}"),
+            &serde_json::to_string(&snapshot.open_orders).map_err(|error| error.to_string())?,
+        )?;
+        let order_differences = Self::record_order_differences(&tx, mode, snapshot)?;
+        Self::record_position_differences(&tx, mode, snapshot)?;
+        // 交易所侧的止损/止盈被触发后，本地不能继续把这笔仓当成还在。
+        let venue_closed = Self::close_missing_positions(&tx, mode, snapshot)?;
+        let config = Self::engine_config(&tx)?;
+        let engine_is_enabled = Self::engine_enabled(&tx, &config)?;
+        let entry_cfg = Self::risk_settings(&tx)?;
+        let cooldown_seconds = entry_cfg["symbol_cooldown_minutes"]
+            .as_i64()
+            .unwrap_or(5)
+            .clamp(0, 1440)
+            * 60;
+        let _ = tx.execute("DELETE FROM cooldowns WHERE until_ts<=?1", [crate::now()]);
+        let (mut preview_value, report, symbols, positions) = Self::run_cycle_state(
+            &tx,
+            mode,
+            &strategy,
+            snapshot,
+            &metrics,
+            &order_differences,
+            engine_is_enabled,
+        )?;
+        let executed = Self::execute_demo_cycle(
+            &tx,
+            mode,
+            &symbols,
+            &positions,
+            &report,
+            snapshot,
+            engine_is_enabled,
+        )?;
+        let closed_symbols: Vec<(i64, String, f64, i64)> = {
+            let mut stmt = tx.prepare("SELECT id,symbol,realized_pnl,trade_id FROM positions WHERE mode=?1 AND closed_at>=?2 AND status='closed'").map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map((mode, crate::now() - 2), |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+        };
+        // 平仓事务提交后再触发复盘；这里只收集本轮的成交 id。
+        let review_ids: Vec<i64> = closed_symbols
+            .iter()
+            .filter_map(|(_, _, _, trade_id)| (*trade_id > 0).then_some(*trade_id))
+            .collect();
+        for (id, symbol, pnl, _) in closed_symbols {
+            let seen: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key=?1)",
+                    [format!("cooldown_close.{mode}.{id}")],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if seen {
+                continue;
+            }
+            if pnl < 0.0 && cooldown_seconds > 0 {
+                tx.execute("INSERT INTO cooldowns(symbol,until_ts,reason,kind) VALUES(?1,?2,?3,'symbol') ON CONFLICT(symbol) DO UPDATE SET until_ts=excluded.until_ts,reason=excluded.reason,kind=excluded.kind WHERE cooldowns.until_ts<excluded.until_ts", (&symbol, crate::now() + cooldown_seconds, format!("本笔亏损 {pnl:.4} USDT"))).map_err(|e| e.to_string())?;
+            } else if pnl >= 0.0 {
+                tx.execute(
+                    "DELETE FROM cooldowns WHERE symbol=?1 AND kind='symbol'",
+                    [&symbol],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            upsert_state(
+                &tx,
+                &format!("cooldown_close.{mode}.{id}"),
+                &crate::now().to_string(),
+            )?;
+        }
+        let mut executed = executed;
+        let mut entries = Vec::new();
+        if engine_is_enabled && !report.scanned.is_empty() {
+            executed.extend(Self::process_entries(
+                &tx,
+                mode,
+                &config,
+                &strategy,
+                snapshot,
+                &metrics,
+                &report.scanned,
+                &order_differences,
+                &mut entries,
+                self.reviewer.as_deref(),
+                strategy["ai_review_enabled"].as_bool().unwrap_or(false),
+            )?);
+        }
+        preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
+        preview_value["executed"] = serde_json::json!(executed);
+        preview_value["venue_closed"] = serde_json::json!(venue_closed);
+        upsert_state(
+            &tx,
+            &format!("cycle_preview.{mode}"),
+            &serde_json::to_string(&preview_value).map_err(|e| e.to_string())?,
+        )?;
+        // 实盘订单要离线发送：这里只给出计划，网络请求留给调用方在事务外做。
+        let plans = if mode == "live" && engine_is_enabled {
+            // 上一轮没拿到结论的平仓单还挂着：再发一张就是重复平仓。
+            let inflight: std::collections::BTreeSet<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        // 只拦市价管仓单：条件单是保护腿，不该阻止平仓。
+                        "SELECT DISTINCT symbol FROM orders WHERE mode='live' \
+                         AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') AND order_type='MARKET'",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            let mut plans = Self::live_plans(&symbols, &positions, &report, &inflight);
+            plans.extend(entries);
+            plans
+        } else {
+            Vec::new()
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        // 事务提交后再推事件：没落库的账不能出现在前端。
+        self.publish_cycle_events(mode, snapshot, &executed, &order_differences);
+        self.spawn_reviews(&review_ids);
+        drop(conn);
+        self.maybe_label_journal(mode, snapshot);
+        Ok(plans)
+    }
+
+    /// 把本轮的账户、持仓、订单变化推给前端。
+    fn publish_cycle_events(
+        &self,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+        executed: &[Value],
+        order_differences: &Value,
+    ) {
+        for item in executed {
+            let symbol = item.get("symbol").and_then(Value::as_str).unwrap_or("");
+            if symbol.is_empty() {
+                continue;
+            }
+            let side = item.get("side").and_then(Value::as_str).unwrap_or("");
+            let reason = item.get("reason").and_then(Value::as_str).unwrap_or("fill");
+            self.events.record(
+                "info",
+                "trade",
+                &format!("{symbol} {reason} {side}"),
+                serde_json::json!({"mode": mode, "symbol": symbol, "side": side, "detail": item}),
+            );
+        }
+        let local_only = order_differences
+            .get("local_only")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let venue_only = order_differences
+            .get("venue_only")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if local_only > 0 || venue_only > 0 {
+            self.events.record(
+                "warn",
+                "engine",
+                &format!("订单对账不一致：本地 {local_only} 条，交易所 {venue_only} 条"),
+                order_differences.clone(),
+            );
+        }
+        self.events.publish(
+            "account",
+            serde_json::json!({
+                "mode": mode,
+                "equity": snapshot.account.equity,
+                "available_balance": snapshot.account.available_balance,
+                "positions": snapshot.positions.len(),
+                "open_orders": snapshot.open_orders.len(),
+                "ts": crate::now(),
+            }),
+        );
+        self.events.publish(
+            "positions",
+            serde_json::json!({"mode": mode, "positions": snapshot.positions}),
+        );
+        self.events.publish(
+            "orders",
+            serde_json::json!({"mode": mode, "orders": snapshot.open_orders}),
+        );
+    }
+
+    /// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
+    fn live_plans(
+        symbols: &[String],
+        positions: &[crate::manage::ManagedPosition],
+        report: &crate::cycle::CycleReport,
+        inflight: &std::collections::BTreeSet<String>,
+    ) -> Vec<LivePlan> {
+        symbols
+            .iter()
+            .zip(positions.iter())
+            .zip(report.manage.iter())
+            .filter(|((symbol, _), _)| !inflight.contains(*symbol))
+            .filter_map(|((symbol, position), action)| {
+                let (qty, purpose) = match action {
+                    crate::manage::ManageAction::Close { reason } => (position.qty, reason.clone()),
+                    crate::manage::ManageAction::PartialTakeProfit { qty } => {
+                        (*qty, "partial_take_profit".to_string())
+                    }
+                    crate::manage::ManageAction::Hold
+                    | crate::manage::ManageAction::MoveToBreakeven { .. } => return None,
+                };
+                if !position.qty.is_finite() || position.qty <= 0.0 {
+                    return None;
+                }
+                Some(LivePlan {
+                    symbol: symbol.clone(),
+                    position_side: position.side.clone(),
+                    side: if position.side == "long" {
+                        "SELL".to_string()
+                    } else {
+                        "BUY".to_string()
+                    },
+                    qty,
+                    purpose,
+                    mark_price: position.mark_price,
+                    entry: None,
+                    features: None,
+                })
+            })
+            .collect()
+    }
+
+    fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
+        let minutes: i64 = match strategy["timeframe"].as_str().unwrap_or("4h") {
+            "1m" => 1,
+            "3m" => 3,
+            "5m" => 5,
+            "15m" => 15,
+            "30m" => 30,
+            "1h" => 60,
+            "2h" => 120,
+            "4h" => 240,
+            "6h" => 360,
+            "8h" => 480,
+            "12h" => 720,
+            "1d" => 1_440,
+            "3d" => 4_320,
+            "1w" => 10_080,
+            _ => return Err("策略 K 线周期无效".into()),
+        };
+        Ok(minutes * 60_000)
+    }
+
+    fn risk_settings(tx: &rusqlite::Transaction<'_>) -> Result<Value, String> {
+        Ok(tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='risk'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_else(|| crate::settings_api::defaults_of("risk")))
+    }
+
+    /// 装载可撮合的持仓。
+    ///
+    /// 三类别跳过：订单状态对不上的标的、没有行情快照的标的、K 线停更的标的。
+    /// 停更行情上的标记价不是当前价，拿它触发止损等于赌运气。
+    /// 顺带把本轮的标记价和最有利价格写回库，移动止损才有峰值可用。
+    fn managed_positions(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        strategy: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+        risk_cfg: &Value,
+        blocked: &std::collections::BTreeSet<&str>,
+        now_ms: i64,
+        max_age_ms: f64,
+    ) -> Result<(Vec<String>, Vec<crate::manage::ManagedPosition>), String> {
+        let policy = Self::trade_policy(
+            strategy,
+            risk_cfg,
+            strategy["mode"].as_str().unwrap_or("trend"),
+        );
+        let rows = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,symbol,side,qty,entry_price,sl_price,tp_price,peak_price,\
+                     initial_sl_price,signal_score,partial_taken_at,opened_at FROM positions \
+                     WHERE mode=?1 AND status='open' ORDER BY opened_at,id",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([mode], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                        row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut symbols = Vec::new();
+        let mut positions = Vec::new();
+        for (
+            id,
+            symbol,
+            side,
+            qty,
+            entry,
+            sl,
+            tp,
+            peak,
+            initial_sl,
+            signal_score,
+            partial,
+            opened_at,
+        ) in rows
+        {
+            if blocked.contains(symbol.as_str()) {
+                continue;
+            }
+            let Some(market) = snapshot
+                .markets
+                .iter()
+                .find(|market| market.symbol == symbol)
+            else {
+                continue;
+            };
+            let Some(last) = market.candles.last() else {
+                continue;
+            };
+            let age_ms = now_ms.saturating_sub(last.close_time);
+            if age_ms < 0 || age_ms as f64 > max_age_ms {
+                continue;
+            }
+            let mark = market.mark_price;
+            if !mark.is_finite() || mark <= 0.0 {
+                continue;
+            }
+            let peak = if peak > 0.0 {
+                if side == "long" {
+                    peak.max(mark)
+                } else {
+                    peak.min(mark)
+                }
+            } else if side == "long" {
+                entry.max(mark)
+            } else {
+                entry.min(mark)
+            };
+            tx.execute(
+                "UPDATE positions SET mark_price=?1, peak_price=?2 WHERE id=?3",
+                (mark, peak, id),
+            )
+            .map_err(|error| error.to_string())?;
+            // 信号反转要看当轮方向分：开仓时的分数不会随行情翻转。
+            let score = metrics
+                .get(market.symbol.as_str())
+                .and_then(|metric| {
+                    crate::trade_policy::evaluate(
+                        &market.candles,
+                        mark,
+                        metric.atr,
+                        policy,
+                        crate::trade_policy::MarketFeatures {
+                            funding_rate: market.funding_rate,
+                            open_interest_change_pct: market.open_interest_change_pct,
+                        },
+                    )
+                })
+                .map_or(signal_score, |signal| signal.score);
+            let held_minutes = (crate::now() - opened_at).max(0) as f64 / 60.0;
+            symbols.push(symbol);
+            positions.push(crate::manage::ManagedPosition {
+                side,
+                entry_price: entry,
+                mark_price: mark,
+                peak_price: peak,
+                sl_price: sl,
+                initial_sl: if initial_sl > 0.0 { initial_sl } else { sl },
+                tp_price: tp,
+                qty,
+                partial_taken: partial.is_some(),
+                score,
+                held_minutes,
+            });
+        }
+        Ok((symbols, positions))
+    }
+
+    /// 交易所已经不在的仓位：按标记价补记平仓。
+    ///
+    /// 保护单在交易所被触发时，引擎没走平仓流程；只把本地状态改成 closed
+    /// 会让成交表和复盘漏掉这笔，所以走同一条结算路径补记。
+    fn close_missing_positions(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<Vec<Value>, String> {
+        if mode != "live" {
+            return Ok(Vec::new());
+        }
+        let venue: std::collections::BTreeSet<&str> = snapshot
+            .positions
+            .iter()
+            .filter(|position| position.qty > 0.0)
+            .map(|position| position.symbol.as_str())
+            .collect();
+        let locals: Vec<(String, String, f64)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT symbol,side,COALESCE(mark_price,0) FROM positions \
+                     WHERE mode='live' AND status='open'",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if locals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fee_rate = Self::risk_settings(tx)?["fee_rate_taker"]
+            .as_f64()
+            .unwrap_or(0.0005);
+        let mut closed = Vec::new();
+        for (symbol, side, stored_mark) in locals {
+            if venue.contains(symbol.as_str()) {
+                continue;
+            }
+            let mark = snapshot
+                .markets
+                .iter()
+                .find(|market| market.symbol == symbol)
+                .map(|market| market.mark_price)
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .unwrap_or(stored_mark);
+            // 没有可信价格就不动账本：宁可下一轮再对，也不能写一个假出场价。
+            if !(mark.is_finite() && mark > 0.0) {
+                continue;
+            }
+            if crate::execution::close_venue_position_tx(
+                tx,
+                "live",
+                crate::now(),
+                fee_rate,
+                &symbol,
+                &side,
+                mark,
+            )? {
+                closed.push(serde_json::json!({
+                    "symbol": symbol,
+                    "side": side,
+                    "exit_price": mark,
+                    "reason": "venue_sync",
+                }));
+            }
+        }
+        Ok(closed)
+    }
+
+    /// 一轮调度：对账、管仓、时段与扫描全部走 `cycle::run_cycle`。
+    ///
+    /// 这里只产出审计结果，不落订单。返回的预览已经是可直接序列化的 JSON，
+    /// 避免调用方再解析一次字符串。
+    fn run_cycle_state(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        strategy: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+        order_differences: &Value,
+        engine_enabled: bool,
+    ) -> Result<
+        (
+            Value,
+            crate::cycle::CycleReport,
+            Vec<String>,
+            Vec<crate::manage::ManagedPosition>,
+        ),
+        String,
+    > {
+        let read = |sql: &str, key: &str| -> Result<Option<String>, String> {
+            tx.query_row(sql, [key], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())
+        };
+        let setting = |key| -> Result<Value, String> {
+            read("SELECT value FROM app_settings WHERE key=?1", key)?
+                .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
+                .transpose()
+                .map(|value| value.unwrap_or(Value::Null))
+        };
+        let state = |key| read("SELECT value FROM engine_state WHERE key=?1", key);
+        let engine = setting("engine")?;
+        let risk_cfg = Self::risk_settings(tx)?;
+        let now_ms = crate::now_millis();
+        let now = now_ms / 1_000;
+        let local_now = now
+            + engine["timezone_offset"]
+                .as_i64()
+                .unwrap_or(8)
+                .clamp(-12, 14)
+                * 3_600;
+        let today: String = tx
+            .query_row("SELECT date(?1, 'unixepoch')", [local_now], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let equity_state = |key| -> Result<f64, String> {
+            Ok(state(key)?
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.0))
+        };
+        let int_state = |key| -> Result<i64, String> {
+            Ok(state(key)?
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .unwrap_or(0))
+        };
+        let risk = crate::risk::RiskInput {
+            equity: snapshot.account.equity,
+            day_start_equity: if state("day_anchor")?.as_deref() == Some(today.as_str()) {
+                equity_state("day_start_equity")?
+            } else {
+                0.0
+            },
+            peak_equity: equity_state("equity_peak")?,
+            min_equity: risk_cfg["min_equity_usdt"].as_f64().unwrap_or(0.5),
+            daily_loss_limit_pct: risk_cfg["daily_loss_limit_pct"].as_f64().unwrap_or(25.0),
+            max_drawdown_pct: risk_cfg["max_drawdown_pct"].as_f64().unwrap_or(50.0),
+            consecutive_losses: int_state("consecutive_losses")?,
+            consecutive_loss_limit: risk_cfg["consecutive_loss_limit"].as_i64().unwrap_or(4),
+            cooldown_until: int_state("loss_halt_until")?,
+            now,
+            halted: state("halted")?.unwrap_or_default(),
+        };
+        let gates = crate::scan::ScanGates {
+            atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
+            atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
+            volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
+            min_24h_quote_volume: strategy["min_24h_quote_volume"]
+                .as_f64()
+                .unwrap_or(3_000_000.0),
+            spread_bps_max: strategy["spread_bps_max"].as_f64().unwrap_or(8.0),
+            entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
+        };
+        let interval_ms = Self::timeframe_ms(strategy)?;
+        let max_age_ms = interval_ms as f64
+            * strategy["data_stale_mult"]
+                .as_f64()
+                .unwrap_or(2.0)
+                .clamp(1.0, 20.0);
+        let max_gaps = strategy["max_data_gaps"].as_u64().unwrap_or(1).min(20) as usize;
+        let candidates: Vec<_> = snapshot
+            .markets
+            .iter()
+            .map(|market| {
+                let metric = &metrics[market.symbol.as_str()];
+                let recent = &market.candles[market.candles.len() - 20..];
+                let fresh = recent.last().is_some_and(|candle| {
+                    let age = now_ms.saturating_sub(candle.close_time);
+                    age > 0 && age as f64 <= max_age_ms
+                });
+                let gaps = recent
+                    .windows(2)
+                    .filter(|pair| {
+                        pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms
+                    })
+                    .count();
+                crate::scan::Candidate {
+                    symbol: market.symbol.clone(),
+                    data_ok: fresh && gaps <= max_gaps,
+                    atr_pct: metric.atr_pct,
+                    vol_ratio: metric.vol_ratio,
+                    quote_volume: market.quote_volume,
+                    spread_bps: market.spread_bps,
+                    strength: 0.0,
+                }
+            })
+            .collect();
+        let windows: Vec<String> = match engine.get("trading_windows") {
+            None => vec!["00:00-24:00".into()],
+            Some(value) => {
+                serde_json::from_value(value.clone()).map_err(|_| "交易时段配置无效".to_string())?
+            }
+        };
+        let blocked: std::collections::BTreeSet<&str> = ["local_only", "venue_only"]
+            .iter()
+            .flat_map(|key| order_differences[*key].as_array().into_iter().flatten())
+            .filter_map(|order| order["symbol"].as_str())
+            .collect();
+        let (symbols, positions) = Self::managed_positions(
+            tx, mode, strategy, snapshot, metrics, &risk_cfg, &blocked, now_ms, max_age_ms,
+        )?;
+        let local: Vec<crate::reconcile::LocalPosition> = {
+            let mut stmt = tx
+                .prepare("SELECT symbol,mode,side,qty,entry_price FROM positions WHERE mode=?1 AND status='open'")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([mode], |row| {
+                    Ok(crate::reconcile::LocalPosition {
+                        symbol: row.get(0)?,
+                        mode: row.get(1)?,
+                        side: row.get(2)?,
+                        qty: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                        entry_price: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            // 缺开仓价就算不出盈亏，硬凑一个 0 会在对账里造出假数字。
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|position| position.qty > 0.0 && position.entry_price > 0.0)
+                .collect()
+        };
+        let venue: Vec<_> = snapshot
+            .positions
+            .iter()
+            .filter(|position| position.qty > 0.0)
+            .map(|position| crate::reconcile::VenuePosition {
+                symbol: position.symbol.clone(),
+                side: position.side.clone(),
+                qty: position.qty,
+                mark_price: snapshot
+                    .markets
+                    .iter()
+                    .find(|market| market.symbol == position.symbol)
+                    .map_or(position.entry_price, |market| market.mark_price),
+                sl_price: 0.0,
+                tp_price: 0.0,
+            })
+            .collect();
+        let mut report = crate::cycle::run_cycle(&crate::cycle::CycleInput {
+            enabled: engine_enabled,
+            mode,
+            now_minute: local_now.rem_euclid(86_400) / 60,
+            windows: &windows,
+            risk: &risk,
+            venue: &venue,
+            local: &local,
+            fee_rate: risk_cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005),
+            exit_price: snapshot
+                .markets
+                .first()
+                .map_or(0.0, |market| market.mark_price),
+            closing: &[],
+            positions: &positions,
+            manage_cfg: &Self::manage_config(strategy, &risk_cfg),
+            candidates: &candidates,
+            scan_gates: &gates,
+            budget: strategy["ai_review_max_per_cycle"]
+                .as_u64()
+                .unwrap_or(6)
+                .min(engine["max_symbols_per_cycle"].as_u64().unwrap_or(12))
+                as usize,
+        });
+        // 止损保护是独立状态，不属于 risk 输入；熔断期间的亏损仓位仍要管，
+        // 所以只拦扫描，不拦管仓。
+        if report.skipped.is_empty() && int_state("sl_guard_until")? > now {
+            report.skipped = "止损熔断中".into();
+            report.scanned.clear();
+        }
+        let rejected: std::collections::BTreeMap<_, _> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let reason = crate::scan::risk_gate(candidate, &gates);
+                (!reason.is_empty()).then_some((&candidate.symbol, reason))
+            })
+            .collect();
+        let preview = serde_json::json!({
+            "skipped": &report.skipped,
+            "scan_candidates": &report.scanned,
+            "rejected": rejected,
+            "reconcile": &report.reconcile,
+        });
+        Ok((preview, report, symbols, positions))
+    }
+
+    fn process_entries(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        engine: &Value,
+        strategy: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+        scanned: &[String],
+        differences: &Value,
+        plans: &mut Vec<LivePlan>,
+        reviewer: Option<&dyn crate::review::AiReviewer>,
+        ai_review_required: bool,
+    ) -> Result<Vec<Value>, String> {
+        if mode == "live" {
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='live' AND purpose='entry' AND status NOT IN ('FILLED','REJECTED','CANCELED','EXPIRED'))",
+                [], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if pending
+                || ["local_only", "venue_only", "quantity_mismatches"]
+                    .iter()
+                    .any(|key| {
+                        differences[*key]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty())
+                    })
+            {
+                return Ok(Vec::new());
+            }
+            for position in &snapshot.positions {
+                let matched: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM positions WHERE mode='live' AND status='open' AND symbol=?1 AND side=?2 AND abs(qty-?3)<1e-9)",
+                    (&position.symbol, &position.side, position.qty), |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                if !matched {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        let cfg = Self::risk_settings(tx)?;
+        let policy =
+            Self::trade_policy(strategy, &cfg, strategy["mode"].as_str().unwrap_or("trend"));
+        let filters = crate::live::load_filters(tx, scanned);
+        let mut executed = Vec::new();
+        let mut available = snapshot.account.available_balance;
+        let now = crate::now();
+        for symbol in scanned {
+            let Some(filter) = filters.get(symbol) else {
+                continue;
+            };
+            if ["local_only", "venue_only"].iter().any(|key| {
+                differences[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|order| order["symbol"].as_str() == Some(symbol))
+            }) {
+                continue;
+            }
+            let Some(market) = snapshot
+                .markets
+                .iter()
+                .find(|market| market.symbol == *symbol)
+            else {
+                continue;
+            };
+            let Some(metric) = metrics.get(symbol.as_str()) else {
+                continue;
+            };
+            let price = market.mark_price;
+            let Some(signal) = crate::trade_policy::evaluate(
+                &market.candles,
+                price,
+                metric.atr,
+                policy,
+                crate::trade_policy::MarketFeatures {
+                    funding_rate: market.funding_rate,
+                    open_interest_change_pct: market.open_interest_change_pct,
+                },
+            ) else {
+                continue;
+            };
+            let Some(exchange_max): Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT max_leverage FROM trading_symbols WHERE symbol=?1 AND enabled!=0",
+                    [symbol],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            let mut upper = cfg["max_leverage"]
+                .as_i64()
+                .unwrap_or(100)
+                .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
+                .clamp(1, 100);
+            if let Some(limit) = strategy["leverage_max"].as_i64().filter(|v| *v > 0) {
+                upper = upper.min(limit);
+            }
+            let leverage = strategy["leverage_min"]
+                .as_i64()
+                .filter(|v| *v > 0)
+                .unwrap_or_else(|| cfg["default_leverage"].as_i64().unwrap_or(20))
+                .clamp(1, upper) as f64;
+            let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
+            let scale = if target > 0.0 && metric.atr_pct > 0.0 {
+                (target / metric.atr_pct).clamp(0.25, 2.0)
+            } else {
+                1.0
+            };
+            // 决策前注入：心法按健康度排序，经验按场景相似度检索；只记录 ID，
+            // 不把正文写进成交，避免把历史规则当成当前指令。
+            let journal_snapshot = serde_json::json!({
+                "atr_pct": metric.atr_pct,
+                "funding": market.funding_rate,
+            });
+            let evolution = crate::evolution_api::evolution_cfg(tx);
+            let (_mantra_text, injected_mantra_ids) =
+                crate::evolution_api::injection_payload(tx, &evolution);
+            let injected_experience_ids =
+                crate::journal::inject_ids(tx, symbol, &journal_snapshot, signal.side);
+            let features_text = serde_json::to_string(&serde_json::json!({
+                "injected_mantra_ids": injected_mantra_ids,
+                "injected_experience_ids": injected_experience_ids,
+                "journal_snapshot": journal_snapshot,
+            }))
+            .unwrap_or_else(|_| "{}".to_string());
+            let proposal = crate::review::EntryProposal {
+                symbol: symbol.clone(),
+                side: signal.side.to_string(),
+                leverage,
+                stop_price: signal.stop_price,
+                mark_price: price,
+            };
+            let reviewed = match crate::review::apply_review(
+                &proposal,
+                reviewer,
+                ai_review_required,
+            ) {
+                Ok(reviewed) => reviewed,
+                Err(reason) => {
+                    let _ = tx.execute(
+                        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','ai',?2,?3)",
+                        (
+                            now,
+                            "AI 复核跳过开仓",
+                            serde_json::json!({"symbol": symbol, "reason": reason}).to_string(),
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let leverage = reviewed.leverage;
+            let stop_price = reviewed.stop_price;
+            let (qty, _) = crate::risk::estimate_qty(
+                snapshot.account.equity,
+                price,
+                leverage,
+                &crate::risk::SizeParams {
+                    risk_per_trade_pct: cfg["risk_per_trade_pct"].as_f64().unwrap_or(10.0),
+                    margin_pct: cfg["margin_pct"].as_f64().unwrap_or(50.0),
+                    min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
+                },
+                (price - stop_price).abs() / price,
+                filter,
+                scale,
+                Some(available),
+            );
+            if qty <= 0.0
+                || !Self::entry_allowed(
+                    tx,
+                    mode,
+                    engine,
+                    &cfg,
+                    snapshot,
+                    symbol,
+                    signal.side,
+                    qty * price,
+                    now,
+                )?
+            {
+                continue;
+            }
+            let side = if signal.side == "long" { "BUY" } else { "SELL" };
+            let entry = EntryTerms {
+                leverage,
+                stop: stop_price,
+                take_profit: signal.take_profit,
+                score: signal.score,
+            };
+            if mode == "live" {
+                plans.push(LivePlan {
+                    symbol: symbol.clone(),
+                    position_side: signal.side.into(),
+                    side: side.into(),
+                    qty,
+                    purpose: "entry".into(),
+                    mark_price: price,
+                    entry: Some(entry),
+                    features: Some(features_text.clone()),
+                });
+                break;
+            }
+            let client_id = format!(
+                "demo-entry-{}-{symbol}",
+                market.candles.last().map_or(0, |c| c.close_time)
+            );
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='demo' AND client_order_id=?1)",
+                    [&client_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if exists {
+                continue;
+            }
+            let margin = price * qty / leverage;
+            let fee_rate = cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+            tx.execute("INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) VALUES(?1,?2,?3,'MARKET',?4,?5,'FILLED','entry',?6,'',0,'demo',0)", (now, symbol, side, qty, price, &client_id)).map_err(|e| e.to_string())?;
+            Self::insert_entry_position(
+                tx,
+                mode,
+                symbol,
+                signal.side,
+                qty,
+                price,
+                &entry,
+                fee_rate,
+                now,
+                Some(&features_text),
+            )?;
+            let target_pct = if price > 0.0 {
+                let pct = (signal.take_profit - price).abs() / price * 100.0;
+                (pct * 10_000.0).round() / 10_000.0
+            } else {
+                0.0
+            };
+            crate::journal::record_decision(
+                tx,
+                mode,
+                symbol,
+                signal.side,
+                signal.score,
+                price,
+                target_pct,
+                "量化信号",
+                &journal_snapshot,
+            );
+            available -= margin + price * qty * fee_rate;
+            executed.push(serde_json::json!({"symbol": symbol, "side": side, "qty": qty, "price": price, "reason": "entry", "client_order_id": client_id}));
+        }
+        Ok(executed)
+    }
+
+    fn insert_entry_position(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        symbol: &str,
+        side: &str,
+        qty: f64,
+        price: f64,
+        entry: &EntryTerms,
+        fee_rate: f64,
+        now: i64,
+        features: Option<&str>,
+    ) -> Result<(), String> {
+        tx.execute("INSERT INTO positions(symbol,side,qty,entry_price,mark_price,leverage,margin,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,realized_pnl,fees,status,mode,venue_unrealized,venue_ts,partial_taken_at,ai_confidence,ai_reason,entry_slippage_bps,trade_id) VALUES(?1,?2,?3,?4,?4,?5,?6,?7,?8,?4,?7,?9,?10,0,0,'',0,?11,'open',?12,0,0,0,0,'',0,0)", (symbol, side, qty, price, entry.leverage, qty * price / entry.leverage, entry.stop, entry.take_profit, entry.score, now, qty * price * fee_rate, mode)).map_err(|e| e.to_string())?;
+        if let Some(features) = features {
+            let id = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE positions SET features=?1 WHERE id=?2",
+                (features, id),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn entry_allowed(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        engine: &Value,
+        cfg: &Value,
+        snapshot: &crate::providers::TradingSnapshot,
+        symbol: &str,
+        side: &str,
+        notional: f64,
+        now: i64,
+    ) -> Result<bool, String> {
+        let cooldown: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cooldowns WHERE symbol=?1 AND until_ts>?2)",
+                (symbol, now),
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if cooldown {
+            return Ok(false);
+        }
+        let category = |symbol: &str| {
+            if symbol.contains("BTC") {
+                0
+            } else if symbol.contains("ETH") {
+                1
+            } else if [
+                "SOL", "BNB", "XRP", "ADA", "DOGE", "LTC", "AVAX", "LINK", "DOT", "TRX", "TON",
+                "SUI", "MATIC", "POL",
+            ]
+            .iter()
+            .any(|base| symbol.contains(base))
+            {
+                2
+            } else {
+                3
+            }
+        };
+        let mut stmt = tx.prepare("SELECT symbol,side,qty,COALESCE(NULLIF(mark_price,0),entry_price) FROM positions WHERE mode=?1 AND status='open'").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([mode], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let (mut count, mut same, mut total, mut group) = (0, 0, notional, notional);
+        for row in rows {
+            let (held, direction, qty, fallback) = row.map_err(|e| e.to_string())?;
+            if held == symbol {
+                return Ok(false);
+            }
+            let price = snapshot
+                .markets
+                .iter()
+                .find(|m| m.symbol == held)
+                .map_or(fallback, |m| m.mark_price);
+            let value = qty * price;
+            if !value.is_finite() || value <= 0.0 {
+                return Ok(false);
+            }
+            count += 1;
+            same += i64::from(direction == side);
+            total += value;
+            if category(&held) == category(symbol) {
+                group += value;
+            }
+        }
+        let side_cap = cfg["max_same_direction"].as_i64().unwrap_or(0);
+        let category_cap = cfg["category_exposure_limit_pct"].as_f64().unwrap_or(500.0);
+        let equity = snapshot.account.equity;
+        Ok(count < engine["max_positions"].as_i64().unwrap_or(2)
+            && (side_cap <= 0 || same < side_cap)
+            && total / equity * 100.0 <= cfg["max_exposure_pct"].as_f64().unwrap_or(2000.0)
+            && (category_cap <= 0.0 || group / equity * 100.0 <= category_cap))
+    }
+
+    fn execute_demo_cycle(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        symbols: &[String],
+        positions: &[crate::manage::ManagedPosition],
+        report: &crate::cycle::CycleReport,
+        snapshot: &crate::providers::TradingSnapshot,
+        enabled: bool,
+    ) -> Result<Vec<Value>, String> {
+        if !enabled || mode != "demo" {
+            return Ok(Vec::new());
+        }
+        let fee_rate = Self::risk_settings(tx)?["fee_rate_taker"]
+            .as_f64()
+            .unwrap_or(0.0005);
+        let cycle_id = format!(
+            "{}-{}",
+            crate::now(),
+            snapshot
+                .markets
+                .iter()
+                .filter_map(|market| market.candles.last().map(|candle| candle.close_time))
+                .max()
+                .unwrap_or(0)
+        );
+        let mut executed = Vec::new();
+        for ((symbol, position), action) in symbols
+            .iter()
+            .zip(positions.iter())
+            .zip(report.manage.iter())
+        {
+            let id: i64 = tx
+                .query_row(
+                    "SELECT id FROM positions WHERE symbol=?1 AND side=?2 AND mode=?3 AND status='open' ORDER BY id LIMIT 1",
+                    (symbol, &position.side, mode),
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            match action {
+                crate::manage::ManageAction::Hold => {}
+                crate::manage::ManageAction::MoveToBreakeven { new_sl } => {
+                    tx.execute("UPDATE positions SET sl_price=?1 WHERE id=?2", (new_sl, id))
+                        .map_err(|error| error.to_string())?;
+                    executed.push(serde_json::json!({
+                        "symbol": symbol,
+                        "action": "move_to_breakeven",
+                        "sl_price": new_sl,
+                    }));
+                }
+                action => {
+                    let Some(fill) = crate::execution::demo_fill_for_manage(
+                        &cycle_id,
+                        symbol,
+                        &position.side,
+                        position.qty,
+                        position.mark_price,
+                        action,
+                    ) else {
+                        continue;
+                    };
+                    let (applied, trade_id) = crate::execution::apply_demo_fill_tx(
+                        tx,
+                        mode,
+                        crate::now(),
+                        fee_rate,
+                        &fill,
+                    )?;
+                    if applied {
+                        executed.push(serde_json::json!({
+                            "symbol": fill.symbol,
+                            "side": fill.side,
+                            "qty": fill.qty,
+                            "price": fill.price,
+                            "reason": fill.reason,
+                            "client_order_id": fill.client_order_id,
+                            "trade_id": trade_id,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(executed)
+    }
+
+    pub(crate) fn exchange_credentials(&self, mode: &str) -> Result<(String, String), String> {
+        let data = self
+            .db
+            .setting("data")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let key =
+            std::str::from_utf8(&self.master_key).map_err(|_| "主密钥格式无效".to_string())?;
+        let decrypt = |name: &str| {
+            let field = format!("{mode}_api_{name}_enc");
+            let legacy = format!("api_{name}_enc");
+            let encrypted = data.get(&field).or_else(|| {
+                if mode == "live" {
+                    data.get(&legacy)
+                } else {
+                    None
+                }
+            });
+            crate::secret::decrypt_secret(key, encrypted.and_then(Value::as_str).unwrap_or(""))
+        };
+        let credentials =
+            crate::sign::require_credentials(mode, &decrypt("key")?, &decrypt("secret")?)?;
+        Ok((credentials.api_key, credentials.secret))
+    }
+
+    pub(crate) fn live_credentials(&self) -> Result<LiveCreds, String> {
+        let (api_key, secret) = self.exchange_credentials("live")?;
+        let engine = self
+            .db
+            .setting("engine")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        Ok(LiveCreds {
+            base: "https://fapi.binance.com".to_string(),
+            api_key,
+            secret,
+            recv_window_ms: engine["recv_window_ms"]
+                .as_i64()
+                .unwrap_or(5_000)
+                .clamp(1_000, 60_000),
+        })
+    }
+
+    pub(crate) fn ban_gate(&self) -> crate::submit::BanGate {
+        let until = self
+            .db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM engine_state WHERE key='execution_ban_until'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(0);
+        crate::submit::BanGate::with_until(until)
+    }
+
+    pub(crate) fn save_ban_gate(&self, gate: &crate::submit::BanGate) {
+        if let Ok(conn) = self.db.conn.lock() {
+            let _ = upsert_state(&conn, "execution_ban_until", &gate.until_ms().to_string());
+        }
+    }
+
+    pub(crate) fn build_live(
+        &self,
+        gate: &mut crate::submit::BanGate,
+        creds: &LiveCreds,
+        method: &str,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<crate::submit::PreparedRequest, String> {
+        let now = crate::now_millis();
+        crate::submit::prepare(
+            gate,
+            now,
+            method,
+            &creds.base,
+            path,
+            params,
+            &creds.api_key,
+            &creds.secret,
+            now,
+            creds.recv_window_ms,
+        )
+    }
+
+    /// 发单前先落一条 `SUBMITTING`：进程崩在请求中途，也能在对账里看到这笔悬案。
+    fn reserve_order(
+        &self,
+        plan: &LivePlan,
+        client_order_id: &str,
+        qty: f64,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        if let Some(entry) = &plan.entry {
+            upsert_state(
+                &tx,
+                &format!("entry_terms.{client_order_id}"),
+                &serde_json::to_string(entry).map_err(|e| e.to_string())?,
+            )?;
+        }
+        if let Some(features) = &plan.features {
+            upsert_state(&tx, &format!("entry_features.{client_order_id}"), features)?;
+        }
+        tx.execute(
+            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
+             client_order_id,exchange_order_id,reduce_only,mode) \
+             VALUES(?1,?2,?3,'MARKET',?4,0,'SUBMITTING',?5,?6,'',?7,'live')",
+            (
+                crate::now(),
+                &plan.symbol,
+                &plan.side,
+                qty,
+                &plan.purpose,
+                client_order_id,
+                plan.entry.is_none(),
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn update_order_status(
+        &self,
+        client_order_id: &str,
+        status: &str,
+        exchange_order_id: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        conn.execute(
+            "UPDATE orders SET status=?1, exchange_order_id=?2 WHERE client_order_id=?3 AND mode='live'",
+            (status, exchange_order_id, client_order_id),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn settle_live(
+        &self,
+        plan: &LivePlan,
+        client_order_id: &str,
+        qty: f64,
+        fee_rate: f64,
+        reply: &crate::live::Reply,
+    ) -> Result<Option<String>, String> {
+        use crate::live::Reply;
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let mut review_ids: Vec<i64> = Vec::new();
+        if plan.purpose == "entry" {
+            if let Reply::Filled {
+                order_id,
+                executed_qty,
+                avg_price,
+            } = reply
+            {
+                let key = format!("entry_terms.{client_order_id}");
+                let raw: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM engine_state WHERE key=?1",
+                        [&key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                let Some(raw) = raw else { return Ok(None) };
+                let entry: EntryTerms = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                let features_key = format!("entry_features.{client_order_id}");
+                let features: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM engine_state WHERE key=?1",
+                        [&features_key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if !avg_price.is_finite()
+                    || *avg_price <= 0.0
+                    || !executed_qty.is_finite()
+                    || *executed_qty <= 0.0
+                {
+                    return Ok(Some(format!(
+                        "{} 开仓回执缺成交价或数量，等待对账",
+                        plan.symbol
+                    )));
+                }
+                Self::insert_entry_position(
+                    &tx,
+                    "live",
+                    &plan.symbol,
+                    &plan.position_side,
+                    *executed_qty,
+                    *avg_price,
+                    &entry,
+                    fee_rate,
+                    crate::now(),
+                    features.as_deref(),
+                )?;
+                let target_pct = if *avg_price > 0.0 {
+                    let pct = (entry.take_profit - *avg_price).abs() / *avg_price * 100.0;
+                    (pct * 10_000.0).round() / 10_000.0
+                } else {
+                    0.0
+                };
+                crate::journal::record_decision(
+                    &tx,
+                    "live",
+                    &plan.symbol,
+                    &plan.position_side,
+                    entry.score,
+                    *avg_price,
+                    target_pct,
+                    "实盘成交",
+                    &serde_json::json!({}),
+                );
+                tx.execute("UPDATE orders SET status='FILLED',price=?1,qty=?2,exchange_order_id=?3 WHERE client_order_id=?4 AND mode='live'", (avg_price, executed_qty, order_id, client_order_id)).map_err(|e| e.to_string())?;
+                tx.execute("DELETE FROM engine_state WHERE key=?1", [&key])
+                    .map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+        }
+        let failure = match reply {
+            Reply::Filled {
+                order_id,
+                executed_qty,
+                avg_price,
+            } => {
+                let price = if avg_price.is_finite() && *avg_price > 0.0 {
+                    *avg_price
+                } else {
+                    plan.mark_price
+                };
+                let filled = if executed_qty.is_finite() && *executed_qty > 0.0 {
+                    *executed_qty
+                } else {
+                    qty
+                };
+                let position_side = if plan.side == "SELL" { "long" } else { "short" };
+                let open: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM positions WHERE symbol=?1 AND side=?2 \
+                         AND mode='live' AND status='open')",
+                        (&plan.symbol, position_side),
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if open {
+                    let fill = crate::execution::DemoFill {
+                        client_order_id: client_order_id.to_string(),
+                        exchange_order_id: order_id.clone(),
+                        symbol: plan.symbol.clone(),
+                        side: plan.side.clone(),
+                        qty: filled,
+                        price,
+                        reduce_only: true,
+                        reason: plan.purpose.clone(),
+                    };
+                    let (applied, trade_id) = crate::execution::apply_live_fill_tx(
+                        &tx,
+                        "live",
+                        crate::now(),
+                        fee_rate,
+                        &fill,
+                    )?;
+                    if applied {
+                        if let Some(trade_id) = trade_id {
+                            review_ids.push(trade_id);
+                        }
+                    }
+                } else {
+                    // 仓位已被 venue_sync 关掉：只补订单状态，不能再减一次。
+                    tx.execute(
+                        "UPDATE orders SET status='FILLED', price=?1, qty=?2, exchange_order_id=?3 \
+                         WHERE client_order_id=?4 AND mode='live'",
+                        (price, filled, order_id, client_order_id),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                None
+            }
+            Reply::Accepted { order_id, status } => {
+                tx.execute(
+                    "UPDATE orders SET status=?1, exchange_order_id=?2 WHERE client_order_id=?3 AND mode='live'",
+                    (if status.is_empty() { "NEW" } else { status.as_str() }, order_id, client_order_id),
+                )
+                .map_err(|error| error.to_string())?;
+                Some(format!(
+                    "{} 下单已受理但未成交（{}）",
+                    plan.symbol,
+                    reply.status_text()
+                ))
+            }
+            Reply::Rejected { code, message } => {
+                tx.execute(
+                    "UPDATE orders SET status='REJECTED' WHERE client_order_id=?1 AND mode='live'",
+                    [client_order_id],
+                )
+                .map_err(|error| error.to_string())?;
+                Some(format!("{} 下单被拒 {code} {message}", plan.symbol))
+            }
+            Reply::NotFound | Reply::Unknown => {
+                tx.execute(
+                    "UPDATE orders SET status='UNKNOWN' WHERE client_order_id=?1 AND mode='live'",
+                    [client_order_id],
+                )
+                .map_err(|error| error.to_string())?;
+                Some(format!(
+                    "{} 下单结果未知，已阻止重发，交由对账确认",
+                    plan.symbol
+                ))
+            }
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        self.spawn_reviews(&review_ids);
+        Ok(failure)
+    }
+
+    /// 未知结果只查不发。返回查询到的结论，查不到就保持未知。
+    async fn query_dual_side(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+    ) -> Result<bool, String> {
+        let mut gate = self.ban_gate();
+        let request =
+            self.build_live(&mut gate, creds, "GET", "/fapi/v1/positionSide/dual", &[])?;
+        let response = gateway.send(&request).await;
+        if response.transport_failed || !(200..300).contains(&response.status) {
+            return Err(format!(
+                "无法读取交易所持仓模式 (HTTP {})，已停止实盘订单",
+                response.status
+            ));
+        }
+        let body: Value = serde_json::from_str(&response.body)
+            .map_err(|_| "交易所持仓模式响应不是有效 JSON，已停止实盘订单".to_string())?;
+        body["dualSidePosition"]
+            .as_bool()
+            .ok_or_else(|| "交易所持仓模式缺少 dualSidePosition，已停止实盘订单".to_string())
+    }
+
+    async fn resolve_live(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> crate::live::Reply {
+        let mut gate = self.ban_gate();
+        for attempt in 0..4 {
+            let params = crate::live::query_params(symbol, client_order_id, creds.recv_window_ms);
+            let request =
+                match self.build_live(&mut gate, creds, "GET", crate::live::ORDER_PATH, &params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!(%error, %symbol, "实盘未知结果查询无法签名");
+                        return crate::live::Reply::Unknown;
+                    }
+                };
+            let reply = crate::live::submit(gateway, &request).await;
+            match reply {
+                crate::live::Reply::NotFound if attempt < 3 => {
+                    // 交易所接受后落账有延迟，立刻重查必然落空。
+                    sleep(Duration::from_millis(1_200)).await;
+                }
+                other => return other,
+            }
+        }
+        crate::live::Reply::Unknown
+    }
+
+    async fn run_live_with(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        plans: Vec<LivePlan>,
+    ) -> Result<Vec<String>, String> {
+        let dual_side = self.query_dual_side(creds, gateway).await?;
+        let risk = self
+            .db
+            .setting("risk")
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| crate::settings_api::defaults_of("risk"));
+        let fee_rate = risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+        let buffer = risk["min_notional_buffer"].as_f64().unwrap_or(1.05);
+        let symbols: Vec<String> = plans.iter().map(|plan| plan.symbol.clone()).collect();
+        let filters = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            crate::live::load_filters(&conn, &symbols)
+        };
+        let mut gate = self.ban_gate();
+        let mut failures = Vec::new();
+        for (index, plan) in plans.into_iter().enumerate() {
+            let filter = filters.get(&plan.symbol).copied().unwrap_or_default();
+            let qty = match crate::live::admit_qty(plan.qty, plan.mark_price, &filter, buffer) {
+                Ok(qty) => qty,
+                Err(error) => {
+                    failures.push(format!("{} {error}", plan.symbol));
+                    continue;
+                }
+            };
+            if let Some(entry) = &plan.entry {
+                let leverage = entry.leverage as i64;
+                let params = [
+                    ("symbol".into(), plan.symbol.clone()),
+                    ("leverage".into(), leverage.to_string()),
+                ];
+                let request =
+                    match self.build_live(&mut gate, creds, "POST", "/fapi/v1/leverage", &params) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
+                            continue;
+                        }
+                    };
+                let response = gateway.send(&request).await;
+                let body = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
+                if body["code"].as_i64() == Some(-1003) {
+                    gate.observe(body["msg"].as_str().unwrap_or(""), crate::now_millis());
+                }
+                if response.transport_failed
+                    || !(200..300).contains(&response.status)
+                    || body["symbol"].as_str() != Some(plan.symbol.as_str())
+                    || body["leverage"].as_i64() != Some(leverage)
+                {
+                    failures.push(format!("{} 无法确认交易所杠杆，跳过开仓", plan.symbol));
+                    continue;
+                }
+            }
+            let client_order_id = crate::live::client_order_id("nq", &plan.purpose, index);
+            self.reserve_order(&plan, &client_order_id, qty)?;
+            let spec = crate::live::OrderSpec {
+                symbol: plan.symbol.clone(),
+                side: plan.side.clone(),
+                qty,
+                reduce_only: plan.entry.is_none(),
+                position_side: plan.position_side.clone(),
+                dual_side,
+                purpose: plan.purpose.clone(),
+                client_order_id: client_order_id.clone(),
+            };
+            let request = match self.build_live(
+                &mut gate,
+                creds,
+                "POST",
+                crate::live::ORDER_PATH,
+                &spec.params(&filter, creds.recv_window_ms),
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.update_order_status(&client_order_id, "REJECTED", "")?;
+                    failures.push(format!("{} 发单前被拦截：{error}", plan.symbol));
+                    continue;
+                }
+            };
+            let mut reply = crate::live::submit(gateway, &request).await;
+            if let crate::live::Reply::Rejected {
+                code: -1003,
+                message,
+            } = &reply
+            {
+                // 限频封禁：记进熔断，后面的请求在本地就拦下，避免续期。
+                gate.observe(message, crate::now_millis());
+            }
+            if reply == crate::live::Reply::Unknown {
+                reply = self
+                    .resolve_live(creds, gateway, &plan.symbol, &client_order_id)
+                    .await;
+            }
+            if let Some(failure) =
+                self.settle_live(&plan, &client_order_id, qty, fee_rate, &reply)?
+            {
+                failures.push(failure);
+            }
+        }
+        failures.extend(
+            self.reconcile_pending(creds, gateway, fee_rate)
+                .await?
+                .into_iter()
+                .map(|failure| format!("对账: {failure}")),
+        );
+        failures.extend(self.ensure_protection(creds, gateway, dual_side).await?);
+        self.save_ban_gate(&gate);
+        Ok(failures)
+    }
+
+    async fn run_live(&self, plans: Vec<LivePlan>) -> Result<Vec<String>, String> {
+        let creds = self.live_credentials()?;
+        let gateway = crate::live::HttpGateway::new();
+        self.run_live_with(&creds, &gateway, plans).await
+    }
+
+    /// 上一轮没拿到明确结论的订单：按 clientOrderId 查，确认后再结算。
+    async fn reconcile_pending(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        fee_rate: f64,
+    ) -> Result<Vec<String>, String> {
+        let pending = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    // 只查市价单：条件单是保护腿，按 clientAlgoId 挂在 Algo 接口上，
+                    // 用订单接口查只会拿到 -2013。
+                    "SELECT client_order_id,symbol,side,purpose FROM orders \
+                     WHERE mode='live' AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') \
+                     AND order_type='MARKET' ORDER BY id LIMIT 20",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut failures = Vec::new();
+        for (client_order_id, symbol, side, purpose) in pending {
+            let reply = self
+                .resolve_live(creds, gateway, &symbol, &client_order_id)
+                .await;
+            let plan = LivePlan {
+                symbol: symbol.clone(),
+                position_side: if (side == "BUY") == (purpose == "entry") {
+                    "long"
+                } else {
+                    "short"
+                }
+                .to_string(),
+                side,
+                qty: 0.0,
+                purpose,
+                mark_price: 0.0,
+                entry: None,
+                features: None,
+            };
+            match reply {
+                crate::live::Reply::Filled {
+                    avg_price,
+                    executed_qty,
+                    ..
+                } => {
+                    if !(avg_price.is_finite()
+                        && avg_price > 0.0
+                        && executed_qty.is_finite()
+                        && executed_qty > 0.0)
+                    {
+                        // 没有成交价就算不出盈亏，保持未知，等下一轮再查。
+                        failures.push(format!("{symbol} 已成交但缺成交价，暂不结算"));
+                        continue;
+                    }
+                    if let Some(failure) =
+                        self.settle_live(&plan, &client_order_id, executed_qty, fee_rate, &reply)?
+                    {
+                        failures.push(failure);
+                    }
+                }
+                crate::live::Reply::Rejected { code, message } => {
+                    self.update_order_status(&client_order_id, "REJECTED", "")?;
+                    failures.push(format!("{symbol} 补查为拒单 {code} {message}"));
+                }
+                crate::live::Reply::NotFound | crate::live::Reply::Unknown => {}
+                crate::live::Reply::Accepted { status, .. } => {
+                    self.update_order_status(
+                        &client_order_id,
+                        if status.is_empty() { "NEW" } else { &status },
+                        "",
+                    )?;
+                }
+            }
+        }
+        Ok(failures)
+    }
+
+    /// 需要补挂保护单的仓位。
+    ///
+    /// 默认只接管引擎自己开过的仓（本地有 `entry` 委托）；手上手动开的仓
+    /// 要等 `risk.auto_protect_external` 打开，否则会替别人的仓位擅自挂单。
+    fn protection_targets(&self) -> Result<Vec<(String, String, f64, f64)>, String> {
+        let auto_external = self
+            .db
+            .setting("risk")
+            .ok()
+            .flatten()
+            .map(|risk| risk["auto_protect_external"].as_bool().unwrap_or(false))
+            .unwrap_or(false);
+        let ownership = if auto_external {
+            ""
+        } else {
+            "AND EXISTS(SELECT 1 FROM orders e WHERE e.mode=p.mode AND e.symbol=p.symbol AND e.purpose='entry')"
+        };
+        let sql = format!(
+            "SELECT p.symbol,p.side,p.sl_price,p.tp_price FROM positions p \
+             WHERE p.mode='live' AND p.status='open' AND p.qty > 0 \
+             AND (p.sl_price > 0 OR p.tp_price > 0) {ownership} \
+             AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.mode=p.mode AND o.symbol=p.symbol \
+                 AND o.side = CASE p.side WHEN 'long' THEN 'SELL' ELSE 'BUY' END \
+                 AND o.purpose IN ('stop_loss','take_profit') \
+                 AND o.status IN ('SUBMITTING','ACCEPTED','NEW','UNKNOWN'))"
+        );
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    async fn ensure_protection(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        dual_side: bool,
+    ) -> Result<Vec<String>, String> {
+        let targets = self.protection_targets()?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let symbols: Vec<String> = targets.iter().map(|item| item.0.clone()).collect();
+        let filters = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            crate::live::load_filters(&conn, &symbols)
+        };
+        let mut gate = self.ban_gate();
+        let mut failures = Vec::new();
+        for (index, (symbol, side, sl, tp)) in targets.iter().enumerate() {
+            let filter = filters.get(symbol).copied().unwrap_or_default();
+            let legs = crate::live::protection_legs_mode(
+                symbol,
+                side,
+                *sl,
+                *tp,
+                &filter,
+                creds.recv_window_ms,
+                index * 2,
+                dual_side,
+            );
+            for leg in legs {
+                let purpose = if leg.kind == "STOP_MARKET" {
+                    "stop_loss"
+                } else {
+                    "take_profit"
+                };
+                let outcome = crate::live::place_protection_leg(
+                    &mut gate,
+                    gateway,
+                    &creds.base,
+                    &creds.api_key,
+                    &creds.secret,
+                    &leg,
+                )
+                .await;
+                match outcome.failure {
+                    None => self.record_protection_order(symbol, purpose, &leg, "ACCEPTED")?,
+                    Some(failure) => {
+                        if outcome.unknown {
+                            // 结果未知的腿先留痕，否则下一轮会再挂一套。
+                            self.record_protection_order(symbol, purpose, &leg, "UNKNOWN")?;
+                        }
+                        failures.push(format!("{symbol} 保护单 {failure}"));
+                    }
+                }
+            }
+        }
+        self.save_ban_gate(&gate);
+        Ok(failures)
+    }
+
+    fn record_protection_order(
+        &self,
+        symbol: &str,
+        purpose: &str,
+        leg: &crate::live::ProtectionLeg,
+        status: &str,
+    ) -> Result<(), String> {
+        let param = |name: &str| {
+            leg.algo_params
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        conn.execute(
+            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
+             client_order_id,exchange_order_id,reduce_only,mode) \
+             VALUES(?1,?2,?3,?4,0,0,?5,?6,?7,'',1,'live')",
+            (
+                crate::now(),
+                symbol,
+                param("side"),
+                leg.kind.clone(),
+                status,
+                purpose,
+                param("clientAlgoId"),
+            ),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    async fn refresh_snapshot(
+        &self,
+        mode: &str,
+        provider: &dyn crate::providers::SnapshotProvider,
+    ) -> Result<Vec<LivePlan>, String> {
+        use crate::providers::ProviderError;
+        let snapshot = tokio::time::timeout(Duration::from_secs(30), provider.snapshot())
+            .await
+            .map_err(|_| "交易所快照超时".to_string())?
+            .map_err(|error| match error {
+                ProviderError::Timeout => "交易所快照超时".into(),
+                ProviderError::Unavailable(message) | ProviderError::InvalidData(message) => {
+                    message
+                }
+            })?;
+        self.persist_snapshot(mode, &snapshot)
+    }
+
+    async fn sync_exchange(&self) -> Result<(String, Vec<LivePlan>), String> {
+        let engine = self
+            .db
+            .setting("engine")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        // 交易环境以 engine_state.mode 为准：切换开关会同时写状态和配置组，
+        // 但只有状态是 `/engine/status` 与其它路由读取的那份。
+        let state_mode: Option<String> = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            conn.query_row(
+                "SELECT value FROM engine_state WHERE key='mode'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        };
+        let mode_raw = state_mode
+            .filter(|mode| !mode.is_empty())
+            .or_else(|| engine["mode"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "demo".into());
+        let (mode, base) = match mode_raw.as_str() {
+            "demo" | "paper" => ("demo", "https://testnet.binancefuture.com"),
+            "live" => ("live", "https://fapi.binance.com"),
+            _ => return Err("交易环境无效".into()),
+        };
+        let credentials = match self.exchange_credentials(mode) {
+            Ok(credentials) => Some(credentials),
+            Err(error) if mode == "demo" => {
+                tracing::info!(%error, "demo 未配置凭证，改用公开行情 + 本地账本");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let symbols = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            let mut stmt = conn.prepare("SELECT symbol FROM trading_symbols WHERE enabled != 0 ORDER BY sort_order, symbol")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let strategy = self
+            .db
+            .setting("strategy")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let timeframe = strategy["timeframe"].as_str().unwrap_or("4h");
+        let provider = match credentials {
+            Some((api_key, secret)) => crate::providers::BinanceProvider::with_symbols(
+                base,
+                symbols.clone(),
+                api_key,
+                secret,
+            ),
+            // demo 没有凭证也必须是真实行情：公开接口 + 本地账本，禁止假行情。
+            None => crate::providers::BinanceProvider::with_symbols_public(
+                base,
+                symbols.clone(),
+                self.db.clone(),
+            ),
+        }
+        .and_then(|provider| provider.with_timeframe(timeframe))
+        .map_err(|error| format!("无法初始化交易所快照客户端: {error:?}"))?;
+        let plans = self.refresh_snapshot(mode, &provider).await?;
+        Ok((mode.to_string(), plans))
+    }
+
+    fn validate_snapshot(
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<(), String> {
+        use std::collections::BTreeSet;
+        let enabled_symbols: BTreeSet<&str> = snapshot
+            .markets
+            .iter()
+            .map(|market| market.symbol.as_str())
+            .collect();
+        if enabled_symbols.is_empty()
+            || snapshot.markets.iter().any(|market| {
+                market.mark_price <= 0.0
+                    || !market.mark_price.is_finite()
+                    || !market.quote_volume.is_finite()
+                    || market.quote_volume < 0.0
+                    || market.candles.len() < 20
+                    || market
+                        .candles
+                        .windows(2)
+                        .any(|pair| pair[0].close_time >= pair[1].close_time)
+                    || market.candles.iter().any(|candle| {
+                        !candle.open.is_finite()
+                            || !candle.high.is_finite()
+                            || !candle.low.is_finite()
+                            || !candle.close.is_finite()
+                            || !candle.volume.is_finite()
+                            || candle.open <= 0.0
+                            || candle.high < candle.low
+                            || candle.low <= 0.0
+                            || candle.close < candle.low
+                            || candle.close > candle.high
+                            || candle.volume < 0.0
+                    })
+            })
+        {
+            return Err("行情快照缺少有效 K 线或成交额".into());
+        }
+        if !snapshot.account.equity.is_finite() || !snapshot.account.available_balance.is_finite() {
+            return Err("账户快照中的权益或可用余额无效".into());
+        }
+        if snapshot.positions.iter().any(|position| {
+            !position.qty.is_finite()
+                || position.qty <= 0.0
+                || !position.entry_price.is_finite()
+                || position.entry_price <= 0.0
+                || !matches!(position.side.as_str(), "long" | "short")
+        }) {
+            return Err("持仓快照中的方向或价量无效".into());
+        }
+        if mode.is_empty() {
+            return Err("交易环境无效".into());
+        }
+        Ok(())
+    }
+
+    fn record_position_differences(
+        conn: &rusqlite::Connection,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<(), String> {
+        use std::collections::BTreeMap;
+        let mut stmt = conn
+            .prepare("SELECT symbol, side, qty FROM positions WHERE mode = ?1 AND status = 'open'")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([mode], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut quantities = BTreeMap::<(String, String), (f64, f64)>::new();
+        for row in rows {
+            let (symbol, side, qty) = row.map_err(|error| error.to_string())?;
+            if !qty.is_finite() || qty <= 0.0 || !matches!(side.as_str(), "long" | "short") {
+                return Err("本地持仓数量或方向无效".into());
+            }
+            quantities.entry((symbol, side)).or_default().0 += qty;
+        }
+        for position in &snapshot.positions {
+            quantities
+                .entry((position.symbol.clone(), position.side.clone()))
+                .or_default()
+                .1 += position.qty;
+        }
+        let mut differences = Vec::new();
+        for ((symbol, side), (local, venue)) in quantities {
+            if !local.is_finite() || !venue.is_finite() {
+                return Err("持仓合计数量无效".into());
+            }
+            let tolerance = f64::EPSILON * 8.0 * local.max(venue);
+            if (local - venue).abs() > tolerance {
+                differences.push(serde_json::json!({"symbol": symbol, "side": side, "local_qty": local, "venue_qty": venue}));
+            }
+        }
+        upsert_state(
+            &conn,
+            &format!("position_differences.{mode}"),
+            &serde_json::json!({"differences": differences}).to_string(),
+        )
+    }
+
+    fn record_order_differences(
+        conn: &rusqlite::Connection,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+    ) -> Result<Value, String> {
+        type OrderIdentity = (String, String, String);
+        let mut stmt = conn.prepare("SELECT symbol, client_order_id, exchange_order_id FROM orders WHERE mode=?1 AND lower(status) IN ('new','pending','partially_filled') ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([mode], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| error.to_string())?;
+        let local = rows
+            .collect::<Result<Vec<OrderIdentity>, _>>()
+            .map_err(|error| error.to_string())?;
+        let venue: Vec<OrderIdentity> = snapshot
+            .open_orders
+            .iter()
+            .map(|order| {
+                (
+                    order.symbol.clone(),
+                    order.client_order_id.clone(),
+                    order.order_id.to_string(),
+                )
+            })
+            .collect();
+        let matches = |local: &OrderIdentity, venue: &OrderIdentity| {
+            local.0 == venue.0
+                && if local.2.is_empty() {
+                    !local.1.is_empty() && local.1 == venue.1
+                } else {
+                    local.2 == venue.2 && (local.1.is_empty() || local.1 == venue.1)
+                }
+        };
+        let as_json = |(symbol, client_order_id, exchange_order_id): &OrderIdentity| serde_json::json!({"symbol":symbol,"client_order_id":client_order_id,"exchange_order_id":exchange_order_id});
+        let local_only: Vec<_> = local
+            .iter()
+            .filter(|row| !venue.iter().any(|other| matches(row, other)))
+            .map(as_json)
+            .collect();
+        let venue_only: Vec<_> = venue
+            .iter()
+            .filter(|row| !local.iter().any(|other| matches(other, row)))
+            .map(as_json)
+            .collect();
+        let report = serde_json::json!({"local_only":local_only,"venue_only":venue_only});
+        upsert_state(
+            conn,
+            &format!("order_differences.{mode}"),
+            &report.to_string(),
+        )?;
+        Ok(report)
+    }
+
+    async fn tick(&self, config: &RuntimeConfig) -> Result<(), String> {
+        let started = Instant::now();
+        let mut failures: Vec<String> = Vec::new();
+        let result = if config.enabled {
+            match self.sync_exchange().await {
+                Ok((mode, plans)) if mode == "live" => match self.run_live(plans).await {
+                    Ok(items) => {
+                        failures = items;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                },
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        for failure in &failures {
+            tracing::warn!(%failure, "实盘执行未完成");
+            self.events.record(
+                "error",
+                "trade",
+                &format!("实盘执行未完成: {failure}"),
+                serde_json::json!({"detail": failure}),
+            );
+        }
+        if let Err(error) = &result {
+            self.events.record(
+                "error",
+                "engine",
+                &format!("引擎循环异常: {error}"),
+                serde_json::json!({"detail": error}),
+            );
+        }
+        let elapsed = started.elapsed().as_millis() as i64;
+        let mut conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        upsert_state(
+            &tx,
+            "last_error",
+            result.as_ref().err().map(String::as_str).unwrap_or(""),
+        )?;
+        upsert_state(
+            &tx,
+            "execution.failures",
+            &serde_json::to_string(&failures).unwrap_or_else(|_| "[]".to_string()),
+        )?;
+        if result.is_ok() {
+            upsert_state(&tx, "last_cycle_ms", &elapsed.to_string())?;
+            upsert_state(&tx, "last_cycle_ts", &crate::now().to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        result
+    }
+
+    pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
+        self.runtime_active.store(true, Ordering::SeqCst);
+        let mut first = true;
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            let config = RuntimeConfig::from_db(&self.db);
+            if !first {
+                tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { break; }
+                        continue;
+                    }
+                    _ = sleep(Duration::from_secs(config.interval_sec)) => {}
+                    _ = wait_cycle_signal(&self.cycle_signal) => {}
+                }
+            }
+            first = false;
+            self.cycle_busy.store(true, Ordering::SeqCst);
+            let result = self.tick(&config).await;
+            self.cycle_busy.store(false, Ordering::SeqCst);
+            if let Err(error) = result {
+                tracing::error!(%error, "Rust 引擎周期未执行");
+            }
+        }
+        self.runtime_active.store(false, Ordering::SeqCst);
+        tracing::info!("Rust 引擎后台任务已停止");
+    }
+}
+
+async fn wait_cycle_signal(signal: &Option<Arc<Notify>>) {
+    match signal {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn truncate_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() > 200 {
+        format!("{}...", trimmed.chars().take(200).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn upsert_state(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, value, crate::now()),
+    ).map(|_| ()).map_err(|e| e.to_string())
+}
+
+pub(crate) fn acquire_lock(data_dir: &Path) -> io::Result<File> {
+    std::fs::create_dir_all(data_dir)?;
+    // 与 legacy 内核（已退役） 共用锁文件。不能截断或删除，否则其他进程可能锁住不同的文件。
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("engine.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+    watch::channel(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_runtime(db: &Db) -> EngineRuntime {
+        let lock = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        EngineRuntime::new(
+            db.clone(),
+            lock,
+            b"MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=".to_vec(),
+            crate::events::EventBus::new(None),
+        )
+    }
+
+    #[test]
+    fn engine_lock_rejects_second_owner_and_can_be_reacquired() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanoquant-lock-{}-{}",
+            std::process::id(),
+            crate::now_millis()
+        ));
+        let first = acquire_lock(&dir).unwrap();
+        assert!(acquire_lock(&dir).is_err());
+        drop(first);
+        drop(acquire_lock(&dir).unwrap());
+        std::fs::remove_file(dir.join("engine.lock")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_records_scan_and_honors_halt_and_stale_candles() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        let mut snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        for candle in &mut snapshot.markets[0].candles {
+            candle.high = 101.0;
+            candle.low = 99.0;
+        }
+        let read_scan = || {
+            let conn = db.conn.lock().unwrap();
+            let raw: String = conn
+                .query_row(
+                    "SELECT value FROM engine_state WHERE key = 'cycle_preview.demo'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(read_scan()["skipped"], "引擎未启用");
+        assert_eq!(read_scan()["scan_candidates"], serde_json::json!([]));
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"demo"}"#],
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(
+            read_scan()["scan_candidates"],
+            serde_json::json!(["BTCUSDT"])
+        );
+        upsert_state(&db.conn.lock().unwrap(), "halted", "手动暂停").unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let preview = read_scan();
+        assert_eq!(preview["scan_candidates"], serde_json::json!([]));
+        assert!(preview["skipped"].as_str().unwrap().contains("熔断"));
+        {
+            let conn = db.conn.lock().unwrap();
+            upsert_state(&conn, "halted", "").unwrap();
+            upsert_state(
+                &conn,
+                "equity_peak",
+                &(snapshot.account.equity * 3.0).to_string(),
+            )
+            .unwrap();
+        }
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let preview = read_scan();
+        assert_eq!(preview["scan_candidates"], serde_json::json!([]));
+        assert!(preview["skipped"].as_str().unwrap().contains("最大回撤"));
+        assert_eq!(preview["rejected"], serde_json::json!({}));
+        {
+            let conn = db.conn.lock().unwrap();
+            upsert_state(&conn, "equity_peak", "0").unwrap();
+        }
+        for candle in &mut snapshot.markets[0].candles {
+            candle.close_time -= 48 * 60 * 60 * 1_000;
+        }
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(read_scan()["scan_candidates"], serde_json::json!([]));
+        assert!(read_scan()["rejected"]["BTCUSDT"]
+            .as_str()
+            .unwrap()
+            .contains("行情"));
+    }
+
+    #[tokio::test]
+    async fn demo_signal_opens_once_with_sized_quantity_and_protection() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (count, qty, leverage, sl, tp): (i64, f64, f64, f64, f64) = conn
+            .query_row("SELECT COUNT(*),COALESCE(MAX(qty),0),COALESCE(MAX(leverage),0),COALESCE(MAX(sl_price),0),COALESCE(MAX(tp_price),0) FROM positions WHERE mode='demo' AND status='open' AND side='long'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!((qty - 50.0).abs() < 1e-9);
+        assert_eq!(leverage, 5.0);
+        assert!(sl > 0.0 && sl < 100.0 && tp > 100.0);
+        let orders: i64 = conn.query_row("SELECT COUNT(*) FROM orders WHERE purpose='entry' AND status='FILLED' AND reduce_only=0", [], |r| r.get(0)).unwrap();
+        assert_eq!(orders, 1);
+        let features: String = conn
+            .query_row(
+                "SELECT features FROM positions WHERE mode='demo' AND status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let features: Value = serde_json::from_str(&features).unwrap();
+        assert!(
+            !features["injected_mantra_ids"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "开仓前要记录注入了哪些心法: {features}"
+        );
+        assert!(
+            features["injected_experience_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(1)),
+            "同币种同向的赢家经验要注入: {features}"
+        );
+        let (journal_status, journal_mode, journal_direction, journal_entry): (String, String, String, f64) = conn
+            .query_row(
+                "SELECT status, mode, direction, entry_price FROM decision_journal ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(journal_status, "pending", "开仓要留下待回访的决策快照");
+        assert_eq!(journal_mode, "demo", "快照必须绑定开仓环境");
+        assert_eq!(journal_direction, "long");
+        assert_eq!(journal_entry, 100.0);
+    }
+
+    #[tokio::test]
+    async fn live_entry_reconciles_after_restart_at_actual_fill_price() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.purpose, "entry");
+        runtime
+            .reserve_order(plan, "nq-entry-test", plan.qty)
+            .unwrap();
+        assert!(runtime
+            .persist_snapshot("live", &snapshot)
+            .unwrap()
+            .is_empty());
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":42,"status":"FILLED","executedQty":"2","avgPrice":"100.1"}"#,
+            ),
+            (200, r#"{"algoId":12}"#),
+            (200, r#"{"algoId":13}"#),
+        ]);
+        let restarted = test_runtime(&db);
+        let failures = restarted
+            .run_live_with(&live_creds(), &gateway, vec![])
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let urls = gateway.sent_urls();
+        assert_eq!(urls.len(), 4);
+        assert!(urls[0].contains("/fapi/v1/positionSide/dual"));
+        assert!(urls[1].contains("origClientOrderId=nq-entry-test"));
+        let conn = db.conn.lock().unwrap();
+        let position: (String, f64, f64, f64) = conn
+            .query_row(
+                "SELECT side,qty,entry_price,leverage FROM positions WHERE mode='live'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(position, ("long".into(), 2.0, 100.1, 5.0));
+    }
+
+    #[tokio::test]
+    async fn live_entry_requires_confirmed_leverage_before_sending_order() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert_eq!(plans.len(), 1);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, r#"{"symbol":"BTCUSDT","leverage":4}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(gateway.sent_count(), 2);
+        assert!(gateway.sent_urls()[0].contains("/fapi/v1/positionSide/dual"));
+        assert!(gateway.sent_urls()[1].contains("/fapi/v1/leverage"));
+        let orders: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orders, 0);
+    }
+
+    #[tokio::test]
+    async fn demo_entry_rejects_active_cooldown_and_projected_category_limit() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        let now = crate::now();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cooldowns VALUES('BTCUSDT',?1,'loss','symbol')",
+                [now + 60],
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let entries = || {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM orders WHERE purpose='entry'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(entries(), 0);
+        db.conn.lock().unwrap().execute_batch("UPDATE cooldowns SET until_ts=0; UPDATE app_settings SET value=json_set(value,'$.category_exposure_limit_pct',60) WHERE key='risk'; INSERT INTO positions(symbol,side,qty,entry_price,mark_price,mode,status) VALUES('BTCDOMUSDT','short',20,100,100,'demo','open');").unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(entries(), 0);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE positions SET symbol='ETHUSDT'", [])
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(entries(), 1);
+    }
+
+    struct RejectReviewer;
+
+    impl crate::review::AiReviewer for RejectReviewer {
+        fn review(
+            &self,
+            _proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            Ok(crate::review::ReviewDecision {
+                action: crate::review::ReviewAction::Reject,
+                leverage: None,
+                stop_price: None,
+                reason: "test reject".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_reject_prevents_entry_and_leaves_no_order() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let orders: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE purpose='entry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orders, 0, "AI 拒绝后不能产生订单");
+    }
+
+    #[tokio::test]
+    async fn demo_losing_close_starts_cooldown() {
+        let (db, mut snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        snapshot.markets[0].mark_price = 95.0;
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let expiry: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT until_ts FROM cooldowns WHERE symbol='BTCUSDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(expiry > crate::now());
+    }
+
+    async fn entry_fixture() -> (Db, crate::providers::TradingSnapshot) {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        db.conn.lock().unwrap().execute_batch(
+            r#"UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
+            UPDATE engine_state SET value='true' WHERE key='enabled';
+            ALTER TABLE orders ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
+            ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
+            ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
+
+            INSERT INTO app_settings VALUES('risk','{"default_leverage":10,"margin_pct":10,"risk_per_trade_pct":10,"rsi_long_max":100.1}',0);
+            CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY,enabled INTEGER,max_leverage INTEGER,tick_sz TEXT,min_sz TEXT,min_notional REAL);
+            INSERT INTO trading_symbols VALUES('BTCUSDT',1,5,'0.01','0.001',5);
+            CREATE TABLE IF NOT EXISTS cooldowns(symbol TEXT PRIMARY KEY,until_ts INTEGER,reason TEXT,kind TEXT);
+            INSERT INTO mantras VALUES(1,'回踩入场','当价格回踩 EMA21 且量比大于 0.8 时开多','[]','entry','manual',0.8,0.9,0,0,0,1,1,1,0,'{}',100,100,0);
+            INSERT INTO experiences VALUES(1,'BTCUSDT','["sym:BTCUSDT","dir:long"]','{}','突破后回踩再进','win',0,'journal',1,1,0,1,100,100);"#,
+        ).unwrap();
+        let mut snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        let candles = &mut snapshot.markets[0].candles;
+        let len = candles.len();
+        for (i, candle) in candles.iter_mut().enumerate() {
+            let price = 100.0 - (len - i - 1) as f64 * 0.15;
+            candle.open = price;
+            candle.close = price;
+            candle.high = price + 0.5;
+            candle.low = price - 0.5;
+        }
+        (db, snapshot)
+    }
+
+    #[tokio::test]
+    async fn demo_cycle_closes_stop_loss_once_and_reports_the_fill() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"demo"}"#],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,51000,51000,50000,60000,51000,50000,0.0,1,'open','demo');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        // 标记价跌破硬止损，管仓必须当轮平掉，不能等下一轮。
+        let snapshot = DemoProvider::with_mark_price(50_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let (status, exit_reason, qty): (String, String, f64) = conn
+                .query_row(
+                    "SELECT status, exit_reason, qty FROM positions WHERE symbol='BTCUSDT'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "closed");
+            assert_eq!(exit_reason, "stop_loss");
+            assert_eq!(qty, 0.0);
+            let (purpose, reduce_only, price): (String, i64, f64) = conn
+                .query_row(
+                    "SELECT purpose, reduce_only, price FROM orders WHERE mode='demo'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(purpose, "stop_loss");
+            assert_eq!(reduce_only, 1);
+            assert_eq!(price, 50_000.0);
+        }
+        let raw: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='cycle_preview.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preview: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            preview["executed"][0]["reason"], "stop_loss",
+            "预览里必须能看出当轮真的成交了"
+        );
+        // 同一份快照再跑一轮：仓位已平，不能重复下单。
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let orders: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orders WHERE mode='demo'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(orders, 1, "已平的仓不能再产生第二笔平仓单");
+    }
+
+    #[tokio::test]
+    async fn demo_cycle_skips_stale_quotes_and_symbols_with_unmatched_orders() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"demo"}"#],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,51000,51000,50000,60000,51000,50000,0.0,1,'open','demo');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let mut snapshot = DemoProvider::with_mark_price(50_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        // 停更行情上的标记价不是当前价，用它触发止损等于赌运气。
+        for candle in &mut snapshot.markets[0].candles {
+            candle.close_time -= 48 * 60 * 60 * 1_000;
+        }
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let status: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM positions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "open", "停更行情上不能撮合");
+
+        let mut fresh = DemoProvider::with_mark_price(50_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        fresh.markets[0].candles = snapshot.markets[0]
+            .candles
+            .iter()
+            .cloned()
+            .map(|mut candle| {
+                candle.close_time += 48 * 60 * 60 * 1_000;
+                candle
+            })
+            .collect();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO orders(symbol,client_order_id,exchange_order_id,mode,status) \
+                 VALUES('BTCUSDT','entry-1','','demo','pending');",
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &fresh).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM positions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "open", "订单状态对不上时不能继续对该标的发单");
+        let closings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE purpose='stop_loss'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closings, 0);
+    }
+
+    struct FakeLiveGateway {
+        replies: std::sync::Mutex<Vec<crate::live::GatewayReply>>,
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeLiveGateway {
+        /// `(0, "")` 表示传输失败，其余按状态码+正文回包。
+        fn new(replies: Vec<(u16, &str)>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|(status, body)| crate::live::GatewayReply {
+                            status,
+                            body: body.to_string(),
+                            transport_failed: status == 0,
+                        })
+                        .collect(),
+                ),
+                sent: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent_count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+
+        fn sent_urls(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::live::Gateway for FakeLiveGateway {
+        fn send<'a>(
+            &'a self,
+            request: &'a crate::submit::PreparedRequest,
+        ) -> crate::live::GatewayFuture<'a> {
+            self.sent.lock().unwrap().push(request.url.clone());
+            let mut replies = self.replies.lock().unwrap();
+            let reply = if replies.is_empty() {
+                crate::live::GatewayReply {
+                    status: 0,
+                    body: String::new(),
+                    transport_failed: true,
+                }
+            } else {
+                replies.remove(0)
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn live_creds() -> LiveCreds {
+        LiveCreds {
+            base: "https://example.invalid".into(),
+            api_key: "key".into(),
+            secret: "secret".into(),
+            recv_window_ms: 5_000,
+        }
+    }
+
+    fn seed_live_position(db: &Db) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE app_settings SET value=?1 WHERE key='engine'",
+            [r#"{"enabled":true,"mode":"live"}"#],
+        )
+        .unwrap();
+        conn.execute("UPDATE engine_state SET value='live' WHERE key='mode'", [])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+             peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+             VALUES('BTCUSDT','long',0.5,51000,49000,49000,60000,51000,49000,0.0,1,'open','live');",
+        )
+        .unwrap();
+    }
+
+    async fn live_snapshot() -> crate::providers::TradingSnapshot {
+        use crate::providers::{DemoProvider, PositionSnapshot, SnapshotProvider};
+        let mut snapshot = DemoProvider::with_mark_price(49_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        // 交易所侧确实有这个仓：否则会被判成 venue_sync 直接关掉。
+        snapshot.positions.push(PositionSnapshot {
+            symbol: "BTCUSDT".into(),
+            side: "long".into(),
+            qty: 0.5,
+            entry_price: 51_000.0,
+        });
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn a_position_missing_at_the_venue_is_closed_locally_with_a_trade() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        seed_live_position(&db);
+        let runtime = test_runtime(&db);
+        // 保护单在交易所被触发：快照里已经没有这个仓位。
+        let snapshot = DemoProvider::with_mark_price(49_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert!(plans.is_empty(), "交易所已无此仓，不能再发平仓单");
+        let conn = db.conn.lock().unwrap();
+        let (status, exit_reason, exit_price): (String, String, f64) = conn
+            .query_row(
+                "SELECT status, exit_reason, exit_price FROM positions WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(exit_reason, "venue_sync");
+        assert_eq!(exit_price, 49_000.0, "拿不到成交价时按标记价结算");
+        let order_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM orders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(order_rows, 0, "交易所触发的平仓不该伪造委托");
+        drop(conn);
+        let raw: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='cycle_preview.live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preview: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(preview["venue_closed"][0]["reason"], "venue_sync");
+    }
+
+    #[tokio::test]
+    async fn a_live_stop_is_submitted_settled_and_not_replanned() {
+        let db = test_db();
+        seed_live_position(&db);
+        let runtime = test_runtime(&db);
+        let snapshot = live_snapshot().await;
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert_eq!(plans.len(), 1, "跌破硬止损必须产生平仓计划");
+        assert_eq!(plans[0].side, "SELL");
+        assert_eq!(plans[0].purpose, "stop_loss");
+
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":77,"status":"FILLED","executedQty":"0.5","avgPrice":"49000"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(gateway.sent_count(), 2);
+        assert!(gateway.sent_urls()[1].contains("reduceOnly=true"));
+        assert!(!gateway.sent_urls()[1].contains("positionSide="));
+        {
+            let conn = db.conn.lock().unwrap();
+            let (status, qty): (String, f64) = conn
+                .query_row(
+                    "SELECT status, qty FROM positions WHERE mode='live'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "closed");
+            assert_eq!(qty, 0.0);
+            let (orders, order_status, exchange_id): (i64, String, String) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(status), MAX(exchange_order_id) FROM orders WHERE mode='live'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(orders, 1, "预留行要被推进，不能插出第二条");
+            assert_eq!(order_status, "FILLED");
+            assert_eq!(exchange_id, "77");
+        }
+        // 仓位已平：同一份快照不会再生成计划，重复周期不会重复下单。
+        let replanned = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert!(replanned.is_empty(), "已平的仓不能再出平仓计划");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_live_fill_is_confirmed_by_query_instead_of_resent() {
+        let db = test_db();
+        seed_live_position(&db);
+        let runtime = test_runtime(&db);
+        let plans = runtime
+            .persist_snapshot("live", &live_snapshot().await)
+            .unwrap();
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (0, ""),
+            (
+                200,
+                r#"{"orderId":88,"status":"FILLED","executedQty":"0.5","avgPrice":"48990"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let urls = gateway.sent_urls();
+        assert_eq!(urls.len(), 3, "写请求只发一次，之后是查询");
+        assert!(urls[0].contains("/fapi/v1/positionSide/dual"));
+        assert!(urls[1].contains("/fapi/v1/order?"));
+        assert!(urls[2].contains("origClientOrderId="));
+        let (status, exchange_id): (String, String) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, exchange_order_id FROM orders WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "FILLED");
+        assert_eq!(exchange_id, "88");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_live_order_keeps_the_position_and_reports_the_code() {
+        let db = test_db();
+        seed_live_position(&db);
+        let runtime = test_runtime(&db);
+        let plans = runtime
+            .persist_snapshot("live", &live_snapshot().await)
+            .unwrap();
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (400, r#"{"code":-2019,"msg":"Margin is insufficient."}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| failure.contains("-2019")),
+            "拒单原因必须上报：{failures:?}"
+        );
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM positions WHERE mode='live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open", "被拒的平仓单不能改本地仓位");
+        let order_status: String = conn
+            .query_row("SELECT status FROM orders WHERE mode='live'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(order_status, "REJECTED");
+    }
+
+    #[tokio::test]
+    async fn protection_failure_is_reported_but_the_filled_leg_is_recorded() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"live"}"#],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,51000,50500,49000,60000,51000,49000,0.0,1,'open','live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','BUY','MARKET',0.5,51000,'FILLED','entry','nq-entry','',0,'live');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, r#"{"orderId":101,"status":"NEW"}"#),
+            (400, r#"{"code":-2019,"msg":"Margin is insufficient."}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| failure.contains("保护单")),
+            "止盈挂不上必须让调用方看到：{failures:?}"
+        );
+        let conn = db.conn.lock().unwrap();
+        let (stop, take): (i64, i64) = conn
+            .query_row(
+                "SELECT SUM(purpose='stop_loss'), SUM(purpose='take_profit') FROM orders WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stop, 1, "挂上的那条腿要留痕");
+        assert_eq!(take, 0, "失败的腿不能记成已挂");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_close_is_reconciled_by_the_next_cycle() {
+        let db = test_db();
+        seed_live_position(&db);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
+                 client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','SELL','MARKET',0.5,0,'UNKNOWN','stop_loss','nq-prev','',1,'live')",
+                [],
+            )
+            .unwrap();
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":55,"status":"FILLED","executedQty":"0.5","avgPrice":"48800"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(gateway.sent_count(), 2, "先查模式，再查未知单，不重发");
+        let conn = db.conn.lock().unwrap();
+        let (status, exit_price): (String, f64) = conn
+            .query_row(
+                "SELECT status, exit_price FROM positions WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(exit_price, 48_800.0, "按交易所成交价结算");
+        let (orders, order_status): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(status) FROM orders WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(orders, 1, "对账只推进原订单");
+        assert_eq!(order_status, "FILLED");
+    }
+
+    #[tokio::test]
+    async fn reconciling_a_close_for_an_already_closed_position_only_updates_the_order() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,\
+                 realized_pnl,fees,status,mode) \
+                 VALUES('BTCUSDT','long',0,51000,49000,49000,60000,51000,49000,0.0,1,2,49000,'venue_sync',\
+                 -100.0,0.5,'closed','live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,\
+                 exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','SELL','MARKET',0.5,0,'UNKNOWN','stop_loss','nq-prev','',1,'live');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":66,"status":"FILLED","executedQty":"0.5","avgPrice":"49000"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let conn = db.conn.lock().unwrap();
+        let (status, realized, fees): (String, f64, f64) = conn
+            .query_row(
+                "SELECT status, realized_pnl, fees FROM positions WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(realized, -100.0, "已结算过的仓位不能再记一次盈亏");
+        assert_eq!(fees, 0.5);
+        let order_status: String = conn
+            .query_row("SELECT status FROM orders WHERE mode='live'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(order_status, "FILLED");
+    }
+
+    #[tokio::test]
+    async fn an_inflight_close_blocks_a_second_plan_for_the_same_symbol() {
+        let db = test_db();
+        seed_live_position(&db);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
+                 client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','SELL','MARKET',0.5,0,'UNKNOWN','stop_loss','nq-old','',1,'live')",
+                [],
+            )
+            .unwrap();
+        let runtime = test_runtime(&db);
+        let plans = runtime
+            .persist_snapshot("live", &live_snapshot().await)
+            .unwrap();
+        assert!(
+            plans.is_empty(),
+            "上一轮的平仓单还没结论，这轮再发就是重复平仓"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_protection_leg_is_recorded_and_never_rearmed() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,51000,50500,49000,60000,51000,49000,0.0,1,'open','live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','BUY','MARKET',0.5,51000,'FILLED','entry','nq-entry','',0,'live');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (0, ""),
+            (0, ""),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| failure.contains("未知")),
+            "{failures:?}"
+        );
+        let unknown: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE mode='live' AND status='UNKNOWN' \
+                 AND purpose IN ('stop_loss','take_profit')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 2, "两条腿都要留下未知痕迹");
+
+        let retry = FakeLiveGateway::new(vec![(200, r#"{"dualSidePosition":false}"#)]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &retry, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(retry.sent_count(), 1, "只查模式，未知保护腿不能重挂");
+        assert!(retry.sent_urls()[0].contains("/fapi/v1/positionSide/dual"));
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_position_mode_sends_no_orders() {
+        let db = test_db();
+        seed_live_position(&db);
+        let runtime = test_runtime(&db);
+        let plans = runtime
+            .persist_snapshot("live", &live_snapshot().await)
+            .unwrap();
+        assert!(!plans.is_empty(), "没有计划就测不到停单");
+        let gateway = FakeLiveGateway::new(vec![(500, r#"{"code":-1000}"#)]);
+        let error = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap_err();
+        assert!(error.contains("持仓模式"), "{error}");
+        assert_eq!(gateway.sent_count(), 1);
+        let orders: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM orders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orders, 0, "模式不明不能发单");
+    }
+
+    #[tokio::test]
+    async fn hedge_mode_protects_each_side_of_the_same_symbol() {
+        let db = test_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) VALUES \
+                 ('BTCUSDT','long',0.5,51000,50500,49000,60000,51000,49000,0.0,1,'open','live'), \
+                 ('BTCUSDT','short',0.4,50000,50500,52000,47000,50000,52000,0.0,1,'open','live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) VALUES \
+                 (1,'BTCUSDT','BUY','MARKET',0.5,51000,'FILLED','entry','nq-long','',0,'live'), \
+                 (1,'BTCUSDT','SELL','MARKET',0.4,50000,'FILLED','entry','nq-short','',0,'live');",
+            )
+            .unwrap();
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":true}"#),
+            (200, r#"{"algoId":1}"#),
+            (200, r#"{"algoId":2}"#),
+            (200, r#"{"algoId":3}"#),
+            (200, r#"{"algoId":4}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let urls = gateway.sent_urls();
+        assert_eq!(urls.len(), 5, "一次模式查询加四条保护腿");
+        let long_legs = urls
+            .iter()
+            .filter(|url| url.contains("positionSide=LONG"))
+            .count();
+        let short_legs = urls
+            .iter()
+            .filter(|url| url.contains("positionSide=SHORT"))
+            .count();
+        assert_eq!((long_legs, short_legs), (2, 2));
+        assert!(urls.iter().all(|url| !url.contains("reduceOnly=")));
+        let recorded: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE purpose IN ('stop_loss','take_profit')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 4);
+
+        let again = FakeLiveGateway::new(vec![(200, r#"{"dualSidePosition":true}"#)]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &again, Vec::new())
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(again.sent_count(), 1, "两侧都已挂上，不能再补");
+    }
+
+    #[test]
+    fn reads_engine_interval_with_minimum_floor() {
+        let db = test_db();
+        let config = RuntimeConfig::from_db(&db);
+        assert_eq!(config.interval_sec, MIN_INTERVAL_SEC as u64);
+        assert!(!config.enabled);
+    }
+
+    #[tokio::test]
+    async fn disabled_tick_updates_heartbeat_and_clears_error() {
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        assert!(runtime.tick(&RuntimeConfig::from_db(&db)).await.is_ok());
+        let conn = db.conn.lock().unwrap();
+        let ts: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM engine_state WHERE key='last_cycle_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ts > 0);
+        let error: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='last_error'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabled_tick_refuses_to_fake_cycle_and_records_error() {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"live","cycle_interval_sec":15}"#],
+            )
+            .unwrap();
+            conn.execute_batch("INSERT OR REPLACE INTO engine_state VALUES ('mode','live',0); INSERT INTO engine_state VALUES ('last_cycle_ts','123',0), ('last_cycle_ms','7',0);").unwrap();
+        }
+        let runtime = test_runtime(&db);
+        assert!(runtime.tick(&RuntimeConfig::from_db(&db)).await.is_err());
+        let conn = db.conn.lock().unwrap();
+        let error: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='last_error'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(error.contains("未配置实盘"), "实际错误: {error}");
+        let successful_ts: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='last_cycle_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(successful_ts, "123");
+        let previous_ms: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='last_cycle_ms'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous_ms, "7", "失败的一轮不能刷新成功周期耗时");
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_persisted_without_marking_execution_successful() {
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        runtime
+            .refresh_snapshot("demo", &crate::providers::DemoProvider::new())
+            .await
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='snapshot.demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let snapshot: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(snapshot["markets"][0]["symbol"], "BTCUSDT");
+        assert_eq!(snapshot["account"]["equity"], 10_000.0);
+        assert_eq!(snapshot["positions"], serde_json::json!([]));
+        let raw_metrics: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='candle_metrics.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metrics: Value = serde_json::from_str(&raw_metrics).unwrap();
+        assert_eq!(metrics["BTCUSDT"]["atr_pct"], 0.0);
+        assert_eq!(metrics["BTCUSDT"]["vol_ratio"], 1.0);
+        assert!(conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='last_cycle_ts'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn position_differences_are_scoped_to_mode_symbol_and_side() {
+        let db = test_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO positions(symbol, side, qty, mode, status) VALUES ('BTCUSDT','long',2,'demo','open'),
+                 ('BTCUSDT','short',1,'demo','open'), ('ETHUSDT','long',4,'live','open'),
+                 ('SOLUSDT','short',1,'demo','closed');",
+            )
+            .unwrap();
+        let runtime = test_runtime(&db);
+        use crate::providers::{DemoProvider, PositionSnapshot, SnapshotProvider};
+        let mut snapshot = DemoProvider::new().snapshot().await.unwrap();
+        snapshot.positions.push(PositionSnapshot {
+            symbol: "BTCUSDT".into(),
+            side: "short".into(),
+            qty: 1.0,
+            entry_price: 100.0,
+        });
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='position_differences.demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["differences"],
+            serde_json::json!([
+                {"symbol":"BTCUSDT","side":"long","local_qty":2.0,"venue_qty":0.0}
+            ])
+        );
+        let rows: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn missing_open_order_remains_pending_and_is_reported() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        db.conn.lock().unwrap().execute_batch(
+            "INSERT INTO orders(symbol, client_order_id, exchange_order_id, mode, status) VALUES
+             ('BTCUSDT','entry-1','','demo','pending'),
+             ('BTCUSDT','live-1','','live','NEW'),
+             ('BTCUSDT','done-1','15','demo','FILLED');",
+        ).unwrap();
+        let snapshot = DemoProvider::new().snapshot().await.unwrap();
+        test_runtime(&db)
+            .persist_snapshot("demo", &snapshot)
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let report: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='order_differences.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&report).unwrap(),
+            serde_json::json!({
+                "local_only": [{"symbol":"BTCUSDT","client_order_id":"entry-1","exchange_order_id":""}],
+                "venue_only": []
+            })
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM orders WHERE client_order_id='entry-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[tokio::test]
+    async fn rejected_snapshot_timestamp_rolls_back_snapshot() {
+        let db = test_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO positions(symbol, side, qty, mode, status) VALUES ('BTCUSDT','long',-1,'demo','open');
+             CREATE TRIGGER reject_timestamp BEFORE INSERT ON engine_state
+             WHEN NEW.key = 'snapshot_ts.demo' BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+            )
+            .unwrap();
+        let runtime = test_runtime(&db);
+        assert!(runtime
+            .refresh_snapshot("demo", &crate::providers::DemoProvider::new())
+            .await
+            .is_err());
+        let exists: bool = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key='snapshot.demo')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn stop_signal_interrupts_the_interval_wait() {
+        let db = test_db();
+        let (tx, rx) = stop_channel();
+        let task = tokio::spawn(test_runtime(&db).run(rx));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_tick = db
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key='last_cycle_ts')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap();
+                if has_tick {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("首次停用 tick 应及时写入心跳");
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("停止信号应打断周期等待")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn already_stopped_worker_does_not_write_a_tick() {
+        let db = test_db();
+        let (tx, rx) = stop_channel();
+        tx.send(true).unwrap();
+        test_runtime(&db).run(rx).await;
+        let writes: i64 = db.conn.lock().unwrap().query_row("SELECT count(*) FROM engine_state WHERE key IN ('last_cycle_ts', 'last_cycle_ms', 'last_error')", [], |r| r.get(0)).unwrap();
+        assert_eq!(writes, 0, "收到停止信号后不能执行新的周期");
+    }
+
+    #[tokio::test]
+    async fn closing_a_demo_trade_triggers_review_and_preserves_injected_ids() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"demo"}"#],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_settings VALUES('evolution',\
+                 '{\"enabled\":true,\"review_on_close\":true,\"batch_review_size\":5}',0)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode,features) \
+                 VALUES('BTCUSDT','long',0.5,51000,51000,50000,60000,51000,50000,0.0,1,'open','demo',\
+                 '{\"injected_mantra_ids\":[1],\"injected_experience_ids\":[2]}');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let snapshot = DemoProvider::with_mark_price(50_000.0)
+            .snapshot()
+            .await
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let (features, trade_id): (String, i64) = conn
+                .query_row(
+                    "SELECT features, trade_id FROM positions WHERE symbol='BTCUSDT'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(trade_id > 0, "平仓成交必须回填到仓位");
+            let trade_features: String = conn
+                .query_row(
+                    "SELECT features FROM trades WHERE id=?1",
+                    [trade_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(features, trade_features, "成交记录要携带决策时的注入 ID");
+            assert!(trade_features.contains("injected_experience_ids"));
+        }
+        let mut seen = false;
+        for _ in 0..100 {
+            {
+                let conn = db.conn.lock().unwrap();
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM engine_events WHERE category='evolution'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if count > 0 {
+                    seen = true;
+                }
+            }
+            if seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            seen,
+            "平仓提交后必须触发复盘并留下事件（样本不足时记录跳过原因）"
+        );
+    }
+
+    #[test]
+    fn trade_policy_adx_filter_uses_strategy_settings() {
+        let strategy = serde_json::json!({"adx_filter": false, "adx_min": 30.0});
+        let risk = serde_json::json!({"adx_min": 40.0});
+        let policy = EngineRuntime::trade_policy(&strategy, &risk, "trend");
+        assert_eq!(policy.adx_min, 0.0, "关闭趋势过滤时不能沿用风控默认值");
+
+        let strategy = serde_json::json!({"adx_filter": true, "adx_min": 25.0});
+        let policy = EngineRuntime::trade_policy(&strategy, &risk, "trend");
+        assert_eq!(policy.adx_min, 25.0, "开启趋势过滤时应读取策略组 adx_min");
+    }
+
+    fn test_db() -> Db {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
+        Db {
+            path: String::new(),
+            conn: Arc::new(std::sync::Mutex::new(conn)),
+        }
+    }
+}

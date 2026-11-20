@@ -5,7 +5,6 @@
 **小资金币安合约量化终端 · 最低 1 USDT 起 · 1–100x 杠杆 · AI 辅助决策 · 自进化心法**
 
 <p>
-  <img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI">
   <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white" alt="Vue 3">
   <img src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
@@ -33,7 +32,7 @@
 > **持仓与账户浮盈亏同源同刻**、**K 线价格精度/静态价格/单根竞态修复**、
 > **心法 AI 语义替代、旧版本自动删除与存量去重**、
 > **决策经验闭环（日志→打标→RAG 经验库）、K 线工作台移前台首页、备份还原支持上传文件、登录限流按 IP 与改密吊销旧 token**。
-> 逐项过程与实测数据见 [`docs/TASKS.md`](docs/TASKS.md) #56–#76。
+> 逐项过程与实测数据见 [`docs/archive/history/docs/TASKS.md`](docs/archive/history/docs/TASKS.md) #56–#76。
 
 ## ✨ 特性
 
@@ -55,8 +54,8 @@
 | 📊 **权威盈亏口径** | 持仓浮盈亏直接取交易所 `positionRisk.unRealizedProfit`（按 markPrice 结算，与保护单一致）；账户接口抖动时沿用上次读数而不是刷成 0 |
 | 🛡 **容错与可观测** | 写库单队列 + 死信补偿页、事件总线、9 项一键诊断、慢 SQL 日志、抖动探针、可选 IP 限频与 `/metrics` |
 | 💾 **选择性备份** | 任意勾选配置组与数据文件，SHA-256 校验，还原前自动快照，主密钥不入包 |
-| 🧰 **一键部署** | 宝塔式一条命令在线安装（`install.sh` 引导脚本，curl/wget 自动兜底）；另有 `install.ps1` / Docker Compose 与 systemd unit（主服务 + sidecar，最小权限硬化） |
-| 🩺 **主网演练手册** | [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md) 给出三段演练判据与回滚；`scripts/mainnet_preflight.py --yes` 用实盘凭证做只读预检（不碰下单） |
+| 🧰 **一键部署** | Linux 一条命令在线安装（`install.sh` 引导脚本，curl/wget 自动兜底）；systemd 或 nohup，主服务 + sidecar 最小权限硬化 |
+| 🩺 **主网演练手册** | [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md) 给出三段演练判据与回滚；`nanoquant ops preflight --yes` 用实盘凭证做只读预检（不碰下单） |
 
 ---
 
@@ -92,26 +91,25 @@
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Python | **3.11+** | 必需。`backend/requirements.txt` 是按 3.11 编译的锁文件，CI 覆盖 3.11 / 3.12 / 3.13 |
-| Node.js | 18+ | 可选，仅构建前端时需要；不装则没有面板，API 与引擎照常工作 |
-| 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下 |
-| 系统 | Linux（可选 systemd）/ Windows 10+ / macOS | 常驻运行建议 Linux + systemd |
+| Rust | **1.88+** | 构建期需要；产物 `rust/nanoquant/target/release/nanoquant` 运行期不依赖解释器 |
+| Node.js | **20+** | 仅构建前端时需要；也可在 CI 构建 `frontend/dist` 后只用 `--no-frontend` |
+| 磁盘 | ≥ 2 GB 可用 | SQLite、备份、日志都在 `data/` 下；安装脚本会预检 |
+| 系统 | **Linux only** | 支持 Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE；systemd 或 nohup |
 
 ### 方式一：一条命令在线安装（推荐，Linux）
 
 不用先 `git clone`，复制下面整行到终端回车即可（`curl` 缺失会自动改用 `wget`）：
 
 ```bash
-if [ -f /usr/bin/curl ];then curl -sSO https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;else wget -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --password '你的密码'
+if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh -o install.sh;else wget --https-only -O install.sh https://raw.githubusercontent.com/qiuyuec-qyacgcom/nanoquant/main/install.sh;fi;bash install.sh --install-deps --password '你的密码' --systemd
 ```
 
 > 引导脚本 `install.sh` 会先下载完整代码（git 优先，无 git 自动改用 tarball 解压），
 > 再转交 `scripts/install.sh` 完成依赖安装；`--dir <目录>` 可指定安装位置（默认 `./nanoquant`），
-> 其余参数（`--systemd` / `--mirror` / `--port` 等）全部透传，见下表。
+> 其余参数全部透传，见下表。
 >
-> 装完会**自动在后台启动**，无需再手动 `start.sh --daemon`（想自己控制启动时机加 `--no-start`）。
-> 生产部署想顺便注册开机自启：把命令尾部换成
-> `bash install.sh --password '你的密码' --systemd`。
+> root 且 systemd 可用时默认注册并启动 systemd 服务；否则自动用 `start.sh --daemon` 启动。
+> 想只安装不启动加 `--no-start`；没有 systemd 的机器加 `--no-systemd`。
 
 ### 获取代码（手动，可选）
 
@@ -125,46 +123,37 @@ cd nanoquant
 ### 方式二：本地脚本（等同引导脚本转交的那一步）
 
 ```bash
-# Linux / macOS
-bash scripts/install.sh        # 装依赖 + 建前端产物 + 准备目录 + 装完自动后台启动
-bash scripts/status.sh         # 查看状态
-bash scripts/stop.sh           # 停止
-bash scripts/start.sh --daemon # 手动重新后台启动（机器重启后，或装时加了 --no-start）
+sudo bash scripts/install.sh --install-deps --systemd   # 生产：创建 nanoquant 用户并注册 systemd
+bash scripts/install.sh --no-systemd                    # 无 systemd：nohup 启动
+bash scripts/status.sh                                  # 查看状态
+bash scripts/stop.sh                                    # 停止
+bash scripts/start.sh --daemon                          # 手动重新后台启动
 ```
 
-```powershell
-# Windows PowerShell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-powershell -ExecutionPolicy Bypass -File scripts\start.ps1
-powershell -ExecutionPolicy Bypass -File scripts\stop.ps1   # 按命令行匹配停止，不误杀其它 Python
-```
+参数：
 
-参数（`install.sh` 与 `install.ps1` 一一对应）：
+| 参数 | 作用 |
+|---|---|
+| `--systemd` / `--no-systemd` | 强制 systemd 或 nohup；默认自动检测 |
+| `--install-deps` | 自动安装 gcc/make/perl/curl 等构建依赖 |
+| `--install-rust` / `--install-node` | 缺少 Rust / Node.js 20+ 时自动安装 |
+| `--password-stdin` / `--password-file` | 安全传入首次管理员密码（避免 shell 历史） |
+| `--port 9000` | 改端口；写入 `data/.port`，之后启动不用再传 |
+| `--no-frontend` / `--force-frontend` | 跳过前端构建 / 强制重建前端 |
+| `--skip-build` / `--skip-deps` | 复用二进制 / 跳过工具链检查 |
+| `--user <name>` | systemd 运行用户；默认自动创建 `nanoquant` |
+| `--no-start` / `--no-restart` | 只安装不启动 / 不重启已运行服务 |
+| `--offline` | cargo/npm 离线模式（依赖需已缓存） |
+| `--check` | 只检查环境与产物，不修改文件 |
 
-| Linux | Windows | 作用 |
-|---|---|---|
-| `--port 9000` | `-Port 9000` | 改端口；写入 `data/.port`，之后 `start` 不用再传 |
-| `--systemd` | — | 注册开机自启，并等 `/api/v1/health` 通过才报完成 |
-| `--no-frontend` | `-SkipFrontend` | 跳过前端构建（已有 `dist` 或只跑后端） |
-| `--mirror cn` | `-Mirror cn` | pip 换清华源（`aliyun` / 完整 URL 亦可） |
-| `--password 'xxx'` | `-Password 'xxx'` | 指定初始管理员密码（≥ 8 位）；不传则安装脚本随机生成、装完打印 |
-| `--force` | `-Force` | 忽略 `requirements.txt` 哈希，强制重装依赖 |
-| `--no-pyenv` | — | 不自动用 pyenv 编译 Python（自己管理解释器时用） |
-| `--no-start` | — | 装完不自动后台启动（默认装完即后台运行） |
-| — | `-Python <路径>` | PATH 里没有 `python` 时指定解释器 |
+安装脚本做了什么（**可反复执行**）：
 
-安装脚本做了什么（**可反复执行**，已完成的步骤自动跳过）：
-
-1. 校验 Python 3.11+、Node 18+（缺 Node 只警告，不中止）
-2. 创建或复用 `.venv`；按 `requirements.txt` 的 SHA256 判断要不要重装依赖
-3. 装完跑 `import nanoquant.main` 自检 —— 只有 import 通过才算装好
-4. `npm ci` + `npm run build` 生成 `frontend/dist`
-5. 建 `data/`、`logs/`、`data/backups/`，把端口写进 `data/.port`
-6. `--systemd` 时注册服务并轮询健康检查（30s 超时，失败会打印 `journalctl` 命令）
-7. 装完自动后台启动：`--systemd` 走 systemd 接管；否则等价 `start.sh --daemon` 并轮询健康检查（`--no-start` 跳过）
-
-> Git Bash / Cygwin 下 `install.sh` 会直接拒绝并提示改用 `install.ps1`：那里没有 systemd、
-> venv 是 `Scripts\` 布局，"装成功了"只会在启动时才炸。
+1. 按发行版包管理器检查/安装 gcc、make、perl、curl；校验 Rust 1.88+、Node.js 20+
+2. `cargo build --release --locked` 构建 Rust 后端，并备份旧二进制用于失败回滚
+3. 前端源码比 dist 新时 `npm ci` + `npm run build` 自动重建
+4. 建 `data/`、`logs/`、`data/backups/`，收紧 0700/0600 权限；不覆盖数据库与主密钥
+5. systemd 模式创建 `nanoquant` 用户、生成硬化 unit、重启并做 `/api/v1/health` 检查
+6. 失败时尝试恢复旧二进制/旧 unit；一次性密码文件在成功后自动删除
 
 验证安装：
 
@@ -176,15 +165,12 @@ curl http://127.0.0.1:8899/api/v1/health    # {"ok": true, "app": "NanoQuant", .
 
 **首次登录：账号 `admin`，密码按下面的顺序确定**：
 
-1. 安装时指定过：`install.sh --password '...'` / `install.ps1 -Password '...'`（≥ 8 位）—— 用你指定的；
-2. 设了环境变量 `NANOQUANT_ADMIN_PASSWORD` —— 用它；
-3. 都没指定 —— **安装脚本自己生成 16 位随机密码，装完直接在结尾打印**（无需再去翻启动日志）。
-
-无论哪种，安装完成时脚本都会把初始密码直接打印出来。
+1. 安装时指定过：`NANOQUANT_ADMIN_PASSWORD` 环境变量；
+2. 都没指定 —— Rust 首启生成 16 位随机密码，写入日志并标记必须改密。
 
 随机密码登录后**必须先改密**：改密前，后台除登录/改密/健康检查外的接口一律返回 `403`
 （`code=password_change_required`），前端会把你送到「参数配置 → 安全」。
-忘记密码用 `python scripts/reset_password.py` 重置（重置后仍需改密）。
+忘记密码用 `nanoquant ops reset-password` 重置（重置后仍需改密）。
 
 > 安装脚本的密码只以明文暂存在 `data/.admin_password`（权限 600），首次启动写入数据库后
 > 立即删除；脚本随机生成的密码会额外留一个 `data/.admin_password_generated` 空标记文件，
@@ -200,20 +186,15 @@ docker compose up -d
 ### 方式四：手动
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r backend/requirements.txt             # 锁定版本；源头是 backend/requirements.in
+cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
 cd frontend && npm ci && npm run build && cd ..
-
-cd backend
-python -m nanoquant        # 首次启动自动建库并创建 admin
+scripts/start.sh        # 前台启动；生产用 systemd 或 scripts/start.sh --daemon
 ```
 
-`start.ps1` 按 `-Python` → 无 `-Port` 时的 `data/.port` → `NANOQUANT_VENV` → 仓库 `.venv` →
-上级 `.venvtest` 顺序探测解释器，迁移目录后不会因找不到虚拟环境而启动失败。
-
-> 生产守护（systemd）：主服务与 sidecar 的 unit 文件见 [`deploy/`](deploy/README.md)，含最小权限硬化与 UDS `0600` 权限设置。
+> 生产守护（systemd）：`scripts/install.sh --systemd` 会自动创建 `nanoquant` 用户、生成硬化 unit，
+> 并等 `/api/v1/health` 通过才报完成。sidecar 必须使用同一用户访问 0600 的 UDS。
 > 上主网前请先读 [`docs/MAINNET_DRILL.md`](docs/MAINNET_DRILL.md)（三段演练、判据、回滚），并跑一次
-> `python scripts/mainnet_preflight.py --yes` 只读预检。
+> `nanoquant ops preflight --yes` 只读预检。
 
 ### 环境变量
 
@@ -225,12 +206,11 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 | `NANOQUANT_LOG_DIR` | `$HOME/logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 主密钥；**丢失后已加密的 API 密钥无法解密** |
 | `NANOQUANT_BACKUP_MIRROR` | 空（不启用） | 备份异盘副本目录，如 `F:/nanoquant-backups`。主库/日志/备份都在 `data/` 下，同一块盘写满就一起没；指向另一块盘后每次备份会多抄一份（镜像失败不影响本地备份） |
-| `NANOQUANT_ADMIN_PASSWORD` | 空（随机生成） | **仅首次启动建管理员时生效**：指定初始密码，不设则随机 16 位并打印在日志里。之后改密请走面板或 `scripts/reset_password.py` |
+| `NANOQUANT_ADMIN_PASSWORD` | 空（随机生成） | **仅首次启动建管理员时生效**：指定初始密码，不设则随机 16 位并打印在日志里。之后改密请走面板或 `nanoquant ops reset-password` |
 | `NANOQUANT_FRONTEND` | `$HOME/frontend/dist` | 前端产物目录 |
-| `NANOQUANT_VENV` | 空 | Windows 启动脚本的虚拟环境目录（迁移场景） |
 | `EXEC_SOCKET` | 空 → `/run/nanoquant/exec.sock` | sidecar 地址，如 `unix:/run/nanoquant/exec.sock` / `tcp:127.0.0.1:9101`；参数页 `exec_socket` 优先 |
 | `EXEC_SECRET` | 无 | sidecar 使用的签名 Secret（生产放 `EnvironmentFile`，权限 `0600`） |
-| `EXEC_TCP` | 空 | Windows / 容器联调用的回环 TCP 地址，如 `127.0.0.1:9101` |
+| `EXEC_TCP` | 空 | 容器/本机联调用的回环 TCP 地址，如 `127.0.0.1:9101` |
 | `E2E_BASE_URL` / `E2E_CHANNEL` | `http://127.0.0.1:8899` / 空 | Playwright 冒烟目标与浏览器通道（如 `msedge`） |
 | `NANOQUANT_DEBUG` / `NANOQUANT_SALT` | `false` / 内置值 | 调试开关 / 口令盐 |
 
@@ -242,31 +222,30 @@ python -m nanoquant        # 首次启动自动建库并创建 admin
 
 ```
 nanoquant/
-├── backend/nanoquant/
-│   ├── engine/          # 交易引擎：主循环、信号、风控、出场规则、指标
-│   ├── exchange/        # 币安行情 + 签名客户端（exec_client：sidecar 长连接）、执行层、精度与限频
-│   ├── ai/              # 多模型调用、JSON 契约决策、议会聚合、诊断
-│   ├── evolution/       # 复盘、心法库、防污染审计、effectiveness（采用/未采用对照）
-│   ├── journal/         # 决策留痕、24h 回访打标、场景经验库与相似度检索（决策级闭环）
-│   ├── news/            # 资讯源适配、情绪打分、聚合与源体检
-│   ├── backtest/        # 回测引擎 + 参数网格 + walkforward（与实盘共用策略函数）
-│   ├── services/        # 配置热更新、运行态、事件总线、标的池、备份、写库队列、api_guard、
-│   │                    # exec_shadow、position_view（权威盈亏口径）、诊断
-│   ├── api/routes/      # auth / system / symbols / trade / backtest / ai / evolution / news / backup / public / ws
-│   └── main.py          # FastAPI 装配 + SPA 托管
+├── rust/nanoquant/src/
+│   ├── engine / trade_policy / risk / manage  # 交易引擎：主循环、信号、风控、出场规则、指标
+│   ├── providers / live / submit / sign / reconcile  # 币安行情 + 签名客户端、执行层、精度与限频
+│   ├── ai_providers / ai_client / ai_analysis / ai_market / reasoning  # 多模型调用、JSON 契约决策、议会聚合、诊断
+│   ├── evolution / evolution_review  # 复盘、心法库、防污染审计、effectiveness（采用/未采用对照）
+│   ├── journal / journal_api  # 决策留痕、24h 回访打标、场景经验库与相似度检索（决策级闭环）
+│   ├── news  # 资讯源适配、情绪打分、聚合与源体检
+│   ├── history / backtest / backtest_engine  # 回测引擎 + 参数网格 + walkforward（与实盘共用策略函数）
+│   ├── settings / runtime / events / symbols / backup / archive / system / scan  # 配置热更新、运行态、
+│   │                    # 事件总线、标的池、备份、写库队列、诊断、扫描准入
+│   ├── engine_actions / protection_api / public / ws / signal_follow  # 交易控制、保护单、公开契约、WS、信号跟单
+│   ├── cli.rs           # `nanoquant ops <command>` 运维命令
+│   └── main.rs          # 装配 + SPA 托管
 ├── frontend/src/
 │   ├── views/site/      # 公开前台（首页 / 观点 / 关于）
 │   ├── views/           # 后台页面
 │   ├── components/      # EChart / EnvironmentSwitch / Modal / EventFeed ...
 │   └── layouts/         # SiteLayout（前台）/ ShellLayout（后台）
 ├── frontend/e2e/        # Playwright 冒烟（首页 / 登录 / 4 个后台关键面板）
-├── rust/exec-service/   # 执行内核 sidecar（P2：只签名不下单，UDS + JSON Lines）
+├── rust/exec-service/   # 执行内核 sidecar（只签名不下单，UDS + JSON Lines）
 ├── deploy/              # systemd unit（主服务 + sidecar）与部署说明
-├── scripts/             # install / start / stop / status + 压测/对账/校验/主网预检工具
-├── backend/tests/       # 契约 + 路由测试（临时目录隔离）/ smoke / evolution / ai / news 探测
-├── backend/requirements.in / requirements.txt   # 直接依赖 → 锁定版本
-├── docs/                # RESEARCH 调研 / TASKS 任务书 / EXEC_PROTOCOL 协议 / MAINNET_DRILL 演练手册
-├── .github/workflows/   # CI：pytest / typecheck+build / cargo test / Playwright e2e
+├── scripts/             # install / start / stop / status / supervise 与迁移期验证脚本
+├── docs/                # RUNBOOK / MAINNET_DRILL / EXEC_PROTOCOL 等运维文档
+├── .github/workflows/   # CI：cargo fmt/clippy/test / 前端 typecheck+build / Playwright e2e / 零解释器依赖门禁
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -326,28 +305,27 @@ AI 每次方向判断（开多/开空）另留一份「决策快照」，24 小�
 
 ## 🧩 执行内核 sidecar
 
-把"签名"这件最不能出错的事交给 Rust：Python 算完签名后另送一份给 sidecar，
+把"签名"这件最不能出错的事交给 sidecar：主服务算完签名后另送一份给 sidecar，
 **逐字节比对**成功才继续。sidecar 只持有 Secret 并回传签名，不接触账户、持仓与订单。
 
 | 模式 | 关键路径开销 | 行为 |
 |---|---|---|
-| `off`（默认） | 无 | 只用 Python 本地签名 |
+| `off`（默认） | 无 | 只用主服务本地签名 |
 | `shadow` | 后台任务，**零阻塞** | 每次签名旁路比对，只统计；抽样比例可调 |
 | `enforce` | 同步 +0.5–1ms | 不一致**立即拒绝下单**（转 `-1022`） |
 
-- **只有不一致才 fail-closed**：sidecar 连不上/超时一律降级回 Python 签名，并进入 5s 静默，
+- **只有不一致才 fail-closed**：sidecar 连不上/超时一律降级回主服务签名，并进入 5s 静默，
   不会让每一单都等一次超时；
 - 比对延迟口径是 **sidecar 真实往返**（锁内计时），不含排队；掉线时最大延迟≈超时值；
 - 不一致会写入事件总线（error 级 → 值班告警），并在系统页留 `local/remote/echo` 三份摘要；
 - 切流判据是 `mismatched == 0` 且自检通过，**不是"连上了"**。
 
 配置：参数页「系统 → 执行内核（sidecar）」——`exec_mode` / `exec_socket` / `exec_sample_pct` / `exec_timeout_ms`。
-协议细节与时间线见 [`docs/EXEC_PROTOCOL.md`](docs/EXEC_PROTOCOL.md)，当前进度见 [`docs/TASKS.md`](docs/TASKS.md)。
+协议细节与时间线见 [`docs/EXEC_PROTOCOL.md`](docs/EXEC_PROTOCOL.md)，当前进度见 [`docs/archive/history/docs/TASKS.md`](docs/archive/history/docs/TASKS.md)。
 
-> P2 已完成并**已编译验证**：Rust 二进制（release 0.91MB）在真实测试网 Ed25519 凭证下与 Python 逐字节一致，
-> `shadow` p50 0.50ms / p99 1.18ms，`enforce` p50 0.18ms / p99 0.40ms；错误密钥会被判为不一致、进程被杀 3s 内降级。
-> 尚未覆盖：Linux UDS 部署、systemd 守护、`enforce` 24h 灰度；P3（接管下单）未开始。构建与验证命令见
-> [`rust/README.md`](rust/README.md)。
+> **历史记录（迁移期，已退役、不可执行）**：P2 阶段 Rust sidecar 与旧内核逐字节一致的编译验证结果已归档到
+> `.codeartsdoer/specs/rust_full_migration/evidence/`。当前 sidecar 由 Rust 主服务直接调用，
+> `shadow` / `enforce` 行为不变；构建与验证命令见 [`归档：rust/README.md`](docs/archive/history/rust/README.md)。
 
 ---
 
@@ -407,13 +385,14 @@ AI 每次方向判断（开多/开空）另留一份「决策快照」，24 小�
 ## 🧪 测试
 
 ```bash
-cd backend
-python -m pytest tests -q         # 契约 70 + 路由 17（不联网、不碰真实 data/）
-python tests/smoke_test.py        # 端到端：登录→标的池→引擎→信号→备份→SPA
-python tests/evolution_test.py    # 自进化闭环：平仓→复盘→心法→去重→防污染
-python tests/ai_test.py           # AI 链路：诊断/测试/演练/议会（需本地 Mock 模型）
-python tests/mock_llm.py          # 启动本地 Mock OpenAI 兼容服务
-python tests/news_probe.py        # 资讯源体检
+cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+cargo fmt --all --manifest-path rust/nanoquant/Cargo.toml --check
+cargo clippy --all-targets --manifest-path rust/nanoquant/Cargo.toml -- -D warnings
+cargo test --release --locked --manifest-path rust/nanoquant/Cargo.toml   # 单元/契约/路由（临时库隔离）
+cargo test --release --locked --manifest-path rust/exec-service/Cargo.toml
+npm --prefix frontend run typecheck
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
 契约测试覆盖：部分止盈 R 计算、阶梯止盈档位、出场优先级、配置校验、分位耗时、回测与参数网格、
@@ -424,35 +403,33 @@ python tests/news_probe.py        # 资讯源体检
 紧凑协议 v2 的 token 裁剪 / v1-v2 自动探测 / 枚举码中文转译 / 截断归因、
 下单数量与价格的步进精度格式化与 `-1111` 文案、心法语义替代 / 冷却 / AI 点名替代 / 存量去重 /
 复盘后自动删除旧版本。
-路由测试覆盖鉴权、配置校验、回测/信号汇总与只读观测接口，运行在临时目录（`tests/conftest.py` 强制隔离）。
+路由测试覆盖鉴权、配置校验、回测/信号汇总与只读观测接口，运行在临时目录（Rust 测试用临时库隔离）。
 
 签名链路与性能工具（需在仓库根目录执行）：
 
 ```bash
-python scripts/verify_sidecar.py                                        # 自起 mock，协议 + 签名比对
-EXEC_SECRET=... python scripts/verify_sidecar.py --target unix:/run/nanoquant/exec.sock  # 真实 sidecar 逐字节复核
-python scripts/verify_sidecar.py --target tcp:127.0.0.1:9101            # Windows 回环 TCP（不传 Secret 只验协议）
-python scripts/mock_exec_sidecar.py --port 9101 --secret "$SECRET"      # 本地 mock sidecar（联调）
-python scripts/bench_exec.py --orders 200 --delay-ms 60                 # 分阶段耗时压测
-python scripts/p99_real.py --orders 15 --per-minute 5                   # 真实网络 p99 采样
-python scripts/rtt_probe.py --target testnet --seconds 60               # 交易所 RTT 采样
-python scripts/reconcile.py --self-test                                 # 回测/实盘对账（或 --backtest/--live 传 CSV）
-python scripts/verify_partial_tp.py                                     # 部分止盈边界复核
-python scripts/mainnet_preflight.py --yes                               # 主网演练前只读预检
+nanoquant ops verify-sidecar                                            # 自起 mock，协议 + 签名比对
+EXEC_SECRET=... nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock  # 真实 sidecar 逐字节复核
+nanoquant ops verify-sidecar --target tcp:127.0.0.1:9101                 # 容器/本机回环 TCP（不传 Secret 只验协议）
+nanoquant ops mock-exec-sidecar --port 9101 --secret "$SECRET"           # 本地 mock sidecar（联调）
+nanoquant ops bench-exec --orders 200 --delay-ms 60                      # 分阶段耗时压测
+nanoquant ops p99-real --orders 15 --per-minute 5                        # 真实网络 p99 采样
+nanoquant ops rtt-probe --target testnet --seconds 60                    # 交易所 RTT 采样
+nanoquant ops reconcile --self-test                                      # 回测/实盘对账（或 --backtest/--live 传 CSV）
+nanoquant ops verify-partial-tp                                          # 部分止盈边界复核
+nanoquant ops preflight --yes                                            # 主网演练前只读预检
 ```
 
-前端 e2e 冒烟（需先启动服务；Windows 用系统 Edge 免下载浏览器）：
+前端 e2e 冒烟（Linux，需先启动服务）：
 
-```powershell
+```bash
 cd frontend
-$env:E2E_CHANNEL = 'msedge'
 npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash 模式
 ```
 
-> CI：`.github/workflows/ci.yml` 在 push / PR 时跑 `compileall + pytest tests`（后端）、
-> `npm ci + typecheck + build`（前端）、`cargo test --release`（Rust）与
-> 临时库起服务的 Playwright 冒烟（chromium）。
-> 依赖版本由 `backend/requirements.txt` 锁定，源头是同目录的 `requirements.in`。
+> CI：`.github/workflows/ci.yml` 在 push / PR 时跑 Rust 双 crate 的 fmt/clippy/test、
+> 前端 `npm ci + typecheck + test + build`、临时库起 Rust 服务的 Playwright 冒烟，
+> 以及零解释器依赖的仓库/运行时门禁、镜像断言与 `ops contract-diff`。
 
 ---
 
@@ -461,7 +438,7 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - **一键诊断（9 项）**：数据库 / 写库队列 / 落库补偿 / 交易所接入 / 交易通道 / 引擎心跳 / AI 模型 / 存储 / 执行内核；
   每项给结论与耗时，异常项直接指向下一步。
 - **事件总线**：warn/error 落库 + 实时推送（WS），可配置 Webhook / Telegram、静默时段、摘要合并、冷却去重。
-- **运行态探针**：`/system/runtime` 给出事件循环 lag 分位与 GC 暂停峰值/累计，用来区分"网络慢"还是"Python 自己卡"。
+- **运行态探针**：`/system/runtime` 给出事件循环 lag 分位与 GC 暂停峰值/累计，用来区分"网络慢"还是"服务自身卡顿"。
 - **死信补偿**：写库失败进 `dead_letters`，后台重放或忽略；`/system/write-health` 给出积压与最近耗时。
 - **归档**：过期事件/信号先 gzip 到 `data/archive/` 再批量删除，可在系统页预览。
 - **备份**：选择性打包 + SHA-256 校验，还原前自动快照；主密钥不入包（换机需另行迁移 `data/.master_key`）。
@@ -498,7 +475,7 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
   Anthropic 走 `thinking.budget_tokens`（low 2k → max 64k，`max_tokens` 自动调大），
   OpenAI 兼容走 `reasoning_effort`（只对推理型模型注入）。网关不支持该参数时会自动移除并重试一次，
   不会导致整次调用失败。
-- **推理模型库**：`ai/reasoning.py` 维护 14 个模型族（GPT-6/5、o 系列、GPT-OSS、Claude 3.7+/4、
+- **推理模型库**：`rust/nanoquant/src/reasoning.rs` 维护 14 个模型族（GPT-6/5、o 系列、GPT-OSS、Claude 3.7+/4、
   Gemini 2.5/3、DeepSeek V4/R1、Qwen3/QwQ、Kimi K2.7/K3、GLM-5、MiniMax M2、MiMo V2、Grok），
   另有一张负向表避免 `gpt-4o/qwen2.5/llama/-chat` 被误判。`GET /ai/reasoning-models?model=` 返回
   匹配结果与逐档可用性；xhigh/max 仅旗舰推理模型可用，选了会自动回退。
@@ -516,7 +493,7 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 - [x] 写库单队列 + 死信补偿 + 事件循环抖动探针
 - [x] 路由层测试 + 依赖锁定 + CI 覆盖 Rust / 前端 e2e
 - [x] 心法注入快照与「采用 vs 未采用」效果对照（观察性统计）+ 命中率回写
-- [x] 主网演练手册与只读预检工具；systemd 部署 unit 与 Windows 启停脚本
+- [x] 主网演练手册与只读预检工具；Linux 启停与 systemd 部署 unit
 - [x] 组合风险控制：同向持仓上限 + 波动率目标仓位
 - [x] API 限频 + Prometheus `/metrics` 指标
 - [x] 轮询成本优化：资金费率缓存 / flat 信号合并 / 15s 下限
@@ -550,20 +527,12 @@ npm run e2e       # 首页 / 登录 / 4 个后台关键面板，路由是 hash �
 **Q：装完打开面板到处报"请求失败"，或者接口返回 `403 password_change_required`？**
 A：这是初始密码保护：初始密码（随机的或安装时指定的）只允许登录和改密，其它后台接口一律拒绝。
 登录后前端会把你送到「参数配置 → 安全」，改一次密码即全部恢复（标记自动清除）。
-忘记密码用 `python scripts/reset_password.py`。
+忘记密码用 `nanoquant ops reset-password`。
 
-**Q：安装脚本说找不到 Python 3.11+，但机器上明明装了？**
-A：多半是没加进 PATH。Windows 上用 `-Python C:\Python311\python.exe` 指定路径；Linux 上确认
-`python3.11 -V` 能跑。脚本也会依次尝试 `py -3.13` / `py -3.12` / `py -3.11` / `python` / `python3` 以及
-常见安装目录，实在找不到才报错。
-
-**Q：`pip install` 卡住或超时？**
-A：换源：`bash scripts/install.sh --mirror cn`（Windows 用 `-Mirror cn`），或先 `export PIP_INDEX_URL=...`。
-依赖装完后脚本会跑一次 `import nanoquant.main` 自检，装不全会立刻失败而不是等到启动才发现。
-
-**Q：在 Git Bash 里跑 `install.sh` 报错退出？**
-A：这是有意为之：Git Bash 不是真 Linux（没有 systemd、venv 是 `Scripts\` 布局）。Windows 请用
-`powershell -ExecutionPolicy Bypass -File scripts\install.ps1`。
+**Q：构建或启动失败？**
+A：确认已安装 Rust 工具链与 Node 18+，并先执行
+`cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml`；
+前端产物缺失时执行 `npm --prefix frontend ci && npm --prefix frontend run build`。
 
 **Q：引擎启动了但没有交易？**
 A：按优先级检查「开仓检查」页——标的池是否为空（当前设计：空池不交易）、是否在交易时段、

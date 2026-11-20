@@ -2,15 +2,15 @@
 //!
 //! 阶段目标：把「开仓后立刻挂止损/止盈」这两笔请求的**构造 + 签名**前移到 Rust，
 //! 用 `tokio::join!` 真正并行准备。本阶段**不代发**：只回传有序参数对与签名，
-//! 由 Python 侧逐字节比对，一致后再考虑让 sidecar 直接发单。
+//! 由 legacy 内核（已退役） 侧逐字节比对，一致后再考虑让 sidecar 直接发单。
 //!
 //! 为什么先只构造不发：
 //! - 保护单是 `closePosition=true` 的条件单，一旦参数错（价格精度、positionSide、
 //!   workingType）就是把仓位裸奔或误平，风险远高于普通下单；
-//! - 构造 + 签名的正确性可以用「与 Python 逐字节一致」严格证明，而发单还牵涉
+//! - 构造 + 签名的正确性可以用「与 legacy 内核（已退役） 逐字节一致」严格证明，而发单还牵涉
 //!   网关限频、-4120 回落、结果未知等语义，留到下一阶段。
 //!
-//! 编码一致性（关键）：Python 用 `urllib.parse.urlencode(payload, doseq=True)`，
+//! 编码一致性（关键）：legacy 内核（已退役） 用 `urllib.parse.urlencode(payload, doseq=True)`，
 //! 即 `quote_plus` 且保留 `A-Za-z0-9_.-~`、空格转 `+`、其余 `%XX` 大写。
 //! 本模块 `form_urlencode` 必须逐字节复刻这套规则，否则比对会假失败。
 
@@ -38,7 +38,7 @@ impl ProtectKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProtectionRequest {
     pub kind: String,
-    /// 与 Python 完全同序的 query（不含 signature）
+    /// 与 legacy 内核（已退役） 完全同序的 query（不含 signature）
     pub query: String,
     pub signature: String,
     pub client_algo_id: String,
@@ -90,7 +90,7 @@ fn encode_into(out: &mut String, raw: &str) {
 
 /// 构造并签名一笔保护单。
 ///
-/// 参数顺序必须与 Python `_place_protection` 里 `algo_params` 的**插入顺序**一致：
+/// 参数顺序必须与 legacy 内核（已退役） `_place_protection` 里 `algo_params` 的**插入顺序**一致：
 /// algoType, symbol, side, type, triggerPrice, closePosition, workingType,
 /// priceProtect, clientAlgoId, [positionSide]。
 pub fn build_leg(signer: &Signer, spec: &LegSpec<'_>) -> ProtectionRequest {
@@ -123,10 +123,9 @@ pub async fn build_pair(
     stop: LegSpec<'_>,
     take: LegSpec<'_>,
 ) -> (ProtectionRequest, ProtectionRequest) {
-    let (a, b) = tokio::join!(
-        async { build_leg(signer, &stop) },
-        async { build_leg(signer, &take) }
-    );
+    let (a, b) = tokio::join!(async { build_leg(signer, &stop) }, async {
+        build_leg(signer, &take)
+    });
     (a, b)
 }
 
@@ -135,8 +134,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn urlencode_matches_python_quote_plus() {
-        // Python: urlencode({"a":"x y","b":"A/B","c":"1.5"}) == "a=x+y&b=A%2FB&c=1.5"
+    fn urlencode_matches_legacy_quote_plus() {
+        // legacy 内核（已退役）: urlencode({"a":"x y","b":"A/B","c":"1.5"}) == "a=x+y&b=A%2FB&c=1.5"
         let got = form_urlencode_pairs(&[("a", "x y"), ("b", "A/B"), ("c", "1.5")]);
         assert_eq!(got, "a=x+y&b=A%2FB&c=1.5");
     }
@@ -150,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn leg_query_order_matches_python() {
+    fn leg_query_order_matches_legacy() {
         let signer = Signer::detect("secret");
         let req = build_leg(
             &signer,
@@ -194,7 +193,7 @@ mod tests {
 
     #[test]
     fn signature_urlencode_is_strict() {
-        // Python: quote(sig, safe='') —— '+' '/=' 都必须编码
+        // legacy 内核（已退役）: quote(sig, safe='') —— '+' '/=' 都必须编码
         let raw = "ab+/=Z";
         let got = crate::http::urlencode_component_for_test(raw);
         assert_eq!(got, "ab%2B%2F%3DZ");
@@ -211,8 +210,12 @@ mod tests {
             client_algo_id: "npX",
             position_side: None,
         };
-        let (a, b) = build_pair(&signer, mk(ProtectKind::StopMarket, "73000"),
-                                mk(ProtectKind::TakeProfitMarket, "75000")).await;
+        let (a, b) = build_pair(
+            &signer,
+            mk(ProtectKind::StopMarket, "73000"),
+            mk(ProtectKind::TakeProfitMarket, "75000"),
+        )
+        .await;
         assert!(a.query.contains("STOP_MARKET"));
         assert!(b.query.contains("TAKE_PROFIT_MARKET"));
         assert_ne!(a.signature, b.signature, "两笔价格不同，签名必须不同");

@@ -39,7 +39,12 @@ impl HttpConfig {
             .unwrap_or(3000)
             .clamp(200, 30_000);
         let warmup = std::env::var("EXEC_HTTP_WARMUP")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
             .unwrap_or(true);
         Self {
             base_url: base,
@@ -92,13 +97,13 @@ impl PlaceError {
     }
 }
 
-/// 测试出口：与 Python `quote(signature, safe='')` 对齐的最小 URL 编码。
+/// 测试出口：与 legacy 内核（已退役） `quote(signature, safe='')` 对齐的最小 URL 编码。
 #[cfg(test)]
 pub fn urlencode_component_for_test(raw: &str) -> String {
     urlencode_component(raw)
 }
 
-/// 与 Python `quote(signature, safe='')` 对齐的最小 URL 编码。
+/// 与 legacy 内核（已退役） `quote(signature, safe='')` 对齐的最小 URL 编码。
 fn urlencode_component(raw: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(raw.len() * 2);
@@ -163,7 +168,11 @@ impl HttpClient {
             warmup_ms: self.warmup_ms.load(Ordering::Relaxed),
             ok: self.ok.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            last_error: self.last_error.lock().map(|s| s.clone()).unwrap_or_default(),
+            last_error: self
+                .last_error
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -176,7 +185,7 @@ impl HttpClient {
 
     /// P3-3 收尾：**真正发送**一笔已签名的 POST（仅 `EXEC_PLACE_MODE=enabled` 时被调用）。
     ///
-    /// 返回值语义严格区分三种情形，调用方据此决定是否回退 Python：
+    /// 返回值语义严格区分三种情形，调用方据此决定是否回退 legacy 内核（已退役）：
     /// - `Ok(body)`：交易所明确返回 2xx；
     /// - `Err(PlaceError::Rejected(msg))`：交易所明确拒绝（4xx 带 code）→ 可安全回退/报错；
     /// - `Err(PlaceError::Unknown(msg))`：**结果未知**（超时、连接中断、5xx）→
@@ -189,12 +198,14 @@ impl HttpClient {
         api_key: &str,
     ) -> Result<String, PlaceError> {
         let Some(client) = self.inner.as_ref() else {
-            return Err(PlaceError::Rejected("连接池未启用（EXEC_BASE_URL 为空）".into()));
+            return Err(PlaceError::Rejected(
+                "连接池未启用（EXEC_BASE_URL 为空）".into(),
+            ));
         };
         if api_key.trim().is_empty() {
             return Err(PlaceError::Rejected("缺少 API Key".into()));
         }
-        // 与 Python 一致：签名再做一次 URL 编码（base64 的 '+' 会被当空格）
+        // 与 legacy 内核（已退役） 一致：签名再做一次 URL 编码（base64 的 '+' 会被当空格）
         let encoded_sig = urlencode_component(signature);
         let url = format!(
             "{}{}?{}&signature={}",
@@ -221,7 +232,11 @@ impl HttpClient {
                     let _ = elapsed;
                     Ok(body)
                 } else {
-                    let msg = format!("HTTP {}: {}", status.as_u16(), body.chars().take(280).collect::<String>());
+                    let msg = format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        body.chars().take(280).collect::<String>()
+                    );
                     // 5xx / 429 视作结果未知（可能已受理），4xx 视作明确拒绝
                     let unknown = status.is_server_error() || status.as_u16() == 429;
                     self.record_err(msg.clone());
@@ -320,7 +335,9 @@ mod tests {
     fn from_env_trims_trailing_slash_and_clamps_timeout() {
         // 直接构造等价分支（避免改写全局环境变量影响其它用例）
         let mut cfg = HttpConfig::from_env();
-        cfg.base_url = "https://fapi.binance.com/".trim_end_matches('/').to_string();
+        cfg.base_url = "https://fapi.binance.com/"
+            .trim_end_matches('/')
+            .to_string();
         assert!(!cfg.base_url.ends_with('/'));
         assert!(cfg.enabled());
 

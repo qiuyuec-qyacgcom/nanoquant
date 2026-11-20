@@ -1,11 +1,10 @@
 # 构建上下文只发真正需要的文件给 daemon。
-# 之前没有这个文件，上下文约 400MB：.venv 181M、data 62M（含 57MB 库与加密 API Key）、
+# 上下文约 400MB 主要来自 data 62M（含 57MB 库与加密 API Key）与
 # frontend/node_modules 151M —— 等于把整个数据库和密钥打包发给 docker daemon。
 
 # 运行时数据与凭证（绝不能进镜像层）
 data
 logs
-.venv
 **/.master_key
 **/*.db
 **/*.sqlite*
@@ -14,19 +13,24 @@ logs
 frontend/node_modules
 frontend/dist
 
+# Rust 构建产物与增量缓存（绝不进构建上下文）
+**/target
+**/target-*
+
 # 版本控制与 CI
 .git
 .github
 .gitignore
 
-# Python 缓存
-**/__pycache__
-**/*.pyc
-**/*.pyo
-backend/.pytest_cache
-backend/.mypy_cache
-backend/.ruff_cache
-backend/tests
+# 规格/证据与代理工作目录（构建不需要，避免把诊断产物送进 daemon）
+.codeartsdoer
+.superpowers
+
+# 执行侧 crate 与前端测试产物（Dockerfile 只构建主服务与本目录前端）
+rust/exec-service
+frontend/e2e
+frontend/test-results
+**/*.bak
 
 # 文档与部署脚本（不需要进运行时镜像）
 docs

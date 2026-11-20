@@ -1,10 +1,10 @@
 //! P3-2：订单状态机（Planned → Sent → Acked → Filled），幂等键 `clientOrderId`。
 //!
-//! 阶段目标：把「订单生命周期」从 Python 的查询式收敛（`services/order_sync.py`）
+//! 阶段目标：把「订单生命周期」从 legacy 内核（已退役） 的查询式收敛（`services/order_sync.py`）
 //! 前移成 Rust 侧的**权威台账**，为 P3-3 保护单并行、P3-4 单写线程落库打基础。
 //!
 //! 三条硬约束：
-//! 1. **不发单**：本模块只记账、只做状态迁移；真正下单仍由 Python 走现有链路。
+//! 1. **不发单**：本模块只记账、只做状态迁移；真正下单仍由 legacy 内核（已退役） 走现有链路。
 //! 2. **幂等**：同一 `clientOrderId` 重复 register 不产生第二条记录，返回已存在的那条
 //!    （`duplicate=true`），避免网络重试/双写把台账撑出重复订单。
 //! 3. **非法迁移必须拒绝**：例如 `Filled → Planned`。宁可报错，也不能让台账
@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// 订单状态。与 Python 侧状态字符串一一对应（大写）。
+/// 订单状态。与 legacy 内核（已退役） 侧状态字符串一一对应（大写）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderState {
@@ -54,7 +54,10 @@ impl OrderState {
 
     /// 终态：不再接受任何迁移。
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Filled | Self::Canceled | Self::Expired | Self::Rejected)
+        matches!(
+            self,
+            Self::Filled | Self::Canceled | Self::Expired | Self::Rejected
+        )
     }
 
     /// 从交易所/调用方给的字符串解析（容忍 CANCELLED 与 NEW 这类别名）。
@@ -182,7 +185,8 @@ impl OrderBook {
             avg_price: 0.0,
             history: vec![(initial.as_str().to_string(), Self::now())],
         };
-        self.orders.insert(client_order_id.to_string(), record.clone());
+        self.orders
+            .insert(client_order_id.to_string(), record.clone());
         (record, false)
     }
 
@@ -203,7 +207,11 @@ impl OrderBook {
                 "非法迁移 {} → {}（{}）",
                 from.as_str(),
                 to.as_str(),
-                if from.is_terminal() { "已是终态，不可回退" } else { "不在允许的迁移表内" }
+                if from.is_terminal() {
+                    "已是终态，不可回退"
+                } else {
+                    "不在允许的迁移表内"
+                }
             )));
         }
         if let Some(qty) = filled_qty {
@@ -274,7 +282,11 @@ mod tests {
     fn happy_path_reaches_filled() {
         let mut book = OrderBook::new();
         book.register("c1", "ETHUSDT", OrderState::Planned);
-        for st in [OrderState::Sent, OrderState::Acked, OrderState::PartiallyFilled] {
+        for st in [
+            OrderState::Sent,
+            OrderState::Acked,
+            OrderState::PartiallyFilled,
+        ] {
             book.transition("c1", st, None, None).unwrap();
         }
         let rec = book
@@ -292,9 +304,13 @@ mod tests {
         let mut book = OrderBook::new();
         book.register("c2", "BTCUSDT", OrderState::Planned);
         book.transition("c2", OrderState::Sent, None, None).unwrap();
-        book.transition("c2", OrderState::Acked, None, None).unwrap();
-        book.transition("c2", OrderState::Filled, Some(1.0), None).unwrap();
-        let err = book.transition("c2", OrderState::Planned, None, None).unwrap_err();
+        book.transition("c2", OrderState::Acked, None, None)
+            .unwrap();
+        book.transition("c2", OrderState::Filled, Some(1.0), None)
+            .unwrap();
+        let err = book
+            .transition("c2", OrderState::Planned, None, None)
+            .unwrap_err();
         assert!(err.0.contains("终态"), "终态回退必须被拒: {}", err.0);
     }
 
@@ -302,14 +318,18 @@ mod tests {
     fn cross_level_jump_is_rejected() {
         let mut book = OrderBook::new();
         book.register("c3", "BTCUSDT", OrderState::Planned);
-        let err = book.transition("c3", OrderState::Filled, None, None).unwrap_err();
+        let err = book
+            .transition("c3", OrderState::Filled, None, None)
+            .unwrap_err();
         assert!(err.0.contains("非法迁移"), "Planned 直接 Filled 必须被拒");
     }
 
     #[test]
     fn unknown_order_is_rejected() {
         let mut book = OrderBook::new();
-        let err = book.transition("nope", OrderState::Sent, None, None).unwrap_err();
+        let err = book
+            .transition("nope", OrderState::Sent, None, None)
+            .unwrap_err();
         assert!(err.0.contains("未知订单"));
     }
 
@@ -318,7 +338,8 @@ mod tests {
         let mut book = OrderBook::new();
         book.register("c4", "BTCUSDT", OrderState::Planned);
         book.transition("c4", OrderState::Sent, None, None).unwrap();
-        book.transition("c4", OrderState::Acked, None, None).unwrap();
+        book.transition("c4", OrderState::Acked, None, None)
+            .unwrap();
         book.transition("c4", OrderState::PartiallyFilled, Some(0.8), Some(100.0))
             .unwrap();
         let rec = book
@@ -331,7 +352,10 @@ mod tests {
     fn parse_accepts_exchange_aliases() {
         assert_eq!(OrderState::parse("NEW"), Some(OrderState::Acked));
         assert_eq!(OrderState::parse("cancelled"), Some(OrderState::Canceled));
-        assert_eq!(OrderState::parse("PARTIALLY_FILLED"), Some(OrderState::PartiallyFilled));
+        assert_eq!(
+            OrderState::parse("PARTIALLY_FILLED"),
+            Some(OrderState::PartiallyFilled)
+        );
         assert_eq!(OrderState::parse("bogus"), None);
     }
 }

@@ -104,7 +104,7 @@
 - [ ] 备份能列出来，且 `.master_key` 单独存了一份
 - [ ] 总览「委托流水」里没有长期停在 `NEW/PARTIALLY_FILLED` 的单（有 = 状态回查没跑通，台账不可信）
 - [ ] 备份页 KPI「每日自动备份」显示的是**最近一天内**的时间戳（长期不更新 = 自动备份又哑了）
-- [ ] **恢复演练**：`python scripts/backup_drill.py`（在运行库副本上跑：备份 → 删数据 → 还原 → 逐项比对；退出码非 0 就是有问题）
+- [ ] **恢复演练**：`nanoquant ops backup-drill`（在运行库副本上跑：备份 → 删数据 → 还原 → 逐项比对；退出码非 0 就是有问题）
 
 ## 八、进程守护与数据库维护
 
@@ -113,32 +113,23 @@
 症状（真实发生过）：页面还能打开，但引擎从某刻起再没写过心跳，停了两天半。
 
 ```text
-# 前台守护（Ctrl+C 结束）：健康检查失败就重启，日志按 20MB 轮转
-scripts\supervise.ps1
-
-# 只体检一次（放进计划任务或手工排查）
-scripts\supervise.ps1 -Once
+systemd（推荐）：install.sh --systemd 生成 nanoquant.service，Restart=always 自动拉起
+nohup（无 systemd）：scripts/start.sh --daemon；用 scripts/status.sh 检查，崩溃后需外部守护
 ```
 
-放进计划任务（登录即启动，崩了由脚本自己拉起）：用 `scripts/supervise.ps1` 作为
-`schtasks` 的 `/TR` 目标，或直接在「任务计划程序」里新建"登录时"触发、程序填
-`powershell.exe`、参数填 `-WindowStyle Hidden -ExecutionPolicy Bypass -File <仓库>\scripts\supervise.ps1`。
-
-Linux 用 `deploy/nanoquant.service`（systemd 自带重启策略）。
-
-注意：守护脚本启动的进程会把标准输出写到 `logs/app.out.log`，超过 20MB 自动轮转保留 3 份；
-手工 `python -m nanoquant > app.out.log` 这种写法不会轮转，长期会把磁盘写满。
+systemd 用 `systemctl status nanoquant` / `journalctl -u nanoquant -f`；nohup 用 `scripts/status.sh` 与 `logs/stdout.log`。
+请通过 `scripts/start.sh --daemon` 启动，避免手工重定向导致日志无限增长。
 
 ### 8.2 数据库瘦身
 
 现状（2026-11 实测）：库 56.8MB，其中 34MB 是 2.7 万条 flat 信号的完整指标快照。
-新数据已经改成精简快照（见 `engine/worker.py` 的 `FLAT_FEATURE_KEYS`），
+新数据已经改成精简快照（见 `rust/nanoquant/src/worker.rs` 的 flat 特征键集合），
 **存量**用脚本压：
 
 ```bash
-python scripts/cleanup_history.py                  # 演练：只报告能省多少
-python scripts/cleanup_history.py --apply           # 压缩旧 flat 快照 + 删除废弃表
-python scripts/cleanup_history.py --apply --vacuum  # 再重建库回收磁盘（必须先停服务）
+nanoquant ops cleanup-history                    # 演练：只报告能省多少
+nanoquant ops cleanup-history --apply             # 压缩旧 flat 快照 + 删除废弃表
+nanoquant ops cleanup-history --apply --vacuum    # 再重建库回收磁盘（必须先停服务）
 ```
 
 实测结果：56.8MB → 16.0MB（flat 特征 34.1MB → 5.0MB），行数与 `integrity_check` 均无误。
@@ -161,7 +152,7 @@ Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「�
 首次启动创建管理员时，密码来源按优先级取：
 
 1. `NANOQUANT_ADMIN_PASSWORD` 环境变量；
-2. 安装脚本留下的 `data/.admin_password`（`install.sh --password` / `install.ps1 -Password`）；
+2. 安装时通过 `--password-stdin` / `--password-file` 传入（systemd 模式写入 `/etc/nanoquant/nanoquant.env`，0600，成功后删除；nohup 模式只注入首次启动环境）；
 3. 都没有 → **随机生成 16 位**，只打印在首次启动日志里（控制台 + `logs/nanoquant.log`）。
 
 随机生成的那种会同时置 `security.password_is_default = true`，此时**除登录/改密/健康检查外，
@@ -171,10 +162,10 @@ Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「�
 为什么不做成"只提示"：面板一旦映射到公网，一个能被猜到或从别处泄露的口令就是现成的后门。
 
 - 安装时指定密码 → 不强制改密（是你自己设的）；随机生成 → 首次登录必须改
-- 安装时指定的密码只以明文暂存 `data/.admin_password`（600），入库后立即删除
+- 安装时指定的密码只在 0600 临时 env 文件或首次启动进程中存在，入账后立即删除
 - 老库升级：密码仍是 `admin123` 且没有该标记时，启动会补标并强制改密
-- 测试/CI 绕过：预置 `password_hash` + `password_is_default=false`（见 `tests/conftest.py`）
-- 忘记密码：`python scripts/reset_password.py`（随机生成新密码，并重新要求改密）
+- 测试/CI 绕过：预置 `password_hash` + `password_is_default=false`（Rust 测试在临时库中构造）
+- 忘记密码：`nanoquant ops reset-password`（随机生成新密码，并重新要求改密）
 
 ### 8.6 备份要有第二块盘
 
@@ -182,3 +173,7 @@ Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「�
 设 `NANOQUANT_BACKUP_MIRROR=F:/nanoquant-backups` 后，每次备份会多抄一份到该目录
 （镜像写失败只告警，不影响本地备份）。恢复时优先用镜像里那份 —— 它的存在本身
 就说明当时主盘还没坏。
+### 8.7 迁移期内核回滚（已结束）
+
+P4 已完成 legacy 后端与虚拟环境退役，迁移期回滚开关不再存在。当前唯一内核为 Rust 二进制：
+`rust/nanoquant/target/release/nanoquant`。启动/停止/状态请使用 `scripts/start.sh|stop.sh|status.sh`。

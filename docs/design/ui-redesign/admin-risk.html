@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NanoQuant — 风险与持仓概念稿</title>
+  <link rel="stylesheet" href="theme.css" />
+  <link rel="stylesheet" href="admin.css" />
+  <style>
+    .exposure-row { display:flex; align-items:center; gap:10px; padding:11px 16px; border-bottom:1px solid rgba(255,255,255,.05); }
+    .exposure-row:last-child { border-bottom:0; }
+    .exposure-row .name { width:76px; font-family:var(--mono); font-size:10px; }
+    .exposure-row .bar { flex:1; height:5px; background:#22262e; }
+    .exposure-row .bar i { display:block; height:100%; background:var(--gold); }
+    .exposure-row .bar i.cyan { background:var(--cyan); }
+    .exposure-row .bar i.green { background:var(--green); }
+    .exposure-row .num { width:86px; text-align:right; font-family:var(--mono); font-size:9px; color:var(--muted); }
+    .gate { display:flex; gap:0; }
+    .gate-item { flex:1; padding:14px 16px; border-left:1px solid var(--line); }
+    .gate-item:first-child { border-left:0; }
+    .gate-label { color:var(--muted); font-size:9px; }
+    .gate-value { margin-top:7px; font-family:var(--mono); font-size:17px; }
+    .gate-foot { margin-top:4px; color:#656970; font-family:var(--mono); font-size:8px; }
+  </style>
+</head>
+<body class="dark">
+  <div class="app">
+    <aside class="sidebar">
+      <div class="side-brand"><div class="mark">N</div><div><div class="brand-name">NanoQuant</div><div class="brand-sub">trading terminal</div></div></div>
+      <div class="nav-group">
+        <div class="nav-label">概览</div>
+        <a class="nav-item" href="admin-dashboard.html"><span class="ico"></span>总览</a>
+        <a class="nav-item" href="#"><span class="ico"></span>系统诊断</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">交易</div>
+        <a class="nav-item" href="#"><span class="ico"></span>全局策略</a>
+        <a class="nav-item" href="#"><span class="ico"></span>标的池</a>
+        <a class="nav-item" href="#"><span class="ico"></span>信号审计</a>
+        <a class="nav-item" href="#"><span class="ico"></span>信号跟单</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">研究</div>
+        <a class="nav-item" href="admin-settings.html"><span class="ico"></span>参数配置</a>
+        <a class="nav-item" href="#"><span class="ico"></span>回测</a>
+        <a class="nav-item" href="#"><span class="ico"></span>资讯情绪</a>
+        <a class="nav-item" href="#"><span class="ico"></span>AI 模型</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">运维</div>
+        <a class="nav-item active" href="admin-risk.html"><span class="ico"></span>风险与持仓</a>
+        <a class="nav-item" href="#"><span class="ico"></span>备份还原</a>
+        <a class="nav-item" href="#"><span class="ico"></span>落库补偿</a>
+      </div>
+      <div class="sidebar-foot"><div class="live-line"><i class="dot"></i> LIVE · BINANCE</div><div>全局止盈 6% · 止损 2%</div></div>
+    </aside>
+
+    <section class="main">
+      <header class="topbar">
+        <div class="topbar-title">风险与持仓</div>
+        <div class="topbar-sub">逐仓 · 全局保护</div>
+        <div class="topbar-right">
+          <span class="pill live"><i class="dot"></i> 3 仓运行中</span>
+          <span class="pill">USDT-M</span>
+          <div class="avatar">A</div>
+        </div>
+      </header>
+
+      <main class="content">
+        <div class="page-head">
+          <div>
+            <div class="eyebrow gold">RISK / POSITIONS</div>
+            <h1>风险与持仓</h1>
+            <div class="sub">仓位风险、保护单价位与强平距离</div>
+          </div>
+          <div class="page-actions">
+            <button class="btn ghost sm">全部平仓</button>
+            <button class="btn gold sm">一键补挂保护单</button>
+          </div>
+        </div>
+
+        <div class="kpis">
+          <div class="card kpi"><div class="kpi-label">总敞口</div><div class="kpi-value">2.4<small>x</small></div><div class="kpi-foot"><span>上限 3.0x</span><span class="gold">余量 0.6x</span></div></div>
+          <div class="card kpi"><div class="kpi-label">保证金占用</div><div class="kpi-value">24.8<small>%</small></div><div class="kpi-foot"><span>$31,840</span><span>可用 $96,580</span></div></div>
+          <div class="card kpi"><div class="kpi-label">组合风险预算</div><div class="kpi-value">68<small>%</small></div><div class="kpi-foot"><span>日内亏损 1.2 / 5%</span><span class="up">健康</span></div></div>
+          <div class="card kpi"><div class="kpi-label">最近强平距离</div><div class="kpi-value">18.4<small>%</small></div><div class="kpi-foot"><span>BTCUSDT</span><span class="gold">高于告警线</span></div></div>
+        </div>
+
+        <div class="two-col" style="margin-bottom:12px">
+          <div class="card">
+            <div class="card-hd"><div class="card-title">持仓明细</div><span class="tag">3 笔</span><div class="right"><span class="tag gold">全局止损 2%</span><span class="tag gold">止盈 6%</span></div></div>
+            <table class="table">
+              <thead><tr><th>标的</th><th>方向 / 杠杆</th><th>开仓 / 标记</th><th>未实现盈亏</th><th>止损 / 止盈</th><th>强平距离</th><th></th></tr></thead>
+              <tbody>
+                <tr>
+                  <td class="name"><div class="symbol"><span class="symbol-mark">B</span>BTCUSDT</div></td>
+                  <td><span class="tag green">LONG</span> <span class="muted">10x</span></td><td>66,420.10<br /><span class="muted">67,842.10</span></td>
+                  <td class="up">+$119.74<br /><span class="muted">+2.14%</span></td><td>65,287 / 70,180</td><td class="gold">18.4%</td><td><button class="btn ghost sm">平仓</button></td>
+                </tr>
+                <tr>
+                  <td class="name"><div class="symbol"><span class="symbol-mark">E</span>ETHUSDT</div></td>
+                  <td><span class="tag green">LONG</span> <span class="muted">8x</span></td><td>3,262.40<br /><span class="muted">3,284.62</span></td>
+                  <td class="up">+$27.56<br /><span class="muted">+0.68%</span></td><td>3,201 / 3,410</td><td class="gold">22.1%</td><td><button class="btn ghost sm">平仓</button></td>
+                </tr>
+                <tr>
+                  <td class="name"><div class="symbol"><span class="symbol-mark">S</span>SOLUSDT</div></td>
+                  <td><span class="tag red">SHORT</span> <span class="muted">5x</span></td><td>149.25<br /><span class="muted">148.21</span></td>
+                  <td class="up">+$13.00<br /><span class="muted">+0.70%</span></td><td>152.10 / 142.40</td><td class="gold">26.8%</td><td><button class="btn ghost sm">平仓</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <div class="card-hd"><div class="card-title">敞口分布</div><span class="tag">名义额 / 权益</span></div>
+            <div class="exposure-row"><span class="name">BTC</span><span class="bar"><i style="width:42%"></i></span><span class="num">1.02x</span></div>
+            <div class="exposure-row"><span class="name">ETH</span><span class="bar"><i style="width:28%;background:var(--cyan)"></i></span><span class="num">0.68x</span></div>
+            <div class="exposure-row"><span class="name">SOL</span><span class="bar"><i style="width:18%;background:var(--green)"></i></span><span class="num">0.44x</span></div>
+            <div class="exposure-row"><span class="name">CASH</span><span class="bar"><i style="width:12%;background:#4a4d55"></i></span><span class="num">0.26x</span></div>
+            <div style="padding:13px 16px;border-top:1px solid var(--line);color:var(--muted);font-size:9px;line-height:1.7">
+              相关性组敞口：主流 1.70x / 山寨 0.44x；单标的集中度低于 45%。
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hd"><div class="card-title">风控闸门</div><span class="tag green">全部通过</span><div class="right"><span class="muted" style="font-size:9px">下一轮扫描 09:41:30</span></div></div>
+          <div class="gate">
+            <div class="gate-item"><div class="gate-label">日内亏损</div><div class="gate-value">1.2<small class="muted"> / 5%</small></div><div class="gate-foot">OK · 余量 3.8%</div></div>
+            <div class="gate-item"><div class="gate-label">最大回撤</div><div class="gate-value">8.6<small class="muted"> / 12%</small></div><div class="gate-foot">OK · 余量 3.4%</div></div>
+            <div class="gate-item"><div class="gate-label">连续亏损</div><div class="gate-value">0<small class="muted"> / 4</small></div><div class="gate-foot">OK · 无冷却</div></div>
+            <div class="gate-item"><div class="gate-label">总敞口</div><div class="gate-value">2.4<small class="muted"> / 3.0x</small></div><div class="gate-foot">OK · 余量 0.6x</div></div>
+            <div class="gate-item"><div class="gate-label">全局止损 / 止盈</div><div class="gate-value gold">2 / 6<small class="muted">%</small></div><div class="gate-foot">每仓自动执行</div></div>
+          </div>
+        </div>
+      </main>
+    </section>
+  </div>
+</body>
+</html>

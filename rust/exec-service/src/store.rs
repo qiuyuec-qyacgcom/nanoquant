@@ -1,13 +1,13 @@
 //! P3-4：sidecar 台账落地——**单写线程 + 批量事务**。
 //!
 //! 阶段目标：把「写库」从每个请求的同步路径上摘下来，改由一个专职写线程批量提交，
-//! 与 Python 侧 `services/db_writer.py` 的取舍同源（下单关键路径只付一次入队）。
+//! 与 legacy 内核（已退役） 侧 `services/db_writer.py` 的取舍同源（下单关键路径只付一次入队）。
 //!
 //! 本阶段**只落 sidecar 自己的订单台账**（独立库文件，默认 `exec-ledger.db`）：
-//! - 不动 Python 的 21 张主表，零冲突、可随时删库重建；
-//! - 主库仍在 Python 手里（P3-4 的「Python 只读」要等台账被验证为权威源之后再谈）。
+//! - 不动 legacy 内核（已退役） 的 21 张主表，零冲突、可随时删库重建；
+//! - 主库仍在 legacy 内核（已退役） 手里（P3-4 的「legacy 内核（已退役） 只读」要等台账被验证为权威源之后再谈）。
 //!
-//! 三条安全边界（对齐 Python 的写队列）：
+//! 三条安全边界（对齐 legacy 内核（已退役） 的写队列）：
 //! 1. **有界队列**：满了不阻塞调用方，直接丢弃并计数（台账是旁路，不能拖住下单）；
 //! 2. **批量事务**：一次 `BEGIN..COMMIT` 提交一批，摊薄 fsync；
 //! 3. **失败不吞**：写失败计数 + 记录最后错误，由 `store_status` 暴露。
@@ -24,6 +24,14 @@ use serde::Serialize;
 const BATCH_MAX: usize = 64;
 /// 队列积压上限：满了丢弃（台账是可观测性，不是交易正确性的必要条件）
 const QUEUE_CAP: usize = 8192;
+
+/// 写线程启动后返回的四个句柄。
+type WriterParts = (
+    SyncSender<LedgerRow>,
+    Arc<Counters>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+);
 
 /// 一条待落库的台账记录。
 #[derive(Debug, Clone)]
@@ -120,17 +128,7 @@ impl Store {
         }
     }
 
-    fn spawn_writer(
-        path: &str,
-    ) -> Result<
-        (
-            SyncSender<LedgerRow>,
-            Arc<Counters>,
-            Arc<AtomicBool>,
-            std::thread::JoinHandle<()>,
-        ),
-        rusqlite::Error,
-    > {
+    fn spawn_writer(path: &str) -> Result<WriterParts, rusqlite::Error> {
         // 建表在主线程做：失败要立刻知道（而不是在写线程里静默）
         let conn = Self::connect(path)?;
         Self::init_schema(&conn)?;
@@ -153,7 +151,7 @@ impl Store {
 
     fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(path)?;
-        // WAL + 适度 busy_timeout：与 Python 侧同口径，避免读写互卡
+        // WAL + 适度 busy_timeout：与 legacy 内核（已退役） 侧同口径，避免读写互卡
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(Duration::from_millis(3000))?;
@@ -224,7 +222,12 @@ impl Store {
             batches: self.counters.batches.load(Ordering::Relaxed),
             dropped: self.counters.dropped.load(Ordering::Relaxed),
             errors: self.counters.errors.load(Ordering::Relaxed),
-            last_error: self.counters.last_error.lock().map(|s| s.clone()).unwrap_or_default(),
+            last_error: self
+                .counters
+                .last_error
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
             last_batch_ms: self.counters.last_batch_ms.load(Ordering::Relaxed),
         }
     }
@@ -252,7 +255,12 @@ impl Drop for Store {
 }
 
 /// 写线程主循环：批量取 + 单事务提交。
-fn run_writer(path: &str, rx: Receiver<LedgerRow>, counters: Arc<Counters>, stopping: Arc<AtomicBool>) {
+fn run_writer(
+    path: &str,
+    rx: Receiver<LedgerRow>,
+    counters: Arc<Counters>,
+    stopping: Arc<AtomicBool>,
+) {
     let mut conn = match Store::connect(path).and_then(|c| {
         Store::init_schema(&c)?;
         Ok(c)
@@ -385,7 +393,7 @@ mod tests {
 
     #[test]
     fn empty_path_disables_store() {
-        let mut store = Store::open("");
+        let store = Store::open("");
         assert!(!store.enabled());
         assert!(!store.submit(row("a", "FILLED")));
         assert_eq!(store.status().written, 0);
@@ -395,7 +403,7 @@ mod tests {
     #[test]
     fn batch_persists_and_upserts() {
         let path = tmp_db("batch");
-        let mut store = Store::open(&path);
+        let store = Store::open(&path);
         assert!(store.enabled());
         assert!(store.submit(row("c1", "ACKED")));
         assert!(store.submit(row("c1", "FILLED")));
@@ -428,7 +436,7 @@ mod tests {
     #[test]
     fn shutdown_drains_pending() {
         let path = tmp_db("drain");
-        let mut store = Store::open(&path);
+        let store = Store::open(&path);
         for i in 0..10 {
             assert!(store.submit(row(&format!("c{i}"), "FILLED")));
         }
