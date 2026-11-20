@@ -1078,8 +1078,7 @@ mod tests {
                 rsi_short_min: 0.0,
                 rsi_short_max: 100.0,
                 adx_min: 0.0,
-                htf_enabled: false,
-                htf_trend_pct: 0.0,
+
                 mr_window: 20,
                 mr_z_entry: 2.0,
                 mr_min_risk_reward: 1.5,

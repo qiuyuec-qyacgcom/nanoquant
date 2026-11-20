@@ -38,7 +38,7 @@
   },
   "strategy": {
     "mode": "meanrev",
-    "ai_review_flat": true,
+    "ai_review_enabled": false,
     "ai_review_max_per_cycle": 6,
     "timeframe": "4h",
     "leverage_min": 8,

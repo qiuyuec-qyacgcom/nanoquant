@@ -8,8 +8,7 @@ pub(crate) struct TradePolicy {
     pub rsi_short_min: f64,
     pub rsi_short_max: f64,
     pub adx_min: f64,
-    pub htf_enabled: bool,
-    pub htf_trend_pct: f64,
+
     pub mr_window: usize,
     pub mr_z_entry: f64,
     pub mr_min_risk_reward: f64,
@@ -71,6 +70,9 @@ pub(crate) fn evaluate(
         return None;
     }
     let (side, score, sl_distance, tp_distance) = if policy.mode == "meanrev" {
+        if !policy.mr_z_entry.is_finite() || policy.mr_z_entry <= 0.0 {
+            return None;
+        }
         let count = policy.mr_window.clamp(5, closes.len());
         let window = &closes[closes.len() - count..];
         let mean = window.iter().sum::<f64>() / count as f64;
@@ -128,14 +130,7 @@ pub(crate) fn evaluate(
         if adx(candles, 14)? < policy.adx_min {
             return None;
         }
-        if policy.htf_enabled && policy.htf_trend_pct != 0.0 {
-            let aligned = (score >= 0.0 && policy.htf_trend_pct > 0.0)
-                || (score < 0.0 && policy.htf_trend_pct < 0.0);
-            if !aligned {
-                return None;
-            }
-            score *= (policy.htf_trend_pct.abs() / 0.1).min(1.0);
-        }
+
         if score > 0.0 {
             if !(policy.rsi_long_min..=policy.rsi_long_max).contains(&rsi) {
                 return None;
@@ -200,7 +195,9 @@ fn rsi(values: &[f64], period: usize) -> Option<f64> {
                 let change = pair[1] - pair[0];
                 (gain + change.max(0.0), loss + (-change).max(0.0))
             });
-    Some(if loss == 0.0 {
+    Some(if gain == 0.0 && loss == 0.0 {
+        50.0
+    } else if loss == 0.0 {
         100.0
     } else {
         100.0 - 100.0 / (1.0 + gain / loss)
@@ -248,8 +245,7 @@ mod tests {
             rsi_short_min: 10.0,
             rsi_short_max: 55.0,
             adx_min: 0.0,
-            htf_enabled: false,
-            htf_trend_pct: 0.0,
+
             mr_window: 20,
             mr_z_entry: 2.0,
             mr_min_risk_reward: 1.5,
@@ -367,5 +363,97 @@ mod tests {
             assert!(signal.score.is_finite());
             assert!(signal.score.abs() <= 1.0);
         }
+    }
+
+    #[test]
+    fn insufficient_or_invalid_inputs_never_produce_a_signal() {
+        let short_series = candles(&(0..21).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
+        assert!(
+            evaluate(&short_series, 120.0, 1.0, cfg(), MarketFeatures::default()).is_none(),
+            "少于 22 根 K 线必须直接放弃"
+        );
+        let data = candles(&(0..40).map(|i| 100.0 + i as f64 * 0.1).collect::<Vec<_>>());
+        assert!(
+            evaluate(&data, f64::NAN, 1.0, cfg(), MarketFeatures::default()).is_none(),
+            "mark 为 NaN 不能给出信号"
+        );
+        assert!(
+            evaluate(&data, 0.0, 1.0, cfg(), MarketFeatures::default()).is_none(),
+            "mark 为 0 不能给出信号"
+        );
+        assert!(
+            evaluate(&data, 101.0, 0.0, cfg(), MarketFeatures::default()).is_none(),
+            "atr 为 0 不能给出信号"
+        );
+    }
+
+    #[test]
+    fn mean_reversion_buys_when_price_drops_below_the_mean() {
+        let mut values: Vec<f64> = vec![100.0; 50];
+        values.push(85.0);
+        let policy = TradePolicy {
+            mode: "meanrev",
+            weight_trend: 0.0,
+            weight_momentum: 0.0,
+            weight_volume: 0.0,
+            weight_funding: 0.0,
+            weight_oi: 0.0,
+            ..cfg()
+        };
+        let last = *values.last().unwrap();
+        let signal = evaluate(
+            &candles(&values),
+            last,
+            1.0,
+            policy,
+            MarketFeatures::default(),
+        )
+        .expect("偏离均值 4 个标准差以上应触发回归信号");
+        assert_eq!(signal.side, "long");
+        assert_eq!(signal.score, 1.0, "z 远超阈值时分数应被截断到 1");
+        assert!(signal.stop_price < last);
+        assert!(signal.take_profit > last);
+    }
+
+    #[test]
+    fn flat_series_rsi_is_neutral() {
+        assert_eq!(rsi(&vec![100.0; 40], 14), Some(50.0));
+    }
+
+    #[test]
+    fn zero_or_non_finite_mr_z_entry_is_rejected() {
+        let values: Vec<f64> = (0..40).map(|index| 100.0 + index as f64).collect();
+        let zero = TradePolicy {
+            mode: "meanrev",
+            mr_z_entry: 0.0,
+            ..cfg()
+        };
+        assert!(
+            evaluate(
+                &candles(&values),
+                *values.last().unwrap(),
+                1.0,
+                zero,
+                MarketFeatures::default()
+            )
+            .is_none(),
+            "零偏离阈值不能产生 NaN 信号"
+        );
+        let nan = TradePolicy {
+            mode: "meanrev",
+            mr_z_entry: f64::NAN,
+            ..cfg()
+        };
+        assert!(
+            evaluate(
+                &candles(&values),
+                *values.last().unwrap(),
+                1.0,
+                nan,
+                MarketFeatures::default()
+            )
+            .is_none(),
+            "NaN 偏离阈值不能产生信号"
+        );
     }
 }

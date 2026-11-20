@@ -431,4 +431,93 @@ mod tests {
         assert_eq!(applied, "突破追多");
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn ai_tightening_keeps_side_semantics_for_long_and_short() {
+        let long = ai_client::Decision {
+            action: "open_long".to_string(),
+            confidence: 0.9,
+            leverage: 4.0,
+            sl_pct: 2.0,
+            tp_pct: 0.0,
+            reason: "tighten".to_string(),
+            risk_flags: Vec::new(),
+            invalidation: String::new(),
+        };
+        let reviewed = decision_to_review(&proposal("long"), "any", &long, 0.45).unwrap();
+        assert_eq!(reviewed.action, ReviewAction::Tighten);
+        assert_eq!(reviewed.leverage, Some(4.0));
+        let long_stop = reviewed.stop_price.expect("多单应收紧止损");
+        assert!(
+            (long_stop - 98.0).abs() < 1e-9,
+            "多单止损必须上移到 98，实际 {long_stop}"
+        );
+        assert!(long_stop > 95.0, "收紧后的多单止损不能低于原止损");
+
+        let short = ai_client::Decision {
+            action: "open_short".to_string(),
+            confidence: 0.9,
+            leverage: 3.0,
+            sl_pct: 2.0,
+            tp_pct: 0.0,
+            reason: "tighten".to_string(),
+            risk_flags: Vec::new(),
+            invalidation: String::new(),
+        };
+        let reviewed = decision_to_review(&proposal("short"), "any", &short, 0.45).unwrap();
+        assert_eq!(reviewed.leverage, Some(3.0));
+        let short_stop = reviewed.stop_price.expect("空单应收紧止损");
+        assert!(
+            (short_stop - 102.0).abs() < 1e-9,
+            "空单止损必须下移到 102，实际 {short_stop}"
+        );
+        assert!(short_stop < 105.0, "收紧后的空单止损不能高于原止损");
+    }
+
+    #[test]
+    fn wider_ai_stop_and_higher_leverage_are_downgraded_to_no_change() {
+        let wider = ai_client::Decision {
+            action: "open_long".to_string(),
+            confidence: 0.9,
+            leverage: 50.0,
+            sl_pct: 10.0,
+            tp_pct: 0.0,
+            reason: "wider".to_string(),
+            risk_flags: Vec::new(),
+            invalidation: String::new(),
+        };
+        let reviewed = decision_to_review(&proposal("long"), "any", &wider, 0.45).unwrap();
+        assert_eq!(
+            reviewed.action,
+            ReviewAction::Agree,
+            "更宽的止损和更高的杠杆都不该被采纳"
+        );
+        assert_eq!(reviewed.leverage, None);
+        assert_eq!(reviewed.stop_price, None);
+    }
+
+    #[test]
+    fn ai_side_must_match_the_quant_signal() {
+        let conflict =
+            decision_to_review(&proposal("long"), "any", &decision("open_short", 0.9), 0.45)
+                .unwrap();
+        assert_eq!(conflict.action, ReviewAction::Reject);
+        assert!(
+            conflict.reason.contains("冲突"),
+            "方向冲突必须说明原因，实际：{}",
+            conflict.reason
+        );
+    }
+
+    #[test]
+    fn confidence_equal_to_threshold_is_accepted() {
+        let result =
+            decision_to_review(&proposal("long"), "any", &decision("open_long", 0.45), 0.45)
+                .unwrap();
+        assert_eq!(
+            result.action,
+            ReviewAction::Agree,
+            "置信度等于门槛时应放行，而不是被 < 误杀"
+        );
+    }
 }

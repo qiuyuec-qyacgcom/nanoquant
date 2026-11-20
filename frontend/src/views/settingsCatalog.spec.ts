@@ -43,7 +43,7 @@ describe('参数配置目录', () => {
       'liquidation_warn_pct',
       'max_slippage_pct',
       'rsi_adaptive',
-      'htf_timeframe',
+
       'adx_period',
       'scan_concurrency',
       'max_symbols_per_cycle',
@@ -86,7 +86,7 @@ describe('参数配置目录', () => {
       'max_spread_bps',
       'adx_filter',
       'adx_min',
-      'ai_review_flat',
+      'ai_review_enabled',
       'ai_review_max_per_cycle',
       'leverage_min',
       'leverage_max',

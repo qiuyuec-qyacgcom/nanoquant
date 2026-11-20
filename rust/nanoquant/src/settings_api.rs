@@ -5,6 +5,7 @@
 //! 审计只记真正变化的字段，字段名含 secret/password/token/api_key/_enc 的值一律写成 "***"。
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -126,9 +127,57 @@ async fn reset_group(
         return Err(unknown(&group));
     }
     let conn = db.conn.lock().expect("db");
-    conn.execute("DELETE FROM app_settings WHERE key = ?1", [&group])
+    let before = group_value(&conn, &group);
+    let mut candidate = defaults_of(&group);
+    if group == "security" {
+        let current = stored(&conn, "security");
+        if let Some(target) = candidate.as_object_mut() {
+            for key in [
+                "username",
+                "password_hash",
+                "token_version",
+                "password_is_default",
+            ] {
+                if let Some(value) = current.get(key) {
+                    target.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    if let Err(detail) = validate(&group, &candidate) {
+        return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
+    }
+    let payload = serde_json::to_string(&candidate).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (&group, &payload, crate::now()),
+    )
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "detail": error.to_string() }).into(),
+        )
+    })?;
+    let changes = diff(
+        before.as_object().unwrap_or(&Map::new()),
+        candidate.as_object().unwrap_or(&Map::new()),
+    );
+    if !changes.is_empty() {
+        let blob = serde_json::to_string(&changes).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT INTO settings_audit(ts, user, group_name, changes, ip) VALUES(?1, '', ?2, ?3, '')",
+            (crate::now(), &group, &blob),
+        )
         .ok();
-    Ok(json!({ "ok": true, "group": group, "data": defaults_of(&group) }).into())
+    }
+    Ok(json!({
+        "ok": true,
+        "group": group,
+        "data": candidate,
+        "changed": changes.keys().cloned().collect::<Vec<_>>(),
+    })
+    .into())
 }
 
 #[derive(Deserialize)]
@@ -217,6 +266,13 @@ fn migrate(name: &str, raw: &Value) -> Value {
             }
             out.remove("max_hold_minutes");
             out.remove("max_hold_minutes_chop");
+            out.remove("ai_review_flat");
+
+            out.remove("htf_timeframe");
+        }
+        "risk" => {
+            out.remove("htf_enabled");
+            out.remove("htf_trend_pct");
         }
         "system" => {
             out.remove("timezone_offset");
@@ -281,28 +337,18 @@ fn mask(key: &str, value: &Value) -> Value {
     }
 }
 
+static DEFAULT_SETTINGS: &str = include_str!("default_settings.json");
+static DEFAULTS: OnceLock<Value> = OnceLock::new();
+
+fn all_defaults() -> &'static Value {
+    DEFAULTS.get_or_init(|| serde_json::from_str(DEFAULT_SETTINGS).unwrap_or_else(|_| json!({})))
+}
+
 pub(crate) fn defaults_of(name: &str) -> Value {
-    match name {
-        "engine" => {
-            json!({"enabled": false, "mode": "demo", "cycle_interval_sec": 15, "max_positions": 2, "max_symbols_per_cycle": 12, "scan_concurrency": 3, "trading_windows": ["00:00-24:00"], "timezone_offset": 8, "close_on_halt": false, "order_type": "market", "recv_window_ms": 5000})
-        }
-        "risk" => {
-            json!({"risk_per_trade_pct": 10.0, "max_leverage": 100, "default_leverage": 20, "margin_pct": 50.0, "max_exposure_pct": 2000.0, "max_same_direction": 0, "category_exposure_limit_pct": 500.0, "vol_target_atr_pct": 0.0, "daily_loss_limit_pct": 25.0, "max_drawdown_pct": 50.0, "consecutive_loss_limit": 4, "cooldown_minutes": 10, "symbol_cooldown_minutes": 5, "min_notional_buffer": 1.05, "min_equity_usdt": 0.5, "fee_rate_taker": 0.0005, "fee_rate_maker": 0.0002, "auto_protect_external": false, "global_stop_loss_pct": 0.0, "global_take_profit_pct": 0.0})
-        }
-        "backup" => {
-            json!({"retention": 10, "encrypt": true, "auto_daily": true, "include_logs": false, "last_run_ts": 0})
-        }
-        "journal" => {
-            json!({"enabled": true, "min_record_confidence": 0.45, "label_after_sec": 86400, "correct_threshold_pct": 0.15, "retrieve_top_k": 5, "inject_experiences": true, "max_experiences": 200, "min_similarity": 0.15})
-        }
-        "public" => {
-            json!({"site_enabled": true, "site_title": "NanoQuant", "site_tagline": "小资金 · 币安 U 本位永续 · 超短线量化终端", "hero_note": "", "show_engine_status": true, "show_mantras": true, "show_performance": false})
-        }
-        "system" => {
-            json!({"log_level": "INFO", "event_retention_days": 14, "signal_retention_days": 14, "equity_retention_days": 30, "risk_disclaimer_accepted": false, "alert_enabled": false, "alert_min_level": "warn", "alert_webhook_url": "", "alert_error_webhook_url": "", "alert_telegram_token": "", "alert_telegram_chat_id": "", "alert_cooldown_sec": 120, "alert_quiet_hours": "", "alert_template": "", "alert_digest_enabled": false, "alert_digest_minutes": 60, "exec_mode": "off", "exec_socket": "", "exec_sample_pct": 100, "exec_timeout_ms": 500, "exec_place_protection": false, "exec_ledger_authoritative": false, "api_rate_limit_per_min": 0, "metrics_enabled": true})
-        }
-        _ => json!({}),
-    }
+    all_defaults()
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| json!({}))
 }
 
 fn validate(group: &str, value: &Value) -> Result<(), String> {
@@ -548,6 +594,97 @@ mod tests {
             changes.contains("50") && changes.contains("80"),
             "审计记录旧值与新值: {changes}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn defaults_cover_every_group_and_ai_review_is_real() {
+        for group in GROUPS {
+            let value = defaults_of(group);
+            assert!(
+                value.as_object().is_some_and(|object| !object.is_empty()),
+                "{group} 必须有可见默认值"
+            );
+        }
+        let strategy = defaults_of("strategy");
+        assert_eq!(strategy["ai_review_enabled"], false);
+        assert_eq!(strategy["ai_review_max_per_cycle"], 6);
+        assert!(strategy.get("ai_review_flat").is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_strategy_writes_defaults_and_security_keeps_credentials() {
+        let path = std::env::temp_dir().join("nq-settings-reset.db");
+        let db = fixture(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_settings VALUES('strategy','{\"mode\":\"trend\"}',0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_settings VALUES('security','{\"username\":\"root\",\"password_hash\":\"hash\",\"token_version\":7,\"password_is_default\":true}',0)",
+                [],
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/settings/strategy/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"]["mode"], "meanrev");
+        assert_eq!(body["data"]["timeframe"], "4h");
+        assert_eq!(body["data"]["ai_review_enabled"], false);
+        let stored: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.contains("\"meanrev\""),
+            "重置必须真正写回默认值: {stored}"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/settings/security/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"]["username"], "root");
+        assert_eq!(body["data"]["password_hash"], "hash");
+        assert_eq!(body["data"]["token_version"], 7);
+        assert_eq!(body["data"]["session_ttl_hours"], 12);
         let _ = std::fs::remove_file(&path);
     }
 }

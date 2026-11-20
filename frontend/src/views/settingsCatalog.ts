@@ -56,8 +56,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
     {
       title: 'AI 复审',
-      hint: '量化只提供候选；关闭“无方向也送 AI”后退回量化一 flat 就静默',
-      fields: ['ai_review_flat', 'ai_review_max_per_cycle'],
+      hint: '开启后量化提案先经 AI 复核；候选额度同时限制每轮扫描/复核数量',
+      fields: ['ai_review_enabled', 'ai_review_max_per_cycle'],
     },
     {
       title: '策略杠杆区间',
@@ -141,7 +141,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
 const HIDDEN_BY_GROUP: Record<string, readonly string[]> = {
   engine: ['max_symbols_per_cycle', 'scan_concurrency', 'recv_window_ms'],
   strategy: [
-    'htf_timeframe',
+
     'ema_fast',
     'ema_slow',
     'rsi_period',

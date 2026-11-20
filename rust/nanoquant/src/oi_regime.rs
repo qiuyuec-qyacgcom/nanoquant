@@ -52,8 +52,13 @@ impl OiRegime {
 }
 
 pub fn classify(price_change_pct: f64, oi_change_pct: f64, threshold_pct: f64) -> OiRegime {
+    if !price_change_pct.is_finite() || !oi_change_pct.is_finite() {
+        return OiRegime::Neutral;
+    }
     let threshold = threshold_pct.abs();
-    if price_change_pct.abs() < threshold || oi_change_pct.abs() < threshold {
+    let price_moved = price_change_pct != 0.0 && price_change_pct.abs() >= threshold;
+    let oi_moved = oi_change_pct != 0.0 && oi_change_pct.abs() >= threshold;
+    if !price_moved || !oi_moved {
         return OiRegime::Neutral;
     }
     match (price_change_pct > 0.0, oi_change_pct > 0.0) {
@@ -101,5 +106,36 @@ mod tests {
         assert_eq!(value["code"], "price_up_oi_up");
         assert_eq!(value["short_label"], "上升确认");
         assert_eq!(value["tone"], "up");
+    }
+
+    #[test]
+    fn negative_threshold_is_normalised_to_absolute_value() {
+        assert_eq!(classify(1.2, 0.8, -0.05), OiRegime::PriceUpOiUp);
+        assert_eq!(classify(-1.2, -0.8, -0.05), OiRegime::PriceDownOiDown);
+    }
+
+    #[test]
+    fn exactly_at_threshold_counts_as_a_real_move() {
+        assert_eq!(classify(0.05, 0.8, 0.05), OiRegime::PriceUpOiUp);
+        assert_eq!(classify(-0.05, -0.8, 0.05), OiRegime::PriceDownOiDown);
+    }
+
+    #[test]
+    fn zero_threshold_still_treats_zero_change_as_neutral() {
+        assert_eq!(classify(0.0, 0.0, 0.0), OiRegime::Neutral);
+        assert_eq!(classify(0.0, 1.0, 0.0), OiRegime::Neutral);
+        assert_eq!(classify(1.0, 0.0, 0.0), OiRegime::Neutral);
+        assert_eq!(classify(1.0, 1.0, 0.0), OiRegime::PriceUpOiUp);
+    }
+
+    #[test]
+    fn payload_preserves_raw_inputs_and_the_threshold() {
+        let value = payload(-1.5, 2.0);
+        assert_eq!(value["code"], "price_down_oi_up");
+        assert_eq!(value["short_label"], "下降确认");
+        assert_eq!(value["tone"], "down");
+        assert_eq!(value["price_change_pct"], -1.5);
+        assert_eq!(value["oi_change_pct"], 2.0);
+        assert_eq!(value["threshold_pct"], DEFAULT_THRESHOLD_PCT);
     }
 }
