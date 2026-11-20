@@ -1422,7 +1422,7 @@ impl EngineRuntime {
                 &crate::now().to_string(),
             )?;
         }
-        let ai_review_required = strategy["ai_review_enabled"].as_bool().unwrap_or(false);
+        let ai_review_required = Self::ai_review_required(&tx);
         let drafts = if engine_is_enabled && !report.scanned.is_empty() {
             Self::collect_entries(
                 &tx,
@@ -2041,11 +2041,7 @@ impl EngineRuntime {
             manage_cfg: &Self::manage_config(strategy, &risk_cfg),
             candidates: &candidates,
             scan_gates: &gates,
-            budget: strategy["ai_review_max_per_cycle"]
-                .as_u64()
-                .unwrap_or(6)
-                .min(engine["max_symbols_per_cycle"].as_u64().unwrap_or(12))
-                as usize,
+            budget: engine["max_symbols_per_cycle"].as_u64().unwrap_or(12) as usize,
         });
         // 止损保护是独立状态，不属于 risk 输入；熔断期间的亏损仓位仍要管，
         // 所以只拦扫描，不拦管仓。
@@ -2158,19 +2154,16 @@ impl EngineRuntime {
             else {
                 continue;
             };
-            let mut upper = cfg["max_leverage"]
+            let upper = cfg["max_leverage"]
                 .as_i64()
                 .unwrap_or(100)
                 .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
                 .clamp(1, 100);
-            if let Some(limit) = strategy["leverage_max"].as_i64().filter(|v| *v > 0) {
-                upper = upper.min(limit);
-            }
-            let leverage = strategy["leverage_min"]
+            let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
+            let leverage = cfg["default_leverage"]
                 .as_i64()
-                .filter(|v| *v > 0)
-                .unwrap_or_else(|| cfg["default_leverage"].as_i64().unwrap_or(20))
-                .clamp(1, upper) as f64;
+                .unwrap_or(20)
+                .clamp(lower, upper) as f64;
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
                 (target / metric.atr_pct).clamp(0.25, 2.0)
@@ -2241,6 +2234,20 @@ impl EngineRuntime {
             });
         }
         Ok(drafts)
+    }
+
+    fn ai_review_required(tx: &rusqlite::Transaction<'_>) -> bool {
+        let cfg = crate::ai_client::read_ai_config_conn(tx);
+        if !cfg.enabled {
+            return false;
+        }
+        tx.query_row(
+            "SELECT COUNT(*) FROM ai_providers WHERE enabled != 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
     }
 
     fn review_drafts(
@@ -4044,9 +4051,11 @@ mod tests {
         db.conn
             .lock()
             .unwrap()
-            .execute(
-                "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,0)",
-                [r#"{"ai_review_enabled":true}"#],
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
+                 INSERT OR REPLACE INTO ai_providers(id,enabled) VALUES(1,1); \
+                 INSERT INTO app_settings(key,value,updated_at) VALUES('ai','{\"enabled\":true}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;",
             )
             .unwrap();
         let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));

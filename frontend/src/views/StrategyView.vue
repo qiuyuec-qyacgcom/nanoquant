@@ -85,8 +85,7 @@ const BASE_META: Record<string, FieldMeta> = {
   min_record_confidence: { label: '记录门槛', hint: 'AI 置信度低于该值的方向判断不留痕（journal），避免用低质量判断训练经验库' },
   min_similarity: { label: '相似度阈值', unit: '', hint: '低于该相似度的经验不注入；调低=注入更多但相关性更弱' },
   max_experiences: { label: '经验上限', unit: '条', hint: '超出后停用最旧条目（不删除）' },
-  ai_review_enabled: { label: 'AI 开仓复核', hint: '开启后量化提案先经 AI 复核；关闭则直接按量化信号执行' },
-  ai_review_max_per_cycle: { label: '候选额度', unit: '个/轮', hint: '每轮最多送几个候选进入扫描/复核；0=不限（受 AI 调用频率上限兜底）' },
+
   mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
   mr_min_risk_reward: { label: '回归盈亏比', unit: 'R', hint: '回归模型胜率高但 R 小，用比趋势更低的底线' },
   mr_block_in_trend: { label: '趋势中禁止逆势', hint: '顺势的极值通常是继续走，不是回归' },
@@ -130,19 +129,15 @@ const BASE_META: Record<string, FieldMeta> = {
   margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额；与单笔风险同时约束仓位，取更小值' },
   default_leverage: {
     label: '默认杠杆', unit: 'x', min: 1,
-    hint: '开仓默认杠杆；仍受全局上限、策略区间与交易所上限约束',
+    hint: '开仓目标杠杆；最终受下限、上限与交易所上限共同钳制',
+  },
+  min_leverage: {
+    label: '杠杆下限', unit: 'x', min: 1,
+    hint: '全局杠杆下限；默认杠杆低于该值时会抬到此处',
   },
   max_leverage: {
     label: '杠杆上限', unit: 'x', max: 100,
-    hint: '最高 100x；全局硬上限，AI 开仓杠杆与单标的配置都只能收紧不能突破',
-  },
-  leverage_min: {
-    label: '策略杠杆下限', unit: 'x', min: 0,
-    hint: '策略自主开仓的目标杠杆下限，独立于风控分组的全局杠杆下限；0=沿用全局',
-  },
-  leverage_max: {
-    label: '策略杠杆上限', unit: 'x', min: 0,
-    hint: '策略自主开仓的目标杠杆上限，仍受全局硬上限与交易所上限约束；0=沿用全局',
+    hint: '全局硬上限；默认杠杆与单标的配置都只能收紧不能突破',
   },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
   max_same_direction: {
@@ -284,27 +279,7 @@ const BASE_META: Record<string, FieldMeta> = {
   alert_template: { label: '消息模板', hint: '支持 {level} {category} {message} {time}；留空=默认格式' },
   alert_digest_enabled: { label: '摘要模式', hint: '开启后 warn 攒到间隔合并成一条，error 仍然即时' },
   alert_digest_minutes: { label: '摘要间隔', unit: '分钟' },
-  exec_mode: {
-    label: '执行内核模式',
-    widget: 'seg',
-    hint: 'off 只用内建签名；shadow 旁路比对只统计；enforce 不一致直接拒绝下单',
-    options: [
-      ['off', 'OFF'],
-      ['shadow', 'SHADOW'],
-      ['enforce', 'ENFORCE'],
-    ],
-  },
-  exec_socket: { label: 'sidecar 地址', hint: 'unix:/run/nanoquant/exec.sock 或 tcp:127.0.0.1:9101；留空读 EXEC_SOCKET' },
-  exec_sample_pct: { label: '比对抽样', unit: '%', hint: '下单高峰时可只比对一部分，enforce 模式建议 100' },
-  exec_timeout_ms: { label: '比对超时', unit: 'ms', hint: '超时视为 sidecar 不可用并降级为内建签名' },
-  exec_place_protection: {
-    label: '由 sidecar 代发保护单',
-    hint: '默认关闭。开启后止损/止盈由 Rust 直接下发（还需 sidecar 侧 EXEC_PLACE_MODE=enabled）；结果未知时阻止重发，避免重复挂单',
-  },
-  exec_ledger_authoritative: {
-    label: '台账以 sidecar 为权威',
-    hint: '默认关闭。开启后订单列表的状态/成交量/均价以 Rust 台账为准；sidecar 不可用时自动回退本地表（只影响读取视图，不写数据）',
-  },
+
   api_rate_limit_per_min: {
     label: 'API 限频',
     unit: '次/分/IP',

@@ -125,14 +125,14 @@ ls -l /run/nanoquant/exec.sock
 EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock
 ```
 
-## 启用 sidecar 参与签名
+## sidecar 自检（可选）
 
 1. 面板「系统诊断 → 执行内核」确认 `target=/run/nanoquant/exec.sock`、`connected=true`；
-2. 点「自检」，两侧 88 字符 base64 一致后先把 `exec_mode` 设为 `shadow` 观察；
-3. `mismatched` 恒为 0 再切 `enforce`（灰度 24h）；
-4. 换 Secret 后必须点「清零」，否则切换窗口内的在途比对会残留不一致计数。
+2. 点「自检」，两侧 88 字符 base64 一致即可；
+3. 主服务使用 Rust 内核签名；参数页不再提供 `exec_mode/exec_socket` 设置。
+4. 换 Secret 后必须点「清零」，避免在途比对残留不一致计数。
 
-> 保护单代发、台账权威源等 P3 能力的**启用顺序、判据与回滚**见
+> 保护单代发、台账权威源等 P3 能力的历史说明见
 > [`docs/archive/history/deploy/P3_ROLLOUT.md`](../docs/archive/history/deploy/P3_ROLLOUT.md)。
 
 ## 监控（可选）

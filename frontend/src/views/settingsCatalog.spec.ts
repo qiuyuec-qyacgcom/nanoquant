@@ -52,10 +52,7 @@ describe('参数配置目录', () => {
       'ticker_ttl_sec',
       'request_timeout_sec',
       'max_pool_size',
-      'exec_sample_pct',
-      'exec_timeout_ms',
-      'exec_place_protection',
-      'exec_ledger_authoritative',
+
       'alert_template',
       'alert_digest_enabled',
       'alert_quiet_hours',
@@ -86,10 +83,7 @@ describe('参数配置目录', () => {
       'max_spread_bps',
       'adx_filter',
       'adx_min',
-      'ai_review_enabled',
-      'ai_review_max_per_cycle',
-      'leverage_min',
-      'leverage_max',
+
       'mr_window',
       'mr_z_entry',
       'mr_min_risk_reward',
@@ -97,6 +91,7 @@ describe('参数配置目录', () => {
       'mr_trend_gap_pct',
       'risk_per_trade_pct',
       'margin_pct',
+      'min_leverage',
       'default_leverage',
       'max_leverage',
       'max_exposure_pct',
@@ -117,8 +112,7 @@ describe('参数配置目录', () => {
       'refresh_minutes',
       'alert_enabled',
       'alert_webhook_url',
-      'exec_mode',
-      'exec_socket',
+
       'retention',
       'session_ttl_hours',
     ]

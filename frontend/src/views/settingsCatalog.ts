@@ -55,16 +55,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       fields: ['adx_filter', 'adx_min'],
     },
     {
-      title: 'AI 复审',
-      hint: '开启后量化提案先经 AI 复核；候选额度同时限制每轮扫描/复核数量',
-      fields: ['ai_review_enabled', 'ai_review_max_per_cycle'],
-    },
-    {
-      title: '策略杠杆区间',
-      hint: '只约束策略自主开仓；与风控组最大杠杆同时生效，取更小值',
-      fields: ['leverage_min', 'leverage_max'],
-    },
-    {
+
       title: '均值回归',
       hint: '仅 mode=meanrev 生效；不选均值回归时这些参数不参与信号',
       fields: ['mr_window', 'mr_z_entry', 'mr_min_risk_reward', 'mr_block_in_trend', 'mr_trend_gap_pct'],
@@ -73,8 +64,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   risk: [
     {
       title: '仓位与杠杆',
-      hint: '单笔风险与保证金上限取较小值；杠杆同时受默认值、上限与策略区间约束',
-      fields: ['risk_per_trade_pct', 'margin_pct', 'default_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction'],
+      hint: '杠杆只在此组调整；实际杠杆取默认值，受下限、上限与交易所上限共同钳制',
+      fields: ['risk_per_trade_pct', 'margin_pct', 'min_leverage', 'default_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction'],
     },
     {
       title: '全局止盈止损',
@@ -124,11 +115,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       ],
     },
     {
-      title: '执行内核（高级）',
-      hint: '默认关闭；部署 sidecar 后按需启用 shadow/enforce',
-      fields: ['exec_mode', 'exec_socket'],
-    },
-    {
+
       title: '安全与观测',
       hint: 'API 限频按 IP 计；健康检查与 /metrics 不计数',
       fields: ['api_rate_limit_per_min', 'metrics_enabled'],
@@ -176,10 +163,6 @@ const HIDDEN_BY_GROUP: Record<string, readonly string[]> = {
     'alert_digest_enabled',
     'alert_digest_minutes',
 
-    'exec_sample_pct',
-    'exec_timeout_ms',
-    'exec_place_protection',
-    'exec_ledger_authoritative',
   ],
   security: ['password_is_default'],
 }

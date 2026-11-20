@@ -158,7 +158,7 @@ curl http://127.0.0.1:8899/api/v1/health
 | `NANOQUANT_LOG_DIR` | `logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 加密密钥；丢失后已保存的 API Key 无法解密 |
 | `NANOQUANT_ADMIN_PASSWORD` | 空 | 仅首次建管理员时生效 |
-| `EXEC_SOCKET` | `/run/nanoquant/exec.sock` | sidecar UDS；参数页 `exec_socket` 优先 |
+| `EXEC_SOCKET` | `/run/nanoquant/exec.sock` | sidecar UDS 地址；仅由部署环境提供 |
 | `EXEC_SECRET` | 无 | sidecar 签名 Secret，生产放权限 0600 的 `EnvironmentFile` |
 | `NANOQUANT_BACKUP_MIRROR` | 空 | 备份异盘副本目录，如 `/mnt/nanoquant-backups` |
 
@@ -169,11 +169,11 @@ curl http://127.0.0.1:8899/api/v1/health
 参数分 8 组，全部可在后台热更新：
 
 1. **交易执行**：周期、最大持仓、交易时段、时区、下单方式
-2. **策略**：趋势/均值回归模式、周期、入场过滤、ATR 止损止盈、最小盈亏比、移动止损、保本、部分止盈、ADX、AI 复审、策略杠杆区间
-3. **风控**：单笔风险、保证金、默认/最大杠杆、总敞口、同向持仓、全局止盈止损、日亏/回撤/连亏熔断、高级风控、执行成本
+2. **策略**：趋势/均值回归模式、周期、入场过滤、ATR 止损止盈、最小盈亏比、移动止损、保本、部分止盈、ADX；AI 在配置了可用 provider 时自动复核
+3. **风控**：单笔风险、保证金、默认/最小/最大杠杆、总敞口、同向持仓、全局止盈止损、日亏/回撤/连亏熔断、高级风控、执行成本
 4. **交易所**：测试网/主网地址、备用地址、代理与 API 凭证
 5. **资讯**：抓取节奏、源、情绪与 AI 摘要
-6. **通知与系统**：日志、保留、Webhook/Telegram、执行内核、限频与指标
+6. **通知与系统**：日志、保留、Webhook/Telegram、限频与指标
 7. **备份**：保留份数、加密、自动备份、日志
 8. **安全**：账号、登录要求、会话时长、失败锁定
 
@@ -230,17 +230,12 @@ nanoquant/
 
 ---
 
-## 🧩 执行内核 sidecar
+## 🧩 执行内核 sidecar（兼容诊断）
 
-| 模式 | 行为 |
-|---|---|
-| `off`（默认） | 主服务本地签名 |
-| `shadow` | 旁路逐字节比对，只统计，不阻塞下单 |
-| `enforce` | 不一致立即拒绝下单 |
+主服务以 Rust 内核签名为准，参数页不再提供执行内核模式/地址。sidecar 只作为可选的独立签名与自检通道，
+由部署环境变量 `EXEC_SOCKET` / `EXEC_SECRET` 提供连接信息，不在后台参数页切换 `off/shadow/enforce`。
 
-sidecar 只持有 Secret，不接触账户、持仓与订单。连不上/超时会降级回主服务签名并进入短暂静默；
-切换 `enforce` 前要求 `mismatched == 0` 且自检通过。协议见 `docs/EXEC_PROTOCOL.md`。
-
+sidecar 只持有 Secret，不接触账户、持仓与订单。协议见 `docs/EXEC_PROTOCOL.md`。
 systemd 模式下主服务与 sidecar 必须使用同一用户，才能访问权限 0600 的 UDS；
 `scripts/setup_sidecar.sh` 默认复用已存在的 `nanoquant` 用户。
 

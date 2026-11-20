@@ -17,6 +17,7 @@
   "risk": {
     "risk_per_trade_pct": 10.0,
     "max_leverage": 100,
+    "min_leverage": 1,
     "default_leverage": 20,
     "margin_pct": 50.0,
     "max_exposure_pct": 2000.0,
@@ -38,11 +39,7 @@
   },
   "strategy": {
     "mode": "meanrev",
-    "ai_review_enabled": false,
-    "ai_review_max_per_cycle": 6,
     "timeframe": "4h",
-    "leverage_min": 8,
-    "leverage_max": 30,
 
     "ema_fast": 9,
     "ema_slow": 21,
@@ -232,12 +229,7 @@
     "alert_template": "",
     "alert_digest_enabled": false,
     "alert_digest_minutes": 60,
-    "exec_mode": "off",
-    "exec_socket": "",
-    "exec_sample_pct": 100,
-    "exec_timeout_ms": 500,
-    "exec_place_protection": false,
-    "exec_ledger_authoritative": false,
+
     "api_rate_limit_per_min": 0,
     "metrics_enabled": true
   },

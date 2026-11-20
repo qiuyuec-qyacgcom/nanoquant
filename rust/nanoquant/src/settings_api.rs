@@ -272,7 +272,10 @@ fn migrate(name: &str, raw: &Value) -> Value {
             out.remove("max_hold_minutes");
             out.remove("max_hold_minutes_chop");
             out.remove("ai_review_flat");
-
+            out.remove("ai_review_enabled");
+            out.remove("ai_review_max_per_cycle");
+            out.remove("leverage_min");
+            out.remove("leverage_max");
             out.remove("htf_timeframe");
         }
         "risk" => {
@@ -281,6 +284,12 @@ fn migrate(name: &str, raw: &Value) -> Value {
         }
         "system" => {
             out.remove("timezone_offset");
+            out.remove("exec_mode");
+            out.remove("exec_socket");
+            out.remove("exec_sample_pct");
+            out.remove("exec_timeout_ms");
+            out.remove("exec_place_protection");
+            out.remove("exec_ledger_authoritative");
         }
         "ai" => {
             out.remove("max_position_leverage");
@@ -374,6 +383,8 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         "engine" => check("cycle_interval_sec", 15.0, 3600.0)?,
         "risk" => {
             check("max_leverage", 1.0, 100.0)?;
+            check("min_leverage", 1.0, 100.0)?;
+            check("default_leverage", 1.0, 100.0)?;
             check("daily_loss_limit_pct", 0.01, 100.0)?;
             check("global_stop_loss_pct", 0.0, 100.0)?;
             check("global_take_profit_pct", 0.0, 100.0)?;
@@ -608,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_cover_every_group_and_ai_review_is_real() {
+    fn defaults_cover_every_group_and_risk_leverage_is_present() {
         for group in GROUPS {
             let value = defaults_of(group);
             assert!(
@@ -617,9 +628,12 @@ mod tests {
             );
         }
         let strategy = defaults_of("strategy");
-        assert_eq!(strategy["ai_review_enabled"], false);
-        assert_eq!(strategy["ai_review_max_per_cycle"], 6);
-        assert!(strategy.get("ai_review_flat").is_none());
+        assert!(strategy.get("ai_review_enabled").is_none());
+        assert!(strategy.get("leverage_min").is_none());
+        let risk = defaults_of("risk");
+        assert_eq!(risk["min_leverage"], 1);
+        assert_eq!(risk["default_leverage"], 20);
+        assert_eq!(risk["max_leverage"], 100);
     }
 
     #[tokio::test]
@@ -660,7 +674,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["data"]["mode"], "meanrev");
         assert_eq!(body["data"]["timeframe"], "4h");
-        assert_eq!(body["data"]["ai_review_enabled"], false);
+
         let stored: String = db
             .conn
             .lock()
