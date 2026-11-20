@@ -253,12 +253,12 @@ detect_pm() {
 
 dependency_hint() {
   case "$PM" in
-    apt) echo "apt-get update && apt-get install -y gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils" ;;
-    dnf) echo "dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz" ;;
-    yum) echo "yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz" ;;
-    apk) echo "apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz" ;;
-    zypper) echo "zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz" ;;
-    pacman) echo "pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf git tar gzip xz" ;;
+    apt) echo "apt-get update && apt-get install -y gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils acl" ;;
+    dnf) echo "dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz acl" ;;
+    yum) echo "yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz acl" ;;
+    apk) echo "apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz acl" ;;
+    zypper) echo "zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz acl" ;;
+    pacman) echo "pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf git tar gzip xz acl" ;;
     *) echo "请安装 gcc、make、perl、curl、git、tar、gzip、pkg-config" ;;
   esac
 }
@@ -272,27 +272,27 @@ install_system_deps() {
     apt)
       run_root_logged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
       run_root_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils
+        gcc libc6-dev make perl curl ca-certificates pkg-config git tar gzip xz-utils acl
       ;;
     dnf)
       run_root_logged dnf install -y \
-        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config git tar gzip xz acl
       ;;
     yum)
       run_root_logged yum install -y \
-        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig git tar gzip xz acl
       ;;
     apk)
       run_root_logged apk add --no-cache \
-        gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz
+        gcc musl-dev make perl curl ca-certificates pkgconf git tar gzip xz acl
       ;;
     zypper)
       run_root_logged zypper --non-interactive install \
-        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz
+        gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config git tar gzip xz acl
       ;;
     pacman)
       run_root_logged pacman -Sy --needed --noconfirm \
-        gcc make perl curl ca-certificates pkgconf git tar gzip xz
+        gcc make perl curl ca-certificates pkgconf git tar gzip xz acl
       ;;
   esac
   SYSTEM_DEPS_DONE=1
@@ -617,6 +617,55 @@ create_service_user() {
   RUN_GROUP="$(id -gn "$RUN_USER")"
 }
 
+grant_service_access() {
+  [ "$SYSTEMD" -eq 1 ] || return 0
+  [ -n "$RUN_USER" ] || return 0
+  [ "$RUN_USER" = "root" ] && return 0
+  command -v runuser >/dev/null 2>&1 || {
+    log WARN "缺少 runuser，跳过服务用户路径访问预检"
+    return 0
+  }
+  if runuser -u "$RUN_USER" -- test -x "$ROOT" >/dev/null 2>&1 \
+    && runuser -u "$RUN_USER" -- test -r "$BIN" >/dev/null 2>&1; then
+    return 0
+  fi
+  log WARN "服务用户 $RUN_USER 无法访问安装目录，自动授予路径穿越权限"
+  local path start
+  for start in "$ROOT" "$(dirname "$BIN")" "$(dirname "$FRONTEND_DIST")"; do
+    path="$start"
+    while [ "$path" != "/" ]; do
+      if ! runuser -u "$RUN_USER" -- test -x "$path" >/dev/null 2>&1; then
+        if command -v setfacl >/dev/null 2>&1 \
+          && setfacl -m "u:$RUN_USER:x" "$path" 2>/dev/null; then
+          log INFO "ACL 授权 $RUN_USER 穿越 $path"
+        else
+          chmod o+x "$path" 2>/dev/null || die "无法授予 $RUN_USER 穿越 $path"
+          log WARN "已回退 chmod o+x：$path"
+        fi
+      fi
+      path="$(dirname "$path")"
+    done
+  done
+  if ! runuser -u "$RUN_USER" -- test -r "$BIN" >/dev/null 2>&1; then
+    if command -v setfacl >/dev/null 2>&1 \
+      && setfacl -m "u:$RUN_USER:rX" "$BIN" 2>/dev/null; then
+      log INFO "ACL 授权 $RUN_USER 读取 $BIN"
+    else
+      chmod o+rx "$BIN" 2>/dev/null || die "无法授予 $RUN_USER 读取 $BIN"
+      log WARN "已回退 chmod o+rx：$BIN"
+    fi
+  fi
+  runuser -u "$RUN_USER" -- test -x "$ROOT" >/dev/null 2>&1 \
+    || die "服务用户 $RUN_USER 仍无法进入 $ROOT"
+  runuser -u "$RUN_USER" -- test -r "$BIN" >/dev/null 2>&1 \
+    || die "服务用户 $RUN_USER 仍无法读取 $BIN"
+  if [ -f "$FRONTEND_INDEX" ]; then
+    runuser -u "$RUN_USER" -- test -r "$FRONTEND_INDEX" >/dev/null 2>&1 \
+      || die "服务用户 $RUN_USER 仍无法读取 $FRONTEND_INDEX"
+  fi
+  log OK "服务用户 $RUN_USER 已可访问安装目录"
+}
+
 prepare_dirs() {
   mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups"
   if ! chmod 700 "$ROOT/data" "$ROOT/logs" "$ROOT/data/backups" 2>/dev/null; then
@@ -643,9 +692,9 @@ prepare_dirs() {
     fi
     if command -v runuser >/dev/null 2>&1; then
       runuser -u "$RUN_USER" -- test -r "$BIN" >/dev/null 2>&1 \
-        || die "服务用户 $RUN_USER 无法读取 $BIN；请将仓库放到 /opt 等可读路径"
+        || die "服务用户 $RUN_USER 仍无法读取 $BIN；请检查 ACL 或目录权限"
       runuser -u "$RUN_USER" -- test -x "$ROOT" >/dev/null 2>&1 \
-        || die "服务用户 $RUN_USER 无法进入 $ROOT；请调整目录权限或改用 /opt"
+        || die "服务用户 $RUN_USER 仍无法进入 $ROOT；请检查 ACL 或目录权限"
     fi
   fi
   log OK "数据目录就绪（端口 $PORT）"
@@ -938,6 +987,7 @@ main() {
   build_frontend
   if [ "$SYSTEMD" -eq 1 ]; then
     create_service_user
+    grant_service_access
   fi
   prepare_dirs
   if [ "$SYSTEMD" -eq 1 ]; then

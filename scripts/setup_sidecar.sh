@@ -67,13 +67,13 @@ ensure_sidecar_deps() {
     apt)
       env DEBIAN_FRONTEND=noninteractive apt-get update -qq
       env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        gcc libc6-dev make perl curl ca-certificates pkg-config
+        gcc libc6-dev make perl curl ca-certificates pkg-config acl
       ;;
-    dnf) dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config ;;
-    yum) yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig ;;
-    apk) apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf ;;
-    zypper) zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config ;;
-    pacman) pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf ;;
+    dnf) dnf install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconf-pkg-config acl ;;
+    yum) yum install -y gcc gcc-c++ glibc-devel make perl curl ca-certificates pkgconfig acl ;;
+    apk) apk add --no-cache gcc musl-dev make perl curl ca-certificates pkgconf acl ;;
+    zypper) zypper --non-interactive install gcc gcc-c++ glibc-devel make perl curl ca-certificates pkg-config acl ;;
+    pacman) pacman -Sy --needed --noconfirm gcc make perl curl ca-certificates pkgconf acl ;;
   esac
   hash -r 2>/dev/null || true
   command -v curl >/dev/null 2>&1 || die "自动安装后仍缺少 curl"
@@ -134,6 +134,46 @@ fi
 info "安装二进制到 $APP_HOME/exec-service"
 install -m 0755 "$BIN" "$APP_HOME/exec-service"
 ok "二进制已安装"
+
+grant_sidecar_access() {
+  [[ -n "$RUN_USER" ]] || return 0
+  [[ "$RUN_USER" == "root" ]] && return 0
+  command -v runuser >/dev/null 2>&1 || {
+    warn "缺少 runuser，跳过 sidecar 路径访问预检"
+    return 0
+  }
+  local bin="$APP_HOME/exec-service"
+  if runuser -u "$RUN_USER" -- test -x "$bin" >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "sidecar 用户 $RUN_USER 无法执行 $bin，自动授予路径访问权限"
+  local path
+  path="$(dirname "$bin")"
+  while [[ "$path" != "/" ]]; do
+    if ! runuser -u "$RUN_USER" -- test -x "$path" >/dev/null 2>&1; then
+      if command -v setfacl >/dev/null 2>&1 \
+        && setfacl -m "u:$RUN_USER:x" "$path" 2>/dev/null; then
+        info "ACL 授权 $RUN_USER 穿越 $path"
+      else
+        chmod o+x "$path" 2>/dev/null || die "无法授予 $RUN_USER 穿越 $path"
+        warn "已回退 chmod o+x：$path"
+      fi
+    fi
+    path="$(dirname "$path")"
+  done
+  if ! runuser -u "$RUN_USER" -- test -x "$bin" >/dev/null 2>&1; then
+    if command -v setfacl >/dev/null 2>&1 \
+      && setfacl -m "u:$RUN_USER:rX" "$bin" 2>/dev/null; then
+      info "ACL 授权 $RUN_USER 执行 $bin"
+    else
+      chmod o+rx "$bin" 2>/dev/null || die "无法授予 $RUN_USER 执行 $bin"
+      warn "已回退 chmod o+rx：$bin"
+    fi
+  fi
+  runuser -u "$RUN_USER" -- test -x "$bin" >/dev/null 2>&1 \
+    || die "sidecar 用户 $RUN_USER 仍无法执行 $bin"
+  ok "sidecar 用户 $RUN_USER 已可执行安装目录中的二进制"
+}
 
 # ---------- 4. Secret（必须与 legacy 内核（已退役）交易所签名密钥一致）----------
 mkdir -p /etc/nanoquant
@@ -202,6 +242,7 @@ if [[ -n "$RUN_USER" ]]; then
   chown "$RUN_USER:$RUN_GROUP" "$APP_HOME/exec-service"
   chmod 0755 "$APP_HOME/exec-service"
 fi
+grant_sidecar_access
 systemctl daemon-reload
 systemctl enable --now nanoquant-exec
 sleep 1

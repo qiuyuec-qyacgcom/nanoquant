@@ -8,7 +8,8 @@
 
 - 仅支持 Linux：Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE。
 - systemd 或 nohup 二选一；systemd 模式需要 root。
-- Rust 1.88+、Node.js 20+、gcc/make/perl/curl/git；安装脚本会默认自动补齐缺失工具。
+- Rust 1.88+、Node.js 20+、gcc/make/perl/curl/git/pkg-config/acl；安装脚本会默认自动补齐缺失工具。
+- 仓库可直接放在 `/root` 下；安装脚本会自动为 `nanoquant` 授予路径穿越权限（ACL 优先，失败回退最小 chmod）。
 - systemd 模式默认创建 `nanoquant` 系统用户；sidecar 必须使用同一用户。
 
 ## 已部署机器如何更新

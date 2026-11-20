@@ -82,7 +82,7 @@
 | Rust | **1.88+** | 构建主服务与 sidecar；运行期不需要解释器 |
 | Node.js | **20+** | 仅构建前端时需要；已有 `frontend/dist` 时可用 `--no-frontend` |
 | 系统 | **Linux** | Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE |
-| 构建依赖 | gcc / make / perl / curl / git / pkg-config | 默认自动安装；离线环境可预装 |
+| 构建依赖 | gcc / make / perl / curl / git / pkg-config / acl | 默认自动安装；离线环境可预装 |
 | 磁盘 | ≥ 2 GB 可用 | SQLite、日志、备份均在 `data/` 下 |
 
 ### 方式一：一条命令在线安装
@@ -103,7 +103,8 @@ NANOQUANT_ADMIN_PASSWORD='你的密码' sudo -E bash install.sh --systemd
 
 `install.sh` 下载代码后转交 `scripts/install.sh`：自动安装缺失的构建工具、Rust 与 Node.js，
 检查工具链、构建 Rust/前端，创建 `data/`、`logs/` 与权限、按需创建 `nanoquant` 系统用户并生成 systemd unit，
-最后通过 `/api/v1/health` 验证。失败时会尝试恢复旧二进制/旧 unit。
+最后通过 `/api/v1/health` 验证。仓库位于 `/root` 下也可直接安装，脚本会自动为服务用户授予路径穿越权限。
+失败时会尝试恢复旧二进制/旧 unit。
 
 ### 方式二：本地脚本
 
