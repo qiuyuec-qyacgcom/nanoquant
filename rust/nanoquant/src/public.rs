@@ -21,6 +21,7 @@ pub fn routes() -> Router<Db> {
         .route("/public/klines", get(klines))
         .route("/public/klines/batch", get(klines_batch))
         .route("/public/quotes", get(quotes))
+        .route("/public/oi", get(oi_signal))
 }
 
 fn field<'a>(group: &'a Value, key: &str) -> Option<&'a Value> {
@@ -252,6 +253,13 @@ struct BatchQuery {
 fn default_batch_limit() -> usize {
     120
 }
+
+#[derive(Deserialize)]
+struct OiQuery {
+    symbol: String,
+    #[serde(default = "default_interval")]
+    interval: String,
+}
 fn default_max_symbols() -> usize {
     12
 }
@@ -377,6 +385,103 @@ fn market_url(live: bool, path: &str) -> String {
         "testnet.binancefuture.com"
     };
     format!("https://{host}/fapi/v1/{path}")
+}
+
+fn market_data_url(live: bool, path: &str) -> String {
+    let host = if live {
+        "fapi.binance.com"
+    } else {
+        "testnet.binancefuture.com"
+    };
+    format!("https://{host}/futures/data/{path}")
+}
+
+fn oi_period(interval: &str) -> &'static str {
+    match interval {
+        "5m" => "5m",
+        "15m" => "15m",
+        "1h" => "1h",
+        "1d" => "1d",
+        _ => "5m",
+    }
+}
+
+fn parse_oi_series(rows: &[Value]) -> Option<(f64, f64)> {
+    let values: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| {
+            row.get("sumOpenInterest")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+        })
+        .collect();
+    let last = *values.last()?;
+    let previous = values.get(values.len().checked_sub(2)?)?;
+    if *previous <= 0.0 {
+        return None;
+    }
+    Some((last, (last - previous) / previous * 100.0))
+}
+
+fn parse_price_change(items: &[Value]) -> Option<f64> {
+    let first = items.first()?.get("c")?.as_f64()?;
+    let last = items.last()?.get("c")?.as_f64()?;
+    if first <= 0.0 {
+        return None;
+    }
+    Some((last - first) / first * 100.0)
+}
+
+async fn oi_signal(
+    State(db): State<Db>,
+    Query(query): Query<OiQuery>,
+) -> Result<Json<Value>, MarketError> {
+    require_site(&db)?;
+    if interval_ms(&query.interval).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail": "interval 必须是 5m/15m/1h/1d"})),
+        ));
+    }
+    let symbol = query.symbol.trim().to_uppercase();
+    let symbols = enabled_symbols(&db)?;
+    if !symbols.iter().any(|item| item == &symbol) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"detail": "标的未在池中"})),
+        ));
+    }
+    let live = market_live(&db)?;
+    let client = MARKET_CLIENT.as_ref().map_err(|_| market_unavailable())?;
+    let rows = client
+        .get(market_data_url(live, "openInterestHist"))
+        .query(&[
+            ("symbol", symbol.as_str()),
+            ("period", oi_period(&query.interval)),
+            ("limit", "2"),
+        ])
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|_| market_unavailable())?
+        .json::<Vec<Value>>()
+        .await
+        .map_err(|_| market_unavailable())?;
+    let (open_interest, oi_change_pct) =
+        parse_oi_series(&rows).ok_or_else(market_unavailable)?;
+    let klines = fetch_klines(live, &symbol, &query.interval, 2, false).await?;
+    let price_change_pct = parse_price_change(&klines).unwrap_or(0.0);
+    let regime = crate::oi_regime::payload(price_change_pct, oi_change_pct);
+    Ok(Json(json!({
+        "symbol": symbol,
+        "interval": query.interval,
+        "open_interest": open_interest,
+        "oi_change_pct": oi_change_pct,
+        "price_change_pct": price_change_pct,
+        "oi_regime": regime,
+        "ts": crate::now(),
+    })))
 }
 
 async fn fetch_klines(
@@ -1055,5 +1160,27 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
         );
         assert!(body["items"].as_object().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oi_series_calculates_change_from_last_two_points() {
+        let rows = vec![
+            json!({"sumOpenInterest": "1000"}),
+            json!({"sumOpenInterest": "1010"}),
+            json!({"sumOpenInterest": "1020.2"}),
+        ];
+        let (open_interest, change) = parse_oi_series(&rows).unwrap();
+        assert_eq!(open_interest, 1020.2);
+        assert!((change - 1.00990099).abs() < 1e-6);
+        assert!(parse_oi_series(&rows[..1]).is_none());
+        assert!(parse_oi_series(&[json!({"sumOpenInterest": "0"})]).is_none());
+    }
+
+    #[test]
+    fn oi_price_change_uses_first_and_last_close() {
+        let items = vec![json!({"c": 100.0}), json!({"c": 103.0})];
+        assert_eq!(parse_price_change(&items), Some(3.0));
+        assert_eq!(parse_price_change(&items[..1]), Some(0.0));
+        assert!(parse_price_change(&[json!({"c": 0.0}), json!({"c": 1.0})]).is_none());
     }
 }

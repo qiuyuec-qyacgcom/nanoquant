@@ -60,6 +60,27 @@ export const publicQuotes = () =>
     updated_at: number
   }>('/quotes')
 
+export interface PublicOiSignal {
+  symbol: string
+  interval: string
+  open_interest: number
+  oi_change_pct: number
+  price_change_pct: number
+  oi_regime: {
+    code: string
+    label: string
+    short_label: string
+    tone: 'up' | 'down' | 'warn' | 'dim'
+    price_change_pct: number
+    oi_change_pct: number
+    threshold_pct: number
+  }
+  ts: number
+}
+
+export const publicOi = (symbol: string, interval = '15m') =>
+  pubGet<PublicOiSignal>(`/oi?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`)
+
 /** 池内多标的 K 线 (空池返回 empty=true, 不会请求池外合约) */
 export const publicKlinesBatch = (interval = '1m', limit = 160) =>
   pubGet<{

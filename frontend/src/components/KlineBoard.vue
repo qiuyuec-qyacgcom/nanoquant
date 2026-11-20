@@ -13,7 +13,9 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { getToken } from '../api/client'
-import { publicKlines, publicPool, publicQuotes } from '../api/public'
+import { publicKlines, publicOi, publicPool, publicQuotes } from '../api/public'
+import type { PublicOiSignal } from '../api/public'
+import { useSilentRefresh } from '../composables/silentRefresh'
 import type { Candle, PoolSymbol } from '../types/candle'
 import { fmt, numClass, pct, px, timeStr } from '../utils/format'
 import KlineChartPanel from './KlineChartPanel.vue'
@@ -50,6 +52,7 @@ const mainIndicator = ref('MA')
 const subIndicator = ref('VOL')
 const items = ref<Candle[]>([])
 const tickers = ref<Record<string, TickerBrief>>({})
+const oiSignal = ref<PublicOiSignal | null>(null)
 const loading = ref(true)
 const chartLoading = ref(false)
 const chartError = ref('')
@@ -87,6 +90,31 @@ const stats = computed(() => {
   }
   return { high, low, quote_volume: vol }
 })
+
+const oiTagClass = computed(() => {
+  const tone = oiSignal.value?.oi_regime.tone || 'dim'
+  return tone === 'up' ? 'tag-long' : tone === 'down' ? 'tag-short' : tone === 'warn' ? 'tag-warn' : 'tag-dim'
+})
+
+async function loadOi() {
+  const symbol = selected.value
+  if (!symbol) {
+    oiSignal.value = null
+    return
+  }
+  try {
+    oiSignal.value = await publicOi(symbol, interval.value)
+  } catch {
+    oiSignal.value = null
+  }
+}
+
+watch([selected, interval], () => {
+  oiSignal.value = null
+  void loadOi()
+})
+
+useSilentRefresh(loadOi, 30000)
 
 const countdown = computed(() => {
   if (!nextCloseAt.value) return '--'
@@ -459,6 +487,14 @@ onBeforeUnmount(() => {
                   <span class="muted mono">高 {{ stats ? px(stats.high) : '--' }}</span>
                   <span class="muted mono">低 {{ stats ? px(stats.low) : '--' }}</span>
                   <span class="muted mono">额 {{ stats ? fmt(stats.quote_volume) : '--' }}</span>
+                  <span
+                    v-if="oiSignal"
+                    class="tag"
+                    :class="oiTagClass"
+                    :title="`${oiSignal.oi_regime.label}（价格 ${pct(oiSignal.price_change_pct)}，OI ${pct(oiSignal.oi_change_pct)}）`"
+                  >
+                    OI {{ pct(oiSignal.oi_change_pct) }} · {{ oiSignal.oi_regime.short_label }}
+                  </span>
                   <span v-if="current" class="tag" :class="current.tier === 'tier_1_bluechip' ? 'tag-blue' : 'tag-dim'">
                     {{ current.tier_label }}
                   </span>

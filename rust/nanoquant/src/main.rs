@@ -47,6 +47,7 @@ mod kline_stream;
 mod live;
 mod manage;
 mod news;
+mod oi_regime;
 mod ops_tools;
 mod protection_api;
 mod providers;

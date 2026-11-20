@@ -149,6 +149,8 @@ fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
     } else {
         0.0
     };
+    let price_change_pct = pct_change(&closes, 1).unwrap_or(0.0);
+    let oi_regime = crate::oi_regime::payload(price_change_pct, market.open_interest_change_pct);
     let mut features = json!({
         "bars": candles.len(),
         "close": round4(last),
@@ -164,6 +166,8 @@ fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
         "funding": market.funding_rate,
         "open_interest": market.open_interest,
         "oi_change_pct": market.open_interest_change_pct,
+        "price_change_pct": round4(price_change_pct),
+        "oi_regime": oi_regime,
         "change_24h": round4(change_24h),
         "quote_volume": market.quote_volume,
         "spread_bps": round4(market.spread_bps),
@@ -424,8 +428,10 @@ async fn decision_preview(
         "price": market.mark_price,
         "score": round4(ema_gap / 0.22),
         "side_hint": if fast > slow { "long" } else { "short" },
-        "quant_reasons": ["ema_gap_pct", "rsi", "vol_ratio", "funding", "oi_change_pct", "atr_pct"],
+        "quant_reasons": ["ema_gap_pct", "rsi", "vol_ratio", "funding", "oi_change_pct", "oi_regime", "atr_pct"],
         "features": features,
+        "oi_regime": features["oi_regime"].clone(),
+        "oi_regime_hint": "价涨+OI增=上升趋势确认；价涨+OI减=反弹不牢；价跌+OI增=下降趋势确认；价跌+OI减=趋势可能尾声",
         "klines": recent_bars(&market.candles, 14)
             .iter()
             .map(|bar| json!({"o": bar["o"], "h": bar["h"], "l": bar["l"], "c": bar["c"]}))
