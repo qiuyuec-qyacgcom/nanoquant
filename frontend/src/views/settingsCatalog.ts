@@ -28,7 +28,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '下单', fields: ['order_type', 'close_on_halt'] },
   ],
   strategy: [
-    { title: '基础', fields: ['mode', 'timeframe'] },
+    { title: '基础', fields: ['timeframe'] },
     {
       title: '入场过滤',
       hint: '任一项不达标都不开仓',
@@ -50,15 +50,9 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       ],
     },
     {
-      title: '趋势过滤',
-      hint: 'ADX 周期固定 14；关闭后不再用 ADX 拦截信号',
-      fields: ['adx_filter', 'adx_min'],
-    },
-    {
-
-      title: '均值回归',
-      hint: '仅 mode=meanrev 生效；不选均值回归时这些参数不参与信号',
-      fields: ['mr_window', 'mr_z_entry', 'mr_min_risk_reward', 'mr_block_in_trend', 'mr_trend_gap_pct'],
+      title: '融合模型说明',
+      hint: '当前仅使用 NQ-Fusion：趋势/波动突破、横截面相对强弱、资金费率、OI/订单流按行情状态加权；旧 trend/meanrev 参数已隐藏',
+      fields: [],
     },
   ],
   risk: [
@@ -128,7 +122,18 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
 const HIDDEN_BY_GROUP: Record<string, readonly string[]> = {
   engine: ['max_symbols_per_cycle', 'scan_concurrency', 'recv_window_ms'],
   strategy: [
-
+    'mode',
+    'adx_filter',
+    'adx_min',
+    'mr_window',
+    'mr_z_entry',
+    'mr_min_risk_reward',
+    'mr_block_in_trend',
+    'mr_trend_gap_pct',
+    'rsi_long_min',
+    'rsi_long_max',
+    'rsi_short_min',
+    'rsi_short_max',
     'ema_fast',
     'ema_slow',
     'rsi_period',

@@ -1092,6 +1092,8 @@ impl EngineRuntime {
     ) -> crate::trade_policy::TradePolicy {
         let mode = if mode == "meanrev" {
             "meanrev"
+        } else if mode == "fusion" {
+            "fusion"
         } else {
             "trend"
         };
@@ -1653,7 +1655,7 @@ impl EngineRuntime {
         let policy = Self::trade_policy(
             strategy,
             risk_cfg,
-            strategy["mode"].as_str().unwrap_or("trend"),
+            strategy["mode"].as_str().unwrap_or("fusion"),
         );
         let rows = {
             let mut stmt = tx
@@ -1750,6 +1752,8 @@ impl EngineRuntime {
                         crate::trade_policy::MarketFeatures {
                             funding_rate: market.funding_rate,
                             open_interest_change_pct: market.open_interest_change_pct,
+                            relative_strength: 0.0,
+                            relative_strength_available: false,
                         },
                     )
                 })
@@ -2108,9 +2112,58 @@ impl EngineRuntime {
             }
         }
         let cfg = Self::risk_settings(tx)?;
-        let policy =
-            Self::trade_policy(strategy, &cfg, strategy["mode"].as_str().unwrap_or("trend"));
+        let policy = Self::trade_policy(
+            strategy,
+            &cfg,
+            strategy["mode"].as_str().unwrap_or("fusion"),
+        );
         let filters = crate::live::load_filters(tx, scanned);
+        let mut returns = Vec::new();
+        for symbol in scanned {
+            let Some(market) = snapshot
+                .markets
+                .iter()
+                .find(|market| market.symbol == *symbol)
+            else {
+                continue;
+            };
+            if market.candles.len() < 21 {
+                continue;
+            }
+            let last = market.candles.last().map(|candle| candle.close);
+            let previous = market.candles[market.candles.len() - 21].close;
+            if let Some(last) = last.filter(|value| value.is_finite() && previous > 0.0) {
+                returns.push((symbol.clone(), last / previous - 1.0));
+            }
+        }
+        let mean = if returns.is_empty() {
+            0.0
+        } else {
+            returns.iter().map(|(_, value)| value).sum::<f64>() / returns.len() as f64
+        };
+        let sd = if returns.is_empty() {
+            0.0
+        } else {
+            (returns
+                .iter()
+                .map(|(_, value)| (value - mean).powi(2))
+                .sum::<f64>()
+                / returns.len() as f64)
+                .sqrt()
+        };
+        let relative_strength: std::collections::BTreeMap<String, f64> = returns
+            .iter()
+            .map(|(symbol, value)| {
+                (
+                    symbol.clone(),
+                    if sd > 0.0 {
+                        ((value - mean) / sd).clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
 
         let mut drafts = Vec::new();
         for symbol in scanned {
@@ -2145,6 +2198,8 @@ impl EngineRuntime {
                 crate::trade_policy::MarketFeatures {
                     funding_rate: market.funding_rate,
                     open_interest_change_pct: market.open_interest_change_pct,
+                    relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
+                    relative_strength_available: relative_strength.contains_key(symbol),
                 },
             );
             let (side, stop_price, take_profit, score, quant_side, quant_score) = match signal {
@@ -4159,14 +4214,16 @@ mod tests {
             .snapshot()
             .await
             .unwrap();
-        let candles = &mut snapshot.markets[0].candles;
-        let len = candles.len();
-        for (i, candle) in candles.iter_mut().enumerate() {
+        let market = &mut snapshot.markets[0];
+        market.funding_rate = -0.001;
+        market.open_interest_change_pct = 5.0;
+        let len = market.candles.len();
+        for (i, candle) in market.candles.iter_mut().enumerate() {
             let price = 100.0 - (len - i - 1) as f64 * 0.15;
             candle.open = price;
             candle.close = price;
-            candle.high = price + 0.5;
-            candle.low = price - 0.5;
+            candle.high = price + 0.05;
+            candle.low = price - 0.05;
         }
         (db, snapshot)
     }

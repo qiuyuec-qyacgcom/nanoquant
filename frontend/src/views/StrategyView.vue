@@ -69,15 +69,7 @@ const PLAIN_HINTS: Record<string, string> = {
 }
 
 const BASE_META: Record<string, FieldMeta> = {
-  mode: {
-    label: '信号模型',
-    widget: 'select',
-    options: [
-      ['trend', 'trend 趋势跟随'],
-      ['meanrev', 'meanrev 均值回归'],
-    ],
-    hint: '实测两者样本外均为负收益（见 docs/archive/history/docs/EVIDENCE.md），切换前先跑 walk-forward',
-  },
+
   label_after_sec: { label: '回访窗口', unit: '秒', hint: '决策满这么久才回访打标；86400=24h。超短线可调到 3600-14400，让经验更快产生' },
   inject_experiences: { label: '注入经验', hint: '关闭后经验库照常积累，但不会进入 AI 决策上下文' },
   retrieve_top_k: { label: '注入条数', unit: '条', hint: '每次决策最多注入几条相似经验（经验库是 evolution 心法之外的场景化补充，不宜过多）' },
@@ -86,15 +78,7 @@ const BASE_META: Record<string, FieldMeta> = {
   min_similarity: { label: '相似度阈值', unit: '', hint: '低于该相似度的经验不注入；调低=注入更多但相关性更弱' },
   max_experiences: { label: '经验上限', unit: '条', hint: '超出后停用最旧条目（不删除）' },
 
-  mr_z_entry: { label: '偏离阈值', unit: 'σ', hint: '|z| 达到该值才做回归；越大越少但越极端' },
-  mr_min_risk_reward: { label: '回归盈亏比', unit: 'R', hint: '回归模型胜率高但 R 小，用比趋势更低的底线' },
-  mr_block_in_trend: { label: '趋势中禁止逆势', hint: '顺势的极值通常是继续走，不是回归' },
-  mr_trend_gap_pct: { label: '强趋势判定', unit: '%', hint: '|EMA 间距| 超过该值视为趋势，不做逆势回归' },
-  mr_window: { label: '回归窗口', unit: '根', hint: '计算中轨与标准差所用的 K 线根数' },
 
-  adx_filter: { label: '趋势强度过滤', hint: 'ADX 低于阈值不放行，过滤震荡市假突破' },
-  adx_period: { label: 'ADX 周期', unit: '根' },
-  adx_min: { label: 'ADX 下限', unit: '', hint: '低于该值视为无趋势；25 以上才有明显趋势' },
   liquidation_warn_pct: { label: '强平价告警', unit: '%', hint: '标记价距强平价小于该百分比就告警；0=关闭' },
   category_exposure_limit_pct: { label: '相关性组敞口', unit: '%', hint: 'BTC/ETH/主流/山寨 各组名义额占权益上限；山寨彼此高度相关，0=关闭' },
   auto_protect_external: {
@@ -201,11 +185,6 @@ const BASE_META: Record<string, FieldMeta> = {
     widget: 'roi',
     hint: '按盈利百分比自动平仓：每档填「持仓分钟 + 价格涨到百分之几就全平」，可增删档位自行配比',
   },
-  weight_trend: { label: '权重 · 趋势' },
-  weight_momentum: { label: '权重 · 动能' },
-  weight_volume: { label: '权重 · 量能' },
-  weight_funding: { label: '权重 · 资金费率' },
-  weight_oi: { label: '权重 · 持仓量' },
 
   live_base_url: { label: '实盘域名', hint: '币安 U 本位主网 fapi 地址' },
   demo_base_url: { label: '模拟盘域名', hint: '币安测试网地址（模拟盘真实下单环境）' },
@@ -432,7 +411,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: '交易间隔', group: 'engine', key: 'cycle_interval_sec' },
   { label: '下单方式', group: 'engine', key: 'order_type' },
   { label: '最大持仓', group: 'engine', key: 'max_positions' },
-  { label: '策略模式', group: 'strategy', key: 'mode' },
+
   { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
   { label: '单笔风险', group: 'risk', key: 'risk_per_trade_pct' },
   { label: '最大杠杆', group: 'risk', key: 'max_leverage' },

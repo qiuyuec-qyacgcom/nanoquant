@@ -38,7 +38,7 @@
     "global_take_profit_pct": 0.0
   },
   "strategy": {
-    "mode": "meanrev",
+    "mode": "fusion",
     "timeframe": "4h",
 
     "ema_fast": 9,
@@ -60,14 +60,7 @@
     "breakeven_at_r": 1.0,
     "max_data_gaps": 1,
     "data_stale_mult": 2.0,
-    "adx_filter": true,
-    "adx_min": 20.0,
-    "mr_window": 20,
-    "mr_z_entry": 2.0,
-    "mr_min_risk_reward": 0.8,
-    "mr_block_in_trend": true,
-    "mr_trend_gap_pct": 0.35,
-    "mr_exhaustion_confirm": false,
+
     "partial_tp_at_r": 1.0,
     "partial_tp_ratio": 0.5,
     "max_spread_bps": 8.0,
@@ -92,12 +85,7 @@
         120,
         0.2
       ]
-    ],
-    "weight_trend": 0.32,
-    "weight_momentum": 0.26,
-    "weight_volume": 0.18,
-    "weight_funding": 0.12,
-    "weight_oi": 0.12
+    ]
   },
   "ai": {
     "enabled": true,

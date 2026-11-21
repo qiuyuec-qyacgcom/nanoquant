@@ -269,6 +269,7 @@ fn migrate(name: &str, raw: &Value) -> Value {
             ) {
                 out.insert("timeframe".to_string(), json!("15m"));
             }
+            out.insert("mode".to_string(), json!("fusion"));
             out.remove("max_hold_minutes");
             out.remove("max_hold_minutes_chop");
             out.remove("ai_review_flat");
@@ -277,6 +278,19 @@ fn migrate(name: &str, raw: &Value) -> Value {
             out.remove("leverage_min");
             out.remove("leverage_max");
             out.remove("htf_timeframe");
+            out.remove("mr_window");
+            out.remove("mr_z_entry");
+            out.remove("mr_min_risk_reward");
+            out.remove("mr_block_in_trend");
+            out.remove("mr_trend_gap_pct");
+            out.remove("weight_trend");
+            out.remove("weight_momentum");
+            out.remove("weight_volume");
+            out.remove("weight_funding");
+            out.remove("weight_oi");
+            out.remove("adx_filter");
+            out.remove("adx_min");
+            out.remove("mr_exhaustion_confirm");
         }
         "risk" => {
             out.remove("htf_enabled");
@@ -672,7 +686,7 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["data"]["mode"], "meanrev");
+        assert_eq!(body["data"]["mode"], "fusion");
         assert_eq!(body["data"]["timeframe"], "4h");
 
         let stored: String = db
@@ -686,8 +700,12 @@ mod tests {
             )
             .unwrap();
         assert!(
-            stored.contains("\"meanrev\""),
+            stored.contains("\"fusion\""),
             "重置必须真正写回默认值: {stored}"
+        );
+        assert!(
+            !stored.contains("\"mr_z_entry\""),
+            "重置后不应残留已下线的均值回归字段: {stored}"
         );
 
         let response = app

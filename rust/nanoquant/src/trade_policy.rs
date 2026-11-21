@@ -26,6 +26,8 @@ pub(crate) struct TradePolicy {
 pub(crate) struct MarketFeatures {
     pub funding_rate: f64,
     pub open_interest_change_pct: f64,
+    pub relative_strength: f64,
+    pub relative_strength_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +71,105 @@ pub(crate) fn evaluate(
     if !(0.05..=4.0).contains(&atr_pct) {
         return None;
     }
-    let (side, score, sl_distance, tp_distance) = if policy.mode == "meanrev" {
+    let mut extra = String::new();
+    let (side, score, sl_distance, tp_distance) = if policy.mode == "fusion" {
+        if candles.len() < 30 {
+            return None;
+        }
+        let adx_value = adx(candles, 14)?;
+        let fast = ema(&closes, 9)?;
+        let slow = ema(&closes, 21)?;
+        let gap_pct = (fast - slow) / slow * 100.0;
+        let atr_pct = atr / last * 100.0;
+        let regime = if adx_value >= 25.0 && gap_pct.abs() >= 0.15 {
+            "trend"
+        } else if atr_pct >= 2.0 || volume_ratio >= 2.5 {
+            "chaos"
+        } else {
+            "range"
+        };
+        let prior = &candles[candles.len() - 21..candles.len() - 1];
+        let prior_high = prior
+            .iter()
+            .map(|candle| candle.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let prior_low = prior
+            .iter()
+            .map(|candle| candle.low)
+            .fold(f64::INFINITY, f64::min);
+        let breakout_dir = if last > prior_high {
+            1.0
+        } else if last < prior_low {
+            -1.0
+        } else {
+            0.0
+        };
+        let breakout = breakout_dir * (0.4 + 0.6 * ((volume_ratio - 1.0) / 1.5).clamp(0.0, 1.0));
+        let rs = if features.relative_strength_available {
+            features.relative_strength.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let carry = if features.funding_rate.is_finite() {
+            (-features.funding_rate * 2000.0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let price_direction = if last > closes[closes.len() - 2] {
+            1.0
+        } else if last < closes[closes.len() - 2] {
+            -1.0
+        } else {
+            0.0
+        };
+        let flow = if features.open_interest_change_pct.is_finite() {
+            price_direction * (features.open_interest_change_pct / 5.0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let (w_rs, w_break, w_carry, w_flow) = match regime {
+            "trend" => (0.30, 0.35, 0.10, 0.25),
+            "chaos" => (0.20, 0.20, 0.25, 0.35),
+            _ => (0.15, 0.15, 0.35, 0.35),
+        };
+        let raw = w_rs * rs + w_break * breakout + w_carry * carry + w_flow * flow;
+        let score = (raw * 1.2).tanh();
+        if score.abs() < policy.base_threshold {
+            return None;
+        }
+        let direction = score.signum();
+        let agreement = [rs, breakout, carry, flow]
+            .iter()
+            .filter(|factor| factor.abs() > 0.15 && factor.signum() == direction)
+            .count();
+        if agreement < 2 {
+            return None;
+        }
+        let mut coverage: f64 = 0.60;
+        if features.relative_strength_available {
+            coverage += 0.15;
+        }
+        if features.open_interest_change_pct.is_finite() {
+            coverage += 0.075;
+        }
+        if features.funding_rate.is_finite() {
+            coverage += 0.075;
+        }
+        let coverage = coverage.min(1.0);
+        let confidence = (0.55 + 0.10 * agreement as f64) * coverage;
+        if confidence < 0.55 {
+            return None;
+        }
+        extra = format!(
+            "regime={regime},rs={rs:.2},break={breakout:.2},carry={carry:.2},flow={flow:.2},conf={confidence:.2},coverage={coverage:.2}"
+        );
+        (
+            if score > 0.0 { "long" } else { "short" },
+            score,
+            atr * policy.sl_atr_mult.max(0.2),
+            atr * policy.tp_atr_mult.max(0.2),
+        )
+    } else if policy.mode == "meanrev" {
         if !policy.mr_z_entry.is_finite() || policy.mr_z_entry <= 0.0 {
             return None;
         }
@@ -169,7 +269,10 @@ pub(crate) fn evaluate(
         score,
         stop_price,
         take_profit,
-        reason: format!("{}:score={score:.4}:vol={volume_ratio:.2}", policy.mode),
+        reason: format!(
+            "{}:score={score:.4}:vol={volume_ratio:.2}:{extra}",
+            policy.mode
+        ),
     })
 }
 
@@ -331,6 +434,7 @@ mod tests {
             MarketFeatures {
                 funding_rate: 0.0,
                 open_interest_change_pct: 10.0,
+                ..MarketFeatures::default()
             },
         )
         .unwrap();
@@ -357,6 +461,7 @@ mod tests {
             MarketFeatures {
                 funding_rate: 1e9,
                 open_interest_change_pct: -1e9,
+                ..MarketFeatures::default()
             },
         );
         if let Some(signal) = signal {
@@ -455,5 +560,64 @@ mod tests {
             .is_none(),
             "NaN 偏离阈值不能产生信号"
         );
+    }
+
+    fn fusion_policy() -> TradePolicy {
+        TradePolicy {
+            mode: "fusion",
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn fusion_trend_breakout_with_relative_strength_goes_long() {
+        let values: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        let signal = evaluate(
+            &candles(&values),
+            139.0,
+            1.0,
+            fusion_policy(),
+            MarketFeatures {
+                funding_rate: 0.0,
+                open_interest_change_pct: 5.0,
+                relative_strength: 0.8,
+                relative_strength_available: true,
+            },
+        )
+        .expect("趋势 + 突破 + 相对强弱同向应出多单");
+        assert_eq!(signal.side, "long");
+        assert!(signal.score.is_finite() && signal.score > 0.0);
+        assert!(signal.reason.contains("regime=trend"));
+    }
+
+    #[test]
+    fn fusion_requires_at_least_two_agreeing_factors() {
+        let values = vec![100.0; 40];
+        let signal = evaluate(
+            &candles(&values),
+            100.0,
+            1.0,
+            fusion_policy(),
+            MarketFeatures::default(),
+        );
+        assert!(signal.is_none(), "无方向因子时不应出信号");
+    }
+
+    #[test]
+    fn fusion_low_coverage_is_gated_to_flat() {
+        let values: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        let signal = evaluate(
+            &candles(&values),
+            139.0,
+            1.0,
+            fusion_policy(),
+            MarketFeatures {
+                funding_rate: -0.001,
+                open_interest_change_pct: f64::NAN,
+                relative_strength: 0.0,
+                relative_strength_available: false,
+            },
+        );
+        assert!(signal.is_none(), "缺失 RS 与 OI 时覆盖率不足应保持空仓");
     }
 }
