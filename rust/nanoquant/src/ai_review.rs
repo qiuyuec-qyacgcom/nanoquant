@@ -306,7 +306,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     }
     let mut decision = ai_client::parse_decision(&outcome.text, Some(&context))
         .map_err(|error| format!("AI 复核结果无效: {error}"))?;
-    apply_decision_params(&state, &mut decision);
+    let outcome_log_id = outcome.log_id;
+    apply_decision_params(&state, &mut decision, outcome_log_id);
     let side_lock = profile
         .as_ref()
         .and_then(|profile| profile.get("filters"))
@@ -326,7 +327,7 @@ fn tuning_enabled(value: Option<&Value>) -> bool {
     }
 }
 
-fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
+fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision, decision_id: i64) {
     if decision.params.is_empty() {
         return;
     }
@@ -373,11 +374,7 @@ fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
             .push("参数写回失败：数据库锁不可用".to_string());
         return;
     };
-    let decision_id = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM ai_call_logs", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .unwrap_or(0);
+
     match crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode) {
         Ok(report) => {
             if let Some(skipped) = report.get("skipped").and_then(Value::as_array) {

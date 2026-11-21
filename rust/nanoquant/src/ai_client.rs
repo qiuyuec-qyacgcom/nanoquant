@@ -165,6 +165,7 @@ pub struct ChatOutcome {
     pub raw_text: String,
     pub finish_reason: String,
     pub attempts: Vec<Value>,
+    pub log_id: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -453,28 +454,33 @@ fn log_call(
     cost_usd: f64,
     error: &str,
     raw_text: &str,
-) {
+) -> i64 {
     let Ok(conn) = db.conn.lock() else {
-        return;
+        return 0;
     };
-    conn.execute(
-        "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms, prompt_tokens, \
+    if conn
+        .execute(
+            "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms, prompt_tokens, \
          completion_tokens, cost_usd, error, raw_text) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        (
-            crate::now(),
-            &provider.name,
-            &provider.model,
-            purpose,
-            i64::from(ok),
-            latency_ms,
-            prompt_tokens,
-            completion_tokens,
-            cost_usd,
-            truncate(error, 480),
-            truncate(raw_text, 2000),
-        ),
-    )
-    .ok();
+            (
+                crate::now(),
+                &provider.name,
+                &provider.model,
+                purpose,
+                i64::from(ok),
+                latency_ms,
+                prompt_tokens,
+                completion_tokens,
+                cost_usd,
+                truncate(error, 480),
+                truncate(raw_text, 2000),
+            ),
+        )
+        .is_err()
+    {
+        return 0;
+    }
+    conn.last_insert_rowid()
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -612,7 +618,7 @@ pub async fn chat(
         let problem = output_problem(&text, &finish, max_tokens);
         let raw_text = truncate(&text, 2000);
         if problem.is_empty() {
-            log_call(
+            outcome.log_id = log_call(
                 db,
                 provider,
                 call.purpose,
@@ -636,7 +642,7 @@ pub async fn chat(
             outcome.attempts = attempts;
             return outcome;
         }
-        log_call(
+        outcome.log_id = log_call(
             db,
             provider,
             call.purpose,
@@ -660,7 +666,7 @@ pub async fn chat(
         return outcome;
     }
 
-    log_call(
+    outcome.log_id = log_call(
         db,
         provider,
         call.purpose,
@@ -1673,6 +1679,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ai_call_logs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(logs, 1, "成功调用必须留痕");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn chat_outcome_carries_its_own_log_id() {
+        let path = std::env::temp_dir().join("nq-ai-log-id.db");
+        let db = fixture_db(&path);
+        let body = "{\"choices\":[{\"message\":{\"content\":\"{\\\"a\\\":\\\"H\\\"}\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}";
+        let transport = FakeTransport::new(
+            vec![HttpReply {
+                status: 200,
+                body: body.to_string(),
+            }],
+            Vec::new(),
+        );
+        let messages = vec![ChatMessage::new("user", "decide")];
+        let outcome = chat(
+            &transport,
+            &db,
+            &provider(),
+            ChatCall::new(&messages, "decision"),
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.error);
+        assert!(outcome.log_id > 0);
+        let conn = db.conn.lock().unwrap();
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ai_call_logs WHERE id=?1",
+                [outcome.log_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1);
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }

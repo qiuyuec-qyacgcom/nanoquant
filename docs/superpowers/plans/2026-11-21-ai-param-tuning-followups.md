@@ -170,7 +170,7 @@ fn apply_param_updates_is_atomic_when_audit_fails() {
 - 修改：`rust/nanoquant/src/ai_review.rs`
 - 测试：`rust/nanoquant/src/ai_client.rs` 内联测试
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```rust
 #[tokio::test]
@@ -196,25 +196,25 @@ async fn chat_outcome_carries_its_own_log_id() {
 
 测试夹具 `fixture_db`、`FakeTransport`、`provider()` 均来自 `ai_client.rs` 现有 `mod tests`，构造方式参照 `chat_drops_reasoning_effort_after_400_and_retries_once`。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cargo test --bin nanoquant ai_client::tests::chat_outcome_carries_its_own_log_id`
 预期：FAIL，`ChatOutcome` 没有 `log_id` 字段。
 
-- [ ] **步骤 3：实现日志 id 回传**
+- [x] **步骤 3：实现日志 id 回传**
 
 `ChatOutcome` 增加 `pub log_id: i64`；`log_call` 返回 `i64`（无锁或插入失败时返回 `0`，插入后返回 `conn.last_insert_rowid()`）；`chat` 的每个 `log_call(...)` 调用点赋值 `outcome.log_id = ...`；`chat_with_fallback` 自然透传。
 
-- [ ] **步骤 4：复核阶段使用该 id**
+- [x] **步骤 4：复核阶段使用该 id**
 
 `ai_review::review_entry` 删除 `SELECT COALESCE(MAX(id), 0) FROM ai_call_logs`，改用 `outcome.log_id`。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行：`cargo test --bin nanoquant ai_client::tests`、`cargo test --bin nanoquant ai_review::tests`
 预期：PASS；`review_applies_param_updates_when_enabled` 中可加断言 `parameter_changes.decision_id > 0`。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 `git commit -m "fix(ai): 调参记录精确关联本次调用日志"`
 
