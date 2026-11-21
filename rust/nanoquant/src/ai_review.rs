@@ -282,6 +282,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         },
         "constraints": {
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
+            "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
             "min_confidence": cfg.min_confidence,
         },
         "news": news,
@@ -527,9 +528,18 @@ fn decision_to_review(
     {
         return Ok(reject("AI 返回的止损/止盈价无效"));
     }
-    let leverage = (decision.leverage > 0.0 && decision.leverage < proposal.leverage)
-        .then_some(decision.leverage);
-    let changed = side != proposal.side || leverage.is_some();
+    // 杠杆由 AI 在全局区间内决定：低于下限抬回下限，高于上限压回上限。
+    let upper = proposal.max_leverage.max(proposal.leverage);
+    let leverage = (decision.leverage.is_finite() && decision.leverage > 0.0)
+        .then(|| decision.leverage.clamp(proposal.leverage, upper));
+    let leverage_changed =
+        leverage.is_some_and(|value| (value - proposal.leverage).abs() > f64::EPSILON);
+    let stop_tightened = match (side, side == proposal.side) {
+        ("long", true) => stop_price > proposal.stop_price,
+        ("short", true) => stop_price < proposal.stop_price,
+        _ => false,
+    };
+    let changed = side != proposal.side || leverage_changed || stop_tightened;
     Ok(ReviewDecision {
         action: if changed {
             ReviewAction::Tighten
@@ -554,7 +564,8 @@ mod tests {
             side: side.to_string(),
             quant_side: Some(side.to_string()),
             quant_score: Some(0.8),
-            leverage: 10.0,
+            leverage: 2.0,
+            max_leverage: 20.0,
             stop_price: if side == "long" { 95.0 } else { 105.0 },
             take_profit: if side == "long" { 110.0 } else { 90.0 },
             mark_price: 100.0,
@@ -928,11 +939,42 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     #[test]
+    fn ai_leverage_is_clamped_to_the_global_bounds() {
+        let raised = ai_client::Decision {
+            action: "open_long".to_string(),
+            confidence: 0.9,
+            leverage: 12.0,
+            sl_pct: 0.0,
+            tp_pct: 0.0,
+            reason: "波动收敛，区间内加杠杆".to_string(),
+            risk_flags: Vec::new(),
+            invalidation: String::new(),
+            params: Vec::new(),
+        };
+        let reviewed = decision_to_review(&proposal("long"), "any", &raised, 0.45).unwrap();
+        assert_eq!(reviewed.leverage, Some(12.0), "区间内允许上调杠杆");
+
+        let too_high = ai_client::Decision {
+            leverage: 80.0,
+            ..raised.clone()
+        };
+        let reviewed = decision_to_review(&proposal("long"), "any", &too_high, 0.45).unwrap();
+        assert_eq!(reviewed.leverage, Some(20.0), "超过上限压回上限");
+
+        let too_low = ai_client::Decision {
+            leverage: 1.0,
+            ..raised
+        };
+        let reviewed = decision_to_review(&proposal("long"), "any", &too_low, 0.45).unwrap();
+        assert_eq!(reviewed.leverage, Some(2.0), "低于下限抬回下限");
+    }
+
+    #[test]
     fn wider_ai_stop_is_not_used_for_an_agree_decision() {
         let wider = ai_client::Decision {
             action: "open_long".to_string(),
             confidence: 0.9,
-            leverage: 50.0,
+            leverage: 0.0,
             sl_pct: 10.0,
             tp_pct: 0.0,
             reason: "wider".to_string(),
@@ -956,7 +998,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         }
         let clamped =
             crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
-        assert_eq!(clamped.leverage, 10.0);
+        assert_eq!(clamped.leverage, 2.0, "AI 未给杠杆时取全局下限");
         assert_eq!(clamped.stop_price, 95.0, "更宽的 AI 止损不能被主机采纳");
     }
 

@@ -86,7 +86,7 @@ nanoquant ops preflight --yes
 1. 总览「引擎控制」→ 停止；
 2. 「参数配置 → 交易环境」切回**模拟盘**（无需短语）；
 3. 交易所侧确认无挂单、无持仓；
-4. 把 `partial_tp_at_r`、`default_leverage`、`risk_per_trade_pct` 恢复默认（1.0 / 20 / 10）；
+4. 把 `partial_tp_at_r`、`min_leverage`、`max_leverage`、`risk_per_trade_pct` 恢复默认（1.0 / 1 / 100 / 10）；
 5. 记录演练结果到 `TASKS.md`，附余额变化与成交截图。
 
 ## 8. 记录模板

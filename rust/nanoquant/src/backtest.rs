@@ -459,7 +459,8 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
         initial_equity: input.initial_equity,
         risk_per_trade_pct: prepared.risk["risk_per_trade_pct"].as_f64().unwrap_or(1.0),
         margin_pct: prepared.risk["margin_pct"].as_f64().unwrap_or(50.0),
-        leverage: prepared.risk["default_leverage"].as_f64().unwrap_or(20.0),
+        // 回测没有 AI 决策，杠杆取全局下限：与实盘「AI 未给杠杆时的回退值」一致
+        leverage: prepared.risk["min_leverage"].as_f64().unwrap_or(1.0),
         maintenance_margin_rate: 0.005,
         max_bars_hold: None,
         policy,

@@ -18,7 +18,6 @@
     "risk_per_trade_pct": 10.0,
     "max_leverage": 100,
     "min_leverage": 1,
-    "default_leverage": 20,
     "margin_pct": 50.0,
     "max_exposure_pct": 2000.0,
     "max_same_direction": 0,

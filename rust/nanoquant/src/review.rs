@@ -21,7 +21,10 @@ pub(crate) struct EntryProposal {
     pub side: String,
     pub quant_side: Option<String>,
     pub quant_score: Option<f64>,
+    /// 全局杠杆下限，也是 AI 未给杠杆时的回退值。
     pub leverage: f64,
+    /// 全局杠杆上限（已并入交易所/单标的限制）。
+    pub max_leverage: f64,
     pub stop_price: f64,
     pub take_profit: f64,
     pub mark_price: f64,
@@ -69,6 +72,16 @@ pub(crate) fn apply_review(
     apply_decision(proposal, decision)
 }
 
+/// 杠杆由 AI 在 [下限, 上限] 内决定；未给值时回退到下限。
+fn clamp_leverage(proposal: &EntryProposal, requested: Option<f64>) -> Result<f64, String> {
+    let upper = proposal.max_leverage.max(proposal.leverage);
+    match requested {
+        None => Ok(proposal.leverage),
+        Some(value) if !value.is_finite() || value <= 0.0 => Err("AI 返回的杠杆无效".to_string()),
+        Some(value) => Ok(value.clamp(proposal.leverage, upper)),
+    }
+}
+
 fn apply_decision(
     proposal: &EntryProposal,
     decision: ReviewDecision,
@@ -84,7 +97,10 @@ fn apply_decision(
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
             side,
-            leverage: proposal.leverage,
+            leverage: clamp_leverage(
+                proposal,
+                decision.leverage.filter(|v| v.is_finite() && *v > 0.0),
+            )?,
             stop_price: proposal.stop_price,
             take_profit,
             reason: decision.reason,
@@ -95,11 +111,7 @@ fn apply_decision(
             decision.reason
         }),
         ReviewAction::Tighten => {
-            let leverage = decision.leverage.unwrap_or(proposal.leverage);
-            if !leverage.is_finite() || leverage <= 0.0 {
-                return Err("AI 返回的杠杆无效".to_string());
-            }
-            let leverage = leverage.min(proposal.leverage);
+            let leverage = clamp_leverage(proposal, decision.leverage)?;
             let stop_price = match decision.stop_price {
                 Some(stop) if !stop.is_finite() || stop <= 0.0 => {
                     return Err("AI 返回的止损价无效".to_string())
@@ -147,6 +159,7 @@ mod tests {
             quant_side: Some("long".to_string()),
             quant_score: Some(0.8),
             leverage: 10.0,
+            max_leverage: 20.0,
             stop_price: 95.0,
             take_profit: 110.0,
             mark_price: 100.0,
@@ -173,8 +186,8 @@ mod tests {
     }
 
     #[test]
-    fn tighten_never_increases_leverage_or_widens_the_stop() {
-        let reviewer = FakeReviewer(Ok(ReviewDecision {
+    fn leverage_is_clamped_into_the_global_bounds_but_can_rise() {
+        let too_high = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(50.0),
@@ -182,11 +195,22 @@ mod tests {
             take_profit: None,
             reason: "tighten".to_string(),
         }));
-        let reviewed = apply_review(&proposal(), Some(&reviewer), true).unwrap();
-        assert_eq!(reviewed.leverage, 10.0, "AI 只能降杠杆");
+        let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
+        assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
         assert_eq!(reviewed.stop_price, 95.0, "AI 只能收紧多单止损");
 
-        let tightened = FakeReviewer(Ok(ReviewDecision {
+        let raised = FakeReviewer(Ok(ReviewDecision {
+            action: ReviewAction::Tighten,
+            side: None,
+            leverage: Some(18.0),
+            stop_price: Some(97.0),
+            take_profit: None,
+            reason: "raise within bounds".to_string(),
+        }));
+        let reviewed = apply_review(&proposal(), Some(&raised), true).unwrap();
+        assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
+
+        let too_low = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(5.0),
@@ -194,9 +218,17 @@ mod tests {
             take_profit: None,
             reason: "tighten".to_string(),
         }));
-        let reviewed = apply_review(&proposal(), Some(&tightened), true).unwrap();
-        assert_eq!(reviewed.leverage, 5.0);
-        assert_eq!(reviewed.stop_price, 97.0);
+        let reviewed = apply_review(&proposal(), Some(&too_low), true).unwrap();
+        assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
+    }
+
+    #[test]
+    fn missing_ai_leverage_falls_back_to_the_lower_bound() {
+        let silent = FakeReviewer(Ok(decision(ReviewAction::Tighten)));
+        let reviewed = apply_review(&proposal(), Some(&silent), true).unwrap();
+        assert_eq!(reviewed.leverage, 10.0, "AI 未给杠杆时取下限");
+        let unreviewed = apply_review(&proposal(), None, false).unwrap();
+        assert_eq!(unreviewed.leverage, 10.0, "AI 未启用时同样取下限");
     }
 
     #[test]

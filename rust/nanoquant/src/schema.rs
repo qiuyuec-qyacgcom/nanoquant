@@ -128,6 +128,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         }
         backfill_sort_order(conn)?;
         ensure_parameter_changes(conn)?;
+        drop_legacy_default_leverage(conn)?;
         Ok(())
     })();
     let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
@@ -144,6 +145,18 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
          CREATE INDEX IF NOT EXISTS ix_parameter_changes_ts ON parameter_changes(ts);",
     )
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
+}
+
+/// 杠杆改由「AI 在全局上下限内给值」，老库里的 default_leverage 必须清掉：
+/// 留着会被 group_value 合并回读路径，页面继续显示一个已不生效的旧值。
+fn drop_legacy_default_leverage(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE app_settings SET value = json_remove(value, '$.default_leverage') \
+         WHERE key = 'risk' AND json_valid(value) AND json_type(value, '$.default_leverage') IS NOT NULL",
+        [],
+    )
+    .map_err(|e| format!("清理 default_leverage 失败: {e}"))?;
+    Ok(())
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
@@ -245,6 +258,33 @@ mod tests {
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
         assert_eq!(table_count(&conn), 24);
+    }
+
+    #[test]
+    fn migrate_drops_legacy_default_leverage_but_keeps_the_bounds() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings(key,value,updated_at) \
+             VALUES('risk','{\"min_leverage\":1,\"max_leverage\":100,\"default_leverage\":20}',0)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='risk'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let risk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            risk.get("default_leverage").is_none(),
+            "旧默认杠杆必须被清掉"
+        );
+        assert_eq!(risk["min_leverage"], 1);
+        assert_eq!(risk["max_leverage"], 100);
     }
 
     #[test]

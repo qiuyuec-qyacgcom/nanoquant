@@ -111,15 +111,16 @@ if sig.direction == "flat":
 
 ---
 
-## 四、仓位层：策略杠杆区间
+## 四、仓位层：杠杆由 AI 在全局区间内决定
 
-`StrategySettings.leverage_min / leverage_max` 是**策略自己的目标杠杆区间**，与风控分组的
-全局上下限（`RiskSettings.default_leverage / max_leverage`）**解耦**：
+风控分组只保留全局上下限（`RiskSettings.min_leverage / max_leverage`），不再有「默认杠杆」。
+开仓杠杆由 AI 在分析波动、置信度与止损距离后给出，主机钳制到
+`[min_leverage, min(max_leverage, 交易所上限)]`：
 
-- 策略下限可低于全局下限（如策略 8、全局 20 → 按 8 走）；
-- 策略上限仍被全局硬上限与交易所上限压回；
-- 只约束**策略自主开仓**；跟单开仓走 `follow_leverage`，不受影响；
-- 0 表示沿用对应方向的全局值，可一键回退。
+- AI 未给杠杆（未启用或未返回）时，回退到全局下限；
+- AI 可以上调也可以下调，越界值会被钳回区间；
+- 单标的 `max_leverage` 与交易所上限继续收紧上限；
+- 跟单开仓走 `follow_leverage`，仍受同一上限约束。
 
 > ⚠️ 数据结论与「高杠杆快翻倍」是冲突的：真实数据里 **3x 是甜点（PF 6.79）**，
 > 5x+ 是亏损源（回撤 62.9%）。若把策略杠杆设到 8-30x，回撤会显著放大，
@@ -211,7 +212,7 @@ if sig.direction == "flat":
 |---|---|---|
 | `risk_per_trade_pct` | 单笔最大亏损占权益% | 2（稳）/ 10-20（激进） |
 | `margin_pct` | 单仓保证金占比 | 30-100 |
-| `default_leverage/max_leverage` | **全局**杠杆上下限 | 20/100（项目默认，勿随意改） |
+| `min_leverage/max_leverage` | **全局**杠杆上下限；开仓杠杆由 AI 在区间内给出 | 1/100（项目默认，勿随意改） |
 | `max_exposure_pct` | 总敞口上限 | 2000%，满仓高杠杆需 ≥3000% |
 | `category_exposure_limit_pct` | 相关性组敞口 | 500（严）/ 0（关） |
 | `max_drawdown_pct` | 回撤熔断 | 20-50 |

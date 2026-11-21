@@ -241,6 +241,7 @@ async fn write_group(
     let mut candidate = defaults_of(&group);
     deep_merge(&mut candidate, &stored(&conn, &group));
     deep_merge(&mut candidate, &Value::Object(body.patch.clone()));
+    drop_removed_keys(&group, &mut candidate);
     if let Err(detail) = validate(&group, &candidate) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
     }
@@ -482,6 +483,15 @@ fn deep_merge(base: &mut Value, patch: &Value) {
             deep_merge(base.get_mut(key).unwrap(), value);
         } else {
             base.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// 已下线的配置项：老客户端再次提交也不能把它写回库。
+fn drop_removed_keys(group: &str, value: &mut Value) {
+    if group == "risk" {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("default_leverage");
         }
     }
 }
@@ -990,6 +1000,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_default_leverage_patch_is_dropped() {
+        let path = std::env::temp_dir().join("nq-settings-drop-leverage.db");
+        let db = fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings/risk")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"patch":{"default_leverage":20,"min_leverage":2}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["data"].get("default_leverage").is_none(),
+            "已下线的默认杠杆不能被旧客户端写回"
+        );
+        assert_eq!(body["data"]["min_leverage"], 2);
+        let stored: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let risk: Value = serde_json::from_str(&stored).unwrap();
+        assert!(risk.get("default_leverage").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn patch_merges_defaults_and_masks_secrets_in_the_audit() {
         let path = std::env::temp_dir().join("nq-settings-write.db");
         let db = fixture(&path);
@@ -1013,10 +1066,7 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["data"]["max_leverage"], 80);
-        assert_eq!(
-            body["data"]["default_leverage"], 20,
-            "未改的字段应保留默认值"
-        );
+        assert_eq!(body["data"]["min_leverage"], 1, "未改的字段应保留默认值");
         let changed = body["changed"].as_array().unwrap();
         assert!(changed.iter().any(|v| v == "live_api_secret_enc"));
 
@@ -1165,8 +1215,11 @@ mod tests {
         assert!(strategy.get("leverage_min").is_none());
         let risk = defaults_of("risk");
         assert_eq!(risk["min_leverage"], 1);
-        assert_eq!(risk["default_leverage"], 20);
         assert_eq!(risk["max_leverage"], 100);
+        assert!(
+            risk.get("default_leverage").is_none(),
+            "杠杆改由 AI 在上下限内给出，不再有默认杠杆"
+        );
     }
 
     #[tokio::test]

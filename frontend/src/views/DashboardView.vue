@@ -281,7 +281,7 @@ useSilentRefresh(load, 30000)
           </div>
           <div class="grid g3" style="gap: 10px">
             <div class="metric"><span>单笔风险</span><span>{{ app.settings.risk?.risk_per_trade_pct ?? '-' }}%</span></div>
-            <div class="metric"><span>杠杆区间</span><span>{{ app.settings.risk?.default_leverage ?? '-' }}–{{ app.settings.risk?.max_leverage ?? '-' }}x</span></div>
+            <div class="metric"><span>杠杆区间</span><span>{{ app.settings.risk?.min_leverage ?? '-' }}–{{ app.settings.risk?.max_leverage ?? '-' }}x</span></div>
             <div class="metric"><span>日内亏损上限</span><span>{{ app.settings.risk?.daily_loss_limit_pct ?? '-' }}%</span></div>
           </div>
           <div v-if="cooldowns.length" class="stack" style="gap: 6px">

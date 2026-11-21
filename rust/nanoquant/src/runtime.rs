@@ -47,7 +47,10 @@ struct EntryDraft {
     side: String,
     quant_side: Option<String>,
     quant_score: Option<f64>,
+    /// 全局杠杆下限（AI 未给杠杆时的回退值）。
     leverage: f64,
+    /// 全局杠杆上限，已并入交易所与单标的限制。
+    max_leverage: f64,
     stop_price: f64,
     take_profit: f64,
     score: f64,
@@ -67,6 +70,7 @@ impl EntryDraft {
             quant_side: self.quant_side.clone(),
             quant_score: self.quant_score,
             leverage: self.leverage,
+            max_leverage: self.max_leverage,
             stop_price: self.stop_price,
             take_profit: self.take_profit,
             mark_price: self.mark_price,
@@ -2199,10 +2203,8 @@ impl EngineRuntime {
                 .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
                 .clamp(1, 100);
             let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
-            let leverage = cfg["default_leverage"]
-                .as_i64()
-                .unwrap_or(20)
-                .clamp(lower, upper) as f64;
+            // 杠杆由 AI 在 [lower, upper] 内决定；这里只给出回退值（下限）。
+            let leverage = lower as f64;
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
                 (target / metric.atr_pct).clamp(0.25, 2.0)
@@ -2237,6 +2239,7 @@ impl EngineRuntime {
                 quant_side,
                 quant_score,
                 leverage,
+                max_leverage: upper as f64,
                 stop_price,
                 take_profit,
                 score,
@@ -4165,7 +4168,7 @@ mod tests {
             ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
             ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
 
-            INSERT INTO app_settings VALUES('risk','{"default_leverage":10,"margin_pct":10,"risk_per_trade_pct":10,"rsi_long_max":100.1}',0);
+            INSERT INTO app_settings VALUES('risk','{"min_leverage":10,"max_leverage":20,"margin_pct":10,"risk_per_trade_pct":10,"rsi_long_max":100.1}',0);
             CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY,enabled INTEGER,max_leverage INTEGER,tick_sz TEXT,min_sz TEXT,min_notional REAL);
             INSERT INTO trading_symbols VALUES('BTCUSDT',1,5,'0.01','0.001',5);
             CREATE TABLE IF NOT EXISTS cooldowns(symbol TEXT PRIMARY KEY,until_ts INTEGER,reason TEXT,kind TEXT);

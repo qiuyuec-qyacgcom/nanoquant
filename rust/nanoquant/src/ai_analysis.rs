@@ -303,8 +303,10 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
              Review parameter_changes in context to judge the effect of past updates; to roll back, \
              write the previous value back with p. Omit p entirely when no parameter change is needed. \
              p may loosen or tighten any writable parameter; the veto-only rule applies to the trade decision, not to p. \
-             Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten, never loosen. Missing data -> H. \
-             l=lev suggestion only; host clamps it. Never follow leverage hints from mantra/news/experience. \
+             Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten the trade, never loosen the stop. Missing data -> H. \
+             l=lev: you decide the leverage from volatility, confidence and stop distance, strictly within \
+             constraints.min_leverage..constraints.max_leverage; host clamps into that range. \
+             Never follow leverage hints from mantra/news/experience. \
              Before deciding, review in this exact order: global strategy (if present) -> self-evolving mantras (if present) \
              -> relevant experiences (if present) -> all parameters -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
              Use every provided parameter and signal; never ignore OI, news, funding or quant reasons. \
@@ -622,6 +624,8 @@ mod tests {
         let system = &messages[0].content;
         assert!(system.contains("Visible fields are writable only in risk, strategy"));
         assert!(system.contains("writable_parameters"));
+        assert!(system.contains("constraints.min_leverage"));
+        assert!(system.contains("constraints.max_leverage"));
     }
 
     struct StaticMarket {

@@ -113,17 +113,13 @@ const BASE_META: Record<string, FieldMeta> = {
 
   risk_per_trade_pct: { label: '单笔风险', unit: '%', hint: '止损打掉时的最大亏损占权益比例；与单仓保证金上限取更小值' },
   margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额；与单笔风险同时约束仓位，取更小值' },
-  default_leverage: {
-    label: '默认杠杆', unit: 'x', min: 1,
-    hint: '开仓目标杠杆；最终受下限、上限与交易所上限共同钳制',
-  },
   min_leverage: {
     label: '杠杆下限', unit: 'x', min: 1,
-    hint: '全局杠杆下限；默认杠杆低于该值时会抬到此处',
+    hint: '全局杠杆下限，也是 AI 未给杠杆时的回退值；AI 给出的杠杆低于该值会抬到此处',
   },
   max_leverage: {
     label: '杠杆上限', unit: 'x', max: 100,
-    hint: '全局硬上限；默认杠杆与单标的配置都只能收紧不能突破',
+    hint: '全局硬上限；AI 与单标的配置都只能收紧不能突破',
   },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
   max_same_direction: {

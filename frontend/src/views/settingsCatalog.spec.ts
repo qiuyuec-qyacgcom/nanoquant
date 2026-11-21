@@ -95,7 +95,6 @@ describe('参数配置目录', () => {
       'risk_per_trade_pct',
       'margin_pct',
       'min_leverage',
-      'default_leverage',
       'max_leverage',
       'max_exposure_pct',
       'min_equity_usdt',
@@ -124,6 +123,13 @@ describe('参数配置目录', () => {
 
   it('分组字段不重复', () => {
     expect(new Set(sectionKeys).size).toBe(sectionKeys.length)
+  })
+
+  it('风控不再提供默认杠杆，只保留上下限', () => {
+    const risk = explicitKeys('risk')
+    expect(risk.has('default_leverage')).toBe(false)
+    expect(risk.has('min_leverage')).toBe(true)
+    expect(risk.has('max_leverage')).toBe(true)
   })
 
   it('不再导出前端写死的隐藏清单', async () => {

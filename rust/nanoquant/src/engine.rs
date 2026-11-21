@@ -998,15 +998,22 @@ fn evaluate_admission(db: &Db) -> Value {
         "管理标的池",
     ));
     let margin_pct = risk["margin_pct"].as_f64().unwrap_or(50.0);
-    let default_leverage = risk["default_leverage"].as_f64().unwrap_or(20.0).max(1.0);
-    let allocatable = equity * margin_pct / 100.0 * default_leverage;
+    let leverage_floor = risk["min_leverage"].as_f64().unwrap_or(1.0).max(1.0);
+    let leverage_cap = risk["max_leverage"]
+        .as_f64()
+        .unwrap_or(100.0)
+        .max(leverage_floor);
+    let allocatable_low = equity * margin_pct / 100.0 * leverage_floor;
+    let allocatable_high = equity * margin_pct / 100.0 * leverage_cap;
     let min_equity = risk["min_equity_usdt"].as_f64().unwrap_or(0.5);
     steps.push(step(
         "funds",
         "资金与风控",
         account_ok && equity >= min_equity && available > 0.0,
         if account_ok {
-            format!("权益 {equity:.4} USDT (下限 {min_equity}), 单笔可分配名义额约 {allocatable:.2} USDT")
+            format!(
+                "权益 {equity:.4} USDT (下限 {min_equity}), 单笔可分配名义额约 {allocatable_low:.2}–{allocatable_high:.2} USDT（杠杆由 AI 在区间内选择）"
+            )
         } else {
             "账户读取失败: 还没有可用的账户快照".into()
         },
@@ -1068,6 +1075,10 @@ fn evaluate_admission(db: &Db) -> Value {
         min_notional_buffer: risk["min_notional_buffer"].as_f64().unwrap_or(1.05),
     };
     let max_leverage = risk["max_leverage"].as_i64().unwrap_or(100);
+    let min_leverage = risk["min_leverage"]
+        .as_i64()
+        .unwrap_or(1)
+        .clamp(1, max_leverage);
     let mut rows = Vec::new();
     for symbol in &enabled {
         let market = snapshot["markets"]
@@ -1088,7 +1099,8 @@ fn evaluate_admission(db: &Db) -> Value {
         };
         let filter = symbol.filter();
         let upper = 1.max(max_leverage.min(symbol.max_leverage).min(100));
-        let leverage = 1.max(default_leverage as i64).min(upper);
+        // 自检按 AI 未给杠杆时的回退值（下限）估算，避免夸大仓位
+        let leverage = min_leverage.min(upper).max(1);
         let available_for_size = if account_ok { Some(available) } else { None };
         let (qty, note) = crate::risk::estimate_qty(
             equity,
@@ -1112,7 +1124,7 @@ fn evaluate_admission(db: &Db) -> Value {
             "min_qty": filter.effective_min_qty(price),
             "min_notional": (need * 10_000.0).round() / 10_000.0,
             "required_margin": (need / leverage as f64 * 10_000.0).round() / 10_000.0,
-            "allocatable_notional": (allocatable * 10_000.0).round() / 10_000.0,
+            "allocatable_notional": (equity * margin_pct / 100.0 * leverage as f64 * 10_000.0).round() / 10_000.0,
             "suggested_leverage": 0,
             "qty_if_open": qty,
             "notional_if_open": if qty > 0.0 { (qty * price * 10_000.0).round() / 10_000.0 } else { 0.0 },
@@ -1169,7 +1181,7 @@ fn evaluate_admission(db: &Db) -> Value {
         "params": {
             "risk_per_trade_pct": params.risk_per_trade_pct,
             "margin_pct": margin_pct,
-            "default_leverage": default_leverage,
+            "min_leverage": min_leverage,
             "max_leverage": max_leverage,
             "sl_estimate_pct": 0.5,
             "timeframe": strategy["timeframe"].as_str().unwrap_or("15m"),
@@ -1752,7 +1764,7 @@ mod tests {
              CREATE TABLE ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
              INSERT INTO engine_state VALUES('enabled','true',0),('mode','demo',0); \
              INSERT INTO app_settings VALUES('engine','{\"enabled\":true,\"mode\":\"demo\",\"trading_windows\":[\"00:00-24:00\"],\"timezone_offset\":8}',0); \
-             INSERT INTO app_settings VALUES('risk','{\"risk_per_trade_pct\":10,\"margin_pct\":50,\"default_leverage\":10,\"max_leverage\":20,\"min_equity_usdt\":0.5,\"min_notional_buffer\":1.05,\"consecutive_loss_limit\":4}',0); \
+             INSERT INTO app_settings VALUES('risk','{\"risk_per_trade_pct\":10,\"margin_pct\":50,\"min_leverage\":10,\"max_leverage\":20,\"min_equity_usdt\":0.5,\"min_notional_buffer\":1.05,\"consecutive_loss_limit\":4}',0); \
              INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"15m\",\"entry_threshold\":0.3}',0); \
              INSERT INTO app_settings VALUES('ai','{\"enabled\":false}',0); \
              INSERT INTO app_settings VALUES('data','{\"demo_api_key_enc\":\"configured\",\"demo_api_secret_enc\":\"configured\"}',0); \
