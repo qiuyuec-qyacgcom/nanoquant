@@ -127,11 +127,23 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
             }
         }
         backfill_sort_order(conn)?;
+        ensure_parameter_changes(conn)?;
         Ok(())
     })();
     let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
     outcome?;
     Ok(report)
+}
+
+pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parameter_changes(\
+         id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, group_name TEXT NOT NULL, key TEXT NOT NULL, \
+         old_value TEXT, new_value TEXT NOT NULL, reason TEXT NOT NULL, \
+         decision_id INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL, source TEXT NOT NULL); \
+         CREATE INDEX IF NOT EXISTS ix_parameter_changes_ts ON parameter_changes(ts);",
+    )
+    .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
@@ -221,7 +233,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let report = migrate(&conn).unwrap();
         assert_eq!(report.created_tables.len(), 23);
-        assert_eq!(table_count(&conn), 23);
+        assert_eq!(table_count(&conn), 24);
     }
 
     #[test]
@@ -232,7 +244,7 @@ mod tests {
         assert!(second.created_tables.is_empty());
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
-        assert_eq!(table_count(&conn), 23);
+        assert_eq!(table_count(&conn), 24);
     }
 
     #[test]

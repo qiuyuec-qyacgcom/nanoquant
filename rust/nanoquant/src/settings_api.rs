@@ -21,6 +21,11 @@ pub fn routes() -> Router<Db> {
         .route("/settings", get(read_all))
         .route("/settings/audit", get(audit))
         .route("/settings/catalog", get(catalog))
+        .route("/settings/parameter-changes", get(parameter_changes))
+        .route(
+            "/settings/parameter-changes/{id}/rollback",
+            post(rollback_parameter_change),
+        )
         .route("/settings/{group}", get(read_group).put(write_group))
         .route("/settings/{group}/reset", post(reset_group))
         .route("/system/system-settings", get(system_settings))
@@ -55,6 +60,53 @@ async fn read_all(State(db): State<Db>) -> Json<Value> {
 
 async fn catalog() -> Json<Value> {
     Json(crate::param_registry::catalog())
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>) -> Json<Value> {
+    let conn = db.conn.lock().expect("db");
+    let _ = crate::schema::ensure_parameter_changes(&conn);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,ts,group_name,key,old_value,new_value,reason,decision_id,mode,source \
+             FROM parameter_changes ORDER BY ts DESC,id DESC LIMIT ?1",
+        )
+        .expect("prepare parameter_changes");
+    let items = stmt
+        .query_map([limit], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "ts": row.get::<_, i64>(1)?,
+                "group": row.get::<_, String>(2)?,
+                "key": row.get::<_, String>(3)?,
+                "old_value": row.get::<_, Option<String>>(4)?,
+                "new_value": row.get::<_, String>(5)?,
+                "reason": row.get::<_, String>(6)?,
+                "decision_id": row.get::<_, i64>(7)?,
+                "mode": row.get::<_, String>(8)?,
+                "source": row.get::<_, String>(9)?,
+            }))
+        })
+        .expect("query parameter_changes")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    json!({ "items": items }).into()
+}
+
+async fn rollback_parameter_change(
+    State(db): State<Db>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let conn = db.conn.lock().expect("db");
+    rollback_param_change(&conn, id)
+        .map_err(|detail| (StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()))?;
+    Ok(json!({ "ok": true }).into())
 }
 
 async fn read_group(
@@ -415,6 +467,180 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn apply_param_updates(
+    conn: &rusqlite::Connection,
+    updates: &[crate::ai_client::ParamUpdate],
+    decision_id: i64,
+    mode: &str,
+) -> Value {
+    let _ = crate::schema::ensure_parameter_changes(conn);
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    for update in updates {
+        let Some(meta) = crate::param_registry::find(&update.group, &update.key) else {
+            skipped.push(json!({
+                "group": update.group,
+                "key": update.key,
+                "reason": "未注册或敏感参数",
+            }));
+            continue;
+        };
+        if !meta.ai_writable {
+            skipped.push(json!({
+                "group": update.group,
+                "key": update.key,
+                "reason": "AI 不可写",
+            }));
+            continue;
+        }
+        let new_value = match crate::param_registry::coerce(&meta, &update.value) {
+            Ok(value) => value,
+            Err(reason) => {
+                skipped.push(json!({
+                    "group": update.group,
+                    "key": update.key,
+                    "reason": reason,
+                }));
+                continue;
+            }
+        };
+        let mut candidate = group_value(conn, &update.group);
+        let Some(object) = candidate.as_object_mut() else {
+            skipped.push(json!({
+                "group": update.group,
+                "key": update.key,
+                "reason": "配置分组不是对象",
+            }));
+            continue;
+        };
+        let old_value = object.insert(update.key.clone(), new_value.clone());
+        if let Err(reason) = validate(&update.group, &candidate) {
+            skipped.push(json!({
+                "group": update.group,
+                "key": update.key,
+                "reason": reason,
+            }));
+            continue;
+        }
+        let payload = serde_json::to_string(&candidate).unwrap_or_default();
+        if let Err(error) = conn.execute(
+            "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (&update.group, &payload, crate::now()),
+        ) {
+            skipped.push(json!({
+                "group": update.group,
+                "key": update.key,
+                "reason": error.to_string(),
+            }));
+            continue;
+        }
+        let old_text = old_value
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok());
+        let new_text = serde_json::to_string(&new_value).unwrap_or_default();
+        let reason = if update.reason.trim().is_empty() {
+            "AI 调参".to_string()
+        } else {
+            update.reason.trim().to_string()
+        };
+        let _ = conn.execute(
+            "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ai')",
+            (
+                crate::now(),
+                &update.group,
+                &update.key,
+                &old_text,
+                &new_text,
+                &reason,
+                decision_id,
+                mode,
+            ),
+        );
+        let _ = conn.execute(
+            "INSERT INTO engine_events(ts, level, category, message, payload) VALUES(?1, 'info', 'param_change', ?2, ?3)",
+            (
+                crate::now(),
+                format!(
+                    "AI 调整 {}.{}: {} -> {}",
+                    update.group,
+                    update.key,
+                    old_text.as_deref().unwrap_or("null"),
+                    new_text
+                ),
+                json!({
+                    "group": update.group,
+                    "key": update.key,
+                    "old": old_value.clone(),
+                    "new": new_value.clone(),
+                    "reason": reason,
+                })
+                .to_string(),
+            ),
+        );
+        applied.push(json!({
+            "group": update.group,
+            "key": update.key,
+            "old": old_value,
+            "new": new_value,
+            "reason": reason,
+        }));
+    }
+    json!({ "applied": applied, "skipped": skipped })
+}
+
+pub(crate) fn rollback_param_change(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
+    let _ = crate::schema::ensure_parameter_changes(conn);
+    let (group, key, old_text, mode): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT group_name, key, old_value, mode FROM parameter_changes WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| format!("调参记录不存在: {error}"))?;
+    let mut candidate = group_value(conn, &group);
+    let current;
+    {
+        let object = candidate
+            .as_object_mut()
+            .ok_or_else(|| format!("{group} 配置不是对象"))?;
+        current = object.get(&key).cloned().unwrap_or(Value::Null);
+        match old_text {
+            Some(text) => {
+                let value: Value = serde_json::from_str(&text)
+                    .map_err(|error| format!("旧值无法解析: {error}"))?;
+                object.insert(key.clone(), value);
+            }
+            None => {
+                object.remove(&key);
+            }
+        }
+    }
+    validate(&group, &candidate)?;
+    let payload = serde_json::to_string(&candidate).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (&group, &payload, crate::now()),
+    )
+    .map_err(|error| error.to_string())?;
+    let restored = candidate.get(&key).cloned().unwrap_or(Value::Null);
+    let _ = conn.execute(
+        "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
+         VALUES(?1, ?2, ?3, ?4, ?5, '回滚 AI 调参', 0, ?6, 'rollback')",
+        (
+            crate::now(),
+            &group,
+            &key,
+            serde_json::to_string(&current).unwrap_or_default(),
+            serde_json::to_string(&restored).unwrap_or_default(),
+            &mode,
+        ),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +662,89 @@ mod tests {
         .unwrap();
         drop(conn);
         Db::open(path.to_str().unwrap()).unwrap()
+    }
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy','{\"entry_threshold\":0.3}',0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn apply_param_updates_writes_valid_and_skips_invalid() {
+        let conn = test_conn();
+        let updates = vec![
+            crate::ai_client::ParamUpdate {
+                group: "strategy".into(),
+                key: "entry_threshold".into(),
+                value: json!(9.0),
+                reason: "放宽入场".into(),
+            },
+            crate::ai_client::ParamUpdate {
+                group: "security".into(),
+                key: "api_key".into(),
+                value: json!("x"),
+                reason: "越权".into(),
+            },
+            crate::ai_client::ParamUpdate {
+                group: "risk".into(),
+                key: "risk_per_trade_pct".into(),
+                value: json!("bad"),
+                reason: "类型错误".into(),
+            },
+        ];
+        let result = apply_param_updates(&conn, &updates, 7, "demo");
+        assert_eq!(result["applied"].as_array().unwrap().len(), 1, "{result}");
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 2, "{result}");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed["entry_threshold"], 1.0);
+        let changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(changes, 1);
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_value() {
+        let conn = test_conn();
+        let updates = vec![crate::ai_client::ParamUpdate {
+            group: "strategy".into(),
+            key: "entry_threshold".into(),
+            value: json!(0.5),
+            reason: "测试".into(),
+        }];
+        apply_param_updates(&conn, &updates, 1, "demo");
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM parameter_changes ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        rollback_param_change(&conn, id).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed["entry_threshold"], 0.3);
     }
 
     #[tokio::test]
