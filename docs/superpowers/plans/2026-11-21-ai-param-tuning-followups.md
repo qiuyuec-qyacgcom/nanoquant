@@ -227,7 +227,7 @@ async fn chat_outcome_carries_its_own_log_id() {
 - 修改：`frontend/src/views/paramChanges.spec.ts`
 - 修改：`frontend/src/views/StrategyView.vue`
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```ts
 import { rollbackWarning, showParamChanges } from './paramChanges'
@@ -244,12 +244,12 @@ it('调参记录只在策略分组显示', () => {
 })
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`node node_modules/vitest/vitest.mjs run paramChanges`
 预期：FAIL，`rollbackWarning`/`showParamChanges` 未导出。
 
-- [ ] **步骤 3：实现纯函数**
+- [x] **步骤 3：实现纯函数**
 
 ```ts
 export function rollbackWarning(dirty: boolean, sameGroup: boolean): string {
@@ -262,16 +262,16 @@ export function showParamChanges(group: string): boolean {
 }
 ```
 
-- [ ] **步骤 4：接入 StrategyView**
+- [x] **步骤 4：接入 StrategyView**
 
 `rollbackChange` 在写库前计算 `changedGroup` 与 `sameGroup`，未通过 `confirm(rollbackWarning(dirty.value, sameGroup))` 直接返回；把调参记录块从 `v-for="sec in currentSections"` 内部移到该循环之后的独立 `v-if="showParamChanges(current)"` 区块，使 `onlyDirty` 不影响显示；`onMounted` 增加 `window.setInterval(refreshParamChanges, 60_000)`，`onUnmounted` 清理定时器。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行：`node node_modules/vitest/vitest.mjs run paramChanges settingsCatalog`；`node node_modules/vue-tsc/bin/vue-tsc.js --noEmit`
 预期：PASS，类型检查无输出。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 `git commit -m "fix(ui): 回滚前确认并固定调参记录位置"`
 
@@ -284,7 +284,7 @@ export function showParamChanges(group: string): boolean {
 - 修改：`rust/nanoquant/src/ai_review.rs`
 - 测试：`rust/nanoquant/src/settings_api.rs` 内联测试
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```rust
 #[test]
@@ -308,27 +308,27 @@ fn effects_are_computed_per_change_window() {
 }
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cargo test --bin nanoquant settings_api::tests::effects_are_computed_per_change_window`
 预期：FAIL，`effects_for_changes` 不存在。
 
-- [ ] **步骤 3：实现批量 effect**
+- [x] **步骤 3：实现批量 effect**
 
 在 `settings_api.rs` 增加 `fn effects_for_changes(conn: &Connection, changes: &[(i64, i64, String)]) -> HashMap<i64, Value>`：一次查询 `SELECT mode, closed_at, pnl FROM trades WHERE closed_at >= ?1`，以最早变更 `ts` 为界；在内存中按 mode（`paper`/空映射为 `demo`）与 `closed_at >= ts` 过滤，升序取前 5 笔，返回 `{"trades": n, "pnl": 合计, "note": "仅供参考，不控制行情与其他变更"}`。
 
-- [ ] **步骤 4：路由与上下文改用批量结果**
+- [x] **步骤 4：路由与上下文改用批量结果**
 
 `parameter_changes` 路由先收集 `(id, ts, mode)`，调用 `effects_for_changes` 后填充每行 `effect`；`ai_review::parameter_change_context` 同样使用该函数，删除其中的 `ensure_parameter_changes`（表由 `schema::migrate` 或 `apply_param_updates` 确保）。
 
 同时把 `review_parameters` 的 `writable_parameters` 从完整 `catalog()["groups"]` 改为新增的 `pub(crate) fn writable_catalog() -> Value`：只输出 `ai_writable=true` 的字段，每项只含 `key/kind/min/max/step`，不含 `hidden`、`visible`、`ai_writable` 标志。新增测试 `writable_catalog_only_lists_writable_fields`：断言包含 `strategy.entry_threshold`，不包含 `engine.cycle_interval_sec`（任务 1 后已不可写）。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行：`cargo test --bin nanoquant settings_api::tests`、`cargo test --bin nanoquant ai_review::tests`
 预期：PASS；现有 `effect` 字段测试保持通过。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 `git commit -m "perf(ai): 批量计算调参效果并移除热路径建表"`
 
@@ -341,7 +341,7 @@ fn effects_are_computed_per_change_window() {
 - 修改：`rust/nanoquant/src/ai_review.rs`
 - 测试：`rust/nanoquant/src/ai_review.rs` 内联测试
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```rust
 #[test]
@@ -353,25 +353,25 @@ fn cooldown_only_blocks_inside_the_window() {
 }
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cargo test --bin nanoquant ai_review::tests::cooldown_only_blocks_inside_the_window`
 预期：FAIL，函数不存在。
 
-- [ ] **步骤 3：实现冷却判断**
+- [x] **步骤 3：实现冷却判断**
 
 `fn tuning_cooldown_active(last_ts: Option<i64>, now: i64, interval_sec: i64) -> bool` 返回 `interval_sec > 0 && last_ts.is_some_and(|last| now - last < interval_sec)`。
 
-- [ ] **步骤 4：接入写回前检查**
+- [x] **步骤 4：接入写回前检查**
 
 `default_settings.json` 的 `ai` 组新增 `"param_tuning_min_interval_sec": 0`；`apply_decision_params` 在锁库后查询 `SELECT MAX(ts) FROM parameter_changes`（查询失败或表不存在时按 `None` 处理，不能用 `?` 中断复核），窗口内时把 `"调参冷却中，已忽略 N 项更新"` push 到 `risk_flags`、写 `engine_events` 并返回；`review_parameters` 的 `ai` 上下文补该字段。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行：`cargo test --bin nanoquant ai_review::tests`
 预期：PASS；默认 0 时既有 `review_applies_param_updates_when_enabled` 不受影响。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 `git commit -m "feat(ai): 增加调参冷却窗口"`
 
@@ -385,7 +385,7 @@ fn cooldown_only_blocks_inside_the_window() {
 - 修改：`rust/nanoquant/src/ai_review.rs`
 - 测试：上述文件内联测试
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```rust
 #[test]
@@ -407,27 +407,27 @@ fn sensitive_mask_uses_the_same_registry() {
 }
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cargo test --bin nanoquant settings_api::tests::validate_accepts_every_registered_bound`
 预期：FAIL 或 `mask` 签名不匹配。
 
-- [ ] **步骤 3：集中可写边界与敏感词**
+- [x] **步骤 3：集中可写边界与敏感词**
 
 在 `param_registry.rs` 定义 `pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["risk", "strategy"];` 与 `const AI_BLOCKED_KEYS: &[(&str, &str)] = &[("engine", "enabled"), ("engine", "close_on_halt"), ("signal_follow", "enabled"), ("backup", "encrypt")];`；`is_ai_writable` 使用这两个常量，不再内联字面量。`ai_analysis.rs` 的提示用 `AI_FULL_WRITABLE_GROUPS.join(", ")` 生成可写组名，并加测试断言提示包含 `risk, strategy`。
 
 `param_registry::is_sensitive` 作为唯一词表；`ai_review::strip_secrets` 改为 `fn strip_secrets(value: &mut Value, group: &str)`，对象键用 `is_sensitive(group, key)` 过滤，递归传递 `group`；`settings_api::mask` 改为 `fn mask(group: &str, key: &str, value: &Value) -> Value`，`diff` 增加 `group` 参数，调用处传当前分组。
 
-- [ ] **步骤 4：统一范围校验**
+- [x] **步骤 4：统一范围校验**
 
 `validate` 改为遍历 `value` 的对象键：对每个键调用 `param_registry::find(group, key)`；有 `min/max` 时要求值为有限数字并在范围内，非数字返回 `"{key}: 必须是数字"`；无范围的键不校验。删除手写的 `match group` 分支。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行：`cargo test --bin nanoquant param_registry::tests settings_api::tests ai_review::tests`
 预期：PASS；既有 `out_of_range_leverage_is_rejected...` 保持通过。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 `git commit -m "refactor(ai): 统一敏感词与参数范围校验"`
 
@@ -439,7 +439,7 @@ fn sensitive_mask_uses_the_same_registry() {
 - 修改：本计划文档的复选框
 - 测试：全量门禁
 
-- [ ] **步骤 1：Rust 门禁**
+- [x] **步骤 1：Rust 门禁**
 
 运行：
 
@@ -452,7 +452,7 @@ cargo test
 
 预期：fmt 无差异；clippy 无警告；`cargo test` 全绿（基线 482，新增测试后应更多）。
 
-- [ ] **步骤 2：前端门禁**
+- [x] **步骤 2：前端门禁**
 
 运行：
 
@@ -465,7 +465,7 @@ node node_modules/vite/bin/vite.js build
 
 预期：vue-tsc 无输出；vitest 全绿（基线 36）；构建成功，产物包含「AI 调参记录」。
 
-- [ ] **步骤 3：勾选本计划复选框并 Commit**
+- [x] **步骤 3：勾选本计划复选框并 Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-11-21-ai-param-tuning-followups.md
