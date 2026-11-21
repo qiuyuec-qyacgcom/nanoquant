@@ -122,7 +122,8 @@
       }
     ],
     "decision_schema_version": 2,
-    "allow_param_tuning": true
+    "allow_param_tuning": true,
+    "param_tuning_min_interval_sec": 0
   },
   "data": {
     "live_base_url": "https://fapi.binance.com",

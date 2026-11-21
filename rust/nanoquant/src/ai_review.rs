@@ -30,31 +30,15 @@ impl AiReviewer for EngineAiReviewer {
     }
 }
 
-fn strip_secrets(value: &mut Value) {
+fn strip_secrets(value: &mut Value, group: &str) {
     if let Some(object) = value.as_object_mut() {
-        object.retain(|key, _| {
-            let key = key.to_ascii_lowercase();
-            ![
-                "secret",
-                "token",
-                "password",
-                "api_key",
-                "apikey",
-                "webhook",
-                "credential",
-                "authorization",
-                "chat_id",
-                "private_key",
-            ]
-            .iter()
-            .any(|needle| key.contains(needle))
-        });
+        object.retain(|key, _| !crate::param_registry::is_sensitive(group, key));
         for child in object.values_mut() {
-            strip_secrets(child);
+            strip_secrets(child, group);
         }
     } else if let Some(items) = value.as_array_mut() {
         for child in items {
-            strip_secrets(child);
+            strip_secrets(child, group);
         }
     }
 }
@@ -83,9 +67,17 @@ fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> 
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .unwrap_or(Value::Null);
-        strip_secrets(&mut value);
+        strip_secrets(&mut value, group);
         out.insert(group.to_string(), value);
     }
+    let tuning_interval = conn
+        .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.get("param_tuning_min_interval_sec").cloned())
+        .unwrap_or_else(|| json!(0));
     out.insert(
         "ai".to_string(),
         json!({
@@ -97,6 +89,7 @@ fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> 
             "timeout_sec": cfg.timeout_sec,
             "temperature": cfg.temperature,
             "decision_schema_version": cfg.decision_schema_version,
+            "param_tuning_min_interval_sec": tuning_interval,
         }),
     );
     out.insert(
@@ -105,13 +98,12 @@ fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> 
     );
     out.insert(
         "writable_parameters".to_string(),
-        crate::param_registry::catalog()["groups"].clone(),
+        crate::param_registry::writable_catalog()["groups"].clone(),
     );
     Value::Object(out)
 }
 
 fn parameter_change_context(conn: &rusqlite::Connection) -> Value {
-    let _ = crate::schema::ensure_parameter_changes(conn);
     let Ok(mut statement) = conn.prepare(
         "SELECT id, ts, group_name, key, old_value, new_value, reason, mode, source \
          FROM parameter_changes ORDER BY ts DESC, id DESC LIMIT 10",
@@ -133,8 +125,14 @@ fn parameter_change_context(conn: &rusqlite::Connection) -> Value {
     }) else {
         return json!([]);
     };
-    let items = rows
-        .filter_map(Result::ok)
+    let changes = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    let windows = changes
+        .iter()
+        .map(|row| (row.0, row.1, row.7.clone()))
+        .collect::<Vec<_>>();
+    let effects = crate::settings_api::effects_for_changes(conn, &windows);
+    let items = changes
+        .into_iter()
         .map(
             |(id, ts, group, key, old_value, new_value, reason, mode, source)| {
                 json!({
@@ -147,7 +145,7 @@ fn parameter_change_context(conn: &rusqlite::Connection) -> Value {
                     "reason": reason,
                     "mode": mode,
                     "source": source,
-                    "effect": crate::settings_api::trade_effect_after(conn, ts, &mode),
+                    "effect": effects.get(&id).cloned().unwrap_or_else(|| json!({"trades": 0, "pnl": 0.0})),
                 })
             },
         )
@@ -327,6 +325,11 @@ fn tuning_enabled(value: Option<&Value>) -> bool {
     }
 }
 
+/// 冷却窗口只拦截窗口内的重复调参；间隔为 0 时保持原有行为。
+fn tuning_cooldown_active(last_ts: Option<i64>, now: i64, interval_sec: i64) -> bool {
+    interval_sec > 0 && last_ts.is_some_and(|last| now - last < interval_sec)
+}
+
 fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision, decision_id: i64) {
     if decision.params.is_empty() {
         return;
@@ -368,12 +371,50 @@ fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision, de
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "demo".to_string());
+    // setting() 会再锁一次库，必须在下方的 conn 守卫之前读取
+    let interval_sec = state
+        .db
+        .setting("ai")
+        .ok()
+        .flatten()
+        .and_then(|value| value.get("param_tuning_min_interval_sec").cloned())
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|number| number as i64))
+        })
+        .unwrap_or(0)
+        .max(0);
     let Ok(conn) = state.db.conn.lock() else {
         decision
             .risk_flags
             .push("参数写回失败：数据库锁不可用".to_string());
         return;
     };
+    if interval_sec > 0 {
+        // 表不存在或查询失败都按“没有历史调参”处理，不能中断复核
+        let last_ts = conn
+            .query_row("SELECT MAX(ts) FROM parameter_changes", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten();
+        if tuning_cooldown_active(last_ts, crate::now(), interval_sec) {
+            let note = format!("调参冷却中，已忽略 {} 项更新", decision.params.len());
+            decision.risk_flags.push(note.clone());
+            let _ = conn.execute(
+                "INSERT INTO engine_events(ts, level, category, message, payload) \
+                 VALUES(?1, 'warn', 'param_change', ?2, ?3)",
+                (
+                    crate::now(),
+                    note,
+                    json!({ "count": decision.params.len(), "interval_sec": interval_sec })
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+    }
 
     match crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode) {
         Ok(report) => {
@@ -784,6 +825,14 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         assert!(!tuning_enabled(Some(&json!("false"))));
         assert!(!tuning_enabled(Some(&json!(null))));
         assert!(!tuning_enabled(Some(&json!({ "enabled": true }))));
+    }
+
+    #[test]
+    fn cooldown_only_blocks_inside_the_window() {
+        assert!(!tuning_cooldown_active(None, 1_000, 300));
+        assert!(!tuning_cooldown_active(Some(800), 1_000, 0));
+        assert!(tuning_cooldown_active(Some(800), 1_000, 300));
+        assert!(!tuning_cooldown_active(Some(600), 1_000, 300));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

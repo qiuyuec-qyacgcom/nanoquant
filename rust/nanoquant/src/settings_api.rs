@@ -78,42 +78,115 @@ async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>
              FROM parameter_changes ORDER BY ts DESC,id DESC LIMIT ?1",
         )
         .expect("prepare parameter_changes");
-    let items = stmt
+    let rows = stmt
         .query_map([limit], |row| {
-            let ts: i64 = row.get(1)?;
-            let mode: String = row.get(8)?;
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "ts": ts,
-                "group": row.get::<_, String>(2)?,
-                "key": row.get::<_, String>(3)?,
-                "old_value": row.get::<_, Option<String>>(4)?,
-                "new_value": row.get::<_, String>(5)?,
-                "reason": row.get::<_, String>(6)?,
-                "decision_id": row.get::<_, i64>(7)?,
-                "mode": mode,
-                "source": row.get::<_, String>(9)?,
-                "effect": trade_effect_after(&conn, ts, &mode),
-            }))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
         })
         .expect("query parameter_changes")
         .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let changes = rows
+        .iter()
+        .map(|row| (row.0, row.1, row.8.clone()))
+        .collect::<Vec<_>>();
+    let effects = effects_for_changes(&conn, &changes);
+    let items = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.0,
+                "ts": row.1,
+                "group": row.2,
+                "key": row.3,
+                "old_value": row.4,
+                "new_value": row.5,
+                "reason": row.6,
+                "decision_id": row.7,
+                "mode": row.8,
+                "source": row.9,
+                "effect": effects.get(&row.0).cloned().unwrap_or_else(|| json!({"trades": 0, "pnl": 0.0, "note": EFFECT_NOTE})),
+            })
+        })
         .collect::<Vec<_>>();
     json!({ "items": items }).into()
 }
 
 pub(crate) fn trade_effect_after(conn: &rusqlite::Connection, ts: i64, mode: &str) -> Value {
-    let mode = if mode == "paper" { "demo" } else { mode };
-    conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM ( \
-           SELECT pnl FROM trades WHERE closed_at >= ?1 AND mode = ?2 \
-           ORDER BY closed_at ASC LIMIT 5 \
-         )",
-        (ts, mode),
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
-    )
-    .map(|(trades, pnl)| json!({ "trades": trades, "pnl": (pnl * 10_000.0).round() / 10_000.0 }))
-    .unwrap_or_else(|_| json!({ "trades": 0, "pnl": 0.0 }))
+    let mut effects = effects_for_changes(conn, &[(0, ts, mode.to_string())]);
+    effects
+        .remove(&0)
+        .unwrap_or_else(|| json!({ "trades": 0, "pnl": 0.0, "note": EFFECT_NOTE }))
+}
+
+/// 调参效果只是时间窗参考值，不构成因果结论。
+const EFFECT_NOTE: &str = "仅供参考，不控制行情与其他变更";
+
+/// 一次查询算出多条调参记录各自之后的首批成交，避免逐行查库。
+pub(crate) fn effects_for_changes(
+    conn: &rusqlite::Connection,
+    changes: &[(i64, i64, String)],
+) -> std::collections::HashMap<i64, Value> {
+    let mut effects = std::collections::HashMap::new();
+    let Some(earliest) = changes.iter().map(|(_, ts, _)| *ts).min() else {
+        return effects;
+    };
+    let Ok(mut statement) = conn.prepare(
+        "SELECT mode, closed_at, pnl FROM trades WHERE closed_at >= ?1 ORDER BY closed_at ASC",
+    ) else {
+        return effects;
+    };
+    let trades = statement
+        .query_map([earliest], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (id, ts, mode) in changes {
+        let mode = normalized_mode(mode);
+        let mut count = 0;
+        let mut pnl = 0.0_f64;
+        for (trade_mode, closed_at, value) in &trades {
+            if count == 5 {
+                break;
+            }
+            if *closed_at < *ts || normalized_mode(trade_mode) != mode {
+                continue;
+            }
+            count += 1;
+            pnl += value;
+        }
+        effects.insert(
+            *id,
+            json!({
+                "trades": count,
+                "pnl": (pnl * 10_000.0).round() / 10_000.0,
+                "note": EFFECT_NOTE,
+            }),
+        );
+    }
+    effects
+}
+
+fn normalized_mode(mode: &str) -> String {
+    match mode {
+        "paper" | "" => "demo".to_string(),
+        other => other.to_string(),
+    }
 }
 
 async fn rollback_parameter_change(
@@ -184,6 +257,7 @@ async fn write_group(
         )
     })?;
     let changes = diff(
+        &group,
         before.as_object().unwrap_or(&Map::new()),
         candidate.as_object().unwrap_or(&Map::new()),
     );
@@ -239,6 +313,7 @@ async fn reset_group(
         )
     })?;
     let changes = diff(
+        &group,
         before.as_object().unwrap_or(&Map::new()),
         candidate.as_object().unwrap_or(&Map::new()),
     );
@@ -411,8 +486,12 @@ fn deep_merge(base: &mut Value, patch: &Value) {
     }
 }
 
-/// 只记变化的字段。命中敏感词的值写成 "***"，审计日志不能变成泄密源。
-fn diff(before: &Map<String, Value>, after: &Map<String, Value>) -> BTreeMap<String, Value> {
+/// 只记变化的字段。命中注册表敏感词的值写成 "***"，审计日志不能变成泄密源。
+fn diff(
+    group: &str,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+) -> BTreeMap<String, Value> {
     let mut changes = BTreeMap::new();
     for (key, new) in after {
         let old = before.get(key).cloned().unwrap_or(Value::Null);
@@ -421,18 +500,14 @@ fn diff(before: &Map<String, Value>, after: &Map<String, Value>) -> BTreeMap<Str
         }
         changes.insert(
             key.clone(),
-            json!({ "from": mask(key, &old), "to": mask(key, new) }),
+            json!({ "from": mask(group, key, &old), "to": mask(group, key, new) }),
         );
     }
     changes
 }
 
-fn mask(key: &str, value: &Value) -> Value {
-    let lower = key.to_lowercase();
-    if ["secret", "password", "token", "api_key", "_enc"]
-        .iter()
-        .any(|hint| lower.contains(hint))
-    {
+fn mask(group: &str, key: &str, value: &Value) -> Value {
+    if crate::param_registry::is_sensitive(group, key) {
         json!("***")
     } else {
         value.clone()
@@ -457,29 +532,25 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
     // 字段缺失沿用默认值；字段存在却不是数字时必须拒绝：
     // 否则 "max_leverage":"3" 也能通过校验，运行期 as_f64 拿不到值会回落默认上限，
     // 风控参数被静默放宽，用户却以为已经收紧。
-    let check = |key: &str, lo: f64, hi: f64| -> Result<(), String> {
-        match value.get(key) {
-            None | Some(Value::Null) => Ok(()),
-            Some(Value::Number(number)) => match number.as_f64() {
-                Some(n) if (lo..=hi).contains(&n) => Ok(()),
-                _ => Err(format!("{key}: 超出取值范围")),
-            },
-            Some(_) => Err(format!("{key}: 必须是数字")),
-        }
+    // 范围来自注册表，避免这里和 AI 目录各维护一份边界。
+    let Some(object) = value.as_object() else {
+        return Ok(());
     };
-    match group {
-        "engine" => check("cycle_interval_sec", 15.0, 3600.0)?,
-        "risk" => {
-            check("max_leverage", 1.0, 100.0)?;
-            check("min_leverage", 1.0, 100.0)?;
-            check("default_leverage", 1.0, 100.0)?;
-            check("daily_loss_limit_pct", 0.01, 100.0)?;
-            check("global_stop_loss_pct", 0.0, 100.0)?;
-            check("global_take_profit_pct", 0.0, 100.0)?;
+    for (key, candidate) in object {
+        let Some(meta) = crate::param_registry::find(group, key) else {
+            continue;
+        };
+        let (Some(low), Some(high)) = (meta.min, meta.max) else {
+            continue;
+        };
+        match candidate {
+            Value::Null => {}
+            Value::Number(number) => match number.as_f64() {
+                Some(number) if number.is_finite() && (low..=high).contains(&number) => {}
+                _ => return Err(format!("{key}: 超出取值范围")),
+            },
+            _ => return Err(format!("{key}: 必须是数字")),
         }
-        "journal" => check("min_similarity", 0.0, 1.0)?,
-        "backup" => check("retention", 1.0, 200.0)?,
-        _ => {}
     }
     Ok(())
 }
@@ -694,6 +765,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_every_registered_bound() {
+        for &(group, key, min, max, _) in crate::param_registry::RANGES {
+            let mut lo = Map::new();
+            lo.insert(key.to_string(), json!(min));
+            assert!(
+                validate(group, &Value::Object(lo)).is_ok(),
+                "{group}.{key} 下界"
+            );
+            let mut hi = Map::new();
+            hi.insert(key.to_string(), json!(max));
+            assert!(
+                validate(group, &Value::Object(hi)).is_ok(),
+                "{group}.{key} 上界"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_mask_uses_the_same_registry() {
+        assert_eq!(
+            mask("system", "alert_webhook_url", &json!("https://x")),
+            json!("***")
+        );
+        assert_eq!(mask("strategy", "ema_fast", &json!(9)), json!(9));
+    }
+
+    #[test]
     fn apply_param_updates_is_atomic_when_audit_fails() {
         let conn = test_conn();
         conn.execute_batch(
@@ -765,6 +863,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(changes, 1);
+    }
+
+    #[test]
+    fn effects_are_computed_per_change_window() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO trades(symbol,side,qty,entry_price,exit_price,leverage,notional,pnl,pnl_pct,roi_pct,fees,opened_at,closed_at,hold_seconds,exit_reason,ai_confidence,ai_reason,signal_score,slippage_bps,mode,reviewed,review_note) VALUES
+               ('BTCUSDT','LONG',1,1,1,1,1,10,0,0,0,0,150,0,'tp',0,'',0,0,'demo',0,''),
+               ('BTCUSDT','LONG',1,1,1,1,1,-5,0,0,0,0,250,0,'sl',0,'',0,0,'demo',0,''),
+               ('BTCUSDT','LONG',1,1,1,1,1,7,0,0,0,0,350,0,'tp',0,'',0,0,'demo',0,''),
+               ('BTCUSDT','LONG',1,1,1,1,1,99,0,0,0,0,150,0,'tp',0,'',0,0,'live',0,'');
+             INSERT INTO parameter_changes(ts,group_name,key,old_value,new_value,reason,decision_id,mode,source)
+               VALUES(100,'strategy','entry_threshold','0.3','0.35','a',1,'demo','ai'),
+                     (200,'strategy','ema_fast','9','12','b',2,'demo','ai'),
+                     (300,'strategy','ema_fast','12','8','c',3,'demo','ai');",
+        )
+        .unwrap();
+        let changes = vec![
+            (1, 100, "demo".to_string()),
+            (2, 200, "demo".to_string()),
+            (3, 300, "demo".to_string()),
+        ];
+        let effects = effects_for_changes(&conn, &changes);
+        assert_eq!(effects[&1]["trades"], 3);
+        assert_eq!(effects[&1]["pnl"], 12.0);
+        assert_eq!(effects[&2]["trades"], 2);
+        assert_eq!(effects[&3]["trades"], 1);
+        assert_eq!(effects[&1]["note"], EFFECT_NOTE);
     }
 
     #[test]

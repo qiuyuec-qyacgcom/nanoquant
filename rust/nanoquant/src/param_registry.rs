@@ -14,7 +14,19 @@ pub(crate) struct ParamMeta {
     pub ai_writable: bool,
 }
 
-const RANGES: &[(&str, &str, f64, f64, f64)] = &[
+/// 这些组的全部非敏感字段可写（含页面可见字段）。
+pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["risk", "strategy"];
+
+/// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
+const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
+    ("engine", "mode"),
+    ("engine", "enabled"),
+    ("engine", "close_on_halt"),
+    ("signal_follow", "enabled"),
+    ("backup", "encrypt"),
+];
+
+pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("engine", "cycle_interval_sec", 15.0, 3600.0, 1.0),
     ("engine", "max_positions", 1.0, 50.0, 1.0),
     ("engine", "max_symbols_per_cycle", 1.0, 100.0, 1.0),
@@ -251,22 +263,13 @@ fn is_visible(group: &str, key: &str) -> bool {
 }
 
 fn is_ai_writable(group: &str, key: &str) -> bool {
-    if group == "ai" {
-        return false;
-    }
-    if group == "engine" && matches!(key, "mode" | "enabled" | "close_on_halt") {
-        return false;
-    }
-    if group == "signal_follow" && key == "enabled" {
-        return false;
-    }
-    if group == "backup" && key == "encrypt" {
+    if group == "ai" || AI_BLOCKED_KEYS.contains(&(group, key)) {
         return false;
     }
     if is_sensitive(group, key) {
         return false;
     }
-    if group == "risk" || group == "strategy" {
+    if AI_FULL_WRITABLE_GROUPS.contains(&group) {
         return true;
     }
     !is_visible(group, key)
@@ -332,6 +335,36 @@ pub(crate) fn catalog() -> Value {
             group.clone(),
             json!({ "hidden": hidden, "writable": writable, "meta": meta }),
         );
+    }
+    json!({ "groups": groups })
+}
+
+/// 只给 AI 看可写字段的边界：不带 visible/hidden 标志，避免模型猜测可见性。
+pub(crate) fn writable_catalog() -> Value {
+    let mut groups = Map::new();
+    for (group, object) in defaults().as_object().unwrap() {
+        let Some(object) = object.as_object() else {
+            continue;
+        };
+        let mut fields = Map::new();
+        for (key, default) in object {
+            if !is_ai_writable(group, key) {
+                continue;
+            }
+            let (min, max, step) = range_of(group, key);
+            fields.insert(
+                key.clone(),
+                json!({
+                    "kind": kind_of(default),
+                    "min": min,
+                    "max": max,
+                    "step": step,
+                }),
+            );
+        }
+        if !fields.is_empty() {
+            groups.insert(group.clone(), Value::Object(fields));
+        }
     }
     json!({ "groups": groups })
 }
@@ -491,5 +524,22 @@ mod tests {
             !find("ai", "allow_param_tuning").unwrap().ai_writable,
             "ai 组始终不可写"
         );
+    }
+
+    #[test]
+    fn writable_catalog_only_lists_writable_fields() {
+        let catalog = writable_catalog();
+        let groups = catalog["groups"].as_object().unwrap();
+        let field = &groups["strategy"]["entry_threshold"];
+        assert_eq!(field["kind"], "number");
+        assert!(field.get("min").is_some());
+        assert!(field.get("hidden").is_none(), "不暴露可见性标志");
+        assert!(field.get("ai_writable").is_none(), "不暴露可写标志");
+        let engine = groups.get("engine").and_then(Value::as_object);
+        assert!(
+            engine.is_none_or(|fields| !fields.contains_key("cycle_interval_sec")),
+            "可见运行参数不该出现在写目录里"
+        );
+        assert!(groups.get("ai").is_none(), "ai 组不可写，不应出现");
     }
 }

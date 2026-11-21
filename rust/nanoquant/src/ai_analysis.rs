@@ -281,10 +281,12 @@ fn analyze_messages(symbol: &str, snapshot: &Value) -> Vec<ChatMessage> {
 }
 
 pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
+    let writable_groups = crate::param_registry::AI_FULL_WRITABLE_GROUPS.join(", ");
     vec![
         ChatMessage::new(
             "system",
-            "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
+            &[
+                "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
              {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"p\":[{\"g\":\"group\",\"k\":\"key\",\"v\":0,\"w\":\"Chinese reason\"}],\"f\":\"Chinese conclusion and reason <=60 chars\"} \
              a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop%; t=tp%. \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
@@ -292,7 +294,9 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
              p: optional parameter updates, one entry per field: g=group k=key v=value w=Chinese reason. \
              Allowed groups: engine strategy risk news journal evolution system data backup public signal_follow; \
-             Visible fields are writable only in risk and strategy; all other groups allow hidden fields only. \
+             Visible fields are writable only in ",
+                writable_groups.as_str(),
+                "; all other groups allow hidden fields only. \
              Never ai, security, secrets, passwords, API keys, webhooks or chat ids. \
              Use parameters.writable_parameters as the authoritative list of writable fields and ranges; \
              values are clamped to the registered range, invalid or sensitive items are skipped and audited. \
@@ -307,6 +311,8 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
              Hard risk and parameter limits always win. You are the first decision-maker: choose the final direction; \
              the quant signal is advisory and may conflict. \
              Think silently; the answer itself MUST be only the JSON object.",
+            ]
+            .concat(),
         ),
         ChatMessage::new(
             "user",
@@ -614,7 +620,7 @@ mod tests {
     fn decision_prompt_explains_writable_scope() {
         let messages = decision_messages(&json!({}));
         let system = &messages[0].content;
-        assert!(system.contains("Visible fields are writable only in risk and strategy"));
+        assert!(system.contains("Visible fields are writable only in risk, strategy"));
         assert!(system.contains("writable_parameters"));
     }
 
