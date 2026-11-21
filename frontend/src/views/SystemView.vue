@@ -72,7 +72,8 @@ async function selfTestSidecar() {
   try {
     const res = await http.post('/system/exec-sidecar/self-test', {})
     if (res.ok) {
-      app.notify(`签名一致（${res.algo} · ${res.compare_ms}ms）`, 'ok')
+      // 这里只验证端点可达；逐字节签名比对要用 ops verify-sidecar
+      app.notify(`执行内核端点可达（${res.endpoint}）`, 'ok')
     } else {
       app.notify(res.detail || '自检失败', 'error')
     }
@@ -167,6 +168,10 @@ useSilentRefresh(load, 15000)
       <div class="panel-body stack" style="gap: 10px">
         <div class="muted" style="font-size: 11px; line-height: 1.7">
           {{ sidecar?.verdict || '读取中…' }}
+        </div>
+        <div class="hint">
+          端点只能通过环境变量配置：<code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>；
+          Rust 引擎直连交易所，未部署执行内核时自检失败不影响下单。
         </div>
         <table v-if="sidecar" class="table">
           <tbody>

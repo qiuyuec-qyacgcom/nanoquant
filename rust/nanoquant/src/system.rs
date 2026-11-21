@@ -990,7 +990,7 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
     let conn = state.db.conn.lock().expect("db");
     let mode = current_mode(&conn);
     let endpoint = exec_endpoint();
-    let connected = endpoint.as_deref().is_some_and(tcp_reachable);
+    let connected = endpoint.as_deref().is_some_and(endpoint_reachable);
     let stats = state
         .exec
         .lock()
@@ -1004,7 +1004,7 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
         )
         .unwrap_or(0);
     let reason = if endpoint.is_none() {
-        "未配置执行内核端点 (EXEC_TCP)"
+        "未配置执行内核端点（EXEC_TCP 或 EXEC_SOCKET）"
     } else if connected {
         ""
     } else {
@@ -1028,11 +1028,11 @@ async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
             "ok": false,
             "connected": false,
             "has_key": false,
-            "detail": "未配置执行内核端点 (EXEC_TCP)，无法自检",
+            "detail": "未配置执行内核端点：设置 EXEC_TCP=host:port 或 EXEC_SOCKET=/path/to.sock 后重启服务；Rust 引擎直连交易所，不用 sidecar 也可正常交易",
         })
         .into();
     };
-    let connected = tcp_reachable(&endpoint);
+    let connected = endpoint_reachable(&endpoint);
     if let Ok(mut stats) = state.exec.lock() {
         stats.checks += 1;
         if !connected {
@@ -1122,11 +1122,40 @@ async fn exec_reset(State(state): State<SystemState>) -> Json<Value> {
     .into()
 }
 
+/// 执行内核端点。Linux 生产用 UDS（EXEC_SOCKET），Windows/容器联调用 TCP（EXEC_TCP）；
+/// 只认 TCP 会让 UDS 部署永远显示「未配置」。
 fn exec_endpoint() -> Option<String> {
-    std::env::var("EXEC_TCP")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    exec_endpoint_from(
+        std::env::var("EXEC_TCP").ok(),
+        std::env::var("EXEC_SOCKET").ok(),
+    )
+}
+
+fn exec_endpoint_from(tcp: Option<String>, socket: Option<String>) -> Option<String> {
+    let clean = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(address) = clean(tcp) {
+        return Some(format!("tcp:{address}"));
+    }
+    clean(socket).map(|path| format!("unix:{path}"))
+}
+
+fn endpoint_reachable(endpoint: &str) -> bool {
+    if let Some(path) = endpoint.strip_prefix("unix:") {
+        #[cfg(unix)]
+        {
+            return std::os::unix::net::UnixStream::connect(path).is_ok();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return false;
+        }
+    }
+    tcp_reachable(endpoint.strip_prefix("tcp:").unwrap_or(endpoint))
 }
 
 fn tcp_reachable(address: &str) -> bool {
@@ -1729,7 +1758,7 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
 
     let started = std::time::Instant::now();
     let endpoint = exec_endpoint();
-    let connected = endpoint.as_deref().is_some_and(tcp_reachable);
+    let connected = endpoint.as_deref().is_some_and(endpoint_reachable);
     let channel_ok = mode == "demo" || connected;
     checks.push(diag_check(
         "交易通道",
@@ -1811,8 +1840,10 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
                 "端点 {address} ({})",
                 if connected { "可达" } else { "不可达" }
             ),
-            None if mode == "demo" => "未配置 EXEC_TCP；模拟盘以本地执行为准".to_string(),
-            None => "未配置 EXEC_TCP，实盘缺少执行内核".to_string(),
+            None if mode == "demo" => {
+                "未配置 EXEC_TCP / EXEC_SOCKET；模拟盘以本地执行为准".to_string()
+            }
+            None => "未配置 EXEC_TCP / EXEC_SOCKET；Rust 引擎仍直连交易所执行".to_string(),
         },
         started,
     ));
@@ -2411,6 +2442,35 @@ mod tests {
         assert_eq!(logs["items"][0]["channels"], "webhook");
         assert_eq!(logs["items"][0]["ok"], true);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exec_endpoint_accepts_tcp_or_unix_socket() {
+        assert_eq!(
+            exec_endpoint_from(Some("127.0.0.1:9101".into()), Some("/tmp/x.sock".into()))
+                .as_deref(),
+            Some("tcp:127.0.0.1:9101"),
+            "TCP 优先"
+        );
+        assert_eq!(
+            exec_endpoint_from(None, Some(" /run/nanoquant/exec.sock ".into())).as_deref(),
+            Some("unix:/run/nanoquant/exec.sock"),
+            "Linux 生产用 UDS 也必须被识别"
+        );
+        assert_eq!(exec_endpoint_from(Some("  ".into()), Some("".into())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_endpoint_is_probed() {
+        let dir = std::env::temp_dir().join(format!("nq-exec-{}", crate::now_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("exec.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(endpoint_reachable(&format!("unix:{}", path.display())));
+        drop(listener);
+        assert!(!endpoint_reachable("unix:/nonexistent/nq-exec.sock"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
