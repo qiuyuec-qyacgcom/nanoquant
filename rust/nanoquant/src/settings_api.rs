@@ -80,23 +80,39 @@ async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>
         .expect("prepare parameter_changes");
     let items = stmt
         .query_map([limit], |row| {
+            let ts: i64 = row.get(1)?;
+            let mode: String = row.get(8)?;
             Ok(json!({
                 "id": row.get::<_, i64>(0)?,
-                "ts": row.get::<_, i64>(1)?,
+                "ts": ts,
                 "group": row.get::<_, String>(2)?,
                 "key": row.get::<_, String>(3)?,
                 "old_value": row.get::<_, Option<String>>(4)?,
                 "new_value": row.get::<_, String>(5)?,
                 "reason": row.get::<_, String>(6)?,
                 "decision_id": row.get::<_, i64>(7)?,
-                "mode": row.get::<_, String>(8)?,
+                "mode": mode,
                 "source": row.get::<_, String>(9)?,
+                "effect": trade_effect_after(&conn, ts, &mode),
             }))
         })
         .expect("query parameter_changes")
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
     json!({ "items": items }).into()
+}
+
+pub(crate) fn trade_effect_after(conn: &rusqlite::Connection, ts: i64, mode: &str) -> Value {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM ( \
+           SELECT pnl FROM trades WHERE closed_at >= ?1 AND mode = ?2 \
+           ORDER BY closed_at ASC LIMIT 5 \
+         )",
+        (ts, mode),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+    )
+    .map(|(trades, pnl)| json!({ "trades": trades, "pnl": (pnl * 10_000.0).round() / 10_000.0 }))
+    .unwrap_or_else(|_| json!({ "trades": 0, "pnl": 0.0 }))
 }
 
 async fn rollback_parameter_change(

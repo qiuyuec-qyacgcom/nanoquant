@@ -10,11 +10,12 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { http } from '../api/client'
+import { api, http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { useParamCatalogStore } from '../stores/paramCatalog'
+import { loadParamChanges, rollbackParamChange, type ParamChange } from './paramChanges'
 import { SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
@@ -350,6 +351,9 @@ const tagDraft = reactive<Record<string, string>>({})
 const jsonText = reactive<Record<string, string>>({})
 const jsonError = reactive<Record<string, string>>({})
 const engineBusy = ref(false)
+const paramChanges = ref<ParamChange[]>([])
+const paramChangesBusy = ref(false)
+const paramChangesError = ref('')
 
 const currentGroup = computed(() => groups.find((g) => g.id === current.value))
 const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(baseline.value))
@@ -950,6 +954,37 @@ async function changePassword() {
   }
 }
 
+function displayParamValue(raw: string | null | undefined): string {
+  if (raw === null || raw === undefined || raw === '') return '—'
+  try {
+    return JSON.stringify(JSON.parse(raw))
+  } catch {
+    return raw
+  }
+}
+
+async function refreshParamChanges() {
+  try {
+    paramChanges.value = await loadParamChanges(api, 20)
+    paramChangesError.value = ''
+  } catch (err: any) {
+    paramChangesError.value = err?.message || '加载失败'
+  }
+}
+
+async function rollbackChange(id: number) {
+  paramChangesBusy.value = true
+  try {
+    await rollbackParamChange(api, id)
+    await Promise.all([refreshParamChanges(), app.loadSettings()])
+    app.notify('已回滚该次 AI 调参', 'ok')
+  } catch (err: any) {
+    app.notify(err.message, 'error')
+  } finally {
+    paramChangesBusy.value = false
+  }
+}
+
 watch(current, (id) => {
   draft.value = clone(app.settings[id] || {})
   baseline.value = clone(app.settings[id] || {})
@@ -959,7 +994,7 @@ watch(current, (id) => {
 onMounted(async () => {
   window.addEventListener('keydown', onHotkey)
   if (!Object.keys(app.settings).length) await app.loadSettings()
-  await Promise.all([app.loadStatus(), paramCatalog.load()])
+  await Promise.all([app.loadStatus(), paramCatalog.load(), refreshParamChanges()])
   const wanted = String(route.query.group || '')
   const group = groups.some((g) => g.id === wanted) ? wanted : 'engine'
   loadGroup(group)
@@ -1399,6 +1434,43 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
                   />
                 </div>
               </div>
+
+              <div v-if="current === 'strategy' && sec.title === '信号模型 · NQ-Fusion'" class="param-changes">
+                <div class="section-hd">
+                  <span class="section-title">AI 调参记录</span>
+                  <span class="section-hint">最近 20 条；回滚按旧值写回并再次留痕</span>
+                </div>
+                <div v-if="paramChangesError" class="empty" style="padding: 10px">
+                  调参记录加载失败：{{ paramChangesError }}
+                </div>
+                <div v-else-if="!paramChanges.length" class="empty" style="padding: 10px">暂无 AI 调参记录</div>
+                <div v-else class="change-table">
+                  <div class="change-row change-head">
+                    <span>时间</span>
+                    <span>字段</span>
+                    <span>旧值 → 新值</span>
+                    <span>原因</span>
+                    <span>效果</span>
+                    <span>操作</span>
+                  </div>
+                  <div v-for="row in paramChanges" :key="row.id" class="change-row">
+                    <span class="muted">{{ tsText(row.ts) }}</span>
+                    <span class="mono">{{ row.group }}.{{ row.key }}</span>
+                    <span class="mono">
+                      <s>{{ displayParamValue(row.old_value) }}</s>
+                      →
+                      {{ displayParamValue(row.new_value) }}
+                    </span>
+                    <span>{{ row.reason }}</span>
+                    <span class="muted">
+                      {{ row.effect?.trades ?? 0 }} 笔 · {{ (row.effect?.pnl ?? 0).toFixed(2) }} USDT
+                    </span>
+                    <button class="btn btn-xs" :disabled="paramChangesBusy" @click="rollbackChange(row.id)">
+                      回滚
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div v-if="auditRows.length" class="section">
@@ -1741,6 +1813,42 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
   .roi-row {
     grid-template-columns: minmax(70px, 1fr) minmax(88px, 1fr) 26px;
     gap: 5px;
+  }
+}
+
+/* ------------------------------------------------ AI 调参记录 */
+.change-table {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+}
+.change-row {
+  display: grid;
+  grid-template-columns: 84px 150px minmax(0, 1.2fr) minmax(0, 1fr) 120px 58px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 0;
+  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+}
+.change-row:first-of-type {
+  border-top: none;
+}
+.change-head {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.change-row s {
+  color: var(--muted);
+  text-decoration-color: rgba(240, 75, 90, 0.6);
+}
+@media (max-width: 720px) {
+  .change-row {
+    grid-template-columns: 76px minmax(0, 1fr) 56px;
+  }
+  .change-row > :nth-child(3),
+  .change-row > :nth-child(4),
+  .change-row > :nth-child(5) {
+    display: none;
   }
 }
 

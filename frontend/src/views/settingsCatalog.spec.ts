@@ -125,4 +125,15 @@ describe('参数配置目录', () => {
   it('分组字段不重复', () => {
     expect(new Set(sectionKeys).size).toBe(sectionKeys.length)
   })
+
+  it('不再导出前端写死的隐藏清单', async () => {
+    const catalog = await import('./settingsCatalog')
+    expect('HIDDEN_BY_GROUP' in catalog).toBe(false)
+    expect('HIDDEN_SETTINGS' in catalog).toBe(false)
+  })
+
+  it('目录失败时只显示 section 显式字段', () => {
+    expect(sectionKeys).not.toContain('ema_fast')
+    expect(sectionKeys).toContain('entry_threshold')
+  })
 })
