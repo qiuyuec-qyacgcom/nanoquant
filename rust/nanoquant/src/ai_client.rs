@@ -935,6 +935,14 @@ const NUMBER_LABELS: [(&str, &str); 17] = [
 ];
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParamUpdate {
+    pub group: String,
+    pub key: String,
+    pub value: Value,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Decision {
     pub action: String,
     pub confidence: f64,
@@ -944,6 +952,7 @@ pub struct Decision {
     pub reason: String,
     pub risk_flags: Vec<String>,
     pub invalidation: String,
+    pub params: Vec<ParamUpdate>,
 }
 
 impl Decision {
@@ -970,9 +979,53 @@ impl Decision {
     }
 }
 
+fn parse_param_updates(data: &Map<String, Value>) -> Vec<ParamUpdate> {
+    let items = data
+        .get("params")
+        .or_else(|| data.get("p"))
+        .and_then(Value::as_array);
+    let mut updates = Vec::new();
+    for item in items.into_iter().flatten() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let group = object
+            .get("group")
+            .or_else(|| object.get("g"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let key = object
+            .get("key")
+            .or_else(|| object.get("k"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let Some(value) = object.get("value").or_else(|| object.get("v")).cloned() else {
+            continue;
+        };
+        if group.is_empty() || key.is_empty() {
+            continue;
+        }
+        let reason = object
+            .get("reason")
+            .or_else(|| object.get("w"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        updates.push(ParamUpdate {
+            group: group.to_string(),
+            key: key.to_string(),
+            value,
+            reason: reason.chars().take(200).collect(),
+        });
+    }
+    updates
+}
+
 /// v1（中文详细 JSON）与 v2（英文短键）自动探测，统一产出中文字段。
 pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, String> {
     let data = extract_json(text)?;
+    let params = parse_param_updates(&data);
     let localized = if is_compact_payload(&data) {
         localize(&data, ctx)
     } else {
@@ -1016,6 +1069,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
         reason: text_of("reason"),
         risk_flags: flags,
         invalidation: text_of("invalidation"),
+        params,
     }
     .normalized())
 }
@@ -1521,6 +1575,32 @@ mod tests {
         assert!(decision.reason.contains("fade rally"));
         assert_eq!(decision.risk_flags.len(), 1);
         assert!(decision.invalidation.contains("EMA21"));
+    }
+
+    #[test]
+    fn decision_parses_v2_param_updates() {
+        let text = r#"{"a":"L","c":0.7,"l":3,"s":1,"t":2,"r":[1],"k":[1],"x":1,"p":[{"g":"strategy","k":"entry_threshold","v":0.35,"w":"放量"}]}"#;
+        let decision = parse_decision(text, None).unwrap();
+        assert_eq!(decision.params.len(), 1);
+        assert_eq!(decision.params[0].group, "strategy");
+        assert_eq!(decision.params[0].key, "entry_threshold");
+        assert_eq!(decision.params[0].value, serde_json::json!(0.35));
+        assert_eq!(decision.params[0].reason, "放量");
+    }
+
+    #[test]
+    fn decision_drops_params_without_group_or_key() {
+        let text = r#"{"a":"H","c":0.5,"p":[{"k":"entry_threshold","v":0.35},{"g":"risk","v":1}]}"#;
+        assert!(parse_decision(text, None).unwrap().params.is_empty());
+    }
+
+    #[test]
+    fn decision_parses_v1_param_updates() {
+        let text = r#"{"action":"hold","confidence":0.5,"params":[{"group":"risk","key":"risk_per_trade_pct","value":5,"reason":"降风险"}]}"#;
+        let decision = parse_decision(text, None).unwrap();
+        assert_eq!(decision.params.len(), 1);
+        assert_eq!(decision.params[0].group, "risk");
+        assert_eq!(decision.params[0].value, serde_json::json!(5));
     }
 
     #[test]

@@ -386,6 +386,7 @@ mod tests {
             reason: "test".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
+            params: Vec::new(),
         }
     }
 
@@ -589,6 +590,7 @@ mod tests {
             reason: "tighten".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
+            params: Vec::new(),
         };
         let reviewed = decision_to_review(&proposal("long"), "any", &long, 0.45).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Tighten);
@@ -609,6 +611,7 @@ mod tests {
             reason: "tighten".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
+            params: Vec::new(),
         };
         let reviewed = decision_to_review(&proposal("short"), "any", &short, 0.45).unwrap();
         assert_eq!(reviewed.leverage, Some(3.0));
@@ -631,6 +634,7 @@ mod tests {
             reason: "wider".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
+            params: Vec::new(),
         };
         let reviewed = decision_to_review(&proposal("long"), "any", &wider, 0.45).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
