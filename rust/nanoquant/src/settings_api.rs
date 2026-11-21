@@ -489,8 +489,11 @@ pub(crate) fn apply_param_updates(
     updates: &[crate::ai_client::ParamUpdate],
     decision_id: i64,
     mode: &str,
-) -> Value {
+) -> Result<Value, String> {
     let _ = crate::schema::ensure_parameter_changes(conn);
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("开启参数事务失败: {error}"))?;
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
     for update in updates {
@@ -521,7 +524,7 @@ pub(crate) fn apply_param_updates(
                 continue;
             }
         };
-        let mut candidate = group_value(conn, &update.group);
+        let mut candidate = group_value(&tx, &update.group);
         let Some(object) = candidate.as_object_mut() else {
             skipped.push(json!({
                 "group": update.group,
@@ -540,18 +543,12 @@ pub(crate) fn apply_param_updates(
             continue;
         }
         let payload = serde_json::to_string(&candidate).unwrap_or_default();
-        if let Err(error) = conn.execute(
+        tx.execute(
             "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             (&update.group, &payload, crate::now()),
-        ) {
-            skipped.push(json!({
-                "group": update.group,
-                "key": update.key,
-                "reason": error.to_string(),
-            }));
-            continue;
-        }
+        )
+        .map_err(|error| format!("写入 {}.{} 失败: {error}", update.group, update.key))?;
         let old_text = old_value
             .as_ref()
             .and_then(|value| serde_json::to_string(value).ok());
@@ -561,7 +558,7 @@ pub(crate) fn apply_param_updates(
         } else {
             update.reason.trim().to_string()
         };
-        let _ = conn.execute(
+        tx.execute(
             "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ai')",
             (
@@ -574,8 +571,9 @@ pub(crate) fn apply_param_updates(
                 decision_id,
                 mode,
             ),
-        );
-        let _ = conn.execute(
+        )
+        .map_err(|error| format!("记录 {}.{} 审计失败: {error}", update.group, update.key))?;
+        tx.execute(
             "INSERT INTO engine_events(ts, level, category, message, payload) VALUES(?1, 'info', 'param_change', ?2, ?3)",
             (
                 crate::now(),
@@ -595,7 +593,8 @@ pub(crate) fn apply_param_updates(
                 })
                 .to_string(),
             ),
-        );
+        )
+        .map_err(|error| format!("记录 {}.{} 事件失败: {error}", update.group, update.key))?;
         applied.push(json!({
             "group": update.group,
             "key": update.key,
@@ -604,7 +603,9 @@ pub(crate) fn apply_param_updates(
             "reason": reason,
         }));
     }
-    json!({ "applied": applied, "skipped": skipped })
+    tx.commit()
+        .map_err(|error| format!("提交参数事务失败: {error}"))?;
+    Ok(json!({ "applied": applied, "skipped": skipped }))
 }
 
 pub(crate) fn rollback_param_change(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
@@ -693,6 +694,37 @@ mod tests {
     }
 
     #[test]
+    fn apply_param_updates_is_atomic_when_audit_fails() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_param_changes BEFORE INSERT ON parameter_changes \
+             BEGIN SELECT RAISE(ABORT, 'audit down'); END;",
+        )
+        .unwrap();
+        let result = apply_param_updates(
+            &conn,
+            &[crate::ai_client::ParamUpdate {
+                group: "strategy".into(),
+                key: "entry_threshold".into(),
+                value: json!(0.35),
+                reason: "测试".into(),
+            }],
+            1,
+            "demo",
+        );
+        assert!(result.is_err(), "审计失败必须整体失败");
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed["entry_threshold"], 0.3);
+    }
+
+    #[test]
     fn apply_param_updates_writes_valid_and_skips_invalid() {
         let conn = test_conn();
         let updates = vec![
@@ -715,7 +747,7 @@ mod tests {
                 reason: "类型错误".into(),
             },
         ];
-        let result = apply_param_updates(&conn, &updates, 7, "demo");
+        let result = apply_param_updates(&conn, &updates, 7, "demo").unwrap();
         assert_eq!(result["applied"].as_array().unwrap().len(), 1, "{result}");
         assert_eq!(result["skipped"].as_array().unwrap().len(), 2, "{result}");
         let stored: String = conn
@@ -744,7 +776,7 @@ mod tests {
             value: json!(0.5),
             reason: "测试".into(),
         }];
-        apply_param_updates(&conn, &updates, 1, "demo");
+        apply_param_updates(&conn, &updates, 1, "demo").unwrap();
         let id: i64 = conn
             .query_row(
                 "SELECT id FROM parameter_changes ORDER BY id DESC LIMIT 1",

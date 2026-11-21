@@ -378,16 +378,31 @@ fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
             row.get::<_, i64>(0)
         })
         .unwrap_or(0);
-    let report =
-        crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode);
-    if let Some(skipped) = report.get("skipped").and_then(Value::as_array) {
-        for item in skipped {
-            let note = format!("AI 调参被拒绝: {item}");
+    match crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode) {
+        Ok(report) => {
+            if let Some(skipped) = report.get("skipped").and_then(Value::as_array) {
+                for item in skipped {
+                    let note = format!("AI 调参被拒绝: {item}");
+                    decision.risk_flags.push(note.clone());
+                    let _ = conn.execute(
+                        "INSERT INTO engine_events(ts, level, category, message, payload) \
+                         VALUES(?1, 'warn', 'param_change', ?2, ?3)",
+                        (crate::now(), note, item.to_string()),
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            let note = format!("参数写回失败: {error}");
             decision.risk_flags.push(note.clone());
             let _ = conn.execute(
                 "INSERT INTO engine_events(ts, level, category, message, payload) \
                  VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                (crate::now(), note, item.to_string()),
+                (
+                    crate::now(),
+                    note,
+                    json!({ "count": decision.params.len() }).to_string(),
+                ),
             );
         }
     }
@@ -574,8 +589,9 @@ mod tests {
         conn.execute_batch(
             r#"CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
                CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
-               CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, model TEXT, purpose TEXT,
-                 ok INTEGER, latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL, error TEXT, raw_text TEXT);
+CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, model TEXT, purpose TEXT,
+                  ok INTEGER, latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, cost_usd REAL, error TEXT, raw_text TEXT);
+               CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT);
                CREATE TABLE ai_providers(id INTEGER PRIMARY KEY, name TEXT, protocol TEXT, base_url TEXT,
                  api_key_enc TEXT, model TEXT, temperature REAL, max_tokens INTEGER, reasoning_effort TEXT,
                  timeout_sec INTEGER, json_mode INTEGER, enabled INTEGER, priority INTEGER, role TEXT,

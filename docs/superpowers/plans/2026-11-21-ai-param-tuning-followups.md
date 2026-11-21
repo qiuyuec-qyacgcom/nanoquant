@@ -105,7 +105,7 @@ Use parameters.writable_parameters as the authoritative list.
 - 修改：`rust/nanoquant/src/ai_review.rs`
 - 测试：`rust/nanoquant/src/settings_api.rs` 内联测试
 
-- [ ] **步骤 1：编写失败的测试**
+- [x] **步骤 1：编写失败的测试**
 
 ```rust
 #[test]
@@ -135,29 +135,29 @@ fn apply_param_updates_is_atomic_when_audit_fails() {
 }
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：`cargo test --bin nanoquant settings_api::tests::apply_param_updates_is_atomic_when_audit_fails`
 预期：FAIL，当前返回 `Value` 而非 `Result`，且参数已写入。
 
-- [ ] **步骤 3：把 `apply_param_updates` 改为事务**
+- [x] **步骤 3：把 `apply_param_updates` 改为事务**
 
 签名改为 `pub(crate) fn apply_param_updates(...) -> Result<Value, String>`；内部执行 `let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;`，`app_settings`、`parameter_changes`、`engine_events` 三处写入全部改用 `tx.execute(...)?`，审计与事件错误不得再用 `let _ =` 吞掉；最后 `tx.commit().map_err(|e| e.to_string())?;`，返回 `Ok(json!({ "applied": applied, "skipped": skipped }))`。非法项在写前 `continue`，不触发回滚。
 
-- [ ] **步骤 4：更新调用方**
+- [x] **步骤 4：更新调用方**
 
 `ai_review::apply_decision_params` 改为 `match`：`Ok(report)` 时处理 `skipped`；`Err(error)` 时把 `参数写回失败: {error}` push 到 `risk_flags`，并尝试写 `engine_events`。
 
-- [ ] **步骤 5：更新既有测试**
+- [x] **步骤 5：更新既有测试**
 
 `apply_param_updates_writes_valid_and_skips_invalid` 等测试加 `.unwrap()`；断言 `applied`/`skipped` 数量不变。
 
-- [ ] **步骤 6：运行测试验证通过**
+- [x] **步骤 6：运行测试验证通过**
 
 运行：`cargo test --bin nanoquant settings_api::tests`
 预期：PASS，且 `apply_param_updates_is_atomic_when_audit_fails` 为绿。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 `git commit -m "fix(ai): 参数写回与审计改为单事务"`
 
