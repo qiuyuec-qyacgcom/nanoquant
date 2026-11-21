@@ -15,7 +15,7 @@ import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { useParamCatalogStore } from '../stores/paramCatalog'
-import { loadParamChanges, rollbackParamChange, type ParamChange } from './paramChanges'
+import { loadParamChanges, rollbackParamChange, rollbackWarning, showParamChanges, type ParamChange } from './paramChanges'
 import { SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
@@ -354,6 +354,7 @@ const engineBusy = ref(false)
 const paramChanges = ref<ParamChange[]>([])
 const paramChangesBusy = ref(false)
 const paramChangesError = ref('')
+let paramChangesTimer: number | null = null
 
 const currentGroup = computed(() => groups.find((g) => g.id === current.value))
 const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(baseline.value))
@@ -977,12 +978,15 @@ async function refreshParamChanges() {
 }
 
 async function rollbackChange(id: number) {
+  const changedGroup = paramChanges.value.find((row) => row.id === id)?.group
+  const sameGroup = changedGroup === current.value
+  // 回滚会覆盖本组未保存的编辑，必须让用户先确认
+  if (!confirm(rollbackWarning(dirty.value, sameGroup))) return
   paramChangesBusy.value = true
   try {
-    const changedGroup = paramChanges.value.find((row) => row.id === id)?.group
     await rollbackParamChange(api, id)
     await Promise.all([refreshParamChanges(), app.loadSettings()])
-    if (changedGroup === current.value) {
+    if (sameGroup) {
       draft.value = clone(app.settings[current.value] || {})
       baseline.value = clone(app.settings[current.value] || {})
       syncJsonText()
@@ -1012,9 +1016,19 @@ onMounted(async () => {
   // 支持 ?group=risk&key=max_drawdown_pct 直达某个参数（文档与提示可以精确指路）
   const key = String(route.query.key || '')
   if (key) await jumpTo(group, key)
+  // AI 调参在后台发生，页面停留时也要能看到新记录
+  if (paramChangesTimer === null) {
+    paramChangesTimer = window.setInterval(() => void refreshParamChanges(), 60_000)
+  }
 })
 
-onUnmounted(() => window.removeEventListener('keydown', onHotkey))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onHotkey)
+  if (paramChangesTimer !== null) {
+    window.clearInterval(paramChangesTimer)
+    paramChangesTimer = null
+  }
+})
 </script>
 
 <template>
@@ -1445,40 +1459,42 @@ onUnmounted(() => window.removeEventListener('keydown', onHotkey))
                 </div>
               </div>
 
-              <div v-if="current === 'strategy' && sec.title === '信号模型 · NQ-Fusion'" class="param-changes">
-                <div class="section-hd">
-                  <span class="section-title">AI 调参记录</span>
-                  <span class="section-hint">最近 20 条；回滚按旧值写回并再次留痕</span>
+            </div>
+
+            <!-- AI 调参记录固定在分组之外：只看改动不会把它一起隐藏 -->
+            <div v-if="showParamChanges(current)" class="section param-changes">
+              <div class="section-hd">
+                <span class="section-title">AI 调参记录</span>
+                <span class="section-hint">最近 20 条；回滚按旧值写回并再次留痕；每分钟自动刷新</span>
+              </div>
+              <div v-if="paramChangesError" class="empty" style="padding: 10px">
+                调参记录加载失败：{{ paramChangesError }}
+              </div>
+              <div v-else-if="!paramChanges.length" class="empty" style="padding: 10px">暂无 AI 调参记录</div>
+              <div v-else class="change-table">
+                <div class="change-row change-head">
+                  <span>时间</span>
+                  <span>字段</span>
+                  <span>旧值 → 新值</span>
+                  <span>原因</span>
+                  <span>效果</span>
+                  <span>操作</span>
                 </div>
-                <div v-if="paramChangesError" class="empty" style="padding: 10px">
-                  调参记录加载失败：{{ paramChangesError }}
-                </div>
-                <div v-else-if="!paramChanges.length" class="empty" style="padding: 10px">暂无 AI 调参记录</div>
-                <div v-else class="change-table">
-                  <div class="change-row change-head">
-                    <span>时间</span>
-                    <span>字段</span>
-                    <span>旧值 → 新值</span>
-                    <span>原因</span>
-                    <span>效果</span>
-                    <span>操作</span>
-                  </div>
-                  <div v-for="row in paramChanges" :key="row.id" class="change-row">
-                    <span class="muted">{{ tsText(row.ts) }}</span>
-                    <span class="mono">{{ row.group }}.{{ row.key }}</span>
-                    <span class="mono">
-                      <s>{{ displayParamValue(row.old_value) }}</s>
-                      →
-                      {{ displayParamValue(row.new_value) }}
-                    </span>
-                    <span>{{ row.reason }}</span>
-                    <span class="muted">
-                      {{ row.effect?.trades ?? 0 }} 笔 · {{ (row.effect?.pnl ?? 0).toFixed(2) }} USDT
-                    </span>
-                    <button class="btn btn-xs" :disabled="paramChangesBusy" @click="rollbackChange(row.id)">
-                      回滚
-                    </button>
-                  </div>
+                <div v-for="row in paramChanges" :key="row.id" class="change-row">
+                  <span class="muted">{{ tsText(row.ts) }}</span>
+                  <span class="mono">{{ row.group }}.{{ row.key }}</span>
+                  <span class="mono">
+                    <s>{{ displayParamValue(row.old_value) }}</s>
+                    →
+                    {{ displayParamValue(row.new_value) }}
+                  </span>
+                  <span>{{ row.reason }}</span>
+                  <span class="muted">
+                    {{ row.effect?.trades ?? 0 }} 笔 · {{ (row.effect?.pnl ?? 0).toFixed(2) }} USDT
+                  </span>
+                  <button class="btn btn-xs" :disabled="paramChangesBusy" @click="rollbackChange(row.id)">
+                    回滚
+                  </button>
                 </div>
               </div>
             </div>
