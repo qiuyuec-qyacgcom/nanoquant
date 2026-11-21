@@ -14,7 +14,8 @@ import { http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
-import { HIDDEN_SETTINGS, SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
+import { useParamCatalogStore } from '../stores/paramCatalog'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
 
@@ -328,6 +329,7 @@ const PROTECTED = new Set([
 ])
 
 const app = useAppStore()
+const paramCatalog = useParamCatalogStore()
 const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
@@ -430,7 +432,7 @@ function sectionMapOf(group: string): Map<string, string> {
 }
 
 function skipOf(group: string): Set<string> {
-  return new Set([...PROTECTED, ...(SKIP[group] || []), ...(HIDDEN_SETTINGS[group] || []), 'symbols'])
+  return new Set([...PROTECTED, ...(SKIP[group] || []), ...paramCatalog.hiddenFor(group), 'symbols'])
 }
 
 /** 每个分组有多少可编辑参数（导航上显示，避免"点进去才知有没有"） */
@@ -957,7 +959,7 @@ watch(current, (id) => {
 onMounted(async () => {
   window.addEventListener('keydown', onHotkey)
   if (!Object.keys(app.settings).length) await app.loadSettings()
-  await app.loadStatus()
+  await Promise.all([app.loadStatus(), paramCatalog.load()])
   const wanted = String(route.query.group || '')
   const group = groups.some((g) => g.id === wanted) ? wanted : 'engine'
   loadGroup(group)

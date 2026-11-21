@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { HIDDEN_SETTINGS, SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
 
 const groupIds = SETTINGS_GROUPS.map((group) => group.id)
 const sectionKeys = Object.values(SETTINGS_SECTIONS)
@@ -51,7 +51,6 @@ describe('参数配置目录', () => {
       'liquidation_warn_pct',
       'max_slippage_pct',
       'rsi_adaptive',
-
       'adx_period',
       'scan_concurrency',
       'max_symbols_per_cycle',
@@ -60,7 +59,6 @@ describe('参数配置目录', () => {
       'ticker_ttl_sec',
       'request_timeout_sec',
       'max_pool_size',
-
       'alert_template',
       'alert_digest_enabled',
       'alert_quiet_hours',
@@ -69,8 +67,7 @@ describe('参数配置目录', () => {
       'ui_refresh_sec',
     ]
     for (const key of removed) {
-      expect(sectionKeys).not.toContain(key)
-      expect(Object.values(HIDDEN_SETTINGS).some((hidden) => hidden.has(key)), key).toBe(true)
+      expect(sectionKeys, key).not.toContain(key)
     }
   })
 
@@ -87,7 +84,6 @@ describe('参数配置目录', () => {
       'max_positions',
       'trading_windows',
       'order_type',
-
       'timeframe',
       'entry_threshold',
       'sl_atr_mult',
@@ -96,7 +92,6 @@ describe('参数配置目录', () => {
       'trailing_pct',
       'partial_tp_at_r',
       'max_spread_bps',
-
       'risk_per_trade_pct',
       'margin_pct',
       'min_leverage',
@@ -107,7 +102,6 @@ describe('参数配置目录', () => {
       'category_exposure_limit_pct',
       'vol_target_atr_pct',
       'auto_protect_external',
-
       'daily_loss_limit_pct',
       'max_drawdown_pct',
       'global_stop_loss_pct',
@@ -120,7 +114,6 @@ describe('参数配置目录', () => {
       'refresh_minutes',
       'alert_enabled',
       'alert_webhook_url',
-
       'retention',
       'session_ttl_hours',
     ]
@@ -129,14 +122,7 @@ describe('参数配置目录', () => {
     }
   })
 
-  it('分组字段不重复，且不会落回“其他参数”', () => {
+  it('分组字段不重复', () => {
     expect(new Set(sectionKeys).size).toBe(sectionKeys.length)
-    for (const group of SETTINGS_GROUPS) {
-      for (const section of SETTINGS_SECTIONS[group.id] || []) {
-        for (const key of section.fields) {
-          expect(HIDDEN_SETTINGS[group.id]?.has(key) ?? false, `${group.id}.${key}`).toBe(false)
-        }
-      }
-    }
   })
 })
