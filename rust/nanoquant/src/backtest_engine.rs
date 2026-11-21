@@ -385,12 +385,31 @@ impl<'a> Sim<'a> {
             let Some(metrics) = candle_metrics(slice, 14) else {
                 continue;
             };
+            let closes: Vec<f64> = slice.iter().map(|candle| candle.close).collect();
+            let window = &closes[closes.len() - 20..];
+            let mean = window.iter().sum::<f64>() / 20.0;
+            let sd = (window
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / 20.0)
+                .sqrt();
+            let relative_strength = if sd > 0.0 {
+                ((bar.close - mean) / sd).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
             let Some(signal) = trade_policy::evaluate(
                 slice,
                 bar.close,
                 metrics.atr,
                 self.config.policy,
-                MarketFeatures::default(),
+                MarketFeatures {
+                    funding_rate: self.config.funding_bps_8h / 10_000.0,
+                    open_interest_change_pct: f64::NAN,
+                    relative_strength,
+                    relative_strength_available: true,
+                },
             ) else {
                 continue;
             };
@@ -1072,26 +1091,11 @@ mod tests {
             maintenance_margin_rate: 0.005,
             max_bars_hold: None,
             policy: TradePolicy {
-                mode: "trend",
                 base_threshold: 0.05,
                 volume_ratio_min: 0.0,
-                rsi_long_min: 0.0,
-                rsi_long_max: 100.0,
-                rsi_short_min: 0.0,
-                rsi_short_max: 100.0,
-                adx_min: 0.0,
-
-                mr_window: 20,
-                mr_z_entry: 2.0,
-                mr_min_risk_reward: 1.5,
                 sl_atr_mult: 1.0,
                 tp_atr_mult: 10.0,
                 min_risk_reward: 0.5,
-                weight_trend: 0.32,
-                weight_momentum: 0.26,
-                weight_volume: 0.18,
-                weight_funding: 0.12,
-                weight_oi: 0.12,
             },
             manage: ManageConfig {
                 partial_tp_at_r: 1.0,
@@ -1116,9 +1120,9 @@ mod tests {
                 bar(
                     index as i64 * 900_000,
                     base,
-                    base + 1.0,
+                    base + 1.4,
                     base - 1.0,
-                    base + 0.4,
+                    base + 1.2,
                 )
             })
             .collect()

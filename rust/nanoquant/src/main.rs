@@ -64,7 +64,7 @@ mod secret;
 mod settings_api;
 mod sign;
 mod signal_follow;
-mod signal_model;
+
 mod strategies;
 mod submit;
 mod symbols;

@@ -1085,44 +1085,14 @@ impl EngineRuntime {
         rows
     }
 
-    pub(crate) fn trade_policy(
-        strategy: &Value,
-        risk: &Value,
-        mode: &str,
-    ) -> crate::trade_policy::TradePolicy {
-        let mode = if mode == "meanrev" {
-            "meanrev"
-        } else if mode == "fusion" {
-            "fusion"
-        } else {
-            "trend"
-        };
+    pub(crate) fn trade_policy(strategy: &Value) -> crate::trade_policy::TradePolicy {
         let num = |value: &Value, key: &str, default: f64| value[key].as_f64().unwrap_or(default);
         crate::trade_policy::TradePolicy {
-            mode,
             base_threshold: num(strategy, "entry_threshold", 0.3),
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
-            rsi_long_min: num(risk, "rsi_long_min", 42.0),
-            rsi_long_max: num(risk, "rsi_long_max", 76.0),
-            rsi_short_min: num(risk, "rsi_short_min", 24.0),
-            rsi_short_max: num(risk, "rsi_short_max", 58.0),
-            adx_min: if strategy["adx_filter"].as_bool().unwrap_or(false) {
-                num(strategy, "adx_min", 20.0)
-            } else {
-                0.0
-            },
-
-            mr_window: num(strategy, "mr_window", 20.0) as usize,
-            mr_z_entry: num(strategy, "mr_z_entry", 2.0),
-            mr_min_risk_reward: num(strategy, "mr_min_risk_reward", 1.5),
             sl_atr_mult: num(strategy, "sl_atr_mult", 1.2),
             tp_atr_mult: num(strategy, "tp_atr_mult", 2.0),
             min_risk_reward: num(strategy, "min_risk_reward", 2.0),
-            weight_trend: num(strategy, "weight_trend", 0.32),
-            weight_momentum: num(strategy, "weight_momentum", 0.26),
-            weight_volume: num(strategy, "weight_volume", 0.18),
-            weight_funding: num(strategy, "weight_funding", 0.12),
-            weight_oi: num(strategy, "weight_oi", 0.12),
         }
     }
     fn engine_enabled(tx: &rusqlite::Transaction<'_>, config: &Value) -> Result<bool, String> {
@@ -1647,16 +1617,12 @@ impl EngineRuntime {
         strategy: &Value,
         snapshot: &crate::providers::TradingSnapshot,
         metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
-        risk_cfg: &Value,
+
         blocked: &std::collections::BTreeSet<&str>,
         now_ms: i64,
         max_age_ms: f64,
     ) -> Result<(Vec<String>, Vec<crate::manage::ManagedPosition>), String> {
-        let policy = Self::trade_policy(
-            strategy,
-            risk_cfg,
-            strategy["mode"].as_str().unwrap_or("fusion"),
-        );
+        let policy = Self::trade_policy(strategy);
         let rows = {
             let mut stmt = tx
                 .prepare(
@@ -1988,7 +1954,7 @@ impl EngineRuntime {
             .filter_map(|order| order["symbol"].as_str())
             .collect();
         let (symbols, positions) = Self::managed_positions(
-            tx, mode, strategy, snapshot, metrics, &risk_cfg, &blocked, now_ms, max_age_ms,
+            tx, mode, strategy, snapshot, metrics, &blocked, now_ms, max_age_ms,
         )?;
         let local: Vec<crate::reconcile::LocalPosition> = {
             let mut stmt = tx
@@ -2112,11 +2078,7 @@ impl EngineRuntime {
             }
         }
         let cfg = Self::risk_settings(tx)?;
-        let policy = Self::trade_policy(
-            strategy,
-            &cfg,
-            strategy["mode"].as_str().unwrap_or("fusion"),
-        );
+        let policy = Self::trade_policy(strategy);
         let filters = crate::live::load_filters(tx, scanned);
         let mut returns = Vec::new();
         for symbol in scanned {
@@ -5325,18 +5287,6 @@ mod tests {
             seen,
             "平仓提交后必须触发复盘并留下事件（样本不足时记录跳过原因）"
         );
-    }
-
-    #[test]
-    fn trade_policy_adx_filter_uses_strategy_settings() {
-        let strategy = serde_json::json!({"adx_filter": false, "adx_min": 30.0});
-        let risk = serde_json::json!({"adx_min": 40.0});
-        let policy = EngineRuntime::trade_policy(&strategy, &risk, "trend");
-        assert_eq!(policy.adx_min, 0.0, "关闭趋势过滤时不能沿用风控默认值");
-
-        let strategy = serde_json::json!({"adx_filter": true, "adx_min": 25.0});
-        let policy = EngineRuntime::trade_policy(&strategy, &risk, "trend");
-        assert_eq!(policy.adx_min, 25.0, "开启趋势过滤时应读取策略组 adx_min");
     }
 
     fn test_db() -> Db {

@@ -446,9 +446,7 @@ async fn load_series(
 }
 
 fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
-    let mode = prepared.strategy["mode"].as_str().unwrap_or("fusion");
-    let policy =
-        crate::runtime::EngineRuntime::trade_policy(&prepared.strategy, &prepared.risk, mode);
+    let policy = crate::runtime::EngineRuntime::trade_policy(&prepared.strategy);
     let manage = crate::runtime::EngineRuntime::manage_config(&prepared.strategy, &prepared.risk);
     let taker = prepared.risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
     EngineConfig {
