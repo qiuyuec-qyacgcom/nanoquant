@@ -911,9 +911,9 @@ install_nohup() {
   fi
   if [ "$NO_START" -eq 1 ]; then
     if [ -n "$ADMIN_PASSWORD" ]; then
-      log WARN "启动时请设置 NANOQUANT_ADMIN_PASSWORD 后执行 bash scripts/start.sh --daemon"
+      log WARN "启动时请设置 NANOQUANT_ADMIN_PASSWORD 后执行 bash scripts/start.sh --daemon --no-systemd"
     else
-      log OK "安装完成；按要求未启动。启动: bash scripts/start.sh --daemon"
+      log OK "安装完成；按要求未启动。启动: bash scripts/start.sh --daemon --no-systemd"
     fi
     return
   fi
@@ -922,23 +922,23 @@ install_nohup() {
     log OK "服务正在运行；按要求未重启，新二进制未生效"
     return
   fi
-  bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+  bash "$ROOT/scripts/stop.sh" --no-systemd >/dev/null 2>&1 || true
   if [ -n "$ADMIN_PASSWORD" ]; then
     export NANOQUANT_ADMIN_PASSWORD="$ADMIN_PASSWORD"
   fi
-  if ! bash "$ROOT/scripts/start.sh" --daemon; then
+  if ! bash "$ROOT/scripts/start.sh" --daemon --no-systemd; then
     unset NANOQUANT_ADMIN_PASSWORD || true
     rollback_binary || true
     die "nohup 启动失败"
   fi
   unset NANOQUANT_ADMIN_PASSWORD || true
   if ! healthcheck; then
-    bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+    bash "$ROOT/scripts/stop.sh" --no-systemd >/dev/null 2>&1 || true
     if rollback_binary; then
-      if bash "$ROOT/scripts/start.sh" --daemon && healthcheck; then
+      if bash "$ROOT/scripts/start.sh" --daemon --no-systemd && healthcheck; then
         log WARN "新版本失败，已回滚到旧版本"
       else
-        bash "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
+        bash "$ROOT/scripts/stop.sh" --no-systemd >/dev/null 2>&1 || true
         log ERROR "回滚后仍未通过健康检查"
       fi
     fi

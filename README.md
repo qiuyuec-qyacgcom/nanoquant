@@ -111,9 +111,9 @@ NANOQUANT_ADMIN_PASSWORD='你的密码' sudo -E bash install.sh --systemd
 ```bash
 sudo bash scripts/install.sh --systemd   # systemd：自动安装缺失工具并创建 nanoquant 用户
 bash scripts/install.sh --no-systemd                    # 无 systemd：nohup
-bash scripts/status.sh                                  # 查看状态
-bash scripts/stop.sh                                    # 停止
-bash scripts/start.sh --daemon                          # 手动后台启动
+bash scripts/status.sh                                  # 查看状态（自动识别 systemd）
+bash scripts/stop.sh                                    # 有 unit 自动 systemctl stop；--no-systemd 强制 nohup
+bash scripts/start.sh --daemon                          # 有 unit 自动 systemctl start；--no-systemd 强制 nohup
 bash scripts/update.sh --check                          # 只读检查更新
 ```
 
@@ -130,7 +130,7 @@ docker compose up -d
 cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
 npm --prefix frontend ci
 npm --prefix frontend run build
-scripts/start.sh        # 前台启动；生产用 systemd 或 --daemon
+scripts/start.sh        # 有 systemd unit 自动 systemctl start；--no-systemd 前台启动
 ```
 
 ### 安装验证与首次登录

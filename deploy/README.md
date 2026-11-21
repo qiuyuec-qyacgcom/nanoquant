@@ -35,7 +35,8 @@ sudo bash scripts/update.sh               # 拉代码 + 可选备份 + 构建 + 
 安全边界：有未提交改动会**中止**；`data/`、`.master_key` 与数据库从不覆盖；
 健康检查失败时 `install.sh` 会尝试恢复旧二进制/旧 unit。
 
-非 systemd（nohup 部署）同样适用，脚本会调用 `scripts/stop.sh` / `start.sh --daemon`。
+非 systemd（nohup 部署）同样适用，脚本会调用 `scripts/stop.sh` / `start.sh --daemon`；
+启停脚本会自动识别已安装的 `nanoquant.service`，有 unit 时直接走 `systemctl`，需要强制 nohup 时加 `--no-systemd`。
 
 ## 主服务
 
