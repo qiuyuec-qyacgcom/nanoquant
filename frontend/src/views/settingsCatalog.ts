@@ -50,8 +50,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       ],
     },
     {
-      title: '融合模型说明',
-      hint: '当前仅使用 NQ-Fusion：趋势/波动突破、横截面相对强弱、资金费率、OI/订单流按行情状态加权；旧 trend/meanrev 参数已隐藏',
+      title: '信号模型 · NQ-Fusion',
+      hint: '当前唯一信号模型（fusion）。按趋势/震荡/高波动状态加权相对强弱、波动突破、资金费率与 OI/订单流；至少两个因子同向且置信度达标才开仓。',
       fields: [],
     },
   ],

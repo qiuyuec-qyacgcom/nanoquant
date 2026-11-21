@@ -74,6 +74,13 @@ describe('参数配置目录', () => {
     }
   })
 
+  it('策略分组展示当前唯一信号模型', () => {
+    const model = SETTINGS_SECTIONS.strategy.find((section) => section.title === '信号模型 · NQ-Fusion')
+    expect(model, '策略页必须能直接看到当前信号模型，便于排查').toBeTruthy()
+    expect(model?.hint).toContain('唯一信号模型')
+    expect(model?.fields).toEqual([])
+  })
+
   it('保留实盘常用参数', () => {
     const required = [
       'cycle_interval_sec',

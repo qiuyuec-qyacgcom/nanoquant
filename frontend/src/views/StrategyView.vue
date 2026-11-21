@@ -542,7 +542,7 @@ const currentSections = computed(() => {
   const out: { title: string; hint: string; rows: Row[] }[] = []
   for (const def of SECTIONS[current.value] || []) {
     const list = def.fields.filter((k) => rows.has(k)).map((k) => rows.get(k)!)
-    if (!list.length) continue
+    if (!list.length && (def.fields.length > 0 || onlyDirty.value)) continue
     list.forEach((r) => rows.delete(r.key))
     out.push({ title: def.title, hint: def.hint || '', rows: list })
   }
