@@ -122,7 +122,7 @@ fn apply_fill_tx(
         .map_err(|error| error.to_string())?;
     } else {
         tx.execute(
-            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) VALUES(?1,?2,?3,'MARKET',?4,?5,'FILLED',?6,?7,?8,1,?9)",
+            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) VALUES(?1,?2,?3,'MARKET',?4,?5,'FILLED',?6,?7,?8,1,?9,0)",
             (now, &fill.symbol, &fill.side, fill.qty, fill.price, &fill.reason, &fill.client_order_id, &fill.exchange_order_id, mode),
         ).map_err(|error| error.to_string())?;
     }
@@ -521,8 +521,29 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY,ts INTEGER,symbol TEXT,side TEXT,order_type TEXT,qty REAL,price REAL,status TEXT,purpose TEXT,client_order_id TEXT,exchange_order_id TEXT,reduce_only INTEGER,mode TEXT); CREATE TABLE positions(id INTEGER PRIMARY KEY,symbol TEXT,side TEXT,qty REAL,entry_price REAL,mark_price REAL,leverage REAL,margin REAL,sl_price REAL,tp_price REAL,peak_price REAL,initial_sl_price REAL,signal_score REAL,opened_at INTEGER,closed_at INTEGER,exit_price REAL,exit_reason TEXT,realized_pnl REAL,fees REAL,status TEXT,mode TEXT,venue_unrealized REAL,venue_ts INTEGER,partial_taken_at INTEGER); INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,status,mode,opened_at) VALUES(1,'BTCUSDT','long',0.25,100000,98500,'open','demo',1);") .unwrap();
+        conn.execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY,ts INTEGER,symbol TEXT,side TEXT,order_type TEXT,qty REAL,price REAL,status TEXT,purpose TEXT,client_order_id TEXT,exchange_order_id TEXT,reduce_only INTEGER,mode TEXT,latency_ms INTEGER NOT NULL); CREATE TABLE positions(id INTEGER PRIMARY KEY,symbol TEXT,side TEXT,qty REAL,entry_price REAL,mark_price REAL,leverage REAL,margin REAL,sl_price REAL,tp_price REAL,peak_price REAL,initial_sl_price REAL,signal_score REAL,opened_at INTEGER,closed_at INTEGER,exit_price REAL,exit_reason TEXT,realized_pnl REAL,fees REAL,status TEXT,mode TEXT,venue_unrealized REAL,venue_ts INTEGER,partial_taken_at INTEGER); INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,status,mode,opened_at) VALUES(1,'BTCUSDT','long',0.25,100000,98500,'open','demo',1);") .unwrap();
         conn
+    }
+
+    #[test]
+    fn closing_fill_provides_latency_ms_for_strict_schemas() {
+        // 夹具的 orders.latency_ms 是 NOT NULL 且没有默认值：漏列会让整轮平仓失败
+        let conn = db();
+        let fill = DemoFill {
+            client_order_id: "demo-cycle-42-BTCUSDT-close".into(),
+            exchange_order_id: String::new(),
+            symbol: "BTCUSDT".into(),
+            side: "SELL".into(),
+            qty: 0.25,
+            price: 98_500.0,
+            reduce_only: true,
+            reason: "stop_loss".into(),
+        };
+        assert!(apply_demo_fill(&conn, "demo", 42, 0.0005, &fill).unwrap().0);
+        let latency: i64 = conn
+            .query_row("SELECT latency_ms FROM orders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(latency, 0);
     }
 
     #[test]
@@ -650,8 +671,8 @@ mod tests {
         conn.execute("UPDATE positions SET mode='live' WHERE id=1", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) \
-             VALUES(1,'BTCUSDT','SELL','MARKET',0.25,0,'SUBMITTING','stop_loss','nq-1','',1,'live')",
+            "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+             VALUES(1,'BTCUSDT','SELL','MARKET',0.25,0,'SUBMITTING','stop_loss','nq-1','',1,'live',0)",
             [],
         )
         .unwrap();

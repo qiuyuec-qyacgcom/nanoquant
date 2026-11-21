@@ -2737,8 +2737,8 @@ impl EngineRuntime {
         }
         tx.execute(
             "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
-             client_order_id,exchange_order_id,reduce_only,mode) \
-             VALUES(?1,?2,?3,'MARKET',?4,0,'SUBMITTING',?5,?6,'',?7,'live')",
+             client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+             VALUES(?1,?2,?3,'MARKET',?4,0,'SUBMITTING',?5,?6,'',?7,'live',0)",
             (
                 crate::now(),
                 &plan.symbol,
@@ -3359,8 +3359,8 @@ impl EngineRuntime {
             .map_err(|_| "数据库锁不可用".to_string())?;
         conn.execute(
             "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
-             client_order_id,exchange_order_id,reduce_only,mode) \
-             VALUES(?1,?2,?3,?4,0,0,?5,?6,?7,'',1,'live')",
+             client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+             VALUES(?1,?2,?3,?4,0,0,?5,?6,?7,'',1,'live',0)",
             (
                 crate::now(),
                 symbol,
@@ -3692,29 +3692,42 @@ impl EngineRuntime {
 
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         self.runtime_active.store(true, Ordering::SeqCst);
-        let mut first = true;
+        let mut last_config = RuntimeConfig::from_db(&self.db);
+        let mut due = Instant::now();
         loop {
             if *stop.borrow() {
                 break;
             }
-            let config = RuntimeConfig::from_db(&self.db);
-            if !first {
-                tokio::select! {
-                    biased;
-                    changed = stop.changed() => {
-                        if changed.is_err() || *stop.borrow() { break; }
-                        continue;
-                    }
-                    _ = sleep(Duration::from_secs(config.interval_sec)) => {}
-                    _ = wait_cycle_signal(&self.cycle_signal) => {}
+            if Instant::now() >= due {
+                let config = RuntimeConfig::from_db(&self.db);
+                self.cycle_busy.store(true, Ordering::SeqCst);
+                let result = self.tick(&config).await;
+                self.cycle_busy.store(false, Ordering::SeqCst);
+                if let Err(error) = result {
+                    tracing::error!(%error, "Rust 引擎周期未执行");
                 }
+                due = Instant::now() + Duration::from_secs(config.interval_sec);
+                last_config = config;
+                continue;
             }
-            first = false;
-            self.cycle_busy.store(true, Ordering::SeqCst);
-            let result = self.tick(&config).await;
-            self.cycle_busy.store(false, Ordering::SeqCst);
-            if let Err(error) = result {
-                tracing::error!(%error, "Rust 引擎周期未执行");
+            // 每 2 秒回看一次配置：点「启动引擎」不能等满一个周期才生效。
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() { break; }
+                }
+                _ = wait_cycle_signal(&self.cycle_signal) => {
+                    due = Instant::now();
+                }
+                _ = sleep(Duration::from_secs(2)) => {
+                    let latest = RuntimeConfig::from_db(&self.db);
+                    if latest.enabled != last_config.enabled
+                        || latest.interval_sec != last_config.interval_sec
+                    {
+                        due = Instant::now();
+                        last_config = latest;
+                    }
+                }
             }
         }
         self.runtime_active.store(false, Ordering::SeqCst);
@@ -4168,7 +4181,6 @@ mod tests {
         db.conn.lock().unwrap().execute_batch(
             r#"UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
             UPDATE engine_state SET value='true' WHERE key='enabled';
-            ALTER TABLE orders ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
             ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
@@ -5299,7 +5311,7 @@ mod tests {
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
+        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT, latency_ms INTEGER NOT NULL DEFAULT 0); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
         Db {
             path: String::new(),
             conn: Arc::new(std::sync::Mutex::new(conn)),

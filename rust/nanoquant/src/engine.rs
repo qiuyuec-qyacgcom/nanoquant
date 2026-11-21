@@ -1274,6 +1274,9 @@ fn read_status(db: &Db) -> Value {
     json!({
         "enabled": get("enabled") == "true",
         "mode": if mode.is_empty() { "demo".to_string() } else { mode },
+        // 前端只靠 enabled 分辨不出「后台任务是否真的跑过周期」，带上心跳便于判断
+        "last_cycle_ts": get("last_cycle_ts").parse::<i64>().unwrap_or(0),
+        "last_error": get("last_error"),
     })
 }
 
@@ -1425,6 +1428,11 @@ mod tests {
         let (status, body) = get(app, "/api/v1/engine/status").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.is_object());
+        assert_eq!(body["enabled"], false);
+        assert!(
+            body.get("last_cycle_ts").is_some(),
+            "状态里要能看到周期心跳: {body}"
+        );
     }
 
     #[tokio::test]
