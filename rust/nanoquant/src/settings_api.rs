@@ -20,6 +20,7 @@ pub fn routes() -> Router<Db> {
     Router::new()
         .route("/settings", get(read_all))
         .route("/settings/audit", get(audit))
+        .route("/settings/catalog", get(catalog))
         .route("/settings/{group}", get(read_group).put(write_group))
         .route("/settings/{group}/reset", post(reset_group))
         .route("/system/system-settings", get(system_settings))
@@ -50,6 +51,10 @@ async fn read_all(State(db): State<Db>) -> Json<Value> {
         defaults.insert(name.to_string(), defaults_of(name));
     }
     json!({ "groups": groups, "defaults": defaults }).into()
+}
+
+async fn catalog() -> Json<Value> {
+    Json(crate::param_registry::catalog())
 }
 
 async fn read_group(
@@ -431,6 +436,36 @@ mod tests {
         .unwrap();
         drop(conn);
         Db::open(path.to_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_route_returns_hidden_and_writable_fields() {
+        let path = std::env::temp_dir().join("nq-settings-catalog.db");
+        let db = fixture(&path);
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/settings/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["groups"]["strategy"]["hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "ema_fast"),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("api_key"));
     }
 
     #[tokio::test]
