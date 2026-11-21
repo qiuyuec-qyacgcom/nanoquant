@@ -292,8 +292,9 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
              p: optional parameter updates, one entry per field: g=group k=key v=value w=Chinese reason. \
              Allowed groups: engine strategy risk news journal evolution system data backup public signal_follow; \
-             never ai, security, secrets, passwords, API keys, webhooks or chat ids. \
-             Use parameters.writable_parameters for the exact writable fields and ranges; \
+             Visible fields are writable only in risk and strategy; all other groups allow hidden fields only. \
+             Never ai, security, secrets, passwords, API keys, webhooks or chat ids. \
+             Use parameters.writable_parameters as the authoritative list of writable fields and ranges; \
              values are clamped to the registered range, invalid or sensitive items are skipped and audited. \
              Review parameter_changes in context to judge the effect of past updates; to roll back, \
              write the previous value back with p. Omit p entirely when no parameter change is needed. \
@@ -608,6 +609,14 @@ mod tests {
     use axum::http::Request;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    #[test]
+    fn decision_prompt_explains_writable_scope() {
+        let messages = decision_messages(&json!({}));
+        let system = &messages[0].content;
+        assert!(system.contains("Visible fields are writable only in risk and strategy"));
+        assert!(system.contains("writable_parameters"));
+    }
 
     struct StaticMarket {
         candles: usize,

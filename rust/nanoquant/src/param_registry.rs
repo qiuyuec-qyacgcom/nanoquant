@@ -263,7 +263,13 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     if group == "backup" && key == "encrypt" {
         return false;
     }
-    !is_sensitive(group, key)
+    if is_sensitive(group, key) {
+        return false;
+    }
+    if group == "risk" || group == "strategy" {
+        return true;
+    }
+    !is_visible(group, key)
 }
 
 fn kind_of(value: &Value) -> &'static str {
@@ -457,5 +463,33 @@ mod tests {
         assert!(!is_ai_writable("ai", "enabled"));
         assert!(!is_ai_writable("engine", "mode"));
         assert!(is_ai_writable("strategy", "entry_threshold"));
+    }
+
+    #[test]
+    fn ai_writable_covers_hidden_and_core_groups_only() {
+        assert!(
+            find("strategy", "ema_fast").unwrap().ai_writable,
+            "隐藏参数可写"
+        );
+        assert!(
+            find("strategy", "entry_threshold").unwrap().ai_writable,
+            "入场核心可写"
+        );
+        assert!(
+            find("risk", "max_leverage").unwrap().ai_writable,
+            "风控核心可写"
+        );
+        assert!(
+            !find("engine", "cycle_interval_sec").unwrap().ai_writable,
+            "可见运行参数不可写"
+        );
+        assert!(
+            !find("system", "log_level").unwrap().ai_writable,
+            "可见日志参数不可写"
+        );
+        assert!(
+            !find("ai", "allow_param_tuning").unwrap().ai_writable,
+            "ai 组始终不可写"
+        );
     }
 }
