@@ -443,7 +443,7 @@ impl SnapshotProvider for BinanceProvider {
                 }
                 let mid = (bid + ask) / 2.0;
                 let spread_bps = ((ask - bid) / mid * 10_000.0).max(0.0);
-                let open_interest_json = self
+                let (open_interest, open_interest_change_pct) = match self
                     .get_json(
                         "/futures/data/openInterestHist",
                         &[
@@ -453,14 +453,14 @@ impl SnapshotProvider for BinanceProvider {
                         ],
                         false,
                     )
-                    .await?;
-                let rows = open_interest_json.as_array().ok_or_else(|| {
-                    ProviderError::InvalidData(format!("{symbol} 持仓量历史无效"))
-                })?;
-                let (open_interest, open_interest_change_pct) = parse_open_interest_history(rows)
-                    .ok_or_else(|| {
-                    ProviderError::InvalidData(format!("{symbol} 持仓量历史不足"))
-                })?;
+                    .await
+                {
+                    Ok(payload) => payload
+                        .as_array()
+                        .and_then(|rows| parse_open_interest_history(rows))
+                        .unwrap_or((0.0, f64::NAN)),
+                    Err(_) => (0.0, f64::NAN),
+                };
                 let klines = self
                     .get_json(
                         "/fapi/v1/klines",
@@ -839,6 +839,78 @@ mod tests {
         assert!(
             matches!(result, Err(ProviderError::InvalidData(_))),
             "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_interest_failure_degrades_instead_of_failing_snapshot() {
+        let app = axum::Router::new()
+            .route(
+                "/fapi/v1/premiumIndex",
+                axum::routing::get(|uri: axum::http::Uri| async move {
+                    let symbol = uri
+                        .query()
+                        .and_then(|query| query.strip_prefix("symbol="))
+                        .unwrap_or("unknown");
+                    axum::Json(serde_json::json!({"symbol":symbol,"markPrice":"100","lastFundingRate":"0.0001","time":crate::now_millis()}))
+                }),
+            )
+            .route(
+                "/fapi/v1/ticker/bookTicker",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"symbol":"BTCUSDT","bidPrice":"99","askPrice":"101"}))
+                }),
+            )
+            .route(
+                "/futures/data/openInterestHist",
+                axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/fapi/v1/ticker/24hr",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"symbol":"BTCUSDT","quoteVolume":"5000000"}))
+                }),
+            )
+            .route(
+                "/fapi/v1/klines",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!([[1_700_000_000_000_i64,"100","110","95","105","8",1_700_014_399_999_i64]]))
+                }),
+            )
+            .route(
+                "/fapi/v3/account",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"totalMarginBalance":"125","availableBalance":"75"}))
+                }),
+            )
+            .route(
+                "/fapi/v3/positionRisk",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/fapi/v1/openOrders",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = BinanceProvider::new(
+            url,
+            "BTCUSDT",
+            "fixture-key".into(),
+            "fixture-secret".into(),
+        )
+        .unwrap();
+        let result = provider.snapshot().await;
+        server.abort();
+        let snapshot = result.expect("OI 失败不应拖垮整轮快照");
+        let market = &snapshot.markets[0];
+        assert_eq!(market.mark_price, 100.0);
+        assert!(!market.candles.is_empty());
+        assert_eq!(market.open_interest, 0.0);
+        assert!(
+            market.open_interest_change_pct.is_nan(),
+            "OI 不可用必须以 NaN 标记，融合模型才能跳过该因子"
         );
     }
 
