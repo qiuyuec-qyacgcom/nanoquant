@@ -15,7 +15,7 @@ use crate::db::Db;
 pub struct SystemState {
     pub db: Db,
     pub started_at: i64,
-    pub free_bytes: fn() -> u64,
+    pub free_bytes: fn(&std::path::Path) -> u64,
     pub auth: Option<AuthState>,
     runtime_probe: RuntimeProbe,
     logs_path: std::path::PathBuf,
@@ -40,7 +40,7 @@ impl SystemState {
         Self {
             db,
             started_at,
-            free_bytes,
+            free_bytes: disk_free_bytes,
             auth: None,
             runtime_probe: RuntimeProbe::new(started_at),
             logs_path: logs_dir.join("nanoquant.log"),
@@ -1737,6 +1737,9 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
         })
         .and_then(|key| crate::secret::key_text_from_master_bytes(&key).ok());
     let credential = master_text.map(|master_key| credential_view(&data, &mode, &master_key));
+    let credentials_ok = credential.as_ref().is_some_and(|view| {
+        view["error"].as_str().unwrap_or("").is_empty() && view["configured"] == true
+    });
     checks.push(match credential {
         Some(view) if view["error"].as_str().unwrap_or("").is_empty() => diag_check(
             "交易凭证",
@@ -1759,7 +1762,8 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
     let started = std::time::Instant::now();
     let endpoint = exec_endpoint();
     let connected = endpoint.as_deref().is_some_and(endpoint_reachable);
-    let channel_ok = mode == "demo" || connected;
+    // 实盘走 HttpGateway 直连币安；执行内核只是可选组件，不能当成交易通道的必要条件。
+    let channel_ok = mode == "demo" || connected || credentials_ok;
     checks.push(diag_check(
         "交易通道",
         channel_ok,
@@ -1767,8 +1771,10 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
             "模拟盘本地记账，无需执行内核".to_string()
         } else if connected {
             "实盘执行内核端点可达".to_string()
+        } else if credentials_ok {
+            "实盘凭证可用，直连交易所；未配置执行内核（可选）".to_string()
         } else {
-            "实盘缺少可用的执行内核端点".to_string()
+            "实盘缺少可用的交易凭证".to_string()
         },
         started,
     ));
@@ -1819,31 +1825,28 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
 
     let started = std::time::Instant::now();
     let storage_ok = std::fs::create_dir_all(&state.archives_dir).is_ok();
+    let free = (state.free_bytes)(&state.archives_dir);
     checks.push(diag_check(
         "存储",
         storage_ok,
         format!(
-            "归档目录 {}，剩余 {} 字节",
+            "归档目录 {}，剩余 {}",
             if storage_ok { "可写" } else { "不可写" },
-            (state.free_bytes)()
+            human_bytes(free)
         ),
         started,
     ));
 
     let started = std::time::Instant::now();
-    let exec_ok = endpoint.is_some() || mode == "demo";
+    // 未配置视为正常（可选组件）；只有显式配置了却连不上才算异常。
+    let exec_ok = endpoint.is_none() || connected;
     checks.push(diag_check(
         "执行内核",
         exec_ok,
-        match endpoint {
-            Some(address) => format!(
-                "端点 {address} ({})",
-                if connected { "可达" } else { "不可达" }
-            ),
-            None if mode == "demo" => {
-                "未配置 EXEC_TCP / EXEC_SOCKET；模拟盘以本地执行为准".to_string()
-            }
-            None => "未配置 EXEC_TCP / EXEC_SOCKET；Rust 引擎仍直连交易所执行".to_string(),
+        match &endpoint {
+            Some(address) if connected => format!("端点 {address} (可达)"),
+            Some(address) => format!("端点 {address} (不可达，依赖它的保护单代发会失败)"),
+            None => "未配置 EXEC_TCP / EXEC_SOCKET（可选）；Rust 引擎直连交易所执行".to_string(),
         },
         started,
     ));
@@ -1860,7 +1863,11 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
     ));
 
     let ok = checks.iter().all(|check| check["ok"] == true);
-    Json(json!({"ok": ok, "checks": checks, "free_bytes": (state.free_bytes)()}))
+    Json(json!({
+        "ok": ok,
+        "checks": checks,
+        "free_bytes": (state.free_bytes)(&state.archives_dir)
+    }))
 }
 
 fn round(value: f64, digits: u32) -> f64 {
@@ -1868,8 +1875,58 @@ fn round(value: f64, digits: u32) -> f64 {
     (value * scale).round() / scale
 }
 
-fn free_bytes() -> u64 {
-    0
+fn disk_free_bytes(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return 0;
+        };
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return 0;
+        }
+        (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free = 0_u64;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            free
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[cfg(test)]
@@ -2586,6 +2643,25 @@ mod tests {
         assert_eq!(failed.len(), 1, "注入凭证故障只影响该项: {failed:?}");
         assert_eq!(failed[0]["name"], "交易凭证");
         assert!(failed[0]["detail"].as_str().unwrap().contains("无法解密"));
+        let find = |name: &str| {
+            checks
+                .iter()
+                .find(|check| check["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("缺少诊断项 {name}"))
+        };
+        assert_eq!(
+            find("执行内核")["ok"],
+            true,
+            "未配置执行内核是可选组件，不能算异常"
+        );
+        assert!(
+            !find("存储")["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("0 字节"),
+            "剩余空间要显示真实值"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
