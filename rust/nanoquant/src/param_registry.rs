@@ -15,22 +15,22 @@ pub(crate) struct ParamMeta {
 }
 
 const RANGES: &[(&str, &str, f64, f64, f64)] = &[
-    ("engine", "cycle_interval_sec", 5.0, 3600.0, 1.0),
+    ("engine", "cycle_interval_sec", 15.0, 3600.0, 1.0),
     ("engine", "max_positions", 1.0, 50.0, 1.0),
     ("engine", "max_symbols_per_cycle", 1.0, 100.0, 1.0),
     ("engine", "scan_concurrency", 1.0, 20.0, 1.0),
     ("engine", "timezone_offset", -12.0, 14.0, 1.0),
     ("engine", "recv_window_ms", 1000.0, 60000.0, 1000.0),
     ("risk", "risk_per_trade_pct", 0.1, 100.0, 0.1),
-    ("risk", "max_leverage", 1.0, 125.0, 1.0),
-    ("risk", "min_leverage", 1.0, 125.0, 1.0),
-    ("risk", "default_leverage", 1.0, 125.0, 1.0),
+    ("risk", "max_leverage", 1.0, 100.0, 1.0),
+    ("risk", "min_leverage", 1.0, 100.0, 1.0),
+    ("risk", "default_leverage", 1.0, 100.0, 1.0),
     ("risk", "margin_pct", 1.0, 100.0, 1.0),
     ("risk", "max_exposure_pct", 1.0, 10000.0, 10.0),
     ("risk", "max_same_direction", 0.0, 100.0, 1.0),
     ("risk", "category_exposure_limit_pct", 0.0, 10000.0, 10.0),
     ("risk", "vol_target_atr_pct", 0.0, 10.0, 0.1),
-    ("risk", "daily_loss_limit_pct", 0.0, 100.0, 1.0),
+    ("risk", "daily_loss_limit_pct", 0.01, 100.0, 1.0),
     ("risk", "max_drawdown_pct", 0.0, 100.0, 1.0),
     ("risk", "consecutive_loss_limit", 1.0, 100.0, 1.0),
     ("risk", "cooldown_minutes", 0.0, 1440.0, 1.0),
@@ -89,7 +89,7 @@ const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("evolution", "min_health_sample", 1.0, 1000.0, 1.0),
     ("evolution", "archive_health_threshold", 0.0, 1.0, 0.01),
     ("evolution", "max_active_mantras", 1.0, 1000.0, 1.0),
-    ("backup", "retention", 1.0, 365.0, 1.0),
+    ("backup", "retention", 1.0, 200.0, 1.0),
     ("system", "event_retention_days", 1.0, 3650.0, 1.0),
     ("system", "signal_retention_days", 1.0, 3650.0, 1.0),
     ("system", "equity_retention_days", 1.0, 3650.0, 1.0),
@@ -226,9 +226,20 @@ pub(crate) fn is_sensitive(group: &str, key: &str) -> bool {
         return true;
     }
     let lower = key.to_ascii_lowercase();
-    ["secret", "password", "token", "api_key", "_enc"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "secret",
+        "password",
+        "token",
+        "api_key",
+        "_enc",
+        "webhook",
+        "credential",
+        "authorization",
+        "chat_id",
+        "private_key",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn is_visible(group: &str, key: &str) -> bool {
@@ -240,7 +251,16 @@ fn is_visible(group: &str, key: &str) -> bool {
 }
 
 fn is_ai_writable(group: &str, key: &str) -> bool {
-    if group == "ai" || (group == "engine" && key == "mode") {
+    if group == "ai" {
+        return false;
+    }
+    if group == "engine" && matches!(key, "mode" | "enabled" | "close_on_halt") {
+        return false;
+    }
+    if group == "signal_follow" && key == "enabled" {
+        return false;
+    }
+    if group == "backup" && key == "encrypt" {
         return false;
     }
     !is_sensitive(group, key)
@@ -389,6 +409,31 @@ mod tests {
         assert_eq!(coerce(&meta, &json!(9.0)).unwrap(), json!(1.0));
         assert!(coerce(&meta, &json!("x")).is_err());
         assert!(coerce(&meta, &json!(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn registry_ranges_match_settings_validation() {
+        assert_eq!(
+            find("engine", "cycle_interval_sec").unwrap().min,
+            Some(15.0)
+        );
+        assert_eq!(find("risk", "max_leverage").unwrap().max, Some(100.0));
+        assert_eq!(
+            find("risk", "daily_loss_limit_pct").unwrap().min,
+            Some(0.01)
+        );
+        assert_eq!(find("backup", "retention").unwrap().max, Some(200.0));
+    }
+
+    #[test]
+    fn sensitive_and_runtime_switches_are_not_ai_writable() {
+        assert!(is_sensitive("system", "alert_webhook_url"));
+        assert!(is_sensitive("system", "alert_telegram_chat_id"));
+        assert!(find("system", "alert_webhook_url").is_none());
+        assert!(!find("engine", "enabled").unwrap().ai_writable);
+        assert!(!find("signal_follow", "enabled").unwrap().ai_writable);
+        assert!(!find("backup", "encrypt").unwrap().ai_writable);
+        assert!(find("risk", "max_leverage").unwrap().ai_writable);
     }
 
     #[test]

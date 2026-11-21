@@ -118,3 +118,18 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
   security: [{ title: '登录与会话', fields: ['username', 'require_login', 'session_ttl_hours', 'login_fail_limit', 'login_fail_window_sec'] }],
 }
+/** section 内显式展示的字段。目录失败时页面只允许显示这些字段。 */
+export function explicitKeys(group: string): Set<string> {
+  return new Set((SETTINGS_SECTIONS[group] || []).flatMap((section) => section.fields))
+}
+
+/** 目录失败时不回落到“显示全部”：只保留 section 显式字段。 */
+export function visibleSettingKeys(
+  group: string,
+  keys: string[],
+  skip: Set<string>,
+  catalogFailed: boolean,
+): string[] {
+  const explicit = explicitKeys(group)
+  return keys.filter((key) => !skip.has(key) && (!catalogFailed || explicit.has(key)))
+}

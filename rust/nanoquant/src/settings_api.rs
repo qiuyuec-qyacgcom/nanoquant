@@ -103,6 +103,7 @@ async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>
 }
 
 pub(crate) fn trade_effect_after(conn: &rusqlite::Connection, ts: i64, mode: &str) -> Value {
+    let mode = if mode == "paper" { "demo" } else { mode };
     conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM ( \
            SELECT pnl FROM trades WHERE closed_at >= ?1 AND mode = ?2 \

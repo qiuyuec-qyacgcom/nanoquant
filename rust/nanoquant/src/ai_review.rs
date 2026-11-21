@@ -72,6 +72,7 @@ fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> 
         "data",
         "backup",
         "public",
+        "signal_follow",
     ] {
         let mut value = conn
             .query_row(
@@ -101,6 +102,10 @@ fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> 
     out.insert(
         "parameter_changes".to_string(),
         parameter_change_context(conn),
+    );
+    out.insert(
+        "writable_parameters".to_string(),
+        crate::param_registry::catalog()["groups"].clone(),
     );
     Value::Object(out)
 }
@@ -311,6 +316,16 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     decision_to_review(&proposal, side_lock, &decision, cfg.min_confidence)
 }
 
+fn tuning_enabled(value: Option<&Value>) -> bool {
+    match value {
+        None => true,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_i64().map(|n| n != 0).unwrap_or(false),
+        Some(Value::String(text)) => matches!(text.as_str(), "true" | "1"),
+        _ => false,
+    }
+}
+
 fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
     if decision.params.is_empty() {
         return;
@@ -320,19 +335,24 @@ fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
         .setting("ai")
         .ok()
         .flatten()
-        .and_then(|value| {
-            value.get("allow_param_tuning").and_then(|flag| {
-                flag.as_bool()
-                    .or_else(|| flag.as_i64().map(|number| number != 0))
-                    .or_else(|| flag.as_f64().map(|number| number != 0.0))
-            })
-        })
-        .unwrap_or(true);
-    if !tuning {
-        decision.risk_flags.push(format!(
+        .and_then(|value| value.get("allow_param_tuning").cloned());
+    if !tuning_enabled(tuning.as_ref()) {
+        let note = format!(
             "ai.allow_param_tuning=false，已忽略 {} 项参数更新",
             decision.params.len()
-        ));
+        );
+        decision.risk_flags.push(note.clone());
+        if let Ok(conn) = state.db.conn.lock() {
+            let _ = conn.execute(
+                "INSERT INTO engine_events(ts, level, category, message, payload) \
+                 VALUES(?1, 'warn', 'param_change', ?2, ?3)",
+                (
+                    crate::now(),
+                    note,
+                    json!({ "count": decision.params.len() }).to_string(),
+                ),
+            );
+        }
         return;
     }
     let mode = state
@@ -362,14 +382,12 @@ fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision) {
         crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode);
     if let Some(skipped) = report.get("skipped").and_then(Value::as_array) {
         for item in skipped {
+            let note = format!("AI 调参被拒绝: {item}");
+            decision.risk_flags.push(note.clone());
             let _ = conn.execute(
                 "INSERT INTO engine_events(ts, level, category, message, payload) \
                  VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                (
-                    crate::now(),
-                    format!("AI 调参被拒绝: {item}"),
-                    item.to_string(),
-                ),
+                (crate::now(), note, item.to_string()),
             );
         }
     }
@@ -740,6 +758,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(changes, 1);
+    }
+
+    #[test]
+    fn param_tuning_flag_is_fail_closed() {
+        assert!(tuning_enabled(None));
+        assert!(tuning_enabled(Some(&json!(true))));
+        assert!(tuning_enabled(Some(&json!(1))));
+        assert!(tuning_enabled(Some(&json!("1"))));
+        assert!(!tuning_enabled(Some(&json!(false))));
+        assert!(!tuning_enabled(Some(&json!(0))));
+        assert!(!tuning_enabled(Some(&json!("false"))));
+        assert!(!tuning_enabled(Some(&json!(null))));
+        assert!(!tuning_enabled(Some(&json!({ "enabled": true }))));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,7 +16,7 @@ import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { useParamCatalogStore } from '../stores/paramCatalog'
 import { loadParamChanges, rollbackParamChange, type ParamChange } from './paramChanges'
-import { SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
 
@@ -539,9 +539,12 @@ function toggleOnlyDirty() {
 const currentSections = computed(() => {
   const skip = skippedKeys()
   const keep = onlyDirty.value ? new Set(changedKeys.value) : null
+  const allowed = new Set(
+    visibleSettingKeys(current.value, Object.keys(draft.value || {}), skip, paramCatalog.failed),
+  )
   const rows = new Map<string, Row>()
   for (const [key, value] of Object.entries(draft.value || {})) {
-    if (skip.has(key)) continue
+    if (!allowed.has(key)) continue
     if (keep && !keep.has(key)) continue
     rows.set(key, rowOf(current.value, key, value))
   }
@@ -552,7 +555,8 @@ const currentSections = computed(() => {
     list.forEach((r) => rows.delete(r.key))
     out.push({ title: def.title, hint: def.hint || '', rows: list })
   }
-  if (rows.size) out.push({ title: '其他参数', hint: '未归类的字段，保持后端默认语义', rows: Array.from(rows.values()) })
+  if (rows.size && !paramCatalog.failed)
+    out.push({ title: '其他参数', hint: '未归类的字段，保持后端默认语义', rows: Array.from(rows.values()) })
   return out
 })
 
@@ -975,8 +979,14 @@ async function refreshParamChanges() {
 async function rollbackChange(id: number) {
   paramChangesBusy.value = true
   try {
+    const changedGroup = paramChanges.value.find((row) => row.id === id)?.group
     await rollbackParamChange(api, id)
     await Promise.all([refreshParamChanges(), app.loadSettings()])
+    if (changedGroup === current.value) {
+      draft.value = clone(app.settings[current.value] || {})
+      baseline.value = clone(app.settings[current.value] || {})
+      syncJsonText()
+    }
     app.notify('已回滚该次 AI 调参', 'ok')
   } catch (err: any) {
     app.notify(err.message, 'error')

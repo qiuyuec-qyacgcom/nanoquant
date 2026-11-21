@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SETTINGS_GROUPS, SETTINGS_SECTIONS } from './settingsCatalog'
+import { explicitKeys, SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 
 const groupIds = SETTINGS_GROUPS.map((group) => group.id)
 const sectionKeys = Object.values(SETTINGS_SECTIONS)
@@ -133,7 +133,13 @@ describe('参数配置目录', () => {
   })
 
   it('目录失败时只显示 section 显式字段', () => {
-    expect(sectionKeys).not.toContain('ema_fast')
-    expect(sectionKeys).toContain('entry_threshold')
+    const keys = visibleSettingKeys('strategy', ['ema_fast', 'entry_threshold', 'timeframe'], new Set(), true)
+    expect(keys).toEqual(['entry_threshold', 'timeframe'])
+    expect(explicitKeys('strategy').has('ema_fast')).toBe(false)
+  })
+
+  it('目录正常时保留 section 之外的字段', () => {
+    const keys = visibleSettingKeys('strategy', ['ema_fast', 'entry_threshold'], new Set(), false)
+    expect(keys).toEqual(['ema_fast', 'entry_threshold'])
   })
 })
