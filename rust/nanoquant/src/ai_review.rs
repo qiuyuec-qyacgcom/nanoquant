@@ -30,6 +30,77 @@ impl AiReviewer for EngineAiReviewer {
     }
 }
 
+fn strip_secrets(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| {
+            let key = key.to_ascii_lowercase();
+            ![
+                "secret",
+                "token",
+                "password",
+                "api_key",
+                "apikey",
+                "webhook",
+                "credential",
+                "authorization",
+                "chat_id",
+                "private_key",
+            ]
+            .iter()
+            .any(|needle| key.contains(needle))
+        });
+        for child in object.values_mut() {
+            strip_secrets(child);
+        }
+    } else if let Some(items) = value.as_array_mut() {
+        for child in items {
+            strip_secrets(child);
+        }
+    }
+}
+
+fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> Value {
+    let mut out = serde_json::Map::new();
+    for group in [
+        "engine",
+        "strategy",
+        "risk",
+        "news",
+        "journal",
+        "evolution",
+        "system",
+        "data",
+        "backup",
+        "public",
+    ] {
+        let mut value = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [group],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null);
+        strip_secrets(&mut value);
+        out.insert(group.to_string(), value);
+    }
+    out.insert(
+        "ai".to_string(),
+        json!({
+            "enabled": cfg.enabled,
+            "mode": cfg.mode,
+            "min_confidence": cfg.min_confidence,
+            "max_calls_per_hour": cfg.max_calls_per_hour,
+            "monthly_budget_usd": cfg.monthly_budget_usd,
+            "timeout_sec": cfg.timeout_sec,
+            "temperature": cfg.temperature,
+            "decision_schema_version": cfg.decision_schema_version,
+        }),
+    );
+    Value::Object(out)
+}
+
 async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewDecision, String> {
     let strategy_cfg = state
         .db
@@ -85,14 +156,68 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .as_ref()
         .map(crate::strategies::compact)
         .unwrap_or(Value::Null);
+    let (mantra_text, mantra_ids, experiences, parameters) = {
+        let conn = state
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let evolution = crate::evolution_api::evolution_cfg(&conn);
+        let (mantra_text, mantra_ids) = crate::evolution_api::injection_payload(&conn, &evolution);
+        let journal_snapshot = json!({
+            "atr_pct": features["atr_pct"],
+            "funding": market.funding_rate,
+            "oi_change_pct": features["oi_change_pct"],
+            "oi_regime": features["oi_regime"],
+        });
+        let experiences = crate::journal::inject_lessons(
+            &conn,
+            &proposal.symbol,
+            &journal_snapshot,
+            &proposal.side,
+        );
+        let parameters = review_parameters(&conn, &cfg);
+        (mantra_text, mantra_ids, experiences, parameters)
+    };
+    let news = crate::ai_analysis::news_digest(&state, 8);
+    let quant_signal = proposal.quant_side.as_ref().map(|side| {
+        json!({
+            "side": side,
+            "score": proposal.quant_score,
+            "stop_price": proposal.stop_price,
+            "take_profit": proposal.take_profit,
+            "mark_price": proposal.mark_price,
+        })
+    });
     let context = json!({
+        "analysis_order": [
+            "global_strategy",
+            "self_evolving_mantras",
+            "decision_experiences",
+            "parameters",
+            "symbol_analysis",
+            "oi",
+            "news_sentiment",
+            "quant_signal"
+        ],
+        "strategy": profile,
+        "st": st,
+        "mantras": {
+            "text": mantra_text,
+            "ids": mantra_ids,
+        },
+        "experiences": experiences,
+        "parameters": parameters,
         "symbol": proposal.symbol,
         "price": market.mark_price,
         "score": features["ema_gap_pct"].as_f64().map(|value| value / 0.22).unwrap_or(0.0),
-        "side_hint": proposal.side,
+        "side_hint": proposal.quant_side.clone().unwrap_or_else(|| "flat".to_string()),
         "quant_reasons": ["ema_gap_pct", "rsi", "vol_ratio", "funding", "oi_change_pct", "oi_regime", "atr_pct"],
         "features": features,
-        "oi_regime": features["oi_regime"].clone(),
+        "oi": {
+            "change_pct": features["oi_change_pct"],
+            "regime": features["oi_regime"],
+        },
         "oi_regime_hint": "价涨+OI增=上升趋势确认；价涨+OI减=反弹不牢；价跌+OI增=下降趋势确认；价跌+OI减=趋势可能尾声",
         "klines": crate::ai_analysis::recent_bars(&market.candles, 14),
         "funding": market.funding_rate,
@@ -107,16 +232,14 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_confidence": cfg.min_confidence,
         },
-        "strategy": profile,
-        "st": st,
+        "news": news,
+        "quant_signal": quant_signal,
         "proposal": {
             "side": proposal.side,
             "leverage": proposal.leverage,
             "stop_price": proposal.stop_price,
             "mark_price": proposal.mark_price,
         },
-        "news": [],
-        "mantras": [],
     });
     let messages = crate::ai_analysis::decision_messages(&context);
     let mut call = ChatCall::new(&messages, "engine_review");
@@ -138,6 +261,17 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     decision_to_review(&proposal, side_lock, &decision, cfg.min_confidence)
 }
 
+fn reject(reason: impl Into<String>) -> ReviewDecision {
+    ReviewDecision {
+        action: ReviewAction::Reject,
+        side: None,
+        leverage: None,
+        stop_price: None,
+        take_profit: None,
+        reason: reason.into(),
+    }
+}
+
 fn decision_to_review(
     proposal: &EntryProposal,
     side_lock: &str,
@@ -145,80 +279,82 @@ fn decision_to_review(
     min_confidence: f64,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
-        return Ok(ReviewDecision {
-            action: ReviewAction::Reject,
-            leverage: None,
-            stop_price: None,
-            reason: format!(
-                "AI 置信度 {:.2} 低于 {:.2}",
-                decision.confidence, min_confidence
-            ),
-        });
+        return Ok(reject(format!(
+            "AI 置信度 {:.2} 低于 {:.2}",
+            decision.confidence, min_confidence
+        )));
     }
     let action = decision.action.as_str();
-    if action != "open_long" && action != "open_short" {
-        return Ok(ReviewDecision {
-            action: ReviewAction::Reject,
-            leverage: None,
-            stop_price: None,
-            reason: if decision.reason.is_empty() {
+    let side = match action {
+        "open_long" => "long",
+        "open_short" => "short",
+        _ => {
+            return Ok(reject(if decision.reason.is_empty() {
                 "AI 未批准开仓".to_string()
             } else {
                 decision.reason.clone()
-            },
-        });
-    }
-    if side_lock == "long" && action == "open_short" {
-        return Ok(ReviewDecision {
-            action: ReviewAction::Reject,
-            leverage: None,
-            stop_price: None,
-            reason: "策略只允许做多，AI 提案方向相反".to_string(),
-        });
-    }
-    if side_lock == "short" && action == "open_long" {
-        return Ok(ReviewDecision {
-            action: ReviewAction::Reject,
-            leverage: None,
-            stop_price: None,
-            reason: "策略只允许做空，AI 提案方向相反".to_string(),
-        });
-    }
-    let wanted = if proposal.side == "long" {
-        "open_long"
-    } else {
-        "open_short"
+            }))
+        }
     };
-    if action != wanted {
-        return Ok(ReviewDecision {
-            action: ReviewAction::Reject,
-            leverage: None,
-            stop_price: None,
-            reason: "AI 方向与量化信号冲突".to_string(),
-        });
+    if side_lock == "long" && side == "short" {
+        return Ok(reject("策略只允许做多，AI 方向相反"));
+    }
+    if side_lock == "short" && side == "long" {
+        return Ok(reject("策略只允许做空，AI 方向相反"));
+    }
+    let mark = proposal.mark_price;
+    let stop_price = if decision.sl_pct > 0.0 {
+        if side == "long" {
+            mark * (1.0 - decision.sl_pct / 100.0)
+        } else {
+            mark * (1.0 + decision.sl_pct / 100.0)
+        }
+    } else if side == proposal.side {
+        proposal.stop_price
+    } else {
+        let distance = (mark - proposal.stop_price).abs();
+        if side == "long" {
+            mark - distance
+        } else {
+            mark + distance
+        }
+    };
+    let take_profit = if decision.tp_pct > 0.0 {
+        if side == "long" {
+            mark * (1.0 + decision.tp_pct / 100.0)
+        } else {
+            mark * (1.0 - decision.tp_pct / 100.0)
+        }
+    } else if side == proposal.side {
+        proposal.take_profit
+    } else {
+        let distance = (proposal.take_profit - mark).abs();
+        if side == "long" {
+            mark + distance
+        } else {
+            mark - distance
+        }
+    };
+    if !stop_price.is_finite()
+        || stop_price <= 0.0
+        || !take_profit.is_finite()
+        || take_profit <= 0.0
+    {
+        return Ok(reject("AI 返回的止损/止盈价无效"));
     }
     let leverage = (decision.leverage > 0.0 && decision.leverage < proposal.leverage)
         .then_some(decision.leverage);
-    let stop_price = if decision.sl_pct > 0.0 {
-        let ai_stop = if proposal.side == "long" {
-            proposal.mark_price * (1.0 - decision.sl_pct / 100.0)
-        } else {
-            proposal.mark_price * (1.0 + decision.sl_pct / 100.0)
-        };
-        let tighter = (proposal.side == "long" && ai_stop > proposal.stop_price)
-            || (proposal.side == "short" && ai_stop < proposal.stop_price);
-        tighter.then_some(ai_stop)
-    } else {
-        None
-    };
+    let changed = side != proposal.side || leverage.is_some();
     Ok(ReviewDecision {
-        action: if leverage.is_some() || stop_price.is_some() {
+        action: if changed {
             ReviewAction::Tighten
         } else {
             ReviewAction::Agree
         },
+        side: Some(side.to_string()),
         leverage,
-        stop_price,
+        stop_price: Some(stop_price),
+        take_profit: Some(take_profit),
         reason: decision.reason.clone(),
     })
 }
@@ -231,8 +367,11 @@ mod tests {
         EntryProposal {
             symbol: "BTCUSDT".to_string(),
             side: side.to_string(),
+            quant_side: Some(side.to_string()),
+            quant_score: Some(0.8),
             leverage: 10.0,
             stop_price: if side == "long" { 95.0 } else { 105.0 },
+            take_profit: if side == "long" { 110.0 } else { 90.0 },
             mark_price: 100.0,
         }
     }
@@ -310,6 +449,13 @@ mod tests {
                  extra TEXT, created_at INTEGER, updated_at INTEGER);
                CREATE TABLE strategy_profiles(id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, rule TEXT,
                  enabled INTEGER, priority INTEGER, filters TEXT, created_at INTEGER, updated_at INTEGER);
+               CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT,
+                 source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER,
+                 enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT,
+                 created_at INTEGER, updated_at INTEGER, expires_at INTEGER);
+               CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT,
+                 outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER,
+                 enabled INTEGER, created_at INTEGER, updated_at INTEGER);
                INSERT INTO app_settings VALUES('ai','{"enabled":true,"mode":"single","provider_id":1,"fallback_provider_ids":[],"min_confidence":0.45,"max_calls_per_hour":30,"monthly_budget_usd":3,"temperature":0.2,"timeout_sec":5,"decision_schema_version":2}',0);
                INSERT INTO app_settings VALUES('risk','{"max_leverage":20}',0);
                INSERT INTO app_settings VALUES('strategy','{"timeframe":"15m"}',0);
@@ -475,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn wider_ai_stop_and_higher_leverage_are_downgraded_to_no_change() {
+    fn wider_ai_stop_is_not_used_for_an_agree_decision() {
         let wider = ai_client::Decision {
             action: "open_long".to_string(),
             confidence: 0.9,
@@ -487,26 +633,32 @@ mod tests {
             invalidation: String::new(),
         };
         let reviewed = decision_to_review(&proposal("long"), "any", &wider, 0.45).unwrap();
-        assert_eq!(
-            reviewed.action,
-            ReviewAction::Agree,
-            "更宽的止损和更高的杠杆都不该被采纳"
-        );
+        assert_eq!(reviewed.action, ReviewAction::Agree);
         assert_eq!(reviewed.leverage, None);
-        assert_eq!(reviewed.stop_price, None);
+        assert_eq!(reviewed.stop_price, Some(90.0));
+
+        struct Fixed(crate::review::ReviewDecision);
+        impl crate::review::AiReviewer for Fixed {
+            fn review(
+                &self,
+                _proposal: &crate::review::EntryProposal,
+            ) -> Result<crate::review::ReviewDecision, String> {
+                Ok(self.0.clone())
+            }
+        }
+        let clamped =
+            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
+        assert_eq!(clamped.leverage, 10.0);
+        assert_eq!(clamped.stop_price, 95.0, "更宽的 AI 止损不能被主机采纳");
     }
 
     #[test]
-    fn ai_side_must_match_the_quant_signal() {
+    fn ai_side_can_override_the_quant_signal() {
         let conflict =
             decision_to_review(&proposal("long"), "any", &decision("open_short", 0.9), 0.45)
                 .unwrap();
-        assert_eq!(conflict.action, ReviewAction::Reject);
-        assert!(
-            conflict.reason.contains("冲突"),
-            "方向冲突必须说明原因，实际：{}",
-            conflict.reason
-        );
+        assert_eq!(conflict.action, ReviewAction::Tighten);
+        assert_eq!(conflict.side.as_deref(), Some("short"));
     }
 
     #[test]

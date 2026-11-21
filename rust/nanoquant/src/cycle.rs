@@ -18,6 +18,8 @@ pub struct CycleReport {
     pub manage: Vec<ManageAction>,
     /// 本轮送给 AI 的标的。
     pub scanned: Vec<String>,
+    /// 通过基础行情闸门的全部标的，供 AI 第一决策使用。
+    pub ai_symbols: Vec<String>,
 }
 
 /// 一轮所需的输入，全部由调用方准备好，调度本身不碰网络和数据库。
@@ -46,6 +48,7 @@ pub fn run_cycle(input: &CycleInput) -> CycleReport {
             reconcile: vec![],
             manage: vec![],
             scanned: vec![],
+            ai_symbols: vec![],
         };
     }
 
@@ -71,11 +74,22 @@ pub fn run_cycle(input: &CycleInput) -> CycleReport {
         input.scan_gates,
         input.budget,
     );
+    let ai_symbols = if skipped.is_empty() {
+        input
+            .candidates
+            .iter()
+            .filter(|candidate| crate::scan::risk_gate(candidate, input.scan_gates).is_empty())
+            .map(|candidate| candidate.symbol.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     CycleReport {
         skipped,
         reconcile: reconcile_actions,
         manage: manage_actions,
         scanned,
+        ai_symbols,
     }
 }
 

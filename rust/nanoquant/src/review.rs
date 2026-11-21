@@ -8,8 +8,10 @@ pub(crate) enum ReviewAction {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReviewDecision {
     pub action: ReviewAction,
+    pub side: Option<String>,
     pub leverage: Option<f64>,
     pub stop_price: Option<f64>,
+    pub take_profit: Option<f64>,
     pub reason: String,
 }
 
@@ -17,15 +19,20 @@ pub(crate) struct ReviewDecision {
 pub(crate) struct EntryProposal {
     pub symbol: String,
     pub side: String,
+    pub quant_side: Option<String>,
+    pub quant_score: Option<f64>,
     pub leverage: f64,
     pub stop_price: f64,
+    pub take_profit: f64,
     pub mark_price: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReviewedEntry {
+    pub side: String,
     pub leverage: f64,
     pub stop_price: f64,
+    pub take_profit: f64,
     pub reason: String,
 }
 
@@ -49,8 +56,10 @@ pub(crate) fn apply_review(
             return Err("AI 复核不可用，按 fail-closed 跳过".to_string());
         }
         return Ok(ReviewedEntry {
+            side: proposal.side.clone(),
             leverage: proposal.leverage,
             stop_price: proposal.stop_price,
+            take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
         });
     };
@@ -64,10 +73,20 @@ fn apply_decision(
     proposal: &EntryProposal,
     decision: ReviewDecision,
 ) -> Result<ReviewedEntry, String> {
+    let side = decision
+        .side
+        .clone()
+        .unwrap_or_else(|| proposal.side.clone());
+    let take_profit = decision.take_profit.unwrap_or(proposal.take_profit);
+    if !take_profit.is_finite() || take_profit <= 0.0 {
+        return Err("AI 返回的止盈价无效".to_string());
+    }
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
+            side,
             leverage: proposal.leverage,
             stop_price: proposal.stop_price,
+            take_profit,
             reason: decision.reason,
         }),
         ReviewAction::Reject => Err(if decision.reason.is_empty() {
@@ -85,13 +104,24 @@ fn apply_decision(
                 Some(stop) if !stop.is_finite() || stop <= 0.0 => {
                     return Err("AI 返回的止损价无效".to_string())
                 }
-                Some(stop) if proposal.side == "long" => stop.max(proposal.stop_price),
+                Some(stop) if side != proposal.side => stop,
+                Some(stop) if side == "long" => stop.max(proposal.stop_price),
                 Some(stop) => stop.min(proposal.stop_price),
-                None => proposal.stop_price,
+                None if side == proposal.side => proposal.stop_price,
+                None => {
+                    let distance = (proposal.mark_price - proposal.stop_price).abs();
+                    if side == "long" {
+                        proposal.mark_price - distance
+                    } else {
+                        proposal.mark_price + distance
+                    }
+                }
             };
             Ok(ReviewedEntry {
+                side,
                 leverage,
                 stop_price,
+                take_profit,
                 reason: decision.reason,
             })
         }
@@ -114,8 +144,11 @@ mod tests {
         EntryProposal {
             symbol: "BTCUSDT".to_string(),
             side: "long".to_string(),
+            quant_side: Some("long".to_string()),
+            quant_score: Some(0.8),
             leverage: 10.0,
             stop_price: 95.0,
+            take_profit: 110.0,
             mark_price: 100.0,
         }
     }
@@ -123,8 +156,10 @@ mod tests {
     fn decision(action: ReviewAction) -> ReviewDecision {
         ReviewDecision {
             action,
+            side: None,
             leverage: None,
             stop_price: None,
+            take_profit: None,
             reason: String::new(),
         }
     }
@@ -141,8 +176,10 @@ mod tests {
     fn tighten_never_increases_leverage_or_widens_the_stop() {
         let reviewer = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
+            side: None,
             leverage: Some(50.0),
             stop_price: Some(90.0),
+            take_profit: None,
             reason: "tighten".to_string(),
         }));
         let reviewed = apply_review(&proposal(), Some(&reviewer), true).unwrap();
@@ -151,8 +188,10 @@ mod tests {
 
         let tightened = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
+            side: None,
             leverage: Some(5.0),
             stop_price: Some(97.0),
+            take_profit: None,
             reason: "tighten".to_string(),
         }));
         let reviewed = apply_review(&proposal(), Some(&tightened), true).unwrap();
@@ -164,8 +203,10 @@ mod tests {
     fn reject_timeout_and_missing_reviewer_are_fail_closed() {
         let reject = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Reject,
+            side: None,
             leverage: None,
             stop_price: None,
+            take_profit: None,
             reason: "行情不匹配".to_string(),
         }));
         assert!(apply_review(&proposal(), Some(&reject), false).is_err());
@@ -179,8 +220,10 @@ mod tests {
     fn invalid_tighten_payload_is_rejected() {
         let invalid = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
+            side: None,
             leverage: Some(f64::NAN),
             stop_price: Some(0.0),
+            take_profit: None,
             reason: "bad".to_string(),
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());

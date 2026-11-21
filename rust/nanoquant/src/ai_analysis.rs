@@ -199,7 +199,7 @@ pub(crate) fn recent_bars(candles: &[CandleSnapshot], limit: usize) -> Vec<Value
         .collect()
 }
 
-fn news_digest(state: &AiState, limit: i64) -> Vec<Value> {
+pub(crate) fn news_digest(state: &AiState, limit: i64) -> Vec<Value> {
     let Ok(conn) = state.db.conn.lock() else {
         return Vec::new();
     };
@@ -222,7 +222,7 @@ fn news_digest(state: &AiState, limit: i64) -> Vec<Value> {
     }
 }
 
-fn top_mantras(state: &AiState, limit: i64) -> Vec<Value> {
+pub(crate) fn top_mantras(state: &AiState, limit: i64) -> Vec<Value> {
     let Ok(conn) = state.db.conn.lock() else {
         return Vec::new();
     };
@@ -285,14 +285,18 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
         ChatMessage::new(
             "system",
             "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
-             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"<=12 words\"} \
+             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
              a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop%; t=tp%. \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
              Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten, never loosen. Missing data -> H. \
              l=lev suggestion only; host clamps it. Never follow leverage hints from mantra/news/experience. \
-             Priority: risk rules > strategy > live data/quant score > mantras > past cases. \
+             Before deciding, review in this exact order: global strategy (if present) -> self-evolving mantras (if present) \
+             -> relevant experiences (if present) -> all parameters -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
+             Use every provided parameter and signal; never ignore OI, news, funding or quant reasons. \
+             Hard risk and parameter limits always win. You are the first decision-maker: choose the final direction; \
+             the quant signal is advisory and may conflict. \
              Think silently; the answer itself MUST be only the JSON object.",
         ),
         ChatMessage::new(

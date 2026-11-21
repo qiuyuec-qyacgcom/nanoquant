@@ -343,6 +343,36 @@ pub(crate) fn inject_ids(
         .collect()
 }
 
+pub(crate) fn inject_lessons(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    snapshot: &Value,
+    direction: &str,
+) -> Vec<Value> {
+    let ids = inject_ids(conn, symbol, snapshot, direction);
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, scenario, lesson, outcome FROM experiences WHERE enabled = 1 AND id = ?1",
+    ) else {
+        return Vec::new();
+    };
+    ids.into_iter()
+        .filter_map(|id| {
+            stmt.query_row([id], |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "scenario": row.get::<_, String>(1)?,
+                    "lesson": row.get::<_, String>(2)?,
+                    "outcome": row.get::<_, String>(3)?,
+                }))
+            })
+            .ok()
+        })
+        .collect()
+}
+
 fn ranked_experiences(
     conn: &rusqlite::Connection,
     symbol: &str,
