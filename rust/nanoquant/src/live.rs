@@ -547,6 +547,7 @@ pub(crate) async fn place_protection_leg(
     if raw.transport_failed {
         return LegOutcome::unknown(format!("{}: 结果未知，已阻止重发", leg.kind));
     }
+    crate::exchange_time::note_response(base, raw.status, &raw.body).await;
     let reply = classify_reply("POST", raw.status, &raw.body);
     if let Reply::Rejected {
         code: -1003,
@@ -597,8 +598,9 @@ fn prepare(
     secret: &str,
 ) -> Result<PreparedRequest, String> {
     let now = crate::now_millis();
+    let timestamp = crate::exchange_time::now_ms(base);
     crate::submit::prepare(
-        gate, now, method, base, path, params, api_key, secret, now, 5_000,
+        gate, now, method, base, path, params, api_key, secret, timestamp, 5_000,
     )
 }
 

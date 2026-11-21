@@ -227,6 +227,7 @@ impl EngineControl {
     ) -> Result<(u16, String), String> {
         let gate = self.ban_gate();
         let now = crate::now_millis();
+        let timestamp = crate::exchange_time::now_ms(&creds.base);
         let request = crate::submit::prepare(
             &gate,
             now,
@@ -236,13 +237,14 @@ impl EngineControl {
             params,
             &creds.api_key,
             &creds.secret,
-            now,
+            timestamp,
             creds.recv_window_ms,
         )?;
         let reply = self.gateway.send(&request).await;
         if reply.transport_failed {
             return Err("交易所连接失败".to_string());
         }
+        crate::exchange_time::note_response(&creds.base, reply.status, &reply.body).await;
         Ok((reply.status, reply.body))
     }
 
@@ -1011,6 +1013,7 @@ impl EngineControl {
         let mut gate = self.ban_gate();
         let credentials = self.live_credentials()?;
         let now = crate::now_millis();
+        let timestamp = crate::exchange_time::now_ms(&credentials.base);
         let request = crate::submit::prepare(
             &gate,
             now,
@@ -1020,7 +1023,7 @@ impl EngineControl {
             params,
             &credentials.api_key,
             &credentials.secret,
-            now,
+            timestamp,
             credentials.recv_window_ms,
         )?;
         let reply = self.gateway.send(&request).await;
@@ -1028,6 +1031,7 @@ impl EngineControl {
             return Err("交易所请求传输失败".to_string());
         }
         let (status, body) = (reply.status, reply.body);
+        crate::exchange_time::note_response(&credentials.base, status, &body).await;
         let before = gate.until_ms();
         gate.observe(&body, crate::now_millis());
         if (200..300).contains(&status) {
@@ -2693,6 +2697,7 @@ impl EngineRuntime {
         params: &[(String, String)],
     ) -> Result<crate::submit::PreparedRequest, String> {
         let now = crate::now_millis();
+        let timestamp = crate::exchange_time::now_ms(&creds.base);
         crate::submit::prepare(
             gate,
             now,
@@ -2702,7 +2707,7 @@ impl EngineRuntime {
             params,
             &creds.api_key,
             &creds.secret,
-            now,
+            timestamp,
             creds.recv_window_ms,
         )
     }

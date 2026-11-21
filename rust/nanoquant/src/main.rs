@@ -39,6 +39,7 @@ mod events;
 mod evolution;
 mod evolution_api;
 mod evolution_review;
+mod exchange_time;
 mod execution;
 mod history;
 mod interpreter_refs;
@@ -212,6 +213,8 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("绑定 {addr} 失败: {e}"));
 
+    // 签名时间戳依赖交易所时钟：先用 /fapi/v1/time 对时，之后每分钟刷新
+    exchange_time::spawn_sync_task();
     let (stop_tx, stop_rx) = runtime::stop_channel();
     let runtime_task = database.and_then(|db| match runtime::acquire_lock(&data_dir) {
         Ok(lock) => Some(tokio::spawn(
