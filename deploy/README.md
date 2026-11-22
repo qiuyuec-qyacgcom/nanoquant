@@ -1,6 +1,6 @@
 # 生产部署（Linux）
 
-> **就地部署，不依赖 /opt**：主服务与 sidecar 都直接放在 `git clone` 出来的仓库根目录下，
+> **就地部署，不依赖 /opt**：主服务与执行内核都直接放在 `git clone` 出来的仓库根目录下，
 > 用仓库自带的脚本自动生成 systemd unit。本目录里的两个 `.service` 仅是**模板参考**，
 > 正常部署请勿手抄。
 
@@ -10,7 +10,7 @@
 - systemd 或 nohup 二选一；systemd 模式需要 root。
 - Rust 1.88+、Node.js 20+、gcc/make/perl/curl/git/pkg-config/acl；安装脚本会默认自动补齐缺失工具。
 - 仓库可直接放在 `/root` 下；安装脚本会自动为 `nanoquant` 授予路径穿越权限（ACL 优先，失败回退最小 chmod）。
-- systemd 模式默认创建 `nanoquant` 系统用户；sidecar 必须使用同一用户。
+- systemd 模式默认创建 `nanoquant` 系统用户；执行内核必须使用同一用户。
 
 ## 已部署机器如何更新
 
@@ -29,7 +29,7 @@ sudo bash scripts/update.sh               # 拉代码 + 可选备份 + 构建 + 
 | `--check` | 只预览远端版本与工作树状态，不动文件 |
 | `--no-backup` | 跳过更新前备份（默认在 `data/backups/` 建 `pre-update` 备份） |
 | `--no-frontend` | 只更新后端（已有可用 dist 时） |
-| `--with-sidecar` | 顺带重编并重装 Rust sidecar（之前装过才需要） |
+| `--with-exec-core` | 顺带重编并重装执行内核 exec-core（之前装过才需要） |
 | `--force` | 已是最新也强制重建前端并重启 |
 
 安全边界：有未提交改动会**中止**；`data/`、`.master_key` 与数据库从不覆盖；
@@ -89,15 +89,15 @@ bash install.sh --password-stdin --systemd < /root/nq-password
 | `--no-restart` | 不重启已运行服务（新二进制不会生效） |
 | `--check` | 只检查环境与产物，不修改文件 |
 
-> sidecar 与主服务共用 0600 的 UDS；systemd 模式下两者必须使用同一用户。`scripts/setup_sidecar.sh`
-> 默认复用已存在的 `nanoquant` 用户；自定义 `--user` 时也要给 sidecar 传同一个 `--user`。
+> 执行内核与主服务共用 0600 的 UDS；systemd 模式下两者必须使用同一用户。`scripts/setup_core.sh`
+> 默认复用已存在的 `nanoquant` 用户；自定义 `--user` 时也要给执行内核传同一个 `--user`。
 
-## 执行内核 sidecar（补装 / 重建）
+## 执行内核 exec-core（补装 / 重建）
 
 面板填好 API 凭证后，一条命令即可（自动读取**当前交易环境**的 Secret，不必手工复制）：
 
 ```bash
-sudo bash scripts/setup_sidecar.sh --from-settings
+sudo bash scripts/setup_core.sh --from-settings
 ```
 
 > 默认复用 systemd 主服务的 `nanoquant` 用户；自定义用户时传 `--user <name>`，且必须与主服务一致。
@@ -106,36 +106,35 @@ sudo bash scripts/setup_sidecar.sh --from-settings
 也可以显式给密钥（与面板「参数配置 → 数据源」保存的交易所 API secret 是同一把）：
 
 ```bash
-sudo bash scripts/setup_sidecar.sh --secret '<base64 PKCS#8 或 HMAC secret>'
+sudo bash scripts/setup_core.sh --secret '<base64 PKCS#8 或 HMAC secret>'
 ```
 
 脚本会检测/安装 Rust、`cargo build --release`（已编译可加 `--skip-build` 复用），
-把二进制装到 clone 目录 `exec-service`，写 `/etc/nanoquant/exec.env`（0600），
-并生成 `/etc/systemd/system/nanoquant-exec.service`。
+把二进制装到 clone 目录 `exec-core`，写 `/etc/nanoquant/exec.env`（0600），
+并生成 `/etc/systemd/system/nanoquant-exec-core.service`。
 
 > unit 带 `ConditionPathExists=/etc/nanoquant/exec.env`：**没写密钥就不会启动**，
-> 而不是启动后 panic 被 `Restart=always` 无限拉起。
+> 而不是启动后 panic 被 `Restart=always` 无限拉起。主服务启动时连不上内核则交易引擎不启动。
 
 ## 验证
 
 ```bash
 systemctl status nanoquant --no-pager
+systemctl status nanoquant-exec-core --no-pager
 curl -s localhost:8899/api/v1/health
-# sidecar：
 ls -l /run/nanoquant/exec.sock
-EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock
+EXEC_SECRET='<密钥>' nanoquant ops verify-exec-core --target unix:/run/nanoquant/exec.sock
 ```
 
-## sidecar 自检（可选）
+## 执行内核自检
 
-1. 面板「系统诊断 → 执行内核」确认 `target=/run/nanoquant/exec.sock`、`connected=true`；
-2. 点「自检」：面板「往返耗时」会记下探活一帧 health 的**实测**往返耗时（没有样本时显示「—」，不显示 0ms）；
-   签名的逐字节比对在 CLI 里做：`EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock`；
-3. 主服务使用 Rust 内核签名；参数页不再提供 `exec_mode/exec_socket` 设置。
-4. 换 Secret 后必须点「清零」，避免在途比对残留不一致计数。
+1. 面板「系统诊断 → 执行内核（exec-core）」确认 `target=/run/nanoquant/exec.sock`、`connected=true`；
+2. 点「自检」：已连接会记下探活一帧 health 的**实测**往返耗时（没有样本时显示「—」，不显示 0ms）；
+   签名的逐字节比对在 CLI 里做：`EXEC_SECRET='<密钥>' nanoquant ops verify-exec-core --target unix:/run/nanoquant/exec.sock`；
+3. 未连接时自检直接失败，且主服务启动时交易引擎不会启动——这是默认内核的强依赖语义。
+4. 换 Secret 后点「清零」，清掉探活计数并转发内核 `metrics_reset`。
 
-> 保护单代发、台账权威源等 P3 能力的历史说明见
-> [`docs/archive/history/deploy/P3_ROLLOUT.md`](../docs/archive/history/deploy/P3_ROLLOUT.md)。
+> 历史迁移说明见 [`docs/archive/history/INDEX.md`](../docs/archive/history/INDEX.md)。
 
 ## 监控（可选）
 
@@ -167,7 +166,7 @@ EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant
 ```bash
 systemctl restart nanoquant            # 只重启主服务
 journalctl -u nanoquant -f             # 应用日志（另有 logs/nanoquant.log 按 8MB×5 轮转）
-journalctl -u nanoquant-exec -n 50     # sidecar 输出
+journalctl -u nanoquant-exec-core -n 50  # 执行内核输出
 ```
 
 > 升级代码后：`git pull` → `cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml`

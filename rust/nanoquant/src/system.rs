@@ -1267,118 +1267,7 @@ fn render_alert(cfg: &AlertCfg, event: &AlertEvent) -> String {
     )
 }
 
-/// 执行内核探活结果。
-struct ExecProbe {
-    endpoint: Option<String>,
-    connected: bool,
-    algo: String,
-    detail: String,
-    /// 探一帧 health 的实测往返耗时（毫秒）。没探到就是 None，不填 0。
-    latency_ms: Option<f64>,
-}
-
-/// 探一次执行内核：发一帧 health 协议，能回就算「有内核」。
-/// 只 ping 端口不算数——端口开着不代表内核活着。
-fn exec_probe_state() -> ExecProbe {
-    let Some(endpoint) = exec_endpoint() else {
-        return ExecProbe {
-            endpoint: None,
-            connected: false,
-            algo: String::new(),
-            detail: "未部署执行内核（可选组件）：Rust 内核直连交易所签名下单，本环境无需部署"
-                .to_string(),
-            latency_ms: None,
-        };
-    };
-    let started = std::time::Instant::now();
-    match exec_probe(&endpoint) {
-        Some(response) => {
-            let algo = response
-                .get("algo")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            ExecProbe {
-                endpoint: Some(endpoint.clone()),
-                connected: true,
-                algo,
-                detail: format!("执行内核已连接（端点 {endpoint}）"),
-                latency_ms: Some(round(started.elapsed().as_secs_f64() * 1000.0, 2)),
-            }
-        }
-        None => ExecProbe {
-            endpoint: Some(endpoint.clone()),
-            connected: false,
-            algo: String::new(),
-            // sidecar 的保护单 op 主服务并未接线：下单与保护单都由 Rust 内核自己签名发出，
-            // 端点不可达只丢签名旁证与探活样本，不是下单故障。
-            detail: format!(
-                "执行内核端点不可达（{endpoint}），签名旁证与探活样本缺失；主服务下单不受影响"
-            ),
-            latency_ms: None,
-        },
-    }
-}
-
-/// 发一帧 health 协议，返回 sidecar 的应答。
-fn exec_probe(endpoint: &str) -> Option<Value> {
-    if let Some(path) = endpoint.strip_prefix("unix:") {
-        #[cfg(unix)]
-        {
-            return exec_probe_unix(path);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            return None;
-        }
-    }
-    exec_probe_tcp(endpoint.strip_prefix("tcp:").unwrap_or(endpoint))
-}
-
-fn exec_probe_tcp(address: &str) -> Option<Value> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-    let stream = TcpStream::connect(address).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(800)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(800)))
-        .ok()?;
-    let mut writer = stream.try_clone().ok()?;
-    writer
-        .write_all(b"{\"id\":\"probe\",\"op\":\"health\"}\n")
-        .ok()?;
-    writer.flush().ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str::<Value>(line.trim()).ok()
-}
-
-#[cfg(unix)]
-fn exec_probe_unix(path: &str) -> Option<Value> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(800)))
-        .ok()?;
-    let mut writer = stream.try_clone().ok()?;
-    writer
-        .write_all(b"{\"id\":\"probe\",\"op\":\"health\"}\n")
-        .ok()?;
-    writer.flush().ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    serde_json::from_str::<Value>(line.trim()).ok()
-}
-
-/// 当前交易环境是否配置了交易所 Secret（sidecar 要用它签名）。
+/// 当前交易环境是否配置了交易所 Secret（内核要用它签名）。
 fn exec_secret_configured(conn: &rusqlite::Connection, mode: &str) -> bool {
     conn.query_row(
         "SELECT value FROM app_settings WHERE key='data'",
@@ -2285,19 +2174,17 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
     let started = std::time::Instant::now();
     let endpoint = exec_endpoint();
     let connected = endpoint.as_deref().is_some_and(endpoint_reachable);
-    // 实盘走 HttpGateway 直连币安；执行内核只是可选组件，不能当成交易通道的必要条件。
-    let channel_ok = mode == "demo" || connected || credentials_ok;
+    // 执行内核是默认必选组件：未连接时交易引擎不会启动。
+    let channel_ok = connected;
     checks.push(diag_check(
         "交易通道",
         channel_ok,
-        if mode == "demo" {
-            "模拟盘本地记账，无需执行内核".to_string()
-        } else if connected {
-            "实盘执行内核端点可达".to_string()
+        if connected {
+            "执行内核端点可达".to_string()
         } else if credentials_ok {
-            "实盘凭证可用，直连交易所；未配置执行内核（可选）".to_string()
+            "执行内核未连接（凭证可解密，但交易引擎需内核握手）".to_string()
         } else {
-            "实盘缺少可用的交易凭证".to_string()
+            "执行内核未连接，且当前环境凭证不可用".to_string()
         },
         started,
     ));
@@ -2377,25 +2264,24 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
     ));
 
     let started = std::time::Instant::now();
-    // 未配置视为正常（可选组件）；只有显式配置了却连不上才算异常。
-    let exec_probe = exec_probe_state();
-    let exec_ok = exec_probe.endpoint.is_none() || exec_probe.connected;
+    // 执行内核是默认必选组件：未连接即异常。
+    let core_client = state.exec_client.as_ref();
+    let core_connected = core_client
+        .map(|client| client.state() == crate::exec_client::ConnState::Connected)
+        .unwrap_or(false);
     checks.push(diag_check(
         "执行内核",
-        exec_ok,
-        if exec_probe.connected {
-            format!(
-                "{}（端点 {}，算法 {}）",
-                exec_probe.detail,
-                exec_probe.endpoint.clone().unwrap_or_default(),
-                if exec_probe.algo.is_empty() {
-                    "未知"
-                } else {
-                    &exec_probe.algo
-                }
-            )
+        core_connected,
+        if let Some(client) = core_client {
+            if core_connected {
+                format!("已连接（端点 {}）", client.endpoint())
+            } else {
+                client.last_error().unwrap_or_else(|| {
+                    "内核未连接：检查 EXEC_TCP/EXEC_SOCKET 与内核进程".to_string()
+                })
+            }
         } else {
-            exec_probe.detail.clone()
+            "未配置执行内核端点（EXEC_TCP/EXEC_SOCKET）：交易引擎不会启动".to_string()
         },
         started,
     ));
@@ -3435,9 +3321,24 @@ mod tests {
             .iter()
             .filter(|check| check["ok"] != true)
             .collect::<Vec<_>>();
-        assert_eq!(failed.len(), 1, "注入凭证故障只影响该项: {failed:?}");
-        assert_eq!(failed[0]["name"], "交易凭证");
-        assert!(failed[0]["detail"].as_str().unwrap().contains("无法解密"));
+        assert!(!failed.is_empty(), "凭证故障必须被诊断出来: {failed:?}");
+        let credential = failed
+            .iter()
+            .find(|check| check["name"] == "交易凭证")
+            .unwrap_or_else(|| panic!("缺少交易凭证失败项: {failed:?}"));
+        assert!(credential["detail"]
+            .as_str()
+            .unwrap()
+            .contains("无法解密"));
+        // 未连接执行内核是默认必选组件的故障，会同时让「交易通道」失败；
+        // 除此之外不应有别的检查被凭证故障牵连。
+        for check in &failed {
+            let name = check["name"].as_str().unwrap_or("");
+            assert!(
+                ["交易凭证", "交易通道", "执行内核"].contains(&name),
+                "凭证故障不应影响 {name}: {check}"
+            );
+        }
         let find = |name: &str| {
             checks
                 .iter()
@@ -3447,8 +3348,8 @@ mod tests {
         };
         assert_eq!(
             find("执行内核")["ok"],
-            true,
-            "未配置执行内核是可选组件，不能算异常"
+            false,
+            "默认执行内核未连接必须算异常"
         );
         assert!(
             !find("存储")["detail"]

@@ -6,7 +6,7 @@ BIN="$ROOT/rust/nanoquant/target/release/nanoquant"
 CHECK=0
 NO_BACKUP=0
 NO_FRONTEND=0
-WITH_SIDECAR=0
+WITH_EXEC_CORE=0
 FORCE=0
 
 usage() {
@@ -17,7 +17,7 @@ usage() {
   --check          只预览远端版本与工作树状态，不修改文件
   --no-backup      跳过更新前备份
   --no-frontend    只更新后端；要求已有 frontend/dist
-  --with-sidecar   顺带重编并重装 Rust sidecar（需要 root）
+  --with-exec-core 顺带重编并重装执行内核 exec-core（需要 root）
   --force          已是最新也强制重建前端并重启
   -h, --help       显示帮助
 
@@ -30,7 +30,7 @@ while [ "$#" -gt 0 ]; do
     --check) CHECK=1; shift ;;
     --no-backup) NO_BACKUP=1; shift ;;
     --no-frontend) NO_FRONTEND=1; shift ;;
-    --with-sidecar) WITH_SIDECAR=1; shift ;;
+    --with-exec-core) WITH_EXEC_CORE=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; echo "未知参数: $1" >&2; exit 1 ;;
@@ -81,12 +81,12 @@ fi
 echo "[INFO] 构建并重启（install.sh ${args[*]}）"
 bash "$ROOT/scripts/install.sh" "${args[@]}"
 
-if [ "$WITH_SIDECAR" -eq 1 ]; then
-  [ "$(id -u)" -eq 0 ] || { echo "--with-sidecar 需要 root" >&2; exit 1; }
-  command -v cargo >/dev/null 2>&1 || { echo "缺少 cargo，无法重建 sidecar" >&2; exit 1; }
-  echo "[INFO] 重建 sidecar"
-  cargo build --release --locked --manifest-path "$ROOT/rust/exec-service/Cargo.toml"
-  bash "$ROOT/scripts/setup_sidecar.sh" --skip-build
+if [ "$WITH_EXEC_CORE" -eq 1 ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "--with-exec-core 需要 root" >&2; exit 1; }
+  command -v cargo >/dev/null 2>&1 || { echo "缺少 cargo，无法重建执行内核" >&2; exit 1; }
+  echo "[INFO] 重建执行内核"
+  cargo build --release --locked --manifest-path "$ROOT/rust/exec-core/Cargo.toml"
+  bash "$ROOT/scripts/setup_core.sh" --skip-build
 fi
 
 echo "[OK] 更新完成"

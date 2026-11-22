@@ -1,50 +1,57 @@
-# 执行内核 sidecar 协议（v0.2 · 校验用 sidecar）
+# 执行内核 exec-core 协议（v1.0）
 
-> 执行内核（sidecar）是**可选**的签名校验组件。主服务用 Rust 内核自己签名下单，
-> 不部署 sidecar 也能正常交易；sidecar 提供的是「另一份独立实现的签名能否逐字节对齐」的旁证，
-> 外加诊断面板上的探活状态与实测往返耗时。
->
-> 历史上这里描述过 `shadow` / `enforce` 两种影子比对与强制路由模式。那是 legacy Python 内核
-> 退役、迁移到 Rust 内核期间的过渡脚手架（见 `docs/archive/history/deploy/P3_ROLLOUT.md`），
-> 随 Python 内核一并移除，**代码里已不存在**。
+> exec-core 是 NanoQuant 的**默认执行内核**：独立进程，负责签名校验与七段延迟指标聚合。
+> 主服务启动时必须完成 `hello` 握手，否则交易引擎不启动；HTTP 查询与前端照常可用。
+> 二期将把下单/保护单切换到内核 op（协议号已预留）。
 
 ## 1. 传输
 
-| 环境 | 目标 | 说明 |
+| 环境 | 端点 | 说明 |
 |---|---|---|
-| Linux / 生产 | `unix:/run/nanoquant/exec.sock` | AF_UNIX，低延迟、无端口暴露，权限 0600 |
-| Windows 开发 | `tcp:127.0.0.1:9101` | Windows 不支持 unix socket，用回环 TCP 验证协议 |
+| Linux / 生产 | `unix:/run/nanoquant/exec.sock` | AF_UNIX，权限 0600，由 systemd `RuntimeDirectory` 创建 |
+| Windows 开发 | `tcp:127.0.0.1:9101` | Windows 无 UDS，使用回环 TCP 联调 |
 
-主服务通过 `EXEC_SOCKET`（unix）或 `EXEC_TCP`（tcp）指定端点，只认 TCP 会让 UDS 部署永远显示「未配置」。
-未配置时诊断面板显示「未部署」，属于正常状态，**不影响交易**。
+主服务从 `EXEC_SOCKET`（unix）或 `EXEC_TCP`（tcp）读取端点；两者都未配置时交易引擎不启动。
 
 ## 2. 帧格式
 
-**JSON Lines**：一行一个请求，一行一个响应，UTF-8，以 `\n` 结束。
+**JSON Lines**：一行一个请求/响应，UTF-8，以 `\n` 结尾。`id` 由调用方生成，响应原样回传。
 
 ```json
-{"id":"a1b2c3d4","op":"sign","query":"symbol=BTCUSDT&side=BUY&type=MARKET&timestamp=1700000000000"}
-{"id":"a1b2c3d4","ok":true,"signature":"9Z7/7rbp...","algo":"ed25519","query":"symbol=BTCUSDT&..."}
+{"id":"nq-1","op":"hello","version":"0.1.0"}
+{"id":"nq-1","ok":true,"kernel_version":"1.0.0","capabilities":["health","sign","metrics_ingest","metrics_query","metrics_reset"],"metrics_capacity":2000}
 ```
 
-错误响应：`{"id":"...","ok":false,"error":"..."}`，调用方应视为失败而非重试。
+错误响应：`{"id":"...","ok":false,"error":"..."}`。坏 JSON 返回 `id="unknown"`。
 
 ## 3. 操作
 
-| op | 入参 | 出参 | 主服务是否调用 |
-|---|---|---|---|
-| `health` | — | `algo` | **是**：诊断探活 |
-| `sign` / `plan` | `query` | `signature` / `algo` / `query` | **是**：`ops verify-sidecar` 做逐字节比对 |
-| `probe` | — | `latency_ms` | 否 |
-| `order_register` | `client_order_id` / `symbol` / `state?` | `order` / `duplicate` | 否：sidecar 侧保留的台账能力 |
-| `order_transition` | `client_order_id` / `state` / `filled_qty?` / `avg_price?` | `order` | 否 |
-| `order_get` / `order_snapshot` | `client_order_id` / — | `order` | 否 |
-| `protection_plan` | `symbol` / `close_side` / `stop_price` / `take_price` / ... | `protections` | 否 |
-| `protection_place` | 同上 + `api_key` | `protections`[] | 否：需 `EXEC_PLACE_MODE=enabled` |
-| `store_status` | — | `store` | 否 |
+| op | 方向 | 入参 | 出参 | 说明 |
+|---|---|---|---|---|
+| `hello` | 主服务→内核 | `version` | `ok`/`kernel_version`/`capabilities[]`/`metrics_capacity` | 启动握手；失败 = 交易引擎不启动 |
+| `health` | 双向 | — | `algo`/`uptime_ms`/`sessions` | 探活；主服务每 5s 一次 |
+| `sign` | 主服务→内核 | `query` | `signature`/`algo`/`query` | 签名；`verify-exec-core` 逐字节比对 |
+| `metrics_ingest` | 主服务→内核 | `samples:[{segment,ms,ts}]` | `accepted`/`dropped` | 批量上报；未知 segment 拒绝该条 |
+| `metrics_query` | 主服务→内核 | — | `segments` | 七段分位数；无样本字段为 null |
+| `metrics_reset` | 主服务→内核 | — | `ok` | 清零全部段 |
+| `order_open` | 预留 | — | `ok:false`/`error` | 二期实现；一期返回 `reserved for phase 2` |
+| `order_close` | 预留 | — | 同上 | 同上 |
+| `protection_place` | 预留 | — | 同上 | 同上 |
 
-> 台账与保护单相关 op 在 sidecar 二进制里仍然可用，但 Rust 主服务目前**没有接线**：
-> 下单链路走 `crate::sign::order_params` 自己签名、自己发单。想用这些能力需要先补主服务侧的调用。
+七段：`total` / `plan` / `sign` / `http` / `wait` / `protect` / `persist`，每段返回
+`{count,p50,p95,p99,max,last}`。分位数采用排序后索引法，与主服务探活 `latency_view` 同口径。
+
+### 3.1 七段口径（主服务下单路径）
+
+| segment | 计时范围 |
+|---|---|
+| `total` | 单循环起点 → settle 返回（失败单到失败点） |
+| `plan` | admit → build_live 返回（含 BanGate、参数构造；扣除 reserve 与签名净耗时） |
+| `sign` | `sign::signed_query` 净耗时 |
+| `http` | `live::submit` 往返 |
+| `wait` | `resolve_live` 往返（Unknown 时才有） |
+| `protect` | `ensure_protection` 总耗时（tick 级，每次一条样本） |
+| `persist` | `reserve_order` + `settle_live` 落库耗时 |
 
 ## 4. 签名规则
 
@@ -56,58 +63,62 @@
 - `query` 是**未编码**的参数串（不含 `signature`）。
 - 拼 URL 时 `signature` 必须再做一次 URL 编码（`+` 会被服务端当空格）。
 - PEM 粘贴形态（多行 / 单行 / 纯 base64）一律先归一化。
-- 主服务的 `rust/nanoquant/src/sign.rs` 与 sidecar 的 `rust/exec-service/src/sign.rs` 必须逐字节一致，
-  各自的单测分别守着这条约束。
+- 主服务 `rust/nanoquant/src/sign.rs` 与内核 `rust/exec-core/src/sign.rs` 必须逐字节一致，
+  各自的固定向量单测守着这条约束（`ops verify-exec-core` 再做线上比对）。
 
 ## 5. 职责边界
 
-| | 主服务（Rust 内核） | sidecar（exec-service） |
+| | 主服务（nanoquant） | exec-core |
 |---|---|---|
-| 签名 | ✅ 实际下单用它 | ✅ 只回传签名 |
-| 下单 / 保护单 / 持仓 | ✅ | ❌ 不接触账户、持仓与订单 |
-| 交易所 Secret | 加密存库，按需解密 | 只在启动时从环境变量读取 |
-| 故障影响 | sidecar 挂掉**不影响**交易 | — |
+| 签名 | 实际下单用它，并上报 `sign` 净耗时 | 提供独立实现供逐字节校验 |
+| 下单 / 保护单 / 持仓 | ✅ | ❌ 一期不接触账户与订单 |
+| 指标 | 下单路径七段计时 + 异步批量上报 | 七段环形缓冲与分位数聚合 |
+| 故障影响 | 握手失败 → 交易引擎不启动 | 内核掉线 → 主服务自动重连，样本排队/丢弃 |
 
-> sidecar 目前与主服务通常共用同一个系统用户、同一权限边界，
-> 所以「密钥隔离」在默认部署下并没有额外收益，它的主要价值是**独立实现的交叉校验**。
+密钥只在 exec-core 进程内存与主服务各自的解密路径中，不写日志、不进事件流。
 
 ## 6. 主服务接口
 
 | 端点 | 用途 |
 |---|---|
-| `GET /system/exec-sidecar` | 连接状态、algo、自检计数（成功/失败/跳过）、往返耗时 p50/p95/p99、verdict |
-| `POST /system/exec-sidecar/self-test` | 探活一次并记入计数（不消耗权重、不下单）；未配置端点时记为「通过」——可选组件没部署不是故障 |
-| `POST /system/exec-sidecar/reset` | 清零观测计数（换密钥/换环境后重新统计） |
-| `GET /system/exec-sidecar/reconcile` | 只读对账：本地 `orders` 与执行死信 |
+| `GET /system/exec-core` | `connected`/`configured`/`state`/`last_error`/`target`/`algo`/`counts`/`latency_ms{last,p50,p95,p99,samples}`/`segments`/`dropped`/`verdict` |
+| `POST /system/exec-core/self-test` | 未连接 = `error`；已连接且配 Secret = `ok`；已连接无 Secret = `skipped` |
+| `POST /system/exec-core/reset` | 清零探活计数，并转发内核 `metrics_reset` |
+| `GET /system/exec-core/reconcile` | 只读对账：本地 `orders` 与执行死信 |
 
-> 没有样本的字段返回 `null`，面板显示「—」，不会用 0 冒充实测值。
+`/engine/execution` 与 `/engine/stats` 的延迟读数来自 `segments`（未连接时字段为 null，面板显示「—」）。
+面板「执行内核（exec-core）」显示通道状态、探活往返 p50/p95/p99、七段下单延迟与上报丢弃计数。
 
 ## 7. 部署与验证
 
 Linux（systemd）：
 
 ```bash
-sudo bash scripts/setup_sidecar.sh --from-settings   # 自动读取当前交易环境的 Secret
+sudo bash scripts/setup_core.sh --from-settings
+systemctl status nanoquant-exec-core
 ```
 
 Windows：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start-sidecar.ps1 -Detach
+powershell -ExecutionPolicy Bypass -File scripts\start-core.ps1 -Detach
 ```
 
-逐字节校验（这才是 sidecar 的主要用途）：
+逐字节校验：
 
 ```bash
-EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock
+nanoquant ops verify-exec-core --target unix:/run/nanoquant/exec.sock --secret '<密钥>'
+# Windows 联调
+nanoquant ops verify-exec-core --target tcp:127.0.0.1:9101 --secret '<密钥>'
 ```
 
-它会发一条 `health`、两条真实下单 query 的 `sign`、一条空 query 边界，
-用主服务自己的 `sign::sign_query` 对比 sidecar 的签名，任一不一致即失败。
+该命令依次检查 `hello`（kernel_version）、`health`（algo）、两笔真实下单 query 的 `sign`
+逐字节比对、空 query 必须被拒绝。联调可用 `ops mock-exec-core --port 9101 --secret <密钥>`。
 
 ## 8. 风险控制
 
-- sidecar 不可用时主服务照常用自己的签名下单，不阻塞交易；
-- 密钥只在 sidecar 进程与主服务各自的内存里，不写日志、不进事件流（`ops show-exec-secret` 只打标准输出）；
-- 签名比对不一致必须视为失败，不能「猜」；
-- 主服务不下单时 sidecar 不做任何事，两者没有隐式耦合。
+- **内核掉线**：主服务指数退避重连（250ms 起，上限 8s），期间七段样本在有界队列（8192）排队；
+  队列满丢弃并计数，绝不阻塞下单路径。
+- **内核重启**：内存指标清零重新累计（一期不做跨进程持久化）。
+- **握手失败**：交易引擎不启动，`engine_events` 记录 error，面板红色「未连接」；HTTP/前端照常。
+- **签名比对不一致**：必须视为失败，不能猜测。

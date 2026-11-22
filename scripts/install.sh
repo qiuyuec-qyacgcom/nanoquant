@@ -760,13 +760,13 @@ healthcheck() {
   return 1
 }
 
-align_sidecar_user() {
-  local unit="/etc/systemd/system/nanoquant-exec.service"
+align_exec_core_user() {
+  local unit="/etc/systemd/system/nanoquant-exec-core.service"
   [ -f "$unit" ] || return 0
   local current
   current="$(awk -F= '/^User=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$unit")"
   if [ -n "$current" ] && [ "$current" != "$RUN_USER" ] && [ "$current" != "root" ]; then
-    log WARN "sidecar 运行用户 $current 与主服务 $RUN_USER 不一致；请用 --user $RUN_USER 重新运行 setup_sidecar.sh"
+    log WARN "执行内核运行用户 $current 与主服务 $RUN_USER 不一致；请用 --user $RUN_USER 重新运行 setup_core.sh"
     return 0
   fi
   if [ -z "$current" ] || [ "$current" = "root" ]; then
@@ -782,8 +782,8 @@ align_sidecar_user() {
       sed -i "/^User=$RUN_USER$/a Group=$RUN_GROUP" "$unit"
     fi
     systemctl daemon-reload
-    systemctl restart nanoquant-exec 2>/dev/null || log WARN "nanoquant-exec 重启失败；请检查 journalctl -u nanoquant-exec"
-    log OK "已将 sidecar unit 运行用户对齐为 $RUN_USER"
+    systemctl restart nanoquant-exec-core 2>/dev/null || log WARN "nanoquant-exec-core 重启失败；请检查 journalctl -u nanoquant-exec-core"
+    log OK "已将执行内核 unit 运行用户对齐为 $RUN_USER"
   fi
 }
 
@@ -799,7 +799,7 @@ rollback_binary() {
 systemd_unit() {
   printf '[Unit]\n'
   printf 'Description=NanoQuant (Rust trading engine)\n'
-  printf 'After=network-online.target nanoquant-exec.service\n'
+  printf 'After=network-online.target nanoquant-exec-core.service\n'
   printf 'Wants=network-online.target\n\n'
   printf '[Service]\n'
   printf 'Type=simple\n'
@@ -839,7 +839,7 @@ install_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "缺少 systemctl"
   [ -d /run/systemd/system ] || die "当前系统未运行 systemd"
 
-  align_sidecar_user
+  align_exec_core_user
   if [ -n "$ADMIN_PASSWORD" ]; then
     case "$ADMIN_PASSWORD" in
       *$'\n'*) die "管理员密码不能包含换行" ;;

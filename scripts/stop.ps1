@@ -3,12 +3,12 @@
   停止 NanoQuant (Windows)
 .DESCRIPTION
   以 data\nanoquant.pid 与 nanoquant.exe 为唯一对象；不会按解释器命令行匹配。
-  可选结束 exec-service sidecar。
+  可选结束 exec-core 执行内核。
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
 #>
 param(
-  [switch]$WithSidecar
+  [switch]$WithCore
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,14 +49,14 @@ if (-not $stopped) {
   }
 }
 
-if ($WithSidecar) {
-  $sidebar = Get-Process -Name 'exec-service' -ErrorAction SilentlyContinue
-  if ($sidebar) {
-    $sidebar | ForEach-Object {
+if ($WithCore) {
+  $core = Get-Process -Name 'exec-core' -ErrorAction SilentlyContinue
+  if ($core) {
+    $core | ForEach-Object {
       Stop-Process -Id $_.Id -Force
-      Write-Host "已停止 exec-service (PID $($_.Id))" -ForegroundColor Green
+      Write-Host "已停止 exec-core (PID $($_.Id))" -ForegroundColor Green
     }
   } else {
-    Write-Host "没有正在运行的 exec-service" -ForegroundColor DarkGray
+    Write-Host "没有正在运行的 exec-core" -ForegroundColor DarkGray
   }
 }

@@ -633,7 +633,7 @@ fn master_key_path(options: &Options) -> Option<PathBuf> {
     db.parent().map(|dir| dir.join(".master_key"))
 }
 
-/// 输出当前交易环境的交易所 Secret：sidecar 部署脚本要它才能签名。
+/// 输出当前交易环境的交易所 Secret：执行内核部署脚本要它才能签名。
 /// 只打到标准输出，不写日志、不进事件流。
 fn show_exec_secret(options: &Options, config: &Config) -> Result<(i32, Value), (i32, String)> {
     let db = open_db(&options.db_path)?;

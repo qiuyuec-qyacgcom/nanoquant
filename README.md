@@ -14,7 +14,7 @@
 </p>
 
 **一个面向小资金的币安 U 本位永续量化系统：** 行情、信号、风控、AI 复核、执行与复盘
-串成一条可解释、可审计的链路。默认模拟盘，参数热更新，当前主线为 **Rust 内核 + Rust sidecar**，
+串成一条可解释、可审计的链路。默认模拟盘，参数热更新，当前主线为 **Rust 主服务 + Rust 执行内核 exec-core**，
 不再依赖 Python 运行时。
 
 [特性](#-特性) · [界面](#-界面) · [快速开始](#-快速开始) · [参数](#-参数设置) · [架构](#-架构) ·
@@ -28,7 +28,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 🦀 **Rust 单栈** | 主服务 `rust/nanoquant` 与执行 sidecar `rust/exec-service` 均为 Rust；运行期不依赖解释器 |
+| 🦀 **Rust 单栈** | 主服务 `rust/nanoquant` 与执行内核 `rust/exec-core` 均为 Rust；运行期不依赖解释器 |
 | 📈 **币安 U 本位永续** | 模拟盘走测试网、实盘走主网；合约规格来自币安在线合约表，数量/价格按步进格式化 |
 | 🛡 **先风控再下单** | 单笔风险、保证金、杠杆、总敞口、同向持仓、日亏/回撤/连亏冷却多道闸门 |
 | 🎯 **全局止盈止损** | 风控组可设置全局止损率/止盈率（按开仓价涨跌幅），每仓触发后整仓平仓，优先于 ATR 规则 |
@@ -39,7 +39,7 @@
 | 📰 **资讯情绪** | 多源抓取、情绪指数、源体检；可选用 AI 摘要注入决策上下文 |
 | 🎯 **标的池** | 支持币安真实中文合约（如 `牛来USDT`）；当前环境查不到时降级为自定义标的（仅记录、默认禁用） |
 | 🖥 **前台 + 后台** | 公开品牌站（浅色象牙白/金）与登录后的交易终端（深色黑金）；响应式布局 |
-| 🧩 **执行 sidecar** | 只签名不下单；`shadow` 旁路比对、`enforce` 不一致拒单，掉线自动降级 |
+| 🧩 **执行内核 exec-core** | 签名校验 + 七段延迟指标聚合；主服务启动需完成握手，否则交易引擎不启动 |
 | 🧰 **Linux 一键部署** | `install.sh` 引导脚本；systemd 或 nohup；依赖检查、构建、权限收紧、健康检查与失败回滚 |
 | 🔐 **安全与审计** | 密码 stdin/file/env 传入；systemd 临时 env 文件 0600 且成功后删除；主密钥/数据库不入备份包 |
 | 🩺 **可观测** | 事件总线、死信补偿、运行态探针、`/metrics`、API 限频与执行内核自检 |
@@ -79,7 +79,7 @@
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Rust | **1.88+** | 构建主服务与 sidecar；运行期不需要解释器 |
+| Rust | **1.88+** | 构建主服务与执行内核；运行期不需要解释器 |
 | Node.js | **20+** | 仅构建前端时需要；已有 `frontend/dist` 时可用 `--no-frontend` |
 | 系统 | **Linux** | Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE |
 | 构建依赖 | gcc / make / perl / curl / git / pkg-config / acl | 默认自动安装；离线环境可预装 |
@@ -158,8 +158,9 @@ curl http://127.0.0.1:8899/api/v1/health
 | `NANOQUANT_LOG_DIR` | `logs` | 日志目录 |
 | `NANOQUANT_KEY_FILE` | `data/.master_key` | 加密密钥；丢失后已保存的 API Key 无法解密 |
 | `NANOQUANT_ADMIN_PASSWORD` | 空 | 仅首次建管理员时生效 |
-| `EXEC_SOCKET` | `/run/nanoquant/exec.sock` | sidecar UDS 地址；仅由部署环境提供 |
-| `EXEC_SECRET` | 无 | sidecar 签名 Secret，生产放权限 0600 的 `EnvironmentFile` |
+| `EXEC_SOCKET` | `/run/nanoquant/exec.sock` | 执行内核 UDS 地址（Linux 生产；仅由部署环境提供） |
+| `EXEC_TCP` | 空 | 执行内核回环 TCP 地址（Windows 联调，如 `127.0.0.1:9101`） |
+| `EXEC_SECRET` | 无 | 执行内核签名 Secret，生产放权限 0600 的 `EnvironmentFile` |
 | `NANOQUANT_BACKUP_MIRROR` | 空 | 备份异盘副本目录，如 `/mnt/nanoquant-backups` |
 
 ---
@@ -198,9 +199,9 @@ curl http://127.0.0.1:8899/api/v1/health
 ```text
 nanoquant/
 ├── rust/nanoquant/        # 主服务：API、引擎、风控、AI、回测、SQLite、SPA 托管
-├── rust/exec-service/     # 执行 sidecar：只签名、不下单
+├── rust/exec-core/        # 执行内核：签名校验 + 七段延迟指标
 ├── frontend/              # Vue 3 + TypeScript；site/ 公开站，views/ 后台
-├── scripts/               # install / start / stop / update / setup_sidecar
+├── scripts/               # install / start / stop / update / setup_core
 ├── deploy/                # systemd unit 模板与部署说明
 ├── docs/                  # RUNBOOK / MAINNET_DRILL / EXEC_PROTOCOL / 设计稿 / 归档
 ├── .github/workflows/     # Rust、前端、Playwright、零解释器门禁
@@ -230,14 +231,14 @@ nanoquant/
 
 ---
 
-## 🧩 执行内核 sidecar（兼容诊断）
+## 🧩 执行内核 exec-core（默认组件）
 
-主服务以 Rust 内核签名为准，参数页不再提供执行内核模式/地址。sidecar 只作为可选的独立签名与自检通道，
-由部署环境变量 `EXEC_SOCKET` / `EXEC_SECRET` 提供连接信息，不在后台参数页切换 `off/shadow/enforce`。
+exec-core 是默认执行内核：负责签名校验与七段下单延迟指标聚合，主服务通过长连接完成握手、
+心跳与指数退避重连。握手失败时**交易引擎不启动**，HTTP 查询与前端照常可用；面板会显示红色「未连接」。
 
-sidecar 只持有 Secret，不接触账户、持仓与订单。协议见 `docs/EXEC_PROTOCOL.md`。
-systemd 模式下主服务与 sidecar 必须使用同一用户，才能访问权限 0600 的 UDS；
-`scripts/setup_sidecar.sh` 默认复用已存在的 `nanoquant` 用户。
+内核只持有 Secret，不接触账户、持仓与订单。协议见 `docs/EXEC_PROTOCOL.md`。
+systemd 模式下主服务与执行内核必须使用同一用户，才能访问权限 0600 的 UDS；
+`scripts/setup_core.sh` 默认复用已存在的 `nanoquant` 用户。
 
 ---
 
@@ -252,11 +253,11 @@ nanoquant ops zero-python --scope all --manifest image-manifest.txt
 
 # 契约与签名检查
 nanoquant ops contract-diff --baseline .codeartsdoer/specs/rust_full_migration/baseline/contract_baseline.json
-nanoquant ops verify-sidecar
+nanoquant ops verify-exec-core
 nanoquant ops reconcile --self-test
 ```
 
-- **诊断**：数据库、写队列、交易所通道、引擎心跳、AI、存储、sidecar 一键体检。
+- **诊断**：数据库、写队列、交易所通道、引擎心跳、AI、存储、执行内核一键体检。
 - **事件**：warn/error 入库并实时推送；支持 Webhook / Telegram、冷却与静默时段。
 - **死信**：写库失败可查看、重放或忽略；`/system/write-health` 查看积压。
 - **归档**：过期事件/信号先压缩再删除。
@@ -281,7 +282,7 @@ sudo bash scripts/update.sh
 cargo fmt --all --manifest-path rust/nanoquant/Cargo.toml --check
 cargo clippy --all-targets --manifest-path rust/nanoquant/Cargo.toml -- -D warnings
 cargo test --release --locked --manifest-path rust/nanoquant/Cargo.toml
-cargo test --release --locked --manifest-path rust/exec-service/Cargo.toml
+cargo test --release --locked --manifest-path rust/exec-core/Cargo.toml
 
 npm --prefix frontend run typecheck
 npm --prefix frontend test
@@ -303,7 +304,7 @@ CI 覆盖 Rust 双 crate 的 fmt/clippy/test、前端 typecheck/test/build、Pla
 
 已完成：
 
-- Rust 主服务 + Rust sidecar 单栈
+- Rust 主服务 + Rust 执行内核单栈
 - Linux systemd/nohup 安装与失败回滚
 - 全局止盈止损与参数收敛
 - 真实中文币安合约 + 自定义标的降级
@@ -344,7 +345,7 @@ A：常见于测试网无成交合约或小价格币精度问题；前端会按�
 A：必须同时迁移 `data/` 与 `data/.master_key`，并让 `NANOQUANT_HOME` 指向新目录。
 
 更多运维细节：`docs/RUNBOOK.md`；主网演练：`docs/MAINNET_DRILL.md`；
-sidecar 协议：`docs/EXEC_PROTOCOL.md`；历史迁移记录：`docs/archive/history/INDEX.md`。
+执行内核协议：`docs/EXEC_PROTOCOL.md`；历史迁移记录：`docs/archive/history/INDEX.md`。
 
 ---
 

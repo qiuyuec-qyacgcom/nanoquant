@@ -54,7 +54,7 @@ struct Config {
 }
 
 impl Config {
-    /// 缺 EXEC_SECRET 返回 None（退出码 78 = EX_CONFIG，防 systemd 无限重启），沿用 exec-service 约定。
+    /// 缺 EXEC_SECRET 返回 None（退出码 78 = EX_CONFIG，防 systemd 无限重启）。
     fn from_env() -> Option<Self> {
         let secret = std::env::var("EXEC_SECRET").unwrap_or_default();
         if secret.trim().is_empty() {
