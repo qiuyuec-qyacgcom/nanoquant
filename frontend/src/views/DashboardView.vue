@@ -31,25 +31,25 @@ const dlq = computed(() => stats.value?.dead_letters || { pending: 0, stuck: 0, 
 
 /** 执行质量 (下单延迟 / 入场滑点) + 止损熔断状态 */
 const exec = computed(() => {
-  const e = stats.value?.execution || {}
+  const total = stages.value?.segments?.total || {}
   return {
-    latency_p50_ms: Number(e.latency_p50_ms || 0),
-    latency_p95_ms: Number(e.latency_p95_ms || 0),
-    avg_slippage_bps: Number(e.avg_slippage_bps || 0),
-    order_count: Number(e.order_count || 0),
+    latency_p50_ms: Number(total.p50 || 0),
+    latency_p95_ms: Number(total.p95 || 0),
+    avg_slippage_bps: Number(stats.value?.execution?.avg_slippage_bps || 0),
+    order_count: Number(total.count || 0),
     guard: Number(stats.value?.stoploss_guard_remaining || 0),
   }
 })
 
-/** 下单关键路径分段 p99 (内存滚动窗口) */
+/** 下单关键路径分段 p99（执行内核七段指标，未连接/无样本时为 0） */
 const p99 = computed(() => {
-  const s = stages.value || {}
+  const seg = stages.value?.segments || {}
   return {
-    count: Number(s.count || 0),
-    total: Number(s.total_ms?.p99 || 0),
-    persist: Number(s.persist_ms?.p99 || 0),
-    protect: Number(s.protect_ms?.p99 || 0),
-    sign: Number(s.sign_ms?.p99 || 0),
+    count: Number(seg.total?.count || 0),
+    total: Number(seg.total?.p99 || 0),
+    persist: Number(seg.persist?.p99 || 0),
+    protect: Number(seg.protect?.p99 || 0),
+    sign: Number(seg.sign?.p99 || 0),
   }
 })
 

@@ -32,7 +32,7 @@ const logs = ref<string[]>([])
 const keyword = ref('')
 const levelFilter = ref('')
 const checking = ref(false)
-const sidecar = ref<any>(null)
+const core = ref<any>(null)
 const testing = ref(false)
 const klines = ref<any>(null)
 
@@ -40,13 +40,12 @@ const filteredEvents = computed(() =>
   levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
 )
 
-/** 执行内核状态：已连接 / 未连接 / 未部署。
- *  执行内核是可选组件：没部署是这套部署的正常形态，标「正常」而不是看着像故障的灰色「未部署」。 */
+/** 执行内核状态：已连接 / 重连中 / 未连接。默认必选组件，未连接即异常。 */
 const execTag = computed(() => {
-  if (!sidecar.value) return { text: '读取中…', cls: 'tag-dim' }
-  if (sidecar.value.connected) return { text: '已连接', cls: 'tag-long' }
-  if (sidecar.value.configured) return { text: '未连接', cls: 'tag-warn' }
-  return { text: '正常 · 未部署', cls: 'tag-long' }
+  if (!core.value) return { text: '读取中…', cls: 'tag-dim' }
+  if (core.value.connected) return { text: '已连接', cls: 'tag-long' }
+  if (core.value.state === 'Reconnecting') return { text: '重连中', cls: 'tag-warn' }
+  return { text: '未连接', cls: 'tag-short' }
 })
 
 /** K 线流状态：没订阅时上游本来就不连，标「空闲」而不是「未连接」 */
@@ -81,7 +80,7 @@ async function load() {
     http.get(`/system/logs?lines=300${keyword.value ? '&keyword=' + encodeURIComponent(keyword.value) : ''}`),
     http.get('/system/alerts/logs?limit=10'),
     http.get('/system/archives'),
-    http.get('/system/exec-sidecar'),
+    http.get('/system/exec-core'),
     http.get('/kline/status'),
   ])
   if (i.status === 'fulfilled') info.value = i.value
@@ -89,16 +88,16 @@ async function load() {
   if (l.status === 'fulfilled') logs.value = l.value.lines
   if (a.status === 'fulfilled') alerts.value = a.value.items || []
   if (ar.status === 'fulfilled') archives.value = ar.value.items || []
-  if (sc.status === 'fulfilled') sidecar.value = sc.value
+  if (sc.status === 'fulfilled') core.value = sc.value
   if (k.status === 'fulfilled') klines.value = k.value
 }
 
-async function selfTestSidecar() {
+async function selfTestCore() {
   testing.value = true
   try {
-    const res = await http.post('/system/exec-sidecar/self-test', {})
+    const res = await http.post('/system/exec-core/self-test', {})
     if (res.outcome === 'ok') {
-      // 这里只验证 health 协议能应答；逐字节签名比对要用 ops verify-sidecar
+      // 这里只验证 health 协议能应答；逐字节签名比对要用 ops verify-exec-core
       app.notify(
         res.connected ? '执行内核端点可达（' + res.endpoint + '）' : res.detail || '自检通过',
         'ok'
@@ -108,7 +107,7 @@ async function selfTestSidecar() {
     } else {
       app.notify(res.detail || '自检失败', 'error')
     }
-    sidecar.value = await http.get('/system/exec-sidecar')
+    core.value = await http.get('/system/exec-core')
   } catch (err: any) {
     app.notify(err?.message || '自检失败', 'error')
   } finally {
@@ -116,9 +115,9 @@ async function selfTestSidecar() {
   }
 }
 
-async function resetSidecar() {
+async function resetCore() {
   try {
-    sidecar.value = await http.post('/system/exec-sidecar/reset', {})
+    core.value = await http.post('/system/exec-core/reset', {})
     app.notify('比对计数已清零', 'ok')
   } catch (err: any) {
     app.notify(err?.message || '清零失败', 'error')
@@ -172,54 +171,73 @@ useSilentRefresh(load, 15000)
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">执行内核（sidecar）</span>
+        <span class="panel-title">执行内核（exec-core）</span>
         <div class="right">
           <span class="tag" :class="execTag.cls">{{ execTag.text }}</span>
           <router-link to="/admin/strategy?group=system" class="btn btn-xs">配置</router-link>
-          <button class="btn btn-xs" :disabled="testing" @click="selfTestSidecar">
+          <button class="btn btn-xs" :disabled="testing" @click="selfTestCore">
             {{ testing ? '自检中…' : '自检' }}
           </button>
-          <button class="btn btn-xs" @click="resetSidecar">清零</button>
+          <button class="btn btn-xs" @click="resetCore">清零</button>
         </div>
       </div>
       <div class="panel-body stack" style="gap: 10px">
         <div class="muted" style="font-size: 11px; line-height: 1.7">
-          {{ sidecar?.verdict || '读取中…' }}
+          {{ core?.verdict || '读取中…' }}
         </div>
         <div class="hint">
-          端点通过环境变量配置：<code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>
-          （Windows 可执行 <code>scripts\start-sidecar.ps1</code> 拉起 sidecar）；
-          Rust 内核直连交易所签名下单；执行内核是可选组件，未部署时本环境自检照常通过。
+          默认执行内核，主服务启动需完成握手；端点通过环境变量配置：
+          <code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>
+          （Windows 可执行 <code>scripts\start-core.ps1</code> 拉起内核）。
         </div>
-        <table v-if="sidecar" class="table">
+        <table v-if="core" class="table">
           <tbody>
             <tr>
               <td class="muted">通道</td>
               <td class="mono" style="white-space: normal">
-                {{ sidecar.target || '未配置' }}
-                <span class="muted">（{{ sidecar.connected ? '已连接' : sidecar.configured ? '未连接' : '无需部署（可选）' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
+                {{ core.target || '未配置' }}
+                <span class="muted">（{{ core.connected ? '已连接' : core.state === 'Reconnecting' ? '重连中' : '未连接' }}{{ core.algo ? ' · ' + core.algo : '' }}）</span>
+                <span v-if="core.last_error" class="down"> · {{ core.last_error }}</span>
               </td>
             </tr>
             <tr>
               <td class="muted">自检</td>
               <td class="mono">
-                共 {{ sidecar.counts?.checks ?? 0 }} 次 · 成功 <span class="up">{{ sidecar.counts?.ok ?? 0 }}</span> ·
-                失败 <span class="down">{{ sidecar.counts?.errors ?? 0 }}</span> ·
-                跳过 {{ sidecar.counts?.skipped ?? 0 }}
+                共 {{ core.counts?.checks ?? 0 }} 次 · 成功 <span class="up">{{ core.counts?.ok ?? 0 }}</span> ·
+                失败 <span class="down">{{ core.counts?.errors ?? 0 }}</span> ·
+                跳过 {{ core.counts?.skipped ?? 0 }}
               </td>
             </tr>
             <tr>
               <td class="muted">往返耗时</td>
               <td class="mono">
-                <template v-if="sidecar.configured">
-                  最近 {{ msText(sidecar.latency_ms?.last) }} · p50 {{ msText(sidecar.latency_ms?.p50) }} ·
-                  p95 {{ msText(sidecar.latency_ms?.p95) }} · p99 {{ msText(sidecar.latency_ms?.p99) }}
+                <template v-if="core.connected">
+                  最近 {{ msText(core.latency_ms?.last) }} · p50 {{ msText(core.latency_ms?.p50) }} ·
+                  p95 {{ msText(core.latency_ms?.p95) }} · p99 {{ msText(core.latency_ms?.p99) }}
                   <span class="muted">（探活一帧 health 的往返）</span>
                 </template>
                 <template v-else>
-                  不适用<span class="muted">（未部署执行内核，没有探活样本）</span>
+                  —<span class="muted">（内核未连接，暂无探活样本）</span>
                 </template>
               </td>
+            </tr>
+            <tr>
+              <td class="muted">下单分段延迟</td>
+              <td class="mono" style="white-space: normal">
+                <div v-for="seg in ['total','plan','sign','http','wait','protect','persist']" :key="seg">
+                  <span class="muted">{{ seg }}</span>
+                  <template v-if="core.segments?.[seg]?.count">
+                    count {{ core.segments[seg].count }} · p50 {{ msText(core.segments[seg].p50) }} ·
+                    p95 {{ msText(core.segments[seg].p95) }} · p99 {{ msText(core.segments[seg].p99) }} ·
+                    max {{ msText(core.segments[seg].max) }}
+                  </template>
+                  <template v-else>—<span class="muted">（暂无样本）</span></template>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="core.dropped">
+              <td class="muted">上报丢弃</td>
+              <td class="mono down">{{ core.dropped }} 条（队列满自动丢弃，不影响下单）</td>
             </tr>
           </tbody>
         </table>
