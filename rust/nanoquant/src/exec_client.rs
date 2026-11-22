@@ -323,11 +323,11 @@ impl ExecClient {
         }
     }
 
-    pub async fn probe(&self) -> Result<(String, u128), String> {
+    pub async fn probe(&self) -> Result<(String, f64), String> {
         let started = Instant::now();
         let response = self.request(json!({"op": "health"})).await?;
         let algo = response["algo"].as_str().unwrap_or("").to_string();
-        Ok((algo, started.elapsed().as_millis()))
+        Ok((algo, started.elapsed().as_secs_f64() * 1000.0))
     }
 
     pub async fn query_segments(&self) -> Result<Value, String> {
@@ -443,7 +443,8 @@ mod tests {
         assert_eq!(client.state(), ConnState::Connected);
         let (algo, rtt) = client.probe().await.unwrap();
         assert_eq!(algo, "hmac-sha256");
-        assert!(rtt < 500);
+        assert!(rtt > 0.0, "本地往返必须保留亚毫秒精度: {rtt}");
+        assert!(rtt < 500.0);
     }
 
     #[tokio::test]

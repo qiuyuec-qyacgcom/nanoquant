@@ -1316,7 +1316,7 @@ async fn exec_core(State(state): State<SystemState>) -> Json<Value> {
         if let Some(client) = client.as_ref() {
             if let Ok((value, ms)) = client.probe().await {
                 algo = Some(value);
-                probe_ms = Some(round(ms as f64, 2));
+                probe_ms = Some(round(ms, 2));
             }
             if let Ok(view) = client.query_segments().await {
                 segments = view;
@@ -1404,7 +1404,7 @@ async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
         if let Some(client) = client.as_ref() {
             if let Ok((value, ms)) = client.probe().await {
                 algo = value;
-                latency_ms = Some(round(ms as f64, 2));
+                latency_ms = Some(round(ms, 2));
             }
         }
     }
