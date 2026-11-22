@@ -227,8 +227,8 @@ impl EngineControl {
         }
     }
 
-    /// 注入自定义网关；生产路径目前只用内置 HTTP 网关，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 注入自定义网关。只在测试里用假网关，生产路径固定用内置 HTTP 网关。
+    #[cfg(test)]
     pub(crate) fn with_gateway(mut self, gateway: Arc<dyn crate::live::Gateway>) -> Self {
         self.gateway = gateway;
         self
@@ -265,7 +265,7 @@ impl EngineControl {
     ) -> Result<(u16, String), String> {
         let gate = self.ban_gate();
         let now = crate::now_millis();
-        let timestamp = crate::exchange_time::now_ms(&creds.base);
+        let timestamp = crate::exchange_time::signed_timestamp(&creds.base).await;
         let request = crate::submit::prepare(
             &gate,
             now,
@@ -928,23 +928,6 @@ impl EngineControl {
             .unwrap_or_default()
     }
 
-    /// 切换交易模式时写引擎事件；切换流程尚未接线，接线后取消豁免。
-    #[allow(dead_code)]
-    fn record_trade_mode_event(&self, ok: bool, hedge: bool, isolated: bool, results: &[Value]) {
-        if let Ok(conn) = self.db.conn.lock() {
-            let payload = json!({"hedge": hedge, "isolated": isolated, "results": results});
-            let _ = conn.execute(
-                "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,?2,'engine',?3,?4)",
-                (
-                    crate::now(),
-                    if ok { "info" } else { "warn" },
-                    "切换交易模式",
-                    payload.to_string(),
-                ),
-            );
-        }
-    }
-
     fn live_credentials(&self) -> Result<LiveCreds, String> {
         self.credentials_for_mode(&self.mode())
     }
@@ -1053,7 +1036,7 @@ impl EngineControl {
         let mut gate = self.ban_gate();
         let credentials = self.live_credentials()?;
         let now = crate::now_millis();
-        let timestamp = crate::exchange_time::now_ms(&credentials.base);
+        let timestamp = crate::exchange_time::signed_timestamp(&credentials.base).await;
         let request = crate::submit::prepare(
             &gate,
             now,
@@ -1197,17 +1180,6 @@ impl EngineRuntime {
             ai,
             reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
-    }
-
-    /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP。
-    /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP，接线后取消豁免。
-    #[allow(dead_code)]
-    pub(crate) fn with_ai(mut self, ai: crate::ai_providers::AiState) -> Self {
-        self.reviewer = Some(Arc::new(crate::ai_review::EngineAiReviewer::new(
-            ai.clone(),
-        )));
-        self.ai = Some(ai);
-        self
     }
 
     /// 平仓事务提交后再触发复盘：失败只告警，不能把整轮周期带崩。
@@ -2836,7 +2808,7 @@ impl EngineRuntime {
         }
     }
 
-    pub(crate) fn build_live(
+    pub(crate) async fn build_live(
         &self,
         gate: &mut crate::submit::BanGate,
         creds: &LiveCreds,
@@ -2845,7 +2817,7 @@ impl EngineRuntime {
         params: &[(String, String)],
     ) -> Result<crate::submit::PreparedRequest, String> {
         let now = crate::now_millis();
-        let timestamp = crate::exchange_time::now_ms(&creds.base);
+        let timestamp = crate::exchange_time::signed_timestamp(&creds.base).await;
         crate::submit::prepare(
             gate,
             now,
@@ -3112,8 +3084,9 @@ impl EngineRuntime {
         gateway: &dyn crate::live::Gateway,
     ) -> Result<bool, String> {
         let mut gate = self.ban_gate();
-        let request =
-            self.build_live(&mut gate, creds, "GET", "/fapi/v1/positionSide/dual", &[])?;
+        let request = self
+            .build_live(&mut gate, creds, "GET", "/fapi/v1/positionSide/dual", &[])
+            .await?;
         let response = gateway.send(&request).await;
         if response.transport_failed || !(200..300).contains(&response.status) {
             return Err(format!(
@@ -3138,14 +3111,16 @@ impl EngineRuntime {
         let mut gate = self.ban_gate();
         for attempt in 0..4 {
             let params = crate::live::query_params(symbol, client_order_id, creds.recv_window_ms);
-            let request =
-                match self.build_live(&mut gate, creds, "GET", crate::live::ORDER_PATH, &params) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!(%error, %symbol, "实盘未知结果查询无法签名");
-                        return crate::live::Reply::Unknown;
-                    }
-                };
+            let request = match self
+                .build_live(&mut gate, creds, "GET", crate::live::ORDER_PATH, &params)
+                .await
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, %symbol, "实盘未知结果查询无法签名");
+                    return crate::live::Reply::Unknown;
+                }
+            };
             let reply = crate::live::submit(gateway, &request).await;
             match reply {
                 crate::live::Reply::NotFound if attempt < 3 => {
@@ -3198,14 +3173,16 @@ impl EngineRuntime {
                     ("symbol".into(), plan.symbol.clone()),
                     ("leverage".into(), leverage.to_string()),
                 ];
-                let request =
-                    match self.build_live(&mut gate, creds, "POST", "/fapi/v1/leverage", &params) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
-                            continue;
-                        }
-                    };
+                let request = match self
+                    .build_live(&mut gate, creds, "POST", "/fapi/v1/leverage", &params)
+                    .await
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
+                        continue;
+                    }
+                };
                 let response = gateway.send(&request).await;
                 let body = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
                 if body["code"].as_i64() == Some(-1003) {
@@ -3232,13 +3209,16 @@ impl EngineRuntime {
                 purpose: plan.purpose.clone(),
                 client_order_id: client_order_id.clone(),
             };
-            let request = match self.build_live(
-                &mut gate,
-                creds,
-                "POST",
-                crate::live::ORDER_PATH,
-                &spec.params(&filter, creds.recv_window_ms),
-            ) {
+            let request = match self
+                .build_live(
+                    &mut gate,
+                    creds,
+                    "POST",
+                    crate::live::ORDER_PATH,
+                    &spec.params(&filter, creds.recv_window_ms),
+                )
+                .await
+            {
                 Ok(request) => request,
                 Err(error) => {
                     self.update_order_status(&client_order_id, "REJECTED", "")?;

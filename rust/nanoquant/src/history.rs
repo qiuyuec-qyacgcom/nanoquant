@@ -174,8 +174,8 @@ impl BinanceHistory {
         }
     }
 
-    /// 当前实例是否连实盘；尚未接入调用点，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 当前实例是否连实盘。测试用它确认走的是主网还是测试网。
+    #[cfg(test)]
     pub fn is_live(&self) -> bool {
         self.live
     }

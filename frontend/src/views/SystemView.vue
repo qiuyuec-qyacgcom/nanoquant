@@ -34,6 +34,7 @@ const levelFilter = ref('')
 const checking = ref(false)
 const sidecar = ref<any>(null)
 const testing = ref(false)
+const klines = ref<any>(null)
 
 const filteredEvents = computed(() =>
   levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
@@ -45,6 +46,15 @@ const execTag = computed(() => {
   if (sidecar.value.connected) return { text: '已连接', cls: 'tag-long' }
   if (sidecar.value.configured) return { text: '未连接', cls: 'tag-warn' }
   return { text: '未部署', cls: 'tag-dim' }
+})
+
+/** K 线流状态：没订阅时上游本来就不连，标「空闲」而不是「未连接」 */
+const klineTag = computed(() => {
+  if (!klines.value) return { text: '读取中…', cls: 'tag-dim' }
+  if (klines.value.connected) return { text: '已连接', cls: 'tag-long' }
+  const subs = (klines.value.subscriptions || []).length
+  if (subs > 0) return { text: '未连接', cls: 'tag-warn' }
+  return { text: '空闲', cls: 'tag-dim' }
 })
 
 /** 耗时：没有样本就显示「—」，不显示 0ms */
@@ -64,13 +74,14 @@ async function runDiagnostics() {
 }
 
 async function load() {
-  const [i, e, l, a, ar, sc] = await Promise.allSettled([
+  const [i, e, l, a, ar, sc, k] = await Promise.allSettled([
     http.get('/system/info'),
     http.get('/system/events?limit=120'),
     http.get(`/system/logs?lines=300${keyword.value ? '&keyword=' + encodeURIComponent(keyword.value) : ''}`),
     http.get('/system/alerts/logs?limit=10'),
     http.get('/system/archives'),
     http.get('/system/exec-sidecar'),
+    http.get('/kline/status'),
   ])
   if (i.status === 'fulfilled') info.value = i.value
   if (e.status === 'fulfilled') events.value = e.value.items
@@ -78,6 +89,7 @@ async function load() {
   if (a.status === 'fulfilled') alerts.value = a.value.items || []
   if (ar.status === 'fulfilled') archives.value = ar.value.items || []
   if (sc.status === 'fulfilled') sidecar.value = sc.value
+  if (k.status === 'fulfilled') klines.value = k.value
 }
 
 async function selfTestSidecar() {
@@ -200,6 +212,45 @@ useSilentRefresh(load, 15000)
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">K 线流</span>
+        <div class="right">
+          <span class="tag" :class="klineTag.cls">{{ klineTag.text }}</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <table v-if="klines" class="table">
+          <tbody>
+            <tr>
+              <td class="muted">上游</td>
+              <td class="mono">
+                {{ klines.connected ? '已连接' : '未连接' }}
+                <span class="muted">{{ klines.env ? ' · ' + klines.env : '' }}</span>
+              </td>
+            </tr>
+            <tr>
+              <td class="muted">订阅</td>
+              <td class="mono">
+                {{ (klines.subscriptions || []).length }} 路 · 客户端 {{ klines.clients ?? 0 }} 个
+              </td>
+            </tr>
+            <tr>
+              <td class="muted">最后消息</td>
+              <td class="mono">
+                {{
+                  klines.last_message_age === null || klines.last_message_age === undefined
+                    ? '—'
+                    : klines.last_message_age + 's 前'
+                }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="muted">读取中…</div>
       </div>
     </div>
 

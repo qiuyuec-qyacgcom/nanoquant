@@ -52,19 +52,14 @@ struct TradeRow {
     ai_confidence: f64,
     ai_reason: String,
     signal_score: f64,
-    // 与 TRADE_COLUMNS 对齐的镜像字段；复盘判定尚未读取这两列，接线后取消豁免。
-    #[allow(dead_code)]
-    mode: String,
-    #[allow(dead_code)]
-    reviewed: bool,
     features: Value,
     mantra_ids: Value,
 }
 
 const TRADE_COLUMNS: &str =
     "id, symbol, side, leverage, qty, entry_price, exit_price, pnl, pnl_pct, \
-     roi_pct, fees, hold_seconds, exit_reason, ai_confidence, ai_reason, signal_score, mode, \
-     reviewed, features, mantra_ids";
+     roi_pct, fees, hold_seconds, exit_reason, ai_confidence, ai_reason, signal_score, \
+     features, mantra_ids";
 
 fn load_trades(
     conn: &rusqlite::Connection,
@@ -106,14 +101,12 @@ fn load_trades(
             ai_confidence: row.get(13)?,
             ai_reason: row.get(14)?,
             signal_score: row.get(15)?,
-            mode: row.get(16)?,
-            reviewed: row.get::<_, i64>(17)? != 0,
             features: row
-                .get::<_, Option<String>>(18)?
+                .get::<_, Option<String>>(16)?
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                 .unwrap_or_else(|| json!({})),
             mantra_ids: row
-                .get::<_, Option<String>>(19)?
+                .get::<_, Option<String>>(17)?
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                 .unwrap_or_else(|| json!([])),
         })

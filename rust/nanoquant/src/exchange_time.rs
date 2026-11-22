@@ -4,10 +4,6 @@
 //! `-1021 Timestamp ... ahead of the server's time`，`recvWindow` 不能弥补未来的偏差。
 //! 这里用 `/fapi/v1/time` 定期测出「服务器时间 - 本地时间」的偏移，签名时间戳按偏移修正。
 
-// 「签名前强制对时」链路（ensure_fresh / is_fresh / SYNC_TTL_MS / synced_at_ms）已经实现，
-// 但签名路径目前只使用后台同步好的偏移，还没有调用点。接线后请删除本豁免。
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -118,6 +114,17 @@ pub(crate) async fn ensure_fresh(base: &str) {
         return;
     }
     let _ = sync(base).await;
+}
+
+/// 签名前取时间戳：偏移过期就先对时。
+///
+/// 后台每分钟对时一次，刚启动或后台同步失败时都有窗口期，这时发出的签名会带上
+/// 偏掉的时间戳，被交易所以 `-1021 Timestamp ... ahead of the server's time` 直接拒掉，
+/// 白白丢掉一次下单机会。所以取时间戳前先确认偏移还新鲜：过期才发一次对时请求，
+/// 平时零开销。
+pub(crate) async fn signed_timestamp(base: &str) -> i64 {
+    ensure_fresh(base).await;
+    now_ms(base)
 }
 
 /// 交易所返回 -1021（时间戳偏差）时立刻重新对时，下一次尝试即可恢复。

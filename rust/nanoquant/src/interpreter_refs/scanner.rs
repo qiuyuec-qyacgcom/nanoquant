@@ -47,6 +47,8 @@ pub(crate) struct Hit {
     pub line: usize,
     pub rule: &'static str,
     pub grade: &'static str,
+    /// 命中规则的人话说明：只给 code 看不出这条到底管什么。
+    pub description: &'static str,
     pub matched_rules: Vec<&'static str>,
     pub snippet_hash: String,
     pub waived_by: Option<String>,
@@ -362,11 +364,17 @@ fn push_hit(
 ) {
     let snippet: String = snippet.chars().take(80).collect();
     let snippet_hash = hex::encode(Sha256::digest(snippet.as_bytes()));
+    let description = rules::rules()
+        .iter()
+        .find(|item| item.code == rule)
+        .map(|item| item.description)
+        .unwrap_or("");
     report.hits.push(Hit {
         file: relative(root, path),
         line,
         rule,
         grade: grade.as_str(),
+        description,
         matched_rules,
         snippet_hash,
         waived_by: None,

@@ -64,6 +64,7 @@ mod tests {
             line: 1,
             rule: "text.python_word",
             grade: "text",
+            description: "文档里不要出现 Python 关键字",
             matched_rules: vec!["text.python_word"],
             snippet_hash: "a".repeat(64),
             waived_by: None,

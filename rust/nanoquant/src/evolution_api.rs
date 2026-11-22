@@ -261,10 +261,10 @@ async fn dedupe_mantras(State(db): State<Db>, Query(_q): Query<DedupeQuery>) -> 
 }
 
 #[derive(Deserialize, Default)]
+/// 去重请求参数。`use_ai` 目前只按规则去重、不参与判定，保留字段以兼容既有调用方。
 struct DedupeQuery {
-    #[serde(default)]
-    #[allow(dead_code)]
-    use_ai: bool,
+    #[serde(default, rename = "use_ai")]
+    _use_ai: bool,
 }
 
 const REPLACE_SIM: f64 = 0.48;

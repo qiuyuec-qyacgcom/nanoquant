@@ -279,7 +279,8 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/health", get(health))
         .with_state(state.clone())
         .merge(auth::routes().with_state(state.auth.clone()))
-        .merge(ws::routes().with_state(state.clone()));
+        .merge(ws::routes().with_state(state.clone()))
+        .merge(kline_stream::routes().with_state(state.clone()));
     if let Some(database) = state.db.clone() {
         api = api.merge(symbols::routes().with_state(database.clone()));
         api = api.merge(backtest::routes().with_state(database.clone()));
@@ -318,6 +319,7 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         let system_state = system::SystemState::new(database.clone(), state.started_at)
             .with_auth(state.auth.clone());
         system_state.start_runtime_probe();
+        system::spawn_alert_task(system_state.clone());
         api = api.merge(system::routes().with_state(system_state));
         api = api.merge(settings_api::routes().with_state(database.clone()));
         api = api.merge(signal_follow::routes().with_state(state.clone()));

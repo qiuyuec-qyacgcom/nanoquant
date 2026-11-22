@@ -95,62 +95,6 @@ pub fn global_gates(input: &RiskInput) -> Gate {
     Gate::open()
 }
 
-/// 一笔在仓，只保留闸门要看的字段。
-#[cfg(test)]
-pub struct OpenPosition {
-    pub symbol: String,
-    pub side: String,
-}
-
-/// 单标的闸门：已持有该标的、持仓数上限、同向上限、冷却。
-///
-/// `same_direction_limit <= 0` 表示不限制同向。冷却只看该标的自己的到期时间。
-#[cfg(test)]
-pub fn symbol_gates(
-    symbol: &str,
-    side: &str,
-    positions: &[OpenPosition],
-    max_positions: usize,
-    same_direction_limit: i64,
-    cooldown_until: i64,
-    now: i64,
-) -> Gate {
-    if positions.iter().any(|p| p.symbol == symbol) {
-        return Gate::closed("该标的已有持仓");
-    }
-    if positions.len() >= max_positions {
-        return Gate::closed(format!("持仓数已达上限 {max_positions}"));
-    }
-    if same_direction_limit > 0 && !side.is_empty() {
-        let same = positions.iter().filter(|p| p.side == side).count() as i64;
-        if same >= same_direction_limit {
-            return Gate::closed(format!(
-                "同方向持仓已达上限 {same_direction_limit} 个 ({side}), 避免相关性叠加"
-            ));
-        }
-    }
-    if now < cooldown_until {
-        return Gate::closed(format!("标的冷却中, 剩余 {}s", cooldown_until - now));
-    }
-    Gate::open()
-}
-
-/// 杠杆夹取。上限取全局上限、交易所上限、100 的最小者；没有建议值时用下限。
-///
-/// AI 或信号给的杠杆只是建议：低于下限抬上去，高于上限压下来。
-/// 交易所允许的上限更低时以交易所为准，安全优先。
-#[cfg(test)]
-pub fn choose_leverage(global_min: i64, global_max: i64, exchange_max: i64, suggested: f64) -> i64 {
-    let upper = 1.max(global_max.min(exchange_max).min(100));
-    let lower = 1.max(global_min.min(upper));
-    let desired = if suggested > 0.0 {
-        suggested.round() as i64
-    } else {
-        lower
-    };
-    lower.max(desired.min(upper))
-}
-
 /// 仓位估算用到的风控参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizeParams {
@@ -390,32 +334,6 @@ mod tests {
         assert!(trading_window_open(&[], 12 * 60), "未配置窗口即全天可交易");
     }
 
-    fn pos(symbol: &str, side: &str) -> OpenPosition {
-        OpenPosition {
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-        }
-    }
-
-    #[test]
-    fn symbol_gate_blocks_duplicate_and_same_direction_stacking() {
-        let held = vec![pos("BTCUSDT", "long"), pos("ETHUSDT", "long")];
-        assert_eq!(
-            symbol_gates("BTCUSDT", "long", &held, 5, 3, 0, 0).reason,
-            "该标的已有持仓"
-        );
-        let cap = symbol_gates("SOLUSDT", "long", &held, 5, 2, 0, 0);
-        assert!(cap.reason.contains("同方向"), "两个多头已达同向上限");
-        assert!(
-            symbol_gates("SOLUSDT", "short", &held, 5, 2, 0, 0).ok,
-            "反向不受同向上限影响"
-        );
-        assert!(
-            symbol_gates("SOLUSDT", "long", &held, 5, 0, 0, 0).ok,
-            "上限为 0 表示不限制"
-        );
-    }
-
     #[test]
     fn sizing_is_capped_by_available_margin_not_equity() {
         // 权益 1000 但可用只剩 10：按权益能开很大，按可用余额只能开 10×0.9×10 = 90 名义额
@@ -447,21 +365,5 @@ mod tests {
         );
         assert_eq!(zero, 0.0);
         assert!(why.contains("可用保证金不足"), "{why}");
-    }
-
-    #[test]
-    fn leverage_is_clamped_to_exchange_ceiling() {
-        assert_eq!(choose_leverage(20, 50, 125, 0.0), 20, "无建议值时用下限");
-        assert_eq!(
-            choose_leverage(20, 50, 125, 80.0),
-            50,
-            "建议值不能超过全局上限"
-        );
-        assert_eq!(
-            choose_leverage(20, 50, 10, 30.0),
-            10,
-            "交易所上限更低时以交易所为准"
-        );
-        assert_eq!(choose_leverage(20, 50, 125, 8.0), 20, "低于下限抬到下限");
     }
 }

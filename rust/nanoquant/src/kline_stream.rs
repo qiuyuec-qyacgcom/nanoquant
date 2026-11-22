@@ -18,10 +18,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
+
+use crate::app_state::AppState;
 
 /// 币安 U 本位永续行情推送（模拟盘=测试网，实盘=主网）。
 pub const STREAM_HOSTS: &[(&str, &str)] = &[
@@ -62,6 +67,15 @@ pub fn stream_url(env: &str) -> &'static str {
 
 pub fn stream_name(symbol: &str, interval: &str) -> String {
     format!("{}@kline_{}", symbol.to_lowercase(), interval)
+}
+
+/// K 线流的只读接口：上游连接情况与当前订阅。
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/kline/status", get(kline_status))
+}
+
+async fn kline_status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.klines.status())
 }
 
 /// 上游断开后的下一次退避：1s 起翻倍，封顶 15s。
@@ -256,8 +270,7 @@ impl KlineHub {
     }
 
     /// 运行状态，字段与 legacy 内核（已退役） `kline_hub.status()` 一致。
-    /// 运行状态；尚未挂到路由，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 运行状态：上游连接情况、当前订阅、订阅者数量与最后一条消息的年龄。
     pub fn status(&self) -> Value {
         let streams = self.inner.streams.lock().expect("streams");
         let status = self.inner.status.lock().expect("status");
@@ -290,16 +303,6 @@ impl KlineHub {
         tokio::spawn(async move {
             manager(inner, stop, notify).await;
         });
-    }
-
-    /// 当前订阅的流名列表；尚未挂到路由，接线后取消豁免。
-    #[allow(dead_code)]
-    fn stream_names(&self) -> Vec<String> {
-        let streams = self.inner.streams.lock().expect("streams");
-        streams
-            .keys()
-            .map(|(symbol, interval)| stream_name(symbol, interval))
-            .collect()
     }
 }
 
@@ -546,6 +549,34 @@ impl Upstream for TungsteniteUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_status_route_reports_an_idle_hub() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(crate::test_state(None));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/kline/status")
+                    .body(Body::from(""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["connected"], false, "没有订阅时上游不会连");
+        assert_eq!(body["clients"], 0);
+        assert_eq!(body["subscriptions"].as_array().unwrap().len(), 0);
+    }
 
     /// 假上游：记录收到的指令，按脚本吐消息。
     struct FakeUpstream {

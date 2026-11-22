@@ -18,9 +18,6 @@ pub enum ExchangeReply {
 pub struct Outcome {
     /// 结果未知：订单可能已经生效，必须查询确认，禁止重发。
     pub uncertain: bool,
-    /// 可以换线路重试。只对没有副作用的只读请求为真。
-    #[allow(dead_code)]
-    pub retry: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +201,6 @@ pub fn interpret(method: &str, status: u16, body: &str) -> Outcome {
         let write = !method.eq_ignore_ascii_case("GET");
         return Outcome {
             uncertain: write && !readable,
-            retry: false,
         };
     }
     if (300..400).contains(&status) {
@@ -283,18 +279,11 @@ impl Transport {
 pub fn classify(method: &str, reply: ExchangeReply) -> Outcome {
     let write = !method.eq_ignore_ascii_case("GET");
     match reply {
-        ExchangeReply::TransportError | ExchangeReply::Redirect => Outcome {
-            uncertain: write,
-            retry: !write,
-        },
-        ExchangeReply::ApiError { code } if write && UNCERTAIN_CODES.contains(&code) => Outcome {
-            uncertain: true,
-            retry: false,
-        },
-        ExchangeReply::ApiError { .. } => Outcome {
-            uncertain: false,
-            retry: false,
-        },
+        ExchangeReply::TransportError | ExchangeReply::Redirect => Outcome { uncertain: write },
+        ExchangeReply::ApiError { code } if write && UNCERTAIN_CODES.contains(&code) => {
+            Outcome { uncertain: true }
+        }
+        ExchangeReply::ApiError { .. } => Outcome { uncertain: false },
     }
 }
 
@@ -306,7 +295,6 @@ mod tests {
     fn write_timeout_is_uncertain_and_must_not_be_retried() {
         let outcome = classify("POST", ExchangeReply::TransportError);
         assert!(outcome.uncertain, "写请求超时结果未知，重发会重复下单");
-        assert!(!outcome.retry, "结果未知禁止重试");
 
         let rejected = classify("POST", ExchangeReply::ApiError { code: -2019 });
         assert!(
@@ -316,12 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn read_timeout_may_be_retried_on_another_endpoint() {
+    fn read_timeout_is_certain() {
         let outcome = classify("GET", ExchangeReply::TransportError);
-        assert!(
-            !outcome.uncertain && outcome.retry,
-            "只读请求没有副作用，可以换线路重试"
-        );
+        assert!(!outcome.uncertain, "只读请求没有副作用，结果确定");
 
         let status = classify("DELETE", ExchangeReply::ApiError { code: -1007 });
         assert!(status.uncertain, "写请求收到 -1007 时订单可能已生效");
@@ -330,13 +315,10 @@ mod tests {
     #[test]
     fn redirect_on_a_write_is_uncertain() {
         let outcome = classify("POST", ExchangeReply::Redirect);
-        assert!(
-            outcome.uncertain && !outcome.retry,
-            "3xx 不是币安的正常响应，写请求禁止重发"
-        );
+        assert!(outcome.uncertain, "3xx 不是币安的正常响应，写请求禁止重发");
 
         let read = classify("GET", ExchangeReply::Redirect);
-        assert!(read.retry, "只读请求遇到重定向可以换线路重试");
+        assert!(!read.uncertain, "只读请求遇到重定向可以安全重试");
     }
 
     #[test]
@@ -486,13 +468,10 @@ mod tests {
             400,
             r#"{"code":-2019,"msg":"Margin is insufficient."}"#,
         );
-        assert!(!rejected.uncertain && !rejected.retry, "明确拒单照常处理");
+        assert!(!rejected.uncertain, "明确拒单照常处理");
 
         let accepted = interpret("POST", 200, r#"{"orderId":1,"status":"FILLED"}"#);
-        assert!(
-            !accepted.uncertain && !accepted.retry,
-            "合法的成交回包不是未知"
-        );
+        assert!(!accepted.uncertain, "合法的成交回包不是未知");
     }
 
     #[test]
@@ -525,10 +504,7 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
         };
         let outcome = transport.send(&req).await;
-        assert!(
-            outcome.uncertain && !outcome.retry,
-            "连接被掐断时订单可能已受理，禁止重发"
-        );
+        assert!(outcome.uncertain, "连接被掐断时订单可能已受理，禁止重发");
     }
 
     #[tokio::test]
@@ -554,9 +530,6 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
         };
         let outcome = transport.send(&req).await;
-        assert!(
-            !outcome.uncertain && !outcome.retry,
-            "400 带 -2019 是明确拒单，不是结果未知"
-        );
+        assert!(!outcome.uncertain, "400 带 -2019 是明确拒单，不是结果未知");
     }
 }

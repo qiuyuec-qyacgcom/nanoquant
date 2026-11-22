@@ -25,8 +25,7 @@ impl Grade {
 pub(crate) struct Rule {
     pub code: &'static str,
     pub grade: Grade,
-    /// 规则说明；当前只按 code 分派，尚未读取说明文本，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 规则说明：扫描报告会把它一起带出来，方便直接看懂命中了什么。
     pub description: &'static str,
 }
 

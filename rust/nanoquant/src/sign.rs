@@ -63,11 +63,13 @@ pub fn urlencode_component(raw: &str) -> String {
 
 /// 一笔已签名的请求：待签名的 query、签名本身、以及可以直接拼到 URL 上的最终 query。
 pub struct SignedQuery {
-    // 调试用：请求方目前只取 wire，query/signature 尚未被读取，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 待签名的 query：只有测试在断言，签名方正式路径只取 `wire`。
+    #[cfg(test)]
     pub query: String,
-    #[allow(dead_code)]
+    /// 签名本身：同上，正式路径只把它拼进 `wire`。
+    #[cfg(test)]
     pub signature: String,
+    /// 可以直接拼到 URL 上的最终 query。
     pub wire: String,
 }
 
@@ -91,7 +93,9 @@ pub fn signed_query(
     let signature = sign_query(secret, &query);
     let wire = format!("{query}&signature={}", urlencode_component(&signature));
     SignedQuery {
+        #[cfg(test)]
         query,
+        #[cfg(test)]
         signature,
         wire,
     }
@@ -133,145 +137,6 @@ pub fn order_params(
         params.push(("reduceOnly".to_string(), "true".to_string()));
     }
     params
-}
-
-/// 平仓单：多头仓卖出、空头仓买入，数量不超过持仓。
-#[cfg(test)]
-pub fn closing_order(
-    symbol: &str,
-    position_side: &str,
-    qty: f64,
-    held: f64,
-    client_id: &str,
-    dual: bool,
-) -> Vec<(String, String)> {
-    let order_side = if position_side == "long" {
-        "SELL"
-    } else {
-        "BUY"
-    };
-    let close_qty = qty.min(held);
-    order_params(
-        symbol,
-        order_side,
-        position_side,
-        &trim_qty(close_qty),
-        client_id,
-        dual,
-        true,
-    )
-}
-
-#[cfg(test)]
-fn trim_qty(qty: f64) -> String {
-    let text = format!("{qty:.8}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// 步进的小数位数。`0.001` → 3，整数步进 → 0。
-#[cfg(test)]
-fn step_decimals(step: f64) -> usize {
-    if step <= 0.0 {
-        return 8;
-    }
-    let text = format!("{step:.12}");
-    let trimmed = text.trim_end_matches('0');
-    trimmed
-        .split_once('.')
-        .map(|(_, frac)| frac.len())
-        .unwrap_or(0)
-}
-
-/// 按步进向下取整，并格式化成严格等于步进小数位的字符串。
-///
-/// 直接用 `:.12f` 会把 `12417.2` 打成 `12417.200000000001`，币安以 -1111 拒单。
-#[cfg(test)]
-pub fn format_qty(qty: f64, step: f64) -> String {
-    if step <= 0.0 {
-        return trim_qty(qty);
-    }
-    let steps = (qty / step + 1e-9).floor();
-    let decimals = step_decimals(step);
-    format!("{:.*}", decimals, steps * step)
-}
-
-/// 保护单（止损或止盈）的参数，顺序必须与 legacy 内核（已退役） `_place_protection` 一致：
-/// algoType, symbol, side, type, triggerPrice, closePosition, workingType,
-/// priceProtect, clientAlgoId，双向持仓再追加 positionSide。
-/// 顺序错一位，签名就对不上，条件单会被拒，仓位等于裸奔。
-#[cfg(test)]
-pub fn protection_params(
-    symbol: &str,
-    position_side: &str,
-    kind: &str,
-    trigger_price: &str,
-    client_algo_id: &str,
-    dual: bool,
-) -> Vec<(String, String)> {
-    let close_side = if position_side == "long" {
-        "SELL"
-    } else {
-        "BUY"
-    };
-    let mut params = vec![
-        ("algoType".to_string(), "CONDITIONAL".to_string()),
-        ("symbol".to_string(), symbol.to_string()),
-        ("side".to_string(), close_side.to_string()),
-        ("type".to_string(), kind.to_string()),
-        ("triggerPrice".to_string(), trigger_price.to_string()),
-        ("closePosition".to_string(), "true".to_string()),
-        ("workingType".to_string(), "MARK_PRICE".to_string()),
-        ("priceProtect".to_string(), "TRUE".to_string()),
-        ("clientAlgoId".to_string(), client_algo_id.to_string()),
-    ];
-    if dual {
-        params.push((
-            "positionSide".to_string(),
-            if position_side == "long" {
-                "LONG"
-            } else {
-                "SHORT"
-            }
-            .to_string(),
-        ));
-    }
-    params
-}
-
-/// 发单结果。`Unknown` 表示请求可能已经到达交易所（超时、连接中断、5xx、429），
-/// 调用方绝不能重发，否则会挂出重复的订单或保护单。
-#[derive(Debug, PartialEq, Eq)]
-#[cfg(test)]
-pub enum SubmitOutcome {
-    Accepted,
-    Rejected(i64),
-    Unknown(i64),
-}
-
-/// 写请求的结果分类。只读请求的失败可以换线路重试，写请求不行。
-#[cfg(test)]
-pub fn classify_submit(status: u16, code: i64) -> SubmitOutcome {
-    if (200..300).contains(&status) {
-        return SubmitOutcome::Accepted;
-    }
-    // 5xx / 429：交易所可能已受理；3xx：重定向，请求去向不明
-    if status >= 500 || status == 429 || (300..400).contains(&status) {
-        return SubmitOutcome::Unknown(code);
-    }
-    // 超时、内部错误、服务不可用、时钟偏差：响应里明确说结果不确定
-    if matches!(code, -1000 | -1006 | -1007 | -1021) {
-        return SubmitOutcome::Unknown(code);
-    }
-    SubmitOutcome::Rejected(code)
-}
-
-/// 保护单走 Algo 接口被拒后，是否可以回落到老的 `/fapi/v1/order` 接口。
-///
-/// 只有 -4120（必须走 Algo）、-1121（交易对无效）、-1102（缺参数）这三种明确拒绝才回落。
-/// 结果未知一律不回落：请求可能已经挂上，再走老接口就会挂出第二套保护单。
-#[cfg(test)]
-pub fn protection_should_fallback(outcome: &SubmitOutcome) -> bool {
-    matches!(outcome, SubmitOutcome::Rejected(code) if matches!(code, -4120 | -1121 | -1102))
 }
 
 /// 当前环境的下单凭证。任一为空即拒绝下单，避免用空密钥签出一堆必然失败的请求。
@@ -432,114 +297,6 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("true")
         );
-    }
-
-    #[test]
-    fn closing_a_long_sells_and_never_exceeds_the_position() {
-        let close = closing_order("BTCUSDT", "long", 5.0, 1.5, "nx1", true);
-        assert_eq!(
-            close.iter().find(|(k, _)| k == "side").unwrap().1,
-            "SELL",
-            "平多仓必须卖出"
-        );
-        assert_eq!(
-            close.iter().find(|(k, _)| k == "quantity").unwrap().1,
-            "1.5",
-            "平仓数量不能超过持仓"
-        );
-        assert_eq!(
-            close.iter().find(|(k, _)| k == "positionSide").unwrap().1,
-            "LONG"
-        );
-    }
-
-    #[test]
-    fn quantity_is_floored_to_step_without_float_tail() {
-        assert_eq!(format_qty(1.2399, 0.01), "1.23");
-        assert_eq!(format_qty(12417.2, 0.1), "12417.2", "不能带出浮点尾巴");
-        assert_eq!(format_qty(0.00019, 0.0001), "0.0001");
-    }
-
-    #[test]
-    fn protection_order_keeps_param_order_and_closes_the_position() {
-        let stop = protection_params("BTCUSDT", "long", "STOP_MARKET", "90000", "np1", true);
-        let keys: Vec<&str> = stop.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "algoType",
-                "symbol",
-                "side",
-                "type",
-                "triggerPrice",
-                "closePosition",
-                "workingType",
-                "priceProtect",
-                "clientAlgoId",
-                "positionSide"
-            ],
-            "参数顺序就是签名顺序"
-        );
-        assert_eq!(
-            stop.iter().find(|(k, _)| k == "side").unwrap().1,
-            "SELL",
-            "多头的保护单必须卖出平仓"
-        );
-        assert_eq!(
-            stop.iter().find(|(k, _)| k == "closePosition").unwrap().1,
-            "true"
-        );
-
-        let one_way = protection_params(
-            "BTCUSDT",
-            "short",
-            "TAKE_PROFIT_MARKET",
-            "80000",
-            "np2",
-            false,
-        );
-        assert!(
-            !one_way.iter().any(|(k, _)| k == "positionSide"),
-            "单向持仓不带 positionSide"
-        );
-        assert_eq!(one_way.iter().find(|(k, _)| k == "side").unwrap().1, "BUY");
-    }
-
-    #[test]
-    fn uncertain_submission_must_not_be_retried() {
-        assert_eq!(classify_submit(200, 0), SubmitOutcome::Accepted);
-        assert_eq!(
-            classify_submit(400, -4120),
-            SubmitOutcome::Rejected(-4120),
-            "-4120 是明确拒绝，可以回落"
-        );
-        assert_eq!(classify_submit(400, -1111), SubmitOutcome::Rejected(-1111));
-        assert_eq!(
-            classify_submit(503, -1000),
-            SubmitOutcome::Unknown(-1000),
-            "5xx 结果未知，重发会重复下单"
-        );
-        assert_eq!(classify_submit(429, -1003), SubmitOutcome::Unknown(-1003));
-        assert_eq!(
-            classify_submit(400, -1021),
-            SubmitOutcome::Unknown(-1021),
-            "时钟偏差时请求可能已被受理"
-        );
-    }
-
-    #[test]
-    fn protection_falls_back_only_on_explicit_rejection() {
-        assert!(protection_should_fallback(&SubmitOutcome::Rejected(-4120)));
-        assert!(protection_should_fallback(&SubmitOutcome::Rejected(-1121)));
-        assert!(
-            !protection_should_fallback(&SubmitOutcome::Rejected(-2019)),
-            "保证金不足不是接口问题，回落也一样失败"
-        );
-        assert!(
-            !protection_should_fallback(&SubmitOutcome::Unknown(-1000)),
-            "结果未知回落会挂出第二套保护单"
-        );
-        assert!(!protection_should_fallback(&SubmitOutcome::Accepted));
     }
 
     #[test]

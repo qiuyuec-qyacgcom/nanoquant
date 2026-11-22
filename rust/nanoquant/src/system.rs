@@ -20,8 +20,7 @@ pub struct SystemState {
     runtime_probe: RuntimeProbe,
     logs_path: std::path::PathBuf,
     archives_dir: std::path::PathBuf,
-    // 告警冷却记账表；告警冷却链路尚未接线，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 告警冷却记账表：同一类别在冷却窗口内只推一次。
     alert_last: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     exec: std::sync::Arc<std::sync::Mutex<ExecStats>>,
 }
@@ -803,15 +802,41 @@ fn date_stamp(ts: i64) -> String {
 }
 
 struct AlertCfg {
+    /// 总开关。默认关闭，避免刚装好就往群里推历史告警。
+    enabled: bool,
+    /// 最低告警级别：info / warn / error。
+    min_level: String,
+    /// 自定义模板，可含 {message} {level} {category} 占位符；空则用默认文案。
+    template: String,
     webhook: String,
     error_webhook: String,
     telegram_token: String,
     telegram_chat_id: String,
-    // 告警冷却与静默时段：判定函数已实现但告警发送尚未接入，接线后取消豁免。
-    #[allow(dead_code)]
+    /// 同类别冷却窗口（秒）。
     cooldown_sec: i64,
-    #[allow(dead_code)]
+    /// 静默时段，如 `23:00-07:00`，支持跨天；空串表示不静默。
     quiet_hours: String,
+}
+
+impl AlertCfg {
+    /// 某级别要发到哪些 webhook：错误级别走独立地址，没配置则回落到普通地址。
+    fn webhook_urls(&self, level: &str) -> Vec<String> {
+        let source = if level == "error" && !self.error_webhook.is_empty() {
+            &self.error_webhook
+        } else {
+            &self.webhook
+        };
+        source
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn telegram_enabled(&self) -> bool {
+        !self.telegram_token.is_empty() && !self.telegram_chat_id.is_empty()
+    }
 }
 
 fn alert_cfg(conn: &rusqlite::Connection) -> AlertCfg {
@@ -831,7 +856,18 @@ fn alert_cfg(conn: &rusqlite::Connection) -> AlertCfg {
             .trim()
             .to_string()
     };
+    let min_level = text("alert_min_level");
     AlertCfg {
+        enabled: raw
+            .get("alert_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        min_level: if min_level.is_empty() {
+            "warn".to_string()
+        } else {
+            min_level
+        },
+        template: text("alert_template"),
         webhook: text("alert_webhook_url"),
         error_webhook: text("alert_error_webhook_url"),
         telegram_token: text("alert_telegram_token"),
@@ -908,23 +944,8 @@ async fn alert_test(
         let conn = state.db.conn.lock().expect("db");
         alert_cfg(&conn)
     };
-    let mut urls: Vec<String> = cfg
-        .webhook
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect();
-    if level == "error" && !cfg.error_webhook.is_empty() {
-        urls = cfg
-            .error_webhook
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
-    }
-    let telegram = !cfg.telegram_token.is_empty() && !cfg.telegram_chat_id.is_empty();
+    let urls = cfg.webhook_urls(&level);
+    let telegram = cfg.telegram_enabled();
     if urls.is_empty() && !telegram {
         return (
             StatusCode::BAD_REQUEST,
@@ -1008,7 +1029,6 @@ async fn send_alerts(urls: &[String], cfg: &AlertCfg, text: &str) -> Vec<Value> 
 }
 
 /// 告警冷却：同一类别在窗口内只放行一次。返回 true 表示允许发送并已记账。
-#[cfg(test)]
 fn alert_allowed(
     last: &mut std::collections::HashMap<String, i64>,
     key: &str,
@@ -1024,7 +1044,6 @@ fn alert_allowed(
 }
 
 /// 静默时段（支持跨天，如 23:00-07:00）；空串表示不静默。
-#[cfg(test)]
 fn in_quiet_hours(spec: &str, minutes_of_day: i64) -> bool {
     let Some((start, end)) = spec.trim().split_once('-') else {
         return false;
@@ -1046,6 +1065,172 @@ fn in_quiet_hours(spec: &str, minutes_of_day: i64) -> bool {
     } else {
         minutes_of_day >= start || minutes_of_day < end
     }
+}
+
+/// 自动告警的轮询间隔（秒）。
+const ALERT_POLL_SEC: u64 = 15;
+
+/// 一条待推送的引擎事件。
+struct AlertEvent {
+    id: i64,
+    level: String,
+    category: String,
+    message: String,
+}
+
+/// 后台任务：把引擎事件按告警规则推送到 webhook / Telegram。
+///
+/// 规则（与「发送测试告警」共用同一套设置）：
+/// - `alert_enabled` 默认关闭，打开后才推送，避免刚装好就往群里推历史告警；
+/// - 只看 level 不低于 `alert_min_level`（默认 warn）的事件；
+/// - 同一类别在 `alert_cooldown_sec` 内只推一次；
+/// - `alert_quiet_hours`（如 `23:00-07:00`，支持跨天）内静默丢弃；
+/// - 推送结果写 `alert_logs`，和手动测试告警同表。
+///
+/// 启动时不回补历史事件：重启一次就把陈年告警全推一遍没有意义。
+pub fn spawn_alert_task(state: SystemState) {
+    tokio::spawn(async move {
+        let mut cursor = latest_event_id(&state);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(ALERT_POLL_SEC));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            for event in new_events(&state, cursor) {
+                cursor = cursor.max(event.id);
+                if let Err(error) = dispatch_alert(&state, &event).await {
+                    tracing::warn!(%error, category = %event.category, "自动告警推送失败");
+                }
+            }
+        }
+    });
+}
+
+/// 启动时的游标：只处理这之后的新事件。
+fn latest_event_id(state: &SystemState) -> i64 {
+    let conn = state.db.conn.lock().expect("db");
+    conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM engine_events",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// 取游标之后的新事件。单次上限 200 条，避免一次把几千行全捞出来。
+fn new_events(state: &SystemState, cursor: i64) -> Vec<AlertEvent> {
+    let conn = state.db.conn.lock().expect("db");
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, level, category, message FROM engine_events \
+         WHERE id > ?1 ORDER BY id ASC LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([cursor], |row| {
+        Ok(AlertEvent {
+            id: row.get(0)?,
+            level: row.get(1)?,
+            category: row.get(2)?,
+            message: row.get(3)?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 判断一条事件要不要推：总开关、级别、通道、静默时段、冷却窗口。
+async fn dispatch_alert(state: &SystemState, event: &AlertEvent) -> Result<(), String> {
+    let cfg = {
+        let conn = state.db.conn.lock().expect("db");
+        alert_cfg(&conn)
+    };
+    if !cfg.enabled {
+        return Ok(());
+    }
+    if !level_at_least(&event.level, &cfg.min_level) {
+        return Ok(());
+    }
+    let urls = cfg.webhook_urls(&event.level);
+    if urls.is_empty() && !cfg.telegram_enabled() {
+        return Ok(());
+    }
+    if !cfg.quiet_hours.is_empty() {
+        let minutes_of_day = crate::now().rem_euclid(86_400) / 60;
+        if in_quiet_hours(&cfg.quiet_hours, minutes_of_day) {
+            return Ok(());
+        }
+    }
+    {
+        let mut last = state.alert_last.lock().expect("alert last");
+        if !alert_allowed(&mut last, &event.category, crate::now(), cfg.cooldown_sec) {
+            return Ok(());
+        }
+    }
+    let text = render_alert(&cfg, event);
+    let results = send_alerts(&urls, &cfg, &text).await;
+    let ok = !results.is_empty() && results.iter().all(|item| item["ok"] == true);
+    let channels = results
+        .iter()
+        .filter_map(|item| item["channel"].as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = results
+        .iter()
+        .filter(|item| item["ok"] != true)
+        .filter_map(|item| item["error"].as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let conn = state
+        .db
+        .conn
+        .lock()
+        .map_err(|_| "数据库锁不可用".to_string())?;
+    conn.execute(
+        "INSERT INTO alert_logs(ts, level, category, message, channels, ok, error) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            crate::now(),
+            &event.level,
+            &event.category,
+            event.message.chars().take(500).collect::<String>(),
+            channels,
+            i64::from(ok),
+            error.chars().take(500).collect::<String>(),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 级别排序：info < warn < error。未知级别一律不推。
+fn level_at_least(level: &str, min_level: &str) -> bool {
+    fn rank(value: &str) -> i32 {
+        match value {
+            "info" => 0,
+            "warn" => 1,
+            "error" => 2,
+            _ => -1,
+        }
+    }
+    rank(level) >= rank(min_level)
+}
+
+/// 告警文案：有模板就用模板，否则用默认格式。
+fn render_alert(cfg: &AlertCfg, event: &AlertEvent) -> String {
+    if !cfg.template.is_empty() {
+        return cfg
+            .template
+            .replace("{message}", &event.message)
+            .replace("{level}", &event.level)
+            .replace("{category}", &event.category);
+    }
+    format!(
+        "🟠 [NanoQuant] {} · {}\n{}",
+        event.level.to_uppercase(),
+        event.category,
+        event.message
+    )
 }
 
 /// 执行内核探活结果。
@@ -2702,6 +2887,129 @@ mod tests {
             "冷却期内重复告警被拦截"
         );
         assert!(alert_allowed(&mut last, "risk", 221, 120));
+    }
+
+    /// 起一个只回 200 的本地 webhook，用来验证自动告警真的发出去了。
+    async fn fake_webhook() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, hits)
+    }
+
+    fn alert_event() -> AlertEvent {
+        AlertEvent {
+            id: 1,
+            level: "warn".to_string(),
+            category: "risk".to_string(),
+            message: "回撤超限".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enabled_alert_is_pushed_to_the_webhook_and_written_to_the_log() {
+        let (port, hits) = fake_webhook().await;
+        let path = std::env::temp_dir().join("nq-auto-alert.db");
+        let db = dead_fixture(&path);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({
+                    "alert_enabled": true,
+                    "alert_min_level": "warn",
+                    "alert_webhook_url": format!("http://127.0.0.1:{port}/hook"),
+                    "alert_cooldown_sec": 120
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let state = SystemState::new(db.clone(), crate::now());
+        dispatch_alert(&state, &alert_event())
+            .await
+            .expect("推送应成功");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "启用后应真的发出一次 webhook"
+        );
+        let logged: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logged, 1, "推送结果应写入 alert_logs");
+
+        // 冷却期内同类别不再推
+        dispatch_alert(&state, &alert_event())
+            .await
+            .expect("冷却期静默跳过");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "冷却期内不重复推送"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_alert_never_leaves_the_process() {
+        let (port, hits) = fake_webhook().await;
+        let path = std::env::temp_dir().join("nq-auto-alert-off.db");
+        let db = dead_fixture(&path);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({
+                    "alert_enabled": false,
+                    "alert_webhook_url": format!("http://127.0.0.1:{port}/hook")
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let state = SystemState::new(db.clone(), crate::now());
+        dispatch_alert(&state, &alert_event())
+            .await
+            .expect("关闭时只是跳过，不该报错");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "总开关关闭时不应发出任何请求"
+        );
+        let logged: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logged, 0, "关闭时不写告警记录");
+    }
+
+    #[test]
+    fn the_minimum_level_decides_what_gets_pushed() {
+        assert!(level_at_least("error", "warn"));
+        assert!(level_at_least("warn", "warn"));
+        assert!(!level_at_least("info", "warn"));
+        assert!(!level_at_least("weird", "warn"));
+        assert!(level_at_least("info", "info"));
     }
 
     #[tokio::test]

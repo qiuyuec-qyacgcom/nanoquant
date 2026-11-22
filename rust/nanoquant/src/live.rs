@@ -543,7 +543,9 @@ pub(crate) async fn place_protection_leg(
         &leg.algo_params,
         api_key,
         secret,
-    ) {
+    )
+    .await
+    {
         Ok(request) => request,
         Err(error) => return LegOutcome::failed(format!("{}: {error}", leg.kind)),
     };
@@ -575,7 +577,9 @@ pub(crate) async fn place_protection_leg(
                 &leg.legacy_params,
                 api_key,
                 secret,
-            ) {
+            )
+            .await
+            {
                 Ok(request) => request,
                 Err(error) => return LegOutcome::failed(format!("{}: {error}", leg.kind)),
             };
@@ -592,7 +596,7 @@ pub(crate) async fn place_protection_leg(
     }
 }
 
-fn prepare(
+async fn prepare(
     gate: &mut BanGate,
     base: &str,
     method: &str,
@@ -602,7 +606,7 @@ fn prepare(
     secret: &str,
 ) -> Result<PreparedRequest, String> {
     let now = crate::now_millis();
-    let timestamp = crate::exchange_time::now_ms(base);
+    let timestamp = crate::exchange_time::signed_timestamp(base).await;
     crate::submit::prepare(
         gate, now, method, base, path, params, api_key, secret, timestamp, 5_000,
     )
@@ -995,6 +999,28 @@ mod tests {
         let legs = protection_legs("BTCUSDT", "long", 49_000.0, 52_000.0, &filter, 5_000, 1);
         assert_eq!(legs.len(), 2);
         assert_eq!(legs[0].kind, "STOP_MARKET");
+        // 参数顺序就是签名顺序：错一位签名就对不上，条件单会被拒，仓位等于裸奔。
+        let keys: Vec<&str> = legs[0]
+            .algo_params
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "algoType",
+                "symbol",
+                "side",
+                "type",
+                "triggerPrice",
+                "closePosition",
+                "workingType",
+                "priceProtect",
+                "clientAlgoId",
+                "recvWindow"
+            ],
+            "保护单参数顺序必须与 legacy 内核一致"
+        );
         let side = legs[0]
             .algo_params
             .iter()

@@ -18,19 +18,6 @@ pub(crate) struct Entry {
     pub code: String,
     pub scopes: Vec<String>,
     pub rules: Vec<String>,
-    // 登记时已校验过这几列；判定逻辑尚未读取，接线后取消豁免。
-    #[allow(dead_code)]
-    pub reason: String,
-    #[allow(dead_code)]
-    pub owner: String,
-    #[allow(dead_code)]
-    pub expires_when: String,
-    #[allow(dead_code)]
-    pub verify_kind: String,
-    #[allow(dead_code)]
-    pub verify_target: String,
-    #[allow(dead_code)]
-    pub needle: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -312,12 +299,6 @@ fn parse_entry(
         code,
         scopes,
         rules,
-        reason: string_field(Some(raw), "reason").unwrap_or_default(),
-        owner: string_field(Some(raw), "owner").unwrap_or_default(),
-        expires_when: string_field(Some(raw), "expires_when").unwrap_or_default(),
-        verify_kind: verify_kind.unwrap_or_default(),
-        verify_target: verify_target.unwrap_or_default(),
-        needle,
     })
 }
 
