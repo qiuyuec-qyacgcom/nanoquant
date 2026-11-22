@@ -942,6 +942,16 @@ fn evaluate_admission(db: &Db) -> Value {
         "调整风控参数",
     ));
     let enabled_flag = state("enabled") == "true";
+    // 后台是否真的在跑：只看 enabled 会把「开关开着但任务已经死了」说成运行中。
+    let last_cycle = state("last_cycle_ts").parse::<i64>().unwrap_or(0);
+    let cycle_interval_sec = crate::runtime::cycle_interval_sec(&conn);
+    let liveness_threshold_sec = crate::runtime::liveness_threshold_sec(cycle_interval_sec);
+    let heartbeat_age = if last_cycle > 0 {
+        (crate::now() - last_cycle).max(0)
+    } else {
+        -1
+    };
+    let engine_alive = (0..liveness_threshold_sec).contains(&heartbeat_age);
     let windows = engine["trading_windows"]
         .as_array()
         .map(|items| {
@@ -962,10 +972,22 @@ fn evaluate_admission(db: &Db) -> Value {
     let loss_limit = risk["consecutive_loss_limit"].as_i64().unwrap_or(4);
     let halted = state("halted");
     let halted_on = !halted.is_empty() && halted != "0" && halted != "false";
-    let engine_ok = enabled_flag && window_ok && consecutive < loss_limit && !halted_on;
+    let engine_ok =
+        enabled_flag && engine_alive && window_ok && consecutive < loss_limit && !halted_on;
     let mut details = Vec::new();
     if !enabled_flag {
         details.push("引擎未启动 (总览页点「启动引擎」)".to_string());
+    } else if !engine_alive {
+        // 这是 warn 级别：不拦开仓，但必须说清楚「开关开着 ≠ 引擎在跑」。
+        details.push(if last_cycle > 0 {
+            format!(
+                "引擎开关已开但后台没有心跳（上次扫描 {heartbeat_age} 秒前，判活阈值 {liveness_threshold_sec} 秒，扫描周期 {cycle_interval_sec} 秒）：服务重启后引擎未恢复，或后台任务已退出"
+            )
+        } else {
+            format!(
+                "引擎开关已开但后台从未跑过一轮（判活阈值 {liveness_threshold_sec} 秒，扫描周期 {cycle_interval_sec} 秒）：服务重启后引擎未恢复，或后台任务已退出"
+            )
+        });
     }
     if !window_ok {
         details.push("当前不在允许开仓的时段".to_string());
@@ -1207,7 +1229,11 @@ fn read_status(db: &Db) -> Value {
     } else {
         -1
     };
-    let running = (0..180).contains(&heartbeat_age);
+    // 判活阈值跟着扫描周期走：周期 10 分钟时，两轮之间的间歇期长达近 10 分钟，
+    // 阈值写死 180 秒会把间歇期误报成「引擎停了」。
+    let cycle_interval_sec = crate::runtime::cycle_interval_sec(&conn);
+    let liveness_threshold_sec = crate::runtime::liveness_threshold_sec(cycle_interval_sec);
+    let running = (0..liveness_threshold_sec).contains(&heartbeat_age);
     let started_at = get("service_started_at").parse::<i64>().unwrap_or(0);
     json!({
         "enabled": get("enabled") == "true",
@@ -1216,6 +1242,10 @@ fn read_status(db: &Db) -> Value {
         "env_label": if mode == "live" { "实盘 · 币安主网" } else { "模拟盘 · 币安测试网" },
         "running": running,
         "heartbeat_age": heartbeat_age,
+        "cycle_interval_sec": cycle_interval_sec,
+        "liveness_threshold_sec": liveness_threshold_sec,
+        // 后台任务自己的状态：alive / stopped / panic / lock_failed
+        "runtime_task": get("runtime_task"),
         "uptime": if started_at > 0 { (now - started_at).max(0) } else { 0 },
         // 前端只靠 enabled 分辨不出「后台任务是否真的跑过周期」，带上心跳便于判断
         "last_cycle_ts": last_cycle,
@@ -2092,5 +2122,91 @@ mod tests {
             .iter()
             .any(|key| key == "channel" || key == "funds"));
         assert_eq!(body["tradeable_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn the_engine_stays_running_between_two_long_scans() {
+        // 回归：扫描周期 10 分钟时，两轮之间的间歇期长达近 10 分钟。
+        // 判活阈值写死 180 秒的话，面板每 10 分钟有 7 分钟误报「引擎未运行」。
+        let db = control_db("nq-status-long-interval.db");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
+                [json!({
+                    "enabled": true,
+                    "mode": "demo",
+                    "cycle_interval_sec": 600,
+                    "trading_windows": ["00:00-24:00"],
+                    "timezone_offset": 8
+                })
+                .to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_state(key, value, updated_at) VALUES('last_cycle_ts', ?1, 0)",
+                [(crate::now() - 300).to_string()],
+            )
+            .unwrap();
+        }
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let (status, body) = get(app, "/api/v1/engine/status").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cycle_interval_sec"], json!(600));
+        assert_eq!(body["liveness_threshold_sec"], json!(1260));
+        assert_eq!(
+            body["running"],
+            json!(true),
+            "间歇期不该被判成未运行: {body}"
+        );
+        let age = body["heartbeat_age"].as_i64().unwrap();
+        assert!((299..=302).contains(&age), "心跳年龄应约等于 300: {body}");
+    }
+
+    #[tokio::test]
+    async fn the_admission_reports_a_missing_heartbeat_instead_of_claiming_the_engine_runs() {
+        let db = control_db("nq-admission-no-heartbeat.db");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
+                [json!({
+                    "enabled": true,
+                    "mode": "demo",
+                    "cycle_interval_sec": 600,
+                    "trading_windows": ["00:00-24:00"],
+                    "timezone_offset": 8
+                })
+                .to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_state(key, value, updated_at) VALUES('last_cycle_ts', ?1, 0)",
+                [(crate::now() - 5000).to_string()],
+            )
+            .unwrap();
+        }
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let (status, body) = get(app, "/api/v1/engine/admission").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let engine_step = body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["key"] == "engine")
+            .expect("准入检查必须有引擎项")
+            .clone();
+        assert_eq!(engine_step["ok"], json!(false), "{engine_step}");
+        let detail = engine_step["detail"].as_str().unwrap();
+        assert!(detail.contains("没有心跳"), "必须说清楚没有心跳: {detail}");
+        // 只是提示，不能把人工开仓也堵死。
+        assert!(
+            !body["blocking"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| key == "engine"),
+            "心跳问题只能提示，不能拦开仓: {body}"
+        );
     }
 }

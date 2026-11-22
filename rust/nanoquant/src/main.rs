@@ -101,17 +101,82 @@ struct Health {
     kernel: &'static str,
 }
 
+/// 日志双写：stdout（systemd journal 里能看到）+ 日志文件（面板「服务日志」读它）。
+/// 之前只写 stdout，面板的「服务日志」永远是空的——引擎出错根本无从查起。
+#[derive(Clone)]
+struct TeeWriter {
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(buf);
+            let _ = file.flush();
+        }
+        std::io::stdout().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
+    type Writer = TeeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// 装好日志订阅器：文件写不进去就退回 stdout，不能因为日志把服务拖垮。
+fn init_tracing(home: &std::path::Path) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "nanoquant=info,tower_http=info".into());
+    let logs_dir = std::env::var_os("NANOQUANT_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join("logs"));
+    let file = std::fs::create_dir_all(&logs_dir).ok().and_then(|_| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs_dir.join("nanoquant.log"))
+            .ok()
+    });
+    match file {
+        Some(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(TeeWriter {
+                    file: std::sync::Arc::new(std::sync::Mutex::new(file)),
+                })
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
+}
+
+/// 把后台任务状态写进 engine_state：面板据此区分「引擎停了」和「任务根本没起来」。
+fn set_runtime_task(db: Option<&crate::db::Db>, value: &str) {
+    let Some(db) = db else { return };
+    let Ok(conn) = db.conn.lock() else { return };
+    let _ = conn.execute(
+        "INSERT INTO engine_state(key, value, updated_at) VALUES('runtime_task', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        rusqlite::params![value, now()],
+    );
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nanoquant=info,tower_http=info".into()),
-        )
-        .init();
-
     let args: Vec<String> = env::args().collect();
     let config = config::Config::from_env(&args);
+    init_tracing(&config.home);
     if let Some(index) = args.iter().position(|arg| arg == "ops") {
         let cli_args = args[index + 1..].to_vec();
         std::process::exit(cli::run(&cli_args, &config));
@@ -240,7 +305,10 @@ async fn main() {
             ai_market::BinanceMarketSource::new(db.clone()),
         ))
     });
-    let runtime_task = match (database, ai_state.clone()) {
+    // 先落一个「准备中」：任务真正跑起来会改成 alive，锁没拿到会改成 lock_failed。
+    // 面板靠这个字段区分「引擎停了」和「引擎压根没起来」。
+    set_runtime_task(database.as_ref(), "starting");
+    let runtime_task = match (database.clone(), ai_state.clone()) {
         (Some(db), Some(ai)) => match runtime::acquire_lock(&data_dir) {
             Ok(lock) => Some(tokio::spawn(
                 runtime::EngineRuntime::new(db, lock, master_key, events_bus)
@@ -250,10 +318,14 @@ async fn main() {
             )),
             Err(error) => {
                 tracing::warn!(%error, "无法获取引擎锁，仅启动 HTTP 服务");
+                set_runtime_task(database.as_ref(), "lock_failed");
                 None
             }
         },
-        _ => None,
+        _ => {
+            set_runtime_task(database.as_ref(), "no_runtime");
+            None
+        }
     };
     info!("NanoQuant (Rust) 监听 http://{addr}");
     let signal_stop_tx = stop_tx.clone();

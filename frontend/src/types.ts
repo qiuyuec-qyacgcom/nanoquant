@@ -51,6 +51,12 @@ export interface EngineStatus {
   env_label?: string
   running: boolean
   heartbeat_age: number
+  /** 扫描周期（秒）：后端按这个周期算判活阈值，不是写死的 180 */
+  cycle_interval_sec?: number
+  /** 判活阈值（秒）：两倍周期加一分钟余量 */
+  liveness_threshold_sec?: number
+  /** 后台任务状态：alive / stopped / panic / lock_failed / starting */
+  runtime_task?: string
   uptime: number
   last_cycle_ts: number
   last_cycle_ms: number

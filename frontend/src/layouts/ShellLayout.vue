@@ -187,7 +187,7 @@ onBeforeUnmount(() => {
       <div class="sidebar-foot">
         <div class="row" style="gap: 6px">
           <span class="dot" :class="status?.running ? (status?.enabled ? 'on' : 'off') : 'err'" />
-          <span>{{ status?.running ? (status?.enabled ? '引擎运行中' : '引擎待命') : '引擎未运行' }}</span>
+          <span>{{ status?.running ? (status?.enabled ? '引擎运行中' : '引擎待命') : (status?.enabled ? '引擎已开启但无心跳' : '引擎未运行') }}</span>
         </div>
         <div class="mono" style="margin-top: 6px; font-size: 10px">
           v1.0.0 · {{ status?.mode === 'live' ? '实盘' : '模拟盘' }} · {{ status?.last_cycle_ms || 0 }}ms

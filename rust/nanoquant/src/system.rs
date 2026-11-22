@@ -18,6 +18,8 @@ pub struct SystemState {
     pub free_bytes: fn(&std::path::Path) -> u64,
     pub auth: Option<AuthState>,
     runtime_probe: RuntimeProbe,
+    /// 日志目录：服务日志接口只允许读这个目录里的文件。
+    logs_dir: std::path::PathBuf,
     logs_path: std::path::PathBuf,
     archives_dir: std::path::PathBuf,
     /// 告警冷却记账表：同一类别在冷却窗口内只推一次。
@@ -124,6 +126,7 @@ impl SystemState {
             free_bytes: disk_free_bytes,
             auth: None,
             runtime_probe: RuntimeProbe::new(started_at),
+            logs_dir: logs_dir.clone(),
             logs_path: logs_dir.join("nanoquant.log"),
             archives_dir: home.join("data").join("archives"),
             alert_last: std::sync::Arc::new(
@@ -2051,10 +2054,27 @@ async fn logs(
     Query(query): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let tail = query.lines.unwrap_or(200).clamp(1, 2000);
-    let path = query
-        .path
-        .map(std::path::PathBuf::from)
-        .unwrap_or(state.logs_path);
+    let path = match query.path {
+        Some(raw) => {
+            // 只允许读日志目录里的文件。没有这道闸，这个接口就是任意文件读取：
+            // 拿到管理员口令的人能读 .master_key 和交易所密钥。
+            let requested = std::path::PathBuf::from(raw);
+            let base = state
+                .logs_dir
+                .canonicalize()
+                .unwrap_or_else(|_| state.logs_dir.clone());
+            let resolved = requested.canonicalize().unwrap_or(requested);
+            if !resolved.starts_with(&base) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"detail": "只允许读取日志目录内的文件"})),
+                )
+                    .into_response();
+            }
+            resolved
+        }
+        None => state.logs_path.clone(),
+    };
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let keyword = query.keyword.map(|value| value.to_lowercase());
     let lines: Vec<&str> = content
@@ -2070,7 +2090,7 @@ async fn logs(
         .into_iter()
         .rev()
         .collect();
-    Json(json!({"lines": lines, "count": lines.len()}))
+    Json(json!({"lines": lines, "count": lines.len()})).into_response()
 }
 
 async fn info(State(state): State<SystemState>) -> impl IntoResponse {
@@ -2238,16 +2258,30 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
     let started = std::time::Instant::now();
     let enabled = engine_value(&conn, "enabled") == "true";
     let last_cycle = engine_int(&conn, "last_cycle_ts");
-    let engine_ok = !enabled || (last_cycle > 0 && crate::now().saturating_sub(last_cycle) < 180);
+    // 阈值跟着扫描周期走：写死 180 秒会把 10 分钟周期的间歇期误报成心跳超时。
+    let cycle_interval_sec = crate::runtime::cycle_interval_sec(&conn);
+    let liveness_threshold_sec = crate::runtime::liveness_threshold_sec(cycle_interval_sec);
+    let heartbeat_age = crate::now().saturating_sub(last_cycle);
+    let engine_ok = !enabled || (last_cycle > 0 && heartbeat_age < liveness_threshold_sec);
+    let runtime_task = engine_value(&conn, "runtime_task");
+    let runtime_task = if runtime_task.is_empty() {
+        "未知".to_string()
+    } else {
+        runtime_task
+    };
     checks.push(diag_check(
         "引擎心跳",
         engine_ok,
         if !enabled {
             "引擎已停止".to_string()
         } else if engine_ok {
-            format!("最近心跳 {} 秒前", crate::now().saturating_sub(last_cycle))
+            format!(
+                "最近心跳 {heartbeat_age} 秒前（扫描周期 {cycle_interval_sec} 秒，判活阈值 {liveness_threshold_sec} 秒）"
+            )
         } else {
-            "引擎心跳超时".to_string()
+            format!(
+                "引擎心跳超时：上次扫描 {heartbeat_age} 秒前，超过判活阈值 {liveness_threshold_sec} 秒（扫描周期 {cycle_interval_sec} 秒，后台任务状态 {runtime_task}）"
+            )
         },
         started,
     ));
@@ -3173,6 +3207,73 @@ mod tests {
             )
             .unwrap();
         assert!(events >= 1, "reset 必须写审计");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_diagnostics_heartbeat_follows_the_scan_interval() {
+        let path = std::env::temp_dir().join("nq-diag-heartbeat.db");
+        let db = dead_fixture(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
+                [json!({"enabled": true, "cycle_interval_sec": 600}).to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_state(key, value, updated_at) VALUES('enabled', 'true', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_state(key, value, updated_at) VALUES('last_cycle_ts', ?1, 0)",
+                [(crate::now() - 300).to_string()],
+            )
+            .unwrap();
+        }
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(SystemState::new(db.clone(), crate::now()));
+        let (status, body) = request_json(app, "GET", "/api/v1/system/diagnostics").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let heartbeat = body["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "引擎心跳")
+            .expect("诊断必须有引擎心跳项")
+            .clone();
+        assert_eq!(
+            heartbeat["ok"],
+            json!(true),
+            "间歇期不该报心跳超时: {heartbeat}"
+        );
+        let detail = heartbeat["detail"].as_str().unwrap();
+        assert!(detail.contains("判活阈值"), "{detail}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_logs_endpoint_refuses_to_read_outside_the_log_directory() {
+        let path = std::env::temp_dir().join("nq-logs-guard.db");
+        let db = dead_fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(SystemState::new(db.clone(), crate::now()));
+        // 日志目录之外的文件一律拒绝：不然这个接口就是任意文件读取，
+        // 拿到管理员口令的人能读 .master_key 和交易所密钥。
+        for uri in [
+            "/api/v1/system/logs?path=%2Fetc%2Fpasswd",
+            "/api/v1/system/logs?path=..%2F..%2Fetc%2Fpasswd",
+            "/api/v1/system/logs?path=C%3A%5CWindows%5Cwin.ini",
+        ] {
+            let (status, body) = request_json(app.clone(), "GET", uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} 不该被放行: {body}");
+        }
+        // 默认路径（服务自己的日志文件）不受影响。
+        let (status, _) = request_json(app, "GET", "/api/v1/system/logs?lines=10").await;
+        assert_eq!(status, StatusCode::OK);
         let _ = std::fs::remove_file(&path);
     }
 

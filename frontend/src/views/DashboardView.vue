@@ -242,7 +242,7 @@ useSilentRefresh(load, 30000)
           <div class="right">
             <span class="dot" :class="status?.running ? (status?.enabled ? 'on' : 'off') : 'err'" />
             <span class="muted" style="font-size: 11px">
-              {{ status?.running ? (status?.enabled ? `运行中 · ${status?.last_cycle_ms}ms` : '待命') : '未运行' }}
+              {{ status?.running ? (status?.enabled ? `运行中 · ${status?.last_cycle_ms}ms` : '待命') : (status?.enabled ? '已开启 · 无心跳' : '未运行') }}
             </span>
           </div>
         </div>
@@ -258,6 +258,9 @@ useSilentRefresh(load, 30000)
             <b>{{ status?.env_label || (status?.mode === 'live' ? '实盘 · 币安主网' : '模拟盘 · 币安测试网') }}</b>
             · 账户 {{ (status?.account as any)?.error ? '不可用：' + (status?.account as any)?.error : '已同步' }}
             · 心跳 {{ (status?.heartbeat_age ?? -1) >= 0 ? status?.heartbeat_age + 's 前' : '无' }}
+            <template v-if="status?.liveness_threshold_sec">
+              （判活阈值 {{ status.liveness_threshold_sec }}s · 扫描周期 {{ status.cycle_interval_sec }}s）
+            </template>
             · 数据延迟 {{ status?.last_cycle_ms }}ms
             <template v-if="status?.rate_limit?.banned">
               · <span class="down">

@@ -1,4 +1,5 @@
 use crate::db::Db;
+use futures_util::FutureExt;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
@@ -12,6 +13,41 @@ use tokio::time::{sleep, Duration};
 
 const MIN_INTERVAL_SEC: i64 = 15;
 const MAX_INTERVAL_SEC: i64 = 3600;
+
+/// 引擎判活阈值（秒）。
+///
+/// 必须跟着扫描周期走：周期 10 分钟时，两轮之间天然有近 10 分钟没有新的扫描心跳，
+/// 阈值写死 180 秒的话，面板每 10 分钟有 7 分钟在喊「引擎未运行」——那是假的。
+/// 取两倍周期再加一分钟余量：慢一轮不算死，连续两轮没有心跳才算。
+pub(crate) fn liveness_threshold_sec(interval_sec: u64) -> i64 {
+    const MIN_THRESHOLD_SEC: i64 = 180;
+    (interval_sec as i64 * 2 + 60).max(MIN_THRESHOLD_SEC)
+}
+
+/// 当前扫描周期（秒）。读不到配置就用最小值。
+pub(crate) fn cycle_interval_sec(conn: &rusqlite::Connection) -> u64 {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key='engine'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|value| value.get("cycle_interval_sec").and_then(Value::as_i64))
+    .unwrap_or(MIN_INTERVAL_SEC)
+    .clamp(MIN_INTERVAL_SEC, MAX_INTERVAL_SEC) as u64
+}
+
+/// panic 载荷里能取到字符串就取，取不到给个兜底文案。
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "未知 panic".to_string()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeConfig {
@@ -3830,6 +3866,7 @@ impl EngineRuntime {
 
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         self.runtime_active.store(true, Ordering::SeqCst);
+        self.set_runtime_task("alive");
         let mut last_config = RuntimeConfig::from_db(&self.db);
         let mut due = Instant::now();
         loop {
@@ -3839,10 +3876,30 @@ impl EngineRuntime {
             if Instant::now() >= due {
                 let config = RuntimeConfig::from_db(&self.db);
                 self.cycle_busy.store(true, Ordering::SeqCst);
-                let result = self.tick(&config).await;
+                // 周期里 panic 不能把整个后台任务带走：崩了就记账并停下来。
+                // 否则面板只会显示「引擎未运行」，没人知道后台任务已经死了。
+                let outcome = std::panic::AssertUnwindSafe(self.tick(&config))
+                    .catch_unwind()
+                    .await;
                 self.cycle_busy.store(false, Ordering::SeqCst);
-                if let Err(error) = result {
-                    tracing::error!(%error, "Rust 引擎周期未执行");
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "Rust 引擎周期未执行");
+                    }
+                    Err(payload) => {
+                        let detail = panic_detail(payload.as_ref());
+                        tracing::error!(%detail, "Rust 引擎周期 panic");
+                        self.events.record(
+                            "error",
+                            "engine",
+                            "引擎周期 panic，引擎循环已停止",
+                            serde_json::json!({"detail": detail}),
+                        );
+                        self.set_runtime_task("panic");
+                        self.runtime_active.store(false, Ordering::SeqCst);
+                        return;
+                    }
                 }
                 due = Instant::now() + Duration::from_secs(config.interval_sec);
                 last_config = config;
@@ -3869,7 +3926,15 @@ impl EngineRuntime {
             }
         }
         self.runtime_active.store(false, Ordering::SeqCst);
+        self.set_runtime_task("stopped");
         tracing::info!("Rust 引擎后台任务已停止");
+    }
+
+    /// 后台任务状态写进 engine_state：面板据此区分「引擎停了」和「任务崩了」。
+    fn set_runtime_task(&self, value: &str) {
+        if let Ok(conn) = self.db.conn.lock() {
+            let _ = upsert_state(&conn, "runtime_task", value);
+        }
     }
 }
 
@@ -3946,6 +4011,16 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn the_liveness_threshold_follows_the_scan_interval() {
+        // 扫描周期 10 分钟时，两轮之间的间歇期长达近 10 分钟：
+        // 阈值必须跟着周期走，否则面板每 10 分钟有 7 分钟误报「引擎未运行」。
+        assert_eq!(liveness_threshold_sec(600), 1260);
+        // 短周期仍保底 180 秒
+        assert_eq!(liveness_threshold_sec(15), 180);
+        assert_eq!(liveness_threshold_sec(60), 180);
+    }
 
     fn test_runtime(db: &Db) -> EngineRuntime {
         let lock = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
