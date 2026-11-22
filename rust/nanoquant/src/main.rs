@@ -4,7 +4,6 @@
 //! 探活契约（`/api/v1/health`）和静态前端托管；交易、鉴权、行情等域按
 //! `docs/superpowers/plans/2026-11-18-rust-rewrite.md` 逐个迁入。
 
-#![allow(dead_code)]
 #![allow(
     clippy::too_many_arguments,
     clippy::type_complexity,
@@ -65,6 +64,7 @@ mod schema;
 mod secret;
 mod settings_api;
 mod sign;
+mod signal_audit;
 mod signal_follow;
 
 mod strategies;
@@ -140,6 +140,9 @@ async fn main() {
         admin_password.as_deref(),
     )
     .unwrap_or_else(|error| panic!("数据库初始化失败: {error}"));
+    if bootstrap_report.created_master_key {
+        tracing::warn!("已生成主密钥文件，请单独备份保存（丢失后无法解密历史备份）");
+    }
     if let Some(password) = bootstrap_report.generated_password.as_deref() {
         tracing::warn!("已生成初始管理员密码: {password}（首次登录后请立即修改）");
     }
@@ -168,6 +171,16 @@ async fn main() {
             (default_auth(), None)
         }
     };
+    if let Some(db) = db_handle.as_ref() {
+        // 记录本次启动时间：总览的「运行时长」与「进程是否重启过」都靠它。
+        let conn = db.conn.lock().expect("db");
+        let started = now();
+        let _ = conn.execute(
+            "INSERT INTO engine_state(key, value, updated_at) VALUES('service_started_at', ?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (started.to_string(), started),
+        );
+    }
     let bus = events::EventBus::new(db_handle.clone());
     let mode_db = db_handle.clone();
     let klines = kline_stream::KlineHub::new(
@@ -208,6 +221,10 @@ async fn main() {
         .clone();
     let events_bus = state.events.clone();
     let klines = state.klines.clone();
+    // 每日自动备份：备份页承诺「下一轮检查（≤15 分钟）自动跑」，这里真的按 15 分钟检查一次。
+    // 与交易引擎解耦：引擎停用时同样要备份。
+    let auto_backup_state = state.clone();
+    tokio::spawn(backup::spawn_auto_backup_task(auto_backup_state));
     let app = router(state, config.frontend.clone());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -216,17 +233,28 @@ async fn main() {
     // 签名时间戳依赖交易所时钟：先用 /fapi/v1/time 对时，之后每分钟刷新
     exchange_time::spawn_sync_task();
     let (stop_tx, stop_rx) = runtime::stop_channel();
-    let runtime_task = database.and_then(|db| match runtime::acquire_lock(&data_dir) {
-        Ok(lock) => Some(tokio::spawn(
-            runtime::EngineRuntime::new(db, lock, master_key, events_bus)
-                .with_cycle(cycle_signal, cycle_busy, runtime_active)
-                .run(stop_rx),
-        )),
-        Err(error) => {
-            tracing::warn!(%error, "无法获取引擎锁，仅启动 HTTP 服务");
-            None
-        }
+    // AI 复核器必须注入引擎：漏了这一步，每个候选都会以「AI 复核不可用」被拒，
+    // 信号审计里全是同一句话，真正的复核原因根本落不了库。
+    let ai_state = database.as_ref().map(|db| {
+        ai_providers::AiState::new(db.clone(), master_key.clone()).with_market(std::sync::Arc::new(
+            ai_market::BinanceMarketSource::new(db.clone()),
+        ))
     });
+    let runtime_task = match (database, ai_state.clone()) {
+        (Some(db), Some(ai)) => match runtime::acquire_lock(&data_dir) {
+            Ok(lock) => Some(tokio::spawn(
+                runtime::EngineRuntime::new(db, lock, master_key, events_bus)
+                    .with_reviewer(std::sync::Arc::new(ai_review::EngineAiReviewer::new(ai)))
+                    .with_cycle(cycle_signal, cycle_busy, runtime_active)
+                    .run(stop_rx),
+            )),
+            Err(error) => {
+                tracing::warn!(%error, "无法获取引擎锁，仅启动 HTTP 服务");
+                None
+            }
+        },
+        _ => None,
+    };
     info!("NanoQuant (Rust) 监听 http://{addr}");
     let signal_stop_tx = stop_tx.clone();
     let server_result = axum::serve(listener, app)
@@ -314,11 +342,17 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         if assets.is_dir() {
             app = app.nest_service("/assets", ServeDir::new(assets));
         }
-        let index_html = std::fs::read_to_string(&index).unwrap_or_default();
+        // index.html 不能在启动时固化：前端重新构建后资源 hash 会变，
+        // 缓存旧 HTML 会让页面指向已不存在的 JS，整页白屏且控制台无报错。
+        // 改为每次请求重读；读取失败时退回上一次成功的内容。
+        let index_cache = std::sync::Arc::new(std::sync::Mutex::new(
+            std::fs::read_to_string(&index).unwrap_or_default(),
+        ));
         app = app.fallback(move |request: axum::extract::Request| {
-            let path = request.uri().path().to_string();
-            let body = index_html.clone();
+            let index = index.clone();
+            let index_cache = index_cache.clone();
             async move {
+                let path = request.uri().path().to_string();
                 if path.starts_with("/api/") {
                     return (
                         StatusCode::NOT_FOUND,
@@ -326,6 +360,14 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
                     )
                         .into_response();
                 }
+                let body = match std::fs::read_to_string(&index) {
+                    Ok(text) => {
+                        let mut cache = index_cache.lock().expect("index cache");
+                        *cache = text.clone();
+                        text
+                    }
+                    Err(_) => index_cache.lock().expect("index cache").clone(),
+                };
                 axum::response::Html(body).into_response()
             }
         });

@@ -129,7 +129,8 @@ EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant
 ## sidecar 自检（可选）
 
 1. 面板「系统诊断 → 执行内核」确认 `target=/run/nanoquant/exec.sock`、`connected=true`；
-2. 点「自检」，两侧 88 字符 base64 一致即可；
+2. 点「自检」：面板「往返耗时」会记下探活一帧 health 的**实测**往返耗时（没有样本时显示「—」，不显示 0ms）；
+   签名的逐字节比对在 CLI 里做：`EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock`；
 3. 主服务使用 Rust 内核签名；参数页不再提供 `exec_mode/exec_socket` 设置。
 4. 换 Secret 后必须点「清零」，避免在途比对残留不一致计数。
 
@@ -147,8 +148,19 @@ EXEC_SECRET='<密钥>' nanoquant ops verify-sidecar --target unix:/run/nanoquant
   static_configs: [{ targets: ['127.0.0.1:8899'] }]
 ```
 
-建议告警规则：`nanoquant_up == 0`、`nanoquant_dead_letters_stuck > 0`、
-`nanoquant_exec_shadow_mismatched > 0`（切了 enforce 时尤其重要）。
+可用指标只有下面这些（其余名字是 Python 时代残留，抄进 Prometheus 会静默失效）：
+
+| 指标 | 含义 |
+|---|---|
+| `nanoquant_up` | 服务是否在线 |
+| `nanoquant_signals_last_1h` | 最近 1 小时信号数 |
+| `nanoquant_halted` | 是否处于熔断状态 |
+| `nanoquant_last_cycle_age_seconds` | 距上一轮扫描的秒数 |
+| `nanoquant_account_equity_usdt` | 账户权益（需鉴权） |
+| `nanoquant_account_open_positions` | 当前持仓数（需鉴权） |
+
+建议告警规则：`nanoquant_up == 0`、`nanoquant_halted > 0`、
+`nanoquant_last_cycle_age_seconds > 120`（引擎循环卡住）。
 
 ## 常用
 

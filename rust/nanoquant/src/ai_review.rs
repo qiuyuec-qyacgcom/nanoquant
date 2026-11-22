@@ -455,6 +455,7 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         stop_price: None,
         take_profit: None,
         reason: reason.into(),
+        confidence: 0.0,
     }
 }
 
@@ -465,10 +466,12 @@ fn decision_to_review(
     min_confidence: f64,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
-        return Ok(reject(format!(
+        let mut rejected = reject(format!(
             "AI 置信度 {:.2} 低于 {:.2}",
             decision.confidence, min_confidence
-        )));
+        ));
+        rejected.confidence = decision.confidence;
+        return Ok(rejected);
     }
     let action = decision.action.as_str();
     let side = match action {
@@ -551,6 +554,7 @@ fn decision_to_review(
         stop_price: Some(stop_price),
         take_profit: Some(take_profit),
         reason: decision.reason.clone(),
+        confidence: decision.confidence,
     })
 }
 

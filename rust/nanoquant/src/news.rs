@@ -7,6 +7,7 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::future::join_all;
+#[cfg(test)]
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -270,6 +271,7 @@ pub struct Incoming {
 
 /// 入库。标题短于 8 个字的丢掉；去重键是 `sha1(小写去空白的 url)`，
 /// 没有 url 时用 `sha1(source:title)`。返回新插入的条数。
+#[cfg(test)]
 pub fn ingest(db: &Db, items: &[Incoming]) -> Result<usize, String> {
     let conn = Connection::open(&db.path).map_err(|e| e.to_string())?;
     let mut inserted = 0;
@@ -313,7 +315,11 @@ fn sha1_hex(text: &str) -> String {
     hex::encode(sha1::Sha1::digest(text.as_bytes()))
 }
 
-pub fn seed(path: &std::path::Path) -> Db {
+/// 测试夹具：建一张只含本模块用到的表的最小库。
+///
+/// 仅测试可见；正式构建不编译，避免把夹具当成可用 API。
+#[cfg(test)]
+fn seed(path: &std::path::Path) -> Db {
     let _ = std::fs::remove_file(path);
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(

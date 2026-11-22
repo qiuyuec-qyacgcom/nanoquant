@@ -76,11 +76,47 @@ impl EntryDraft {
             mark_price: self.mark_price,
         }
     }
+
+    /// 拼一条信号审计记录。评分、方向、特征、AI 结论、拒绝原因一次带齐，
+    /// 前端的「信号审计」页直接读这张表回答「为什么没开仓」。
+    fn audit_row(
+        &self,
+        decision: &str,
+        direction: &str,
+        reject_reason: &str,
+        ai_action: &str,
+        ai_confidence: f64,
+        ai_reason: &str,
+    ) -> crate::signal_audit::AuditSignal {
+        let mut features: Value =
+            serde_json::from_str(&self.features_text).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(object) = features.as_object_mut() {
+            object.insert(
+                "quant_side".to_string(),
+                self.quant_side
+                    .clone()
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            object.insert(
+                "quant_score".to_string(),
+                self.quant_score.map(Value::from).unwrap_or(Value::Null),
+            );
+            object.insert("mark_price".to_string(), json!(self.mark_price));
+        }
+        crate::signal_audit::AuditSignal::new(&self.symbol)
+            .with_direction(direction)
+            .with_score(self.quant_score.unwrap_or(self.score))
+            .with_features(features)
+            .with_ai(ai_action, ai_confidence, ai_reason)
+            .with_decision(decision)
+            .with_reject_reason(reject_reason)
+    }
 }
 
 struct ReviewedDraft {
     draft: EntryDraft,
-    result: Result<crate::review::ReviewedEntry, String>,
+    result: Result<crate::review::ReviewedEntry, crate::review::ReviewError>,
 }
 
 #[derive(Clone)]
@@ -191,6 +227,8 @@ impl EngineControl {
         }
     }
 
+    /// 注入自定义网关；生产路径目前只用内置 HTTP 网关，接线后取消豁免。
+    #[allow(dead_code)]
     pub(crate) fn with_gateway(mut self, gateway: Arc<dyn crate::live::Gateway>) -> Self {
         self.gateway = gateway;
         self
@@ -890,6 +928,8 @@ impl EngineControl {
             .unwrap_or_default()
     }
 
+    /// 切换交易模式时写引擎事件；切换流程尚未接线，接线后取消豁免。
+    #[allow(dead_code)]
     fn record_trade_mode_event(&self, ok: bool, hedge: bool, isolated: bool, results: &[Value]) {
         if let Ok(conn) = self.db.conn.lock() {
             let payload = json!({"hedge": hedge, "isolated": isolated, "results": results});
@@ -1160,6 +1200,8 @@ impl EngineRuntime {
     }
 
     /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP。
+    /// 注入带测试 transport 的 AI 状态；生产默认走 HTTP，接线后取消豁免。
+    #[allow(dead_code)]
     pub(crate) fn with_ai(mut self, ai: crate::ai_providers::AiState) -> Self {
         self.reviewer = Some(Arc::new(crate::ai_review::EngineAiReviewer::new(
             ai.clone(),
@@ -1349,7 +1391,7 @@ impl EngineRuntime {
             .clamp(0, 1440)
             * 60;
         let _ = tx.execute("DELETE FROM cooldowns WHERE until_ts<=?1", [crate::now()]);
-        let (mut preview_value, report, symbols, positions) = Self::run_cycle_state(
+        let (mut preview_value, report, symbols, positions, rejected_rows) = Self::run_cycle_state(
             &tx,
             mode,
             &strategy,
@@ -1358,6 +1400,14 @@ impl EngineRuntime {
             &order_differences,
             engine_is_enabled,
         )?;
+        // 行情闸门就把标的挡掉的，本轮已经有结论了，先落审计：
+        // 「为什么没开仓」最常见的一种答案就是它。
+        if !rejected_rows.is_empty() {
+            if let Err(error) = crate::signal_audit::record(&tx, mode, crate::now(), &rejected_rows)
+            {
+                tracing::warn!(%error, "信号审计写入失败，不影响本轮周期");
+            }
+        }
         let executed = Self::execute_demo_cycle(
             &tx,
             mode,
@@ -1848,6 +1898,7 @@ impl EngineRuntime {
             crate::cycle::CycleReport,
             Vec<String>,
             Vec<crate::manage::ManagedPosition>,
+            Vec<crate::signal_audit::AuditSignal>,
         ),
         String,
     > {
@@ -2039,6 +2090,29 @@ impl EngineRuntime {
                 (!reason.is_empty()).then_some((&candidate.symbol, reason))
             })
             .collect();
+        // 没过行情闸门的标的也要进审计：这是「为什么没开仓」最常见的一种答案。
+        let rejected_rows: Vec<crate::signal_audit::AuditSignal> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let reason = crate::scan::risk_gate(candidate, &gates);
+                if reason.is_empty() {
+                    return None;
+                }
+                Some(
+                    crate::signal_audit::AuditSignal::new(&candidate.symbol)
+                        .with_direction("flat")
+                        .with_score(candidate.strength)
+                        .with_features(serde_json::json!({
+                            "atr_pct": candidate.atr_pct,
+                            "vol_ratio": candidate.vol_ratio,
+                            "quote_volume": candidate.quote_volume,
+                            "spread_bps": candidate.spread_bps,
+                        }))
+                        .with_decision("rejected")
+                        .with_reject_reason(&reason),
+                )
+            })
+            .collect();
         let preview = serde_json::json!({
             "skipped": &report.skipped,
             "scan_candidates": &report.scanned,
@@ -2046,7 +2120,7 @@ impl EngineRuntime {
             "rejected": rejected,
             "reconcile": &report.reconcile,
         });
-        Ok((preview, report, symbols, positions))
+        Ok((preview, report, symbols, positions, rejected_rows))
     }
 
     fn collect_entries(
@@ -2289,18 +2363,27 @@ impl EngineRuntime {
         let mut plans = Vec::new();
         let mut available = snapshot.account.available_balance;
         let now = crate::now();
+        let mut audit: Vec<crate::signal_audit::AuditSignal> = Vec::new();
         for ReviewedDraft { draft, result } in reviewed {
             let reviewed = match result {
                 Ok(reviewed) => reviewed,
-                Err(reason) => {
+                Err(error) => {
                     let _ = tx.execute(
                         "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','ai',?2,?3)",
                         (
                             now,
                             "AI 复核跳过开仓",
-                            serde_json::json!({"symbol": draft.symbol, "reason": reason}).to_string(),
+                            serde_json::json!({"symbol": draft.symbol, "reason": error.reason}).to_string(),
                         ),
                     );
+                    audit.push(draft.audit_row(
+                        "rejected",
+                        draft.quant_side.as_deref().unwrap_or("flat"),
+                        &error.reason,
+                        &error.action,
+                        error.confidence,
+                        &error.reason,
+                    ));
                     continue;
                 }
             };
@@ -2345,8 +2428,10 @@ impl EngineRuntime {
                 draft.scale,
                 Some(available),
             );
-            if qty <= 0.0
-                || !Self::entry_allowed(
+            let blocked = if qty <= 0.0 {
+                Some("可用余额或风险预算不足，下单量为 0".to_string())
+            } else {
+                Self::entry_allowed(
                     tx,
                     mode,
                     engine,
@@ -2357,7 +2442,16 @@ impl EngineRuntime {
                     qty * draft.mark_price,
                     now,
                 )?
-            {
+            };
+            if let Some(reason) = blocked {
+                audit.push(draft.audit_row(
+                    "rejected",
+                    draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                    &reason,
+                    &reviewed.action,
+                    reviewed.confidence,
+                    &reviewed.reason,
+                ));
                 continue;
             }
             let side = if final_side == "long" { "BUY" } else { "SELL" };
@@ -2378,6 +2472,15 @@ impl EngineRuntime {
                     entry: Some(entry),
                     features: Some(features_text.clone()),
                 });
+                // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
+                audit.push(draft.audit_row(
+                    "pending",
+                    draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                    "",
+                    &reviewed.action,
+                    reviewed.confidence,
+                    &reviewed.reason,
+                ));
                 break;
             }
             let exists: bool = tx
@@ -2388,6 +2491,14 @@ impl EngineRuntime {
                 )
                 .map_err(|e| e.to_string())?;
             if exists {
+                audit.push(draft.audit_row(
+                    "rejected",
+                    draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                    "同一根 K 线已开过单，忽略重复开仓",
+                    &reviewed.action,
+                    reviewed.confidence,
+                    &reviewed.reason,
+                ));
                 continue;
             }
             let margin = draft.mark_price * qty / leverage;
@@ -2428,6 +2539,20 @@ impl EngineRuntime {
             );
             available -= margin + draft.mark_price * qty * fee_rate;
             executed.push(serde_json::json!({"symbol": draft.symbol, "side": side, "qty": qty, "price": draft.mark_price, "reason": "entry", "client_order_id": draft.client_id}));
+            audit.push(draft.audit_row(
+                "opened",
+                final_side.as_str(),
+                "",
+                &reviewed.action,
+                reviewed.confidence,
+                &reviewed.reason,
+            ));
+        }
+        // 审计写入失败不能拖垮下单：日志里留痕，下一轮继续。
+        if !audit.is_empty() {
+            if let Err(error) = crate::signal_audit::record(tx, mode, now, &audit) {
+                tracing::warn!(%error, "信号审计写入失败，不影响本轮下单");
+            }
         }
         Ok(plans)
     }
@@ -2456,6 +2581,9 @@ impl EngineRuntime {
         Ok(())
     }
 
+    /// 开仓前的最后一道闸门。返回 Ok(None) 表示放行，
+    /// Ok(Some(原因)) 表示被挡下——原因要写进信号审计，
+    /// 「为什么没开仓」不能只说「不允许」。
     fn entry_allowed(
         tx: &rusqlite::Transaction<'_>,
         mode: &str,
@@ -2466,7 +2594,7 @@ impl EngineRuntime {
         side: &str,
         notional: f64,
         now: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         let cooldown: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM cooldowns WHERE symbol=?1 AND until_ts>?2)",
@@ -2475,7 +2603,7 @@ impl EngineRuntime {
             )
             .map_err(|e| e.to_string())?;
         if cooldown {
-            return Ok(false);
+            return Ok(Some(format!("{symbol} 处于冷却期")));
         }
         let category = |symbol: &str| {
             if symbol.contains("BTC") {
@@ -2509,7 +2637,7 @@ impl EngineRuntime {
         for row in rows {
             let (held, direction, qty, fallback) = row.map_err(|e| e.to_string())?;
             if held == symbol {
-                return Ok(false);
+                return Ok(Some(format!("{symbol} 已有持仓")));
             }
             let price = snapshot
                 .markets
@@ -2518,7 +2646,7 @@ impl EngineRuntime {
                 .map_or(fallback, |m| m.mark_price);
             let value = qty * price;
             if !value.is_finite() || value <= 0.0 {
-                return Ok(false);
+                return Ok(Some(format!("{held} 仓位价值异常")));
             }
             count += 1;
             same += i64::from(direction == side);
@@ -2529,11 +2657,31 @@ impl EngineRuntime {
         }
         let side_cap = cfg["max_same_direction"].as_i64().unwrap_or(0);
         let category_cap = cfg["category_exposure_limit_pct"].as_f64().unwrap_or(500.0);
+        let max_positions = engine["max_positions"].as_i64().unwrap_or(2);
         let equity = snapshot.account.equity;
-        Ok(count < engine["max_positions"].as_i64().unwrap_or(2)
-            && (side_cap <= 0 || same < side_cap)
-            && total / equity * 100.0 <= cfg["max_exposure_pct"].as_f64().unwrap_or(2000.0)
-            && (category_cap <= 0.0 || group / equity * 100.0 <= category_cap))
+        if !equity.is_finite() || equity <= 0.0 {
+            return Ok(Some("账户权益为 0，无法开仓".to_string()));
+        }
+        if count >= max_positions {
+            return Ok(Some(format!("持仓数 {count} 已达上限 {max_positions}")));
+        }
+        if side_cap > 0 && same >= side_cap {
+            return Ok(Some(format!("同向持仓 {same} 达到上限 {side_cap}")));
+        }
+        let exposure_pct = total / equity * 100.0;
+        let max_exposure_pct = cfg["max_exposure_pct"].as_f64().unwrap_or(2000.0);
+        if exposure_pct > max_exposure_pct {
+            return Ok(Some(format!(
+                "总敞口 {exposure_pct:.1}% 超过上限 {max_exposure_pct:.1}%"
+            )));
+        }
+        let group_pct = group / equity * 100.0;
+        if category_cap > 0.0 && group_pct > category_cap {
+            return Ok(Some(format!(
+                "同类敞口 {group_pct:.1}% 超过上限 {category_cap:.1}%"
+            )));
+        }
+        Ok(None)
     }
 
     fn execute_demo_cycle(
@@ -3687,7 +3835,17 @@ impl EngineRuntime {
             upsert_state(&tx, "last_cycle_ts", &crate::now().to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
+        Self::write_heartbeat(&self.db.path);
         result
+    }
+
+    /// 心跳文件：守护脚本靠它判断「进程还在、引擎却不动了」。
+    /// 引擎停用时后台同样在跑，所以这个文件只表示后台任务活着。
+    fn write_heartbeat(db_path: &str) {
+        let Some(parent) = std::path::Path::new(db_path).parent() else {
+            return;
+        };
+        let _ = std::fs::write(parent.join("engine.heartbeat"), crate::now().to_string());
     }
 
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
@@ -3835,6 +3993,7 @@ mod tests {
                     stop_price: None,
                     take_profit: None,
                     reason: "flat 候选不自动开仓".to_string(),
+                    confidence: 0.0,
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -3844,6 +4003,7 @@ mod tests {
                 stop_price: None,
                 take_profit: Some(proposal.take_profit),
                 reason: "test approve".to_string(),
+                confidence: 0.0,
             })
         }
     }
@@ -3946,6 +4106,44 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("行情"));
+        let audited: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM signals WHERE mode='demo' AND decision='rejected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(audited > 0, "行情闸门挡下的标的也要进信号审计");
+    }
+
+    #[tokio::test]
+    async fn every_cycle_leaves_a_signal_audit_row() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let rows: Vec<(String, String, String, i64)> = conn
+            .prepare(
+                "SELECT symbol, decision, reject_reason, repeats FROM signals WHERE mode='demo'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(!rows.is_empty(), "每轮扫描都必须留下信号审计行");
+        assert!(
+            rows.iter().any(|(_, decision, _, _)| decision == "opened"),
+            "开仓那一刀要记成已开仓: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|(_, _, reason, _)| !reason.is_empty()
+                || rows.iter().any(|(_, decision, _, _)| decision == "opened")),
+            "被拒的行必须写清楚原因: {rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -4123,6 +4321,7 @@ mod tests {
                 stop_price: None,
                 take_profit: None,
                 reason: "test reject".to_string(),
+                confidence: 0.0,
             })
         }
     }
@@ -5311,7 +5510,7 @@ mod tests {
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT, latency_ms INTEGER NOT NULL DEFAULT 0); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
+        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT, latency_ms INTEGER NOT NULL DEFAULT 0); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE signals(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, score REAL, features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
         Db {
             path: String::new(),
             conn: Arc::new(std::sync::Mutex::new(conn)),

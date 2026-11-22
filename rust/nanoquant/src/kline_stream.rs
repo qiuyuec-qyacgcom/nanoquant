@@ -256,6 +256,8 @@ impl KlineHub {
     }
 
     /// 运行状态，字段与 legacy 内核（已退役） `kline_hub.status()` 一致。
+    /// 运行状态；尚未挂到路由，接线后取消豁免。
+    #[allow(dead_code)]
     pub fn status(&self) -> Value {
         let streams = self.inner.streams.lock().expect("streams");
         let status = self.inner.status.lock().expect("status");
@@ -290,6 +292,8 @@ impl KlineHub {
         });
     }
 
+    /// 当前订阅的流名列表；尚未挂到路由，接线后取消豁免。
+    #[allow(dead_code)]
     fn stream_names(&self) -> Vec<String> {
         let streams = self.inner.streams.lock().expect("streams");
         streams

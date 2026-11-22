@@ -450,7 +450,6 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
     let manage = crate::runtime::EngineRuntime::manage_config(&prepared.strategy, &prepared.risk);
     let taker = prepared.risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
     EngineConfig {
-        symbol: prepared.symbol.clone(),
         interval_ms: history::interval_ms(&input.interval).unwrap_or(900_000),
         fee_bps: fee_bps(input.fee_bps, taker),
         slippage_bps: input.slippage_bps,

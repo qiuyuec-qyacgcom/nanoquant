@@ -1,11 +1,11 @@
 //! 引擎控制。启停状态双写 `engine` 配置组与 `engine_state` 表，
 //! 对齐 `api/routes/trade.py` 的 `control`。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -623,86 +623,6 @@ async fn reset_anchors(State(db): State<Db>) -> (StatusCode, Json<Value>) {
     )
 }
 
-#[derive(Deserialize)]
-struct FlattenBody {
-    confirm: String,
-    #[serde(default = "default_true")]
-    stop_engine: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-async fn flatten(State(db): State<Db>, Json(body): Json<FlattenBody>) -> (StatusCode, Json<Value>) {
-    if body.confirm != "FLATTEN" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"detail": "需要 confirm=FLATTEN"})),
-        );
-    }
-    let mode = current_mode(&db);
-    let mut closed = Vec::new();
-    let mut failures = Vec::new();
-    let positions: Vec<(i64, String, f64)> = {
-        let conn = db.conn.lock().expect("db");
-        let mut stmt = conn
-            .prepare("SELECT id, symbol, mark_price FROM positions WHERE status='open' AND mode=?1")
-            .expect("prepare flatten");
-        stmt.query_map([&mode], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, f64>(2)?))
-        })
-        .expect("query flatten")
-        .flatten()
-        .collect()
-    };
-    for (id, symbol, price) in positions {
-        match crate::execution::close_position(&db, id, price, "flatten", mode == "live") {
-            Ok(()) => closed.push(json!({"id": id, "symbol": symbol, "price": price})),
-            Err(error) => failures.push(json!({"id": id, "symbol": symbol, "error": error})),
-        }
-    }
-    if body.stop_engine {
-        write_state(&db, "enabled", "false");
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": failures.is_empty(),
-            "mode": mode,
-            "engine_stopped": body.stop_engine,
-            "closed": closed,
-            "failures": failures,
-        })),
-    )
-}
-
-async fn close_position(State(db): State<Db>, Path(id): Path<i64>) -> (StatusCode, Json<Value>) {
-    let row: Option<(String, String, f64)> = {
-        let conn = db.conn.lock().expect("db");
-        conn.query_row(
-            "SELECT mode, symbol, mark_price FROM positions WHERE id=?1 AND status='open'",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .expect("query position")
-    };
-    let Some((mode, symbol, price)) = row else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"detail": "仓位不存在或已关闭"})),
-        );
-    };
-    match crate::execution::close_position(&db, id, price, "manual", mode == "live") {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "id": id, "symbol": symbol, "exit_price": price})),
-        ),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"detail": error}))),
-    }
-}
-
 async fn status(State(db): State<Db>) -> Json<Value> {
     Json(read_status(&db))
 }
@@ -1254,6 +1174,8 @@ fn step(
     })
 }
 
+/// 引擎运行态。前端总览、引擎控制都读这一份，
+/// 账户权益、持仓、统计必须在这里齐活——少一个字段页面就显示 0。
 fn read_status(db: &Db) -> Value {
     let conn = db.conn.lock().expect("db");
     let mut stmt = conn
@@ -1271,16 +1193,337 @@ fn read_status(db: &Db) -> Value {
             .unwrap_or_default()
     };
     let mode = get("mode");
+    let mode = if mode.is_empty() {
+        "demo".to_string()
+    } else {
+        mode
+    };
+    let last_cycle = get("last_cycle_ts").parse::<i64>().unwrap_or(0);
+    let now = crate::now();
+    // 心跳年龄：后台任务还在跑就是新鲜的。引擎停用时后台仍然心跳，
+    // 所以 running 与 enabled 要分开看。
+    let heartbeat_age = if last_cycle > 0 {
+        (now - last_cycle).max(0)
+    } else {
+        -1
+    };
+    let running = (0..180).contains(&heartbeat_age);
+    let started_at = get("service_started_at").parse::<i64>().unwrap_or(0);
     json!({
         "enabled": get("enabled") == "true",
-        "mode": if mode.is_empty() { "demo".to_string() } else { mode },
+        "mode": mode,
+        "env": mode,
+        "env_label": if mode == "live" { "实盘 · 币安主网" } else { "模拟盘 · 币安测试网" },
+        "running": running,
+        "heartbeat_age": heartbeat_age,
+        "uptime": if started_at > 0 { (now - started_at).max(0) } else { 0 },
         // 前端只靠 enabled 分辨不出「后台任务是否真的跑过周期」，带上心跳便于判断
-        "last_cycle_ts": get("last_cycle_ts").parse::<i64>().unwrap_or(0),
+        "last_cycle_ts": last_cycle,
+        "last_cycle_ms": get("last_cycle_ms").parse::<i64>().unwrap_or(0),
         "last_error": get("last_error"),
+        "halted": get("halted"),
+        "account": account_view(&conn, &mode),
+        "positions": open_positions(&conn, &mode),
+        "stats": stats_view(&conn, &mode),
     })
 }
 
-pub fn seed(path: &std::path::Path) -> Db {
+/// 账户视图：权益 = 钱包 + 浮动盈亏。
+/// 优先用最近一次账户快照；没有快照就用权益采样；再没有就用配置的初始资金，
+/// 不能返回 0——0 会被当成「账户爆仓」。
+fn account_view(conn: &rusqlite::Connection, mode: &str) -> Value {
+    let now = crate::now();
+    let mut margin_used = 0.0;
+    let mut unrealized = 0.0;
+    let mut position_count = 0_i64;
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT side, qty, entry_price, mark_price, margin, venue_unrealized, venue_ts \
+         FROM positions WHERE mode=?1 AND status='open'",
+    ) {
+        if let Ok(rows) = stmt.query_map([mode], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (side, qty, entry, mark, margin, venue_unrealized, venue_ts) = row;
+                let direction = if side == "long" { 1.0 } else { -1.0 };
+                let mark = if mark == 0.0 { entry } else { mark };
+                let fresh = venue_ts > 0 && now - venue_ts < VENUE_FRESH_SEC;
+                unrealized += if fresh {
+                    venue_unrealized
+                } else {
+                    (mark - entry) * qty * direction
+                };
+                margin_used += margin;
+                position_count += 1;
+            }
+        }
+    }
+    let snapshot: Option<Value> = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [format!("snapshot.{mode}")],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let snapshot_equity = snapshot
+        .as_ref()
+        .and_then(|value| value["account"]["equity"].as_f64());
+    let snapshot_available = snapshot
+        .as_ref()
+        .and_then(|value| value["account"]["available_balance"].as_f64());
+    let point: Option<(f64, f64)> = conn
+        .query_row(
+            "SELECT wallet, available FROM equity_points WHERE mode=?1 ORDER BY ts DESC LIMIT 1",
+            [mode],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let initial = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='engine'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value["initial_equity"].as_f64())
+        .unwrap_or(1000.0);
+    let (wallet, available, source) = match (snapshot_equity, point) {
+        (Some(equity), _) => (
+            (equity - unrealized).max(0.0),
+            snapshot_available.unwrap_or(0.0),
+            "snapshot",
+        ),
+        (None, Some((wallet, available))) => (wallet, available, "ledger"),
+        (None, None) => (initial, initial, "initial"),
+    };
+    let equity = wallet + unrealized;
+    json!({
+        "equity": round4(equity),
+        "wallet": round4(wallet),
+        "available": round4(available),
+        "unrealized": round4(unrealized),
+        "margin_used": round4(margin_used),
+        "positions": position_count,
+        "mode": mode,
+        "source": source,
+        "stale": false,
+        "error": "",
+    })
+}
+
+fn round4(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (value * 10_000.0).round() / 10_000.0
+}
+
+/// 当前环境的在仓持仓，字段与 /engine/positions 一致。
+fn open_positions(conn: &rusqlite::Connection, mode: &str) -> Vec<Value> {
+    let now = crate::now();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, symbol, side, qty, entry_price, mark_price, leverage, margin, sl_price, tp_price, \
+         opened_at, status, mode, venue_unrealized, venue_ts, partial_taken_at \
+         FROM positions WHERE mode = ?1 AND status='open' ORDER BY opened_at DESC LIMIT 100",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([mode], |r| {
+        let side: String = r.get(2)?;
+        let qty: f64 = r.get(3)?;
+        let entry: f64 = r.get(4)?;
+        let mark: f64 = r.get(5)?;
+        let leverage: f64 = r.get(6)?;
+        let margin: f64 = r.get(7)?;
+        let venue_unrealized: f64 = r.get(13)?;
+        let venue_ts: i64 = r.get(14)?;
+        let partial_at: i64 = r.get(15)?;
+        position_row(
+            r,
+            &side,
+            qty,
+            entry,
+            mark,
+            leverage,
+            margin,
+            venue_unrealized,
+            venue_ts,
+            partial_at,
+            now,
+        )
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 总览用的统计：已实现盈亏、胜率、连亏、冷却、死信、执行质量。
+fn stats_view(conn: &rusqlite::Connection, mode: &str) -> Value {
+    let mut trades = 0_i64;
+    let mut wins = 0_i64;
+    let mut losses = 0_i64;
+    let mut realized_pnl = 0.0;
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT pnl FROM trades WHERE mode=?1 ORDER BY closed_at DESC LIMIT 200")
+    {
+        if let Ok(rows) = stmt.query_map([mode], |r| r.get::<_, f64>(0)) {
+            for pnl in rows.flatten() {
+                trades += 1;
+                realized_pnl += pnl;
+                if pnl > 0.0 {
+                    wins += 1;
+                } else if pnl < 0.0 {
+                    losses += 1;
+                }
+            }
+        }
+    }
+    let win_rate = if trades == 0 {
+        0.0
+    } else {
+        (wins as f64 / trades as f64 * 100.0 * 100.0).round() / 100.0
+    };
+    let consecutive_losses = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key='consecutive_losses'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let guard_until = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key='sl_guard_until'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let stoploss_guard_remaining = (guard_until - crate::now()).max(0);
+    let mut cooldowns = serde_json::Map::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT symbol, until_ts, reason FROM cooldowns WHERE until_ts > ?1")
+    {
+        if let Ok(rows) = stmt.query_map([crate::now()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (symbol, until_ts, reason) = row;
+                cooldowns.insert(
+                    symbol,
+                    json!({
+                        "until_ts": until_ts,
+                        "remaining": (until_ts - crate::now()).max(0),
+                        "reason": reason,
+                    }),
+                );
+            }
+        }
+    }
+    let dead_pending = conn
+        .query_row(
+            "SELECT COUNT(*) FROM write_failures WHERE resolved=0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let dead_stuck = conn
+        .query_row(
+            "SELECT COUNT(*) FROM write_failures WHERE resolved=0 AND auto_attempts >= 5",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let dead_last_ts = conn
+        .query_row("SELECT COALESCE(MAX(ts),0) FROM write_failures", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0);
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut slippage: Vec<f64> = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT key, value FROM engine_state WHERE key LIKE 'execution.%'")
+    {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for row in rows.flatten() {
+                let (key, value) = row;
+                let Ok(parsed) = value.parse::<f64>() else {
+                    continue;
+                };
+                if !parsed.is_finite() {
+                    continue;
+                }
+                if key.contains("slippage") {
+                    slippage.push(parsed);
+                } else {
+                    latencies.push(parsed);
+                }
+            }
+        }
+    }
+    latencies.sort_by(f64::total_cmp);
+    slippage.sort_by(f64::total_cmp);
+    let percentile = |values: &[f64], q: f64| -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let index = ((values.len() as f64 * q).floor() as usize).min(values.len() - 1);
+        (values[index] * 100.0).round() / 100.0
+    };
+    let average = |values: &[f64]| -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = values.iter().sum();
+        (sum / values.len() as f64 * 100.0).round() / 100.0
+    };
+    json!({
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "realized_pnl": round4(realized_pnl),
+        "consecutive_losses": consecutive_losses,
+        "cooldowns": cooldowns,
+        "stoploss_guard_remaining": stoploss_guard_remaining,
+        "dead_letters": {
+            "pending": dead_pending,
+            "stuck": dead_stuck,
+            "last_ts": dead_last_ts,
+        },
+        "execution": {
+            "latency_p50_ms": percentile(&latencies, 0.50),
+            "latency_p95_ms": percentile(&latencies, 0.95),
+            "avg_slippage_bps": average(&slippage),
+            "order_count": latencies.len() as i64,
+        },
+    })
+}
+
+/// 测试夹具：建一张最小可用的引擎库（positions / orders / trades / engine_state）。
+///
+/// 仅测试可见；正式构建不编译，避免把夹具当成可用 API。
+#[cfg(test)]
+fn seed(path: &std::path::Path) -> Db {
     let _ = std::fs::remove_file(path);
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -1433,6 +1676,16 @@ mod tests {
             body.get("last_cycle_ts").is_some(),
             "状态里要能看到周期心跳: {body}"
         );
+        // 总览页直接读这份状态：权益、持仓、统计缺一个就会显示 0 或空表。
+        assert!(
+            body["account"]["equity"].as_f64().unwrap_or(0.0) > 0.0,
+            "账户权益不能是 0: {body}"
+        );
+        assert!(body["account"]["wallet"].is_number(), "{body}");
+        assert!(body["account"]["available"].is_number(), "{body}");
+        assert!(body["positions"].is_array(), "{body}");
+        assert!(body["stats"]["trades"].is_number(), "{body}");
+        assert!(body["stats"]["win_rate"].is_number(), "{body}");
     }
 
     #[tokio::test]

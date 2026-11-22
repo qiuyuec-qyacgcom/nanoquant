@@ -84,6 +84,95 @@ pub fn retry_anchor(now: i64) -> i64 {
     now - (AUTO_INTERVAL_SEC - AUTO_RETRY_SEC)
 }
 
+/// 自动备份的检查间隔（秒）：与备份页承诺的「下一轮检查（≤15 分钟）」一致。
+const AUTO_CHECK_INTERVAL_SEC: u64 = 15 * 60;
+
+/// 写回「上次执行时间」：自动备份的成功锚点与失败重试锚点都落在这里。
+fn write_last_run_ts(conn: &Connection, last_run_ts: i64) -> Result<(), String> {
+    let mut cfg = setting(conn, "backup");
+    if !cfg.is_object() {
+        cfg = json!({});
+    }
+    cfg["last_run_ts"] = json!(last_run_ts);
+    let value = serde_json::to_string(&cfg).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO app_settings(key, value, updated_at) VALUES('backup', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        rusqlite::params![value, crate::now()],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 到点且开启了每日自动备份时执行一次；成功写回本次时间，失败写回一小时后重试的锚点。
+/// 返回 `Ok(None)` 表示本轮未到期或未开启自动备份。
+pub fn maybe_auto_backup(state: &AppState) -> Result<Option<Value>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    let (auto_daily, last_run_ts) = {
+        let conn = db.conn.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        let cfg = backup_config(&conn);
+        (
+            cfg["auto_daily"].as_bool().unwrap_or(true),
+            cfg["last_run_ts"].as_i64().unwrap_or(0),
+        )
+    };
+    if !auto_daily {
+        return Ok(None);
+    }
+    let now = crate::now();
+    if next_run_ts(last_run_ts) > now {
+        return Ok(None);
+    }
+    let input = CreateIn {
+        name: "auto".to_string(),
+        settings_groups: None,
+        tables: None,
+        files: None,
+        encrypt: None,
+        created_by: Some("auto".to_string()),
+    };
+    let outcome = create_backup_inner(state, input);
+    // 成功记本次时间；失败按「一小时后重试」回拨，避免大库失败时每 15 分钟打一次磁盘。
+    let anchor = if outcome.is_ok() {
+        now
+    } else {
+        retry_anchor(now)
+    };
+    {
+        let conn = db.conn.lock().map_err(|_| "数据库锁被占用".to_string())?;
+        write_last_run_ts(&conn, anchor)?;
+    }
+    match outcome {
+        Ok(value) => Ok(Some(value)),
+        Err((status, body)) => {
+            let detail = body["detail"].as_str().unwrap_or("未知错误").to_string();
+            state.events.record(
+                "error",
+                "backup",
+                &format!("自动备份失败: {detail}"),
+                json!({"next_retry_sec": AUTO_RETRY_SEC}),
+            );
+            Err(format!("自动备份失败({status}): {detail}"))
+        }
+    }
+}
+
+/// 自动备份调度：每 15 分钟检查一次，到点就备份一次。
+/// 与交易引擎解耦：引擎停用时同样要备份。
+pub async fn spawn_auto_backup_task(state: AppState) {
+    loop {
+        let snapshot = state.clone();
+        match tokio::task::spawn_blocking(move || maybe_auto_backup(&snapshot)).await {
+            Ok(Err(error)) => tracing::warn!(%error, "自动备份未完成"),
+            Ok(Ok(_)) => {}
+            Err(error) => tracing::error!(%error, "自动备份任务异常"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(AUTO_CHECK_INTERVAL_SEC)).await;
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/backup/options", get(options))
@@ -106,6 +195,10 @@ struct CreateIn {
     tables: Option<Vec<String>>,
     files: Option<Vec<String>>,
     encrypt: Option<bool>,
+    /// 任务来源：手工创建留空（记 manual），自动备份记 auto。
+    /// 外部请求无法伪造——HTTP 入口会把这个字段清空。
+    #[serde(default)]
+    created_by: Option<String>,
 }
 
 fn data_dir(db: &Db) -> PathBuf {
@@ -275,8 +368,10 @@ async fn jobs(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode,
 
 async fn create(
     State(state): State<AppState>,
-    Json(input): Json<CreateIn>,
+    Json(mut input): Json<CreateIn>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // 外部请求不能自称自动备份：任务来源只由内部调度器决定。
+    input.created_by = None;
     create_backup(&state, input).map(Json)
 }
 
@@ -294,6 +389,8 @@ fn create_backup_inner(
     let encrypt = input
         .encrypt
         .unwrap_or_else(|| cfg["encrypt"].as_bool().unwrap_or(true));
+    // 任务来源：默认手工，只有内部调度器会传 auto。
+    let created_by = input.created_by.as_deref().unwrap_or("manual").to_string();
     let groups: Vec<String> = input
         .settings_groups
         .unwrap_or_else(|| {
@@ -360,7 +457,7 @@ fn create_backup_inner(
     let manifest = json!({
         "version": 1,
         "created_at": ts,
-        "created_by": "manual",
+        "created_by": created_by,
         "settings_groups": groups,
         "tables": tables,
         "files": files,
@@ -417,7 +514,7 @@ fn create_backup_inner(
         encrypt,
         "ok",
         &format!("配置组 {} 个, 表 {} 张", groups.len(), tables.len()),
-        "manual",
+        &created_by,
     )?;
     apply_retention(&db, cfg["retention"].as_u64().unwrap_or(10) as usize);
     state.events.record(
@@ -597,6 +694,7 @@ fn restore_inner(
             tables: None,
             files: None,
             encrypt: Some(job.encrypted),
+            created_by: None,
         },
     )
     .map_err(|error| {
@@ -1128,6 +1226,7 @@ pub fn create_standalone(
             tables: None,
             files: None,
             encrypt: Some(encrypt),
+            created_by: None,
         },
     )
     .map_err(status_detail)
@@ -1175,6 +1274,7 @@ pub fn drill(db_path: &str, key_file: &Path, keep: bool) -> Result<Value, String
             tables: Some(vec!["app_settings".to_string()]),
             files: None,
             encrypt: Some(true),
+            created_by: None,
         },
     ) {
         Ok(value) => value,
@@ -1407,6 +1507,53 @@ mod tests {
             "回拨后必须仍未到一天，否则下一轮又会触发"
         );
         assert_eq!(recorded + 24 * 3600 - now, 3600, "失败后恰好一小时再试");
+    }
+
+    #[test]
+    fn auto_backup_runs_once_a_day_and_records_the_anchor() {
+        let dir = std::env::temp_dir().join(format!("nq-auto-backup-{}", crate::now_millis()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        crate::bootstrap::initialize(&db_path, &dir.join(".master_key"), Some("test-password"))
+            .unwrap();
+        let db = crate::db::Db::open(&db_path.to_string_lossy()).unwrap();
+        let state = crate::test_state(Some(db));
+        // 备份默认加密：测试自带的默认主密钥不是合法 Fernet 密钥，这里换成 32 字节原文。
+        {
+            let mut security = state.auth.security.lock().unwrap();
+            security.master_key = vec![7u8; 32];
+        }
+
+        // 默认开启且从未执行过：到点应当立刻备份一次。
+        let first = maybe_auto_backup(&state).expect("自动备份不应报错");
+        assert!(first.is_some(), "到点后应当执行一次自动备份");
+        let recorded = {
+            let db = state.db.clone().unwrap();
+            let conn = db.conn.lock().unwrap();
+            let cfg = setting(&conn, "backup");
+            cfg["last_run_ts"].as_i64().unwrap_or(0)
+        };
+        assert!(recorded > 0, "应当写回上次执行时间");
+
+        // 紧接着再调一次：未到期，应当跳过。
+        let second = maybe_auto_backup(&state).expect("自动备份不应报错");
+        assert!(second.is_none(), "一天内不应重复备份");
+
+        // 关掉自动备份后不应再执行。
+        {
+            let db = state.db.clone().unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value = ?1 WHERE key = 'backup'",
+                [json!({"auto_daily": false, "last_run_ts": 0}).to_string()],
+            )
+            .unwrap();
+        }
+        let third = maybe_auto_backup(&state).expect("自动备份不应报错");
+        assert!(third.is_none(), "关闭自动备份后不应执行");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

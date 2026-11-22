@@ -52,7 +52,10 @@ struct TradeRow {
     ai_confidence: f64,
     ai_reason: String,
     signal_score: f64,
+    // 与 TRADE_COLUMNS 对齐的镜像字段；复盘判定尚未读取这两列，接线后取消豁免。
+    #[allow(dead_code)]
     mode: String,
+    #[allow(dead_code)]
     reviewed: bool,
     features: Value,
     mantra_ids: Value,

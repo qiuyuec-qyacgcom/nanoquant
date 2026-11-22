@@ -37,6 +37,7 @@ impl AiState {
         }
     }
 
+    #[cfg(test)]
     pub fn with_transport(db: Db, master_key: Vec<u8>, transport: Arc<dyn AiTransport>) -> Self {
         Self {
             db,

@@ -80,10 +80,12 @@ pub trait SnapshotProvider: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct DemoProvider {
     mark_price: f64,
 }
 
+#[cfg(test)]
 impl DemoProvider {
     pub fn new() -> Self {
         Self {
@@ -96,12 +98,14 @@ impl DemoProvider {
     }
 }
 
+#[cfg(test)]
 impl Default for DemoProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl SnapshotProvider for DemoProvider {
     fn snapshot(
         &self,
@@ -165,6 +169,7 @@ pub struct BinanceProvider {
 }
 
 impl BinanceProvider {
+    #[cfg(test)]
     pub fn new(
         base_url: impl Into<String>,
         symbol: impl Into<String>,
@@ -329,6 +334,7 @@ impl BinanceProvider {
     }
 
     /// 回测历史行情源：环境域名与当前 provider 一致，避免回测取到主网数据。
+    #[cfg(test)]
     pub fn history(&self) -> crate::history::BinanceHistory {
         crate::history::BinanceHistory::new(!self.base_url.contains("testnet"))
     }

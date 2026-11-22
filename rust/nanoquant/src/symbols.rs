@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+#[cfg(test)]
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -593,7 +594,11 @@ fn read_symbols(db: &Db) -> Vec<Value> {
     rows
 }
 
-pub fn seed(path: &std::path::Path) -> Db {
+/// 测试夹具：建一张只含本模块用到的表的最小库。
+///
+/// 仅测试可见；正式构建不编译，避免把夹具当成可用 API。
+#[cfg(test)]
+fn seed(path: &std::path::Path) -> Db {
     let _ = std::fs::remove_file(path);
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(

@@ -174,6 +174,8 @@ impl BinanceHistory {
         }
     }
 
+    /// 当前实例是否连实盘；尚未接入调用点，接线后取消豁免。
+    #[allow(dead_code)]
     pub fn is_live(&self) -> bool {
         self.live
     }
@@ -349,12 +351,14 @@ impl HistorySource for BinanceHistory {
 }
 
 /// 任意数据源前面的 TTL 缓存，测试与回测任务共用。
+#[cfg(test)]
 pub struct CachedHistory<S> {
     inner: S,
     ttl: Duration,
     cache: Mutex<HashMap<(String, String, i64, i64), (Instant, HistorySeries)>>,
 }
 
+#[cfg(test)]
 impl<S> CachedHistory<S> {
     pub fn new(inner: S) -> Self {
         Self {
@@ -365,6 +369,7 @@ impl<S> CachedHistory<S> {
     }
 }
 
+#[cfg(test)]
 impl<S: HistorySource> HistorySource for CachedHistory<S> {
     fn load(
         &self,

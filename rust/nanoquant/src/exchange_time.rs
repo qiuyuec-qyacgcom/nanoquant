@@ -4,6 +4,10 @@
 //! `-1021 Timestamp ... ahead of the server's time`，`recvWindow` 不能弥补未来的偏差。
 //! 这里用 `/fapi/v1/time` 定期测出「服务器时间 - 本地时间」的偏移，签名时间戳按偏移修正。
 
+// 「签名前强制对时」链路（ensure_fresh / is_fresh / SYNC_TTL_MS / synced_at_ms）已经实现，
+// 但签名路径目前只使用后台同步好的偏移，还没有调用点。接线后请删除本豁免。
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;

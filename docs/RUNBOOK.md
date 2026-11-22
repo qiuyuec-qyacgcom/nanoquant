@@ -62,12 +62,12 @@
 
 **症状**：`参数配置 → 备份策略 → 每日自动备份` 是开着的，但 `data/backups/` 一直是空的。
 
-**原因（已修）**：`backup.auto_daily` 曾经只是个存进数据库的开关，没有任何调度代码去读它。现在由 lifespan 里的后台任务每 15 分钟检查一次。
+**原因（已修）**：`backup.auto_daily` 曾经只是个存进数据库的开关，没有任何调度代码去读它。现在由主进程启动的后台任务（`backup::spawn_auto_backup_task`）每 15 分钟检查一次。
 
 自查三步：
 
 1. `GET /api/v1/backup/options` → `auto.enabled` 是否为 `true`
-2. `auto.last_run_ts` 是否为 0：为 0 表示从未成功跑过；非 0 则是上次成功时间
+2. `auto.last_run_ts` 是否为 0：为 0 表示从未跑过；非 0 则是上次执行时间（失败重试时写的是「一小时后重试」的锚点，不是成功时间）
 3. `GET /api/v1/backup/jobs` → `created_by = "auto"` 的记录
 
 失败不会静默：会写一条 `error` 级事件，并把重试时间推到 1 小时后（不是等第二天）。

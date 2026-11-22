@@ -92,6 +92,7 @@ impl EventBus {
     }
 
     /// 最近的事件，最新的在前。
+    #[cfg(test)]
     pub fn recent(&self, limit: usize) -> Vec<Value> {
         let ring = self.inner.ring.lock().expect("event ring");
         ring.iter().rev().take(limit).cloned().collect()

@@ -28,11 +28,15 @@ struct ColumnSpec {
     name: String,
     #[serde(rename = "type")]
     column_type: String,
+    // 建表语句只按 name/type 补列，这三列暂未参与迁移，接线后取消豁免。
     #[serde(default)]
+    #[allow(dead_code)]
     notnull: bool,
     #[serde(default, rename = "default")]
+    #[allow(dead_code)]
     default_value: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pk: bool,
 }
 

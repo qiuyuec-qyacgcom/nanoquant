@@ -5,7 +5,9 @@
 //! 2. 只有明确拒单（带 code 的 4xx）才算失败，可以继续下一轮；
 //! 3. 保护单结果未知时也绝不回退重发，否则会挂出两套条件单。
 
-use crate::submit::{BanGate, PreparedRequest, ReplyClass};
+#[cfg(test)]
+use crate::submit::ReplyClass;
+use crate::submit::{BanGate, PreparedRequest};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -226,6 +228,7 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
+    #[cfg(test)]
     pub(crate) fn class(&self) -> ReplyClass {
         match self {
             Reply::Filled { .. } => ReplyClass::Filled,
@@ -403,6 +406,7 @@ pub(crate) struct ProtectionLeg {
     pub legacy_params: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 pub(crate) fn protection_legs(
     symbol: &str,
     position_side: &str,

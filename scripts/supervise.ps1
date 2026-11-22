@@ -92,6 +92,15 @@ function Start-Engine($Bin) {
   Rotate-Log $ErrLog
   if (-not $env:NANOQUANT_HOME) { $env:NANOQUANT_HOME = $Root }
   $env:NANOQUANT_PORT = "$Port"
+  # 执行内核 sidecar（可选）：主服务靠 EXEC_TCP 找到它。
+  # 起不来也不影响下单——Rust 内核直连交易所。
+  if (-not $env:EXEC_TCP) {
+    $sidecarScript = Join-Path $Root 'scripts\start-sidecar.ps1'
+    if (Test-Path $sidecarScript) {
+      & $sidecarScript -Addr '127.0.0.1:9101' -Detach | Out-Null
+      if ($LASTEXITCODE -eq 0) { $env:EXEC_TCP = '127.0.0.1:9101' }
+    }
+  }
   Write-SupLog "启动进程: $Bin (port $Port, home $env:NANOQUANT_HOME)"
   return Start-Process -FilePath $Bin `
     -WorkingDirectory $Root `

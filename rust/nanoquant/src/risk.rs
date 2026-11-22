@@ -96,6 +96,7 @@ pub fn global_gates(input: &RiskInput) -> Gate {
 }
 
 /// 一笔在仓，只保留闸门要看的字段。
+#[cfg(test)]
 pub struct OpenPosition {
     pub symbol: String,
     pub side: String,
@@ -104,6 +105,7 @@ pub struct OpenPosition {
 /// 单标的闸门：已持有该标的、持仓数上限、同向上限、冷却。
 ///
 /// `same_direction_limit <= 0` 表示不限制同向。冷却只看该标的自己的到期时间。
+#[cfg(test)]
 pub fn symbol_gates(
     symbol: &str,
     side: &str,
@@ -137,6 +139,7 @@ pub fn symbol_gates(
 ///
 /// AI 或信号给的杠杆只是建议：低于下限抬上去，高于上限压下来。
 /// 交易所允许的上限更低时以交易所为准，安全优先。
+#[cfg(test)]
 pub fn choose_leverage(global_min: i64, global_max: i64, exchange_max: i64, suggested: f64) -> i64 {
     let upper = 1.max(global_max.min(exchange_max).min(100));
     let lower = 1.max(global_min.min(upper));

@@ -39,6 +39,19 @@ const filteredEvents = computed(() =>
   levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
 )
 
+/** 执行内核状态：已连接 / 未连接 / 未部署（Rust 内核直连交易所，未部署不影响下单） */
+const execTag = computed(() => {
+  if (!sidecar.value) return { text: '读取中…', cls: 'tag-dim' }
+  if (sidecar.value.connected) return { text: '已连接', cls: 'tag-long' }
+  if (sidecar.value.configured) return { text: '未连接', cls: 'tag-warn' }
+  return { text: '未部署', cls: 'tag-dim' }
+})
+
+/** 耗时：没有样本就显示「—」，不显示 0ms */
+function msText(value: unknown): string {
+  return value === null || value === undefined ? '—' : `${value}ms`
+}
+
 async function runDiagnostics() {
   checking.value = true
   try {
@@ -72,13 +85,12 @@ async function selfTestSidecar() {
   try {
     const res = await http.post('/system/exec-sidecar/self-test', {})
     if (res.ok) {
-      // 这里只验证端点可达；逐字节签名比对要用 ops verify-sidecar
-      app.notify(`执行内核端点可达（${res.endpoint}）`, 'ok')
+      // 这里只验证 health 协议能应答；逐字节签名比对要用 ops verify-sidecar
+      app.notify('执行内核端点可达（' + res.endpoint + '）', 'ok')
     } else {
       app.notify(res.detail || '自检失败', 'error')
     }
-    if (res.mode) sidecar.value = res
-    else sidecar.value = await http.get('/system/exec-sidecar')
+    sidecar.value = await http.get('/system/exec-sidecar')
   } catch (err: any) {
     app.notify(err?.message || '自检失败', 'error')
   } finally {
@@ -144,20 +156,7 @@ useSilentRefresh(load, 15000)
       <div class="panel-hd">
         <span class="panel-title">执行内核（sidecar）</span>
         <div class="right">
-          <span
-            class="tag"
-            :class="
-              !sidecar || sidecar.mode === 'off'
-                ? 'tag-dim'
-                : sidecar.counts?.mismatched
-                  ? 'tag-warn'
-                  : sidecar.connected
-                    ? 'tag-long'
-                    : 'tag-dim'
-            "
-          >
-            {{ !sidecar || sidecar.mode === 'off' ? '未启用' : sidecar.connected ? '已连接' : '未连接' }}
-          </span>
+          <span class="tag" :class="execTag.cls">{{ execTag.text }}</span>
           <router-link to="/admin/strategy?group=system" class="btn btn-xs">配置</router-link>
           <button class="btn btn-xs" :disabled="testing" @click="selfTestSidecar">
             {{ testing ? '自检中…' : '自检' }}
@@ -170,46 +169,34 @@ useSilentRefresh(load, 15000)
           {{ sidecar?.verdict || '读取中…' }}
         </div>
         <div class="hint">
-          端点只能通过环境变量配置：<code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>；
-          Rust 引擎直连交易所，未部署执行内核时自检失败不影响下单。
+          端点通过环境变量配置：<code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>
+          （Windows 可执行 <code>scripts\start-sidecar.ps1</code> 拉起 sidecar）；
+          Rust 内核直连交易所，未部署执行内核时自检失败不影响下单。
         </div>
         <table v-if="sidecar" class="table">
           <tbody>
             <tr>
-              <td class="muted" style="width: 120px">模式</td>
-              <td class="mono">
-                {{ sidecar.mode }}<span class="muted"> · 抽样 {{ sidecar.sample_pct }}% · 超时 {{ sidecar.timeout_ms }}ms</span>
-              </td>
-            </tr>
-            <tr>
               <td class="muted">通道</td>
               <td class="mono" style="white-space: normal">
-                {{ sidecar.target }}
-                <span class="muted">（{{ sidecar.connected ? '已连接' : '未连接' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
+                {{ sidecar.target || '未配置' }}
+                <span class="muted">（{{ sidecar.connected ? '已连接' : sidecar.configured ? '未连接' : '未部署' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
               </td>
             </tr>
             <tr>
-              <td class="muted">比对</td>
+              <td class="muted">自检</td>
               <td class="mono">
-                一致 <span class="up">{{ sidecar.counts.matched }}</span> ·
-                不一致
-                <span :class="sidecar.counts.mismatched ? 'down' : ''">{{ sidecar.counts.mismatched }}</span> ·
-                失败 {{ sidecar.counts.errors }} · 跳过 {{ sidecar.counts.skipped }}
+                共 {{ sidecar.counts?.checks ?? 0 }} 次 · 成功 <span class="up">{{ sidecar.counts?.ok ?? 0 }}</span> ·
+                失败 <span class="down">{{ sidecar.counts?.errors ?? 0 }}</span> ·
+                跳过 {{ sidecar.counts?.skipped ?? 0 }}
               </td>
             </tr>
             <tr>
-              <td class="muted">比对耗时</td>
+              <td class="muted">往返耗时</td>
               <td class="mono">
-                p50 {{ sidecar.latency_ms.p50 }}ms · p95 {{ sidecar.latency_ms.p95 }}ms · p99 {{ sidecar.latency_ms.p99 }}ms
+                最近 {{ msText(sidecar.latency_ms?.last) }} · p50 {{ msText(sidecar.latency_ms?.p50) }} ·
+                p95 {{ msText(sidecar.latency_ms?.p95) }} · p99 {{ msText(sidecar.latency_ms?.p99) }}
+                <span class="muted">（探活一帧 health 的往返）</span>
               </td>
-            </tr>
-            <tr v-if="sidecar.cooldown_ms">
-              <td class="muted">掉线静默</td>
-              <td class="mono">剩余 {{ (sidecar.cooldown_ms / 1000).toFixed(1) }}s（期间不投递比对，直接按降级处理）</td>
-            </tr>
-            <tr v-if="sidecar.last_error">
-              <td class="muted">最近错误</td>
-              <td class="mono down" style="white-space: normal">{{ sidecar.last_error }}</td>
             </tr>
           </tbody>
         </table>

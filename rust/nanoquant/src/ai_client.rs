@@ -155,7 +155,6 @@ pub struct ChatOutcome {
     pub ok: bool,
     pub text: String,
     pub provider: String,
-    pub provider_id: i64,
     pub model: String,
     pub latency_ms: i64,
     pub prompt_tokens: i64,
@@ -496,7 +495,6 @@ pub async fn chat(
 ) -> ChatOutcome {
     let mut outcome = ChatOutcome {
         provider: provider.name.clone(),
-        provider_id: provider.id,
         model: provider.model.clone(),
         ..Default::default()
     };
@@ -766,6 +764,7 @@ impl Default for AiConfig {
     }
 }
 
+#[cfg(test)]
 pub fn read_ai_config(db: &Db) -> AiConfig {
     match db.conn.lock() {
         Ok(conn) => read_ai_config_conn(&conn),

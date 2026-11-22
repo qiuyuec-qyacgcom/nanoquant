@@ -122,13 +122,6 @@ async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>
     json!({ "items": items }).into()
 }
 
-pub(crate) fn trade_effect_after(conn: &rusqlite::Connection, ts: i64, mode: &str) -> Value {
-    let mut effects = effects_for_changes(conn, &[(0, ts, mode.to_string())]);
-    effects
-        .remove(&0)
-        .unwrap_or_else(|| json!({ "trades": 0, "pnl": 0.0, "note": EFFECT_NOTE }))
-}
-
 /// 调参效果只是时间窗参考值，不构成因果结论。
 const EFFECT_NOTE: &str = "仅供参考，不控制行情与其他变更";
 
@@ -448,6 +441,8 @@ fn migrate(name: &str, raw: &Value) -> Value {
         }
         "system" => {
             out.remove("timezone_offset");
+            // 历史键清理：这些键随 legacy 内核退役后已无任何代码读取，
+            // 但老库的 app_settings.system 里可能还留着，不剔除会原样透到参数页。
             out.remove("exec_mode");
             out.remove("exec_socket");
             out.remove("exec_sample_pct");

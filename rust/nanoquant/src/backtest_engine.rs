@@ -19,7 +19,6 @@ use crate::providers::{candle_metrics, CandleSnapshot};
 use crate::trade_policy::{self, MarketFeatures, TradePolicy};
 
 pub const WARMUP: usize = 60;
-pub const DEFAULT_MAX_BARS_HOLD: usize = 0;
 pub const FUNDING_INTERVAL_MS: i64 = 8 * 3_600 * 1_000;
 pub const MAX_GRID_RUNS: usize = 48;
 pub const MIN_GRID_TRADES: usize = 8;
@@ -28,7 +27,6 @@ pub const MIN_FOLDS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub symbol: String,
     pub interval_ms: i64,
     pub fee_bps: f64,
     pub slippage_bps: f64,
@@ -1078,7 +1076,6 @@ mod tests {
 
     fn config() -> EngineConfig {
         EngineConfig {
-            symbol: "BTCUSDT".into(),
             interval_ms: 900_000,
             fee_bps: 5.0,
             slippage_bps: 2.0,

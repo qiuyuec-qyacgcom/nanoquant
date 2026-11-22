@@ -63,7 +63,10 @@ pub fn urlencode_component(raw: &str) -> String {
 
 /// 一笔已签名的请求：待签名的 query、签名本身、以及可以直接拼到 URL 上的最终 query。
 pub struct SignedQuery {
+    // 调试用：请求方目前只取 wire，query/signature 尚未被读取，接线后取消豁免。
+    #[allow(dead_code)]
     pub query: String,
+    #[allow(dead_code)]
     pub signature: String,
     pub wire: String,
 }
@@ -133,6 +136,7 @@ pub fn order_params(
 }
 
 /// 平仓单：多头仓卖出、空头仓买入，数量不超过持仓。
+#[cfg(test)]
 pub fn closing_order(
     symbol: &str,
     position_side: &str,
@@ -158,12 +162,14 @@ pub fn closing_order(
     )
 }
 
+#[cfg(test)]
 fn trim_qty(qty: f64) -> String {
     let text = format!("{qty:.8}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// 步进的小数位数。`0.001` → 3，整数步进 → 0。
+#[cfg(test)]
 fn step_decimals(step: f64) -> usize {
     if step <= 0.0 {
         return 8;
@@ -179,6 +185,7 @@ fn step_decimals(step: f64) -> usize {
 /// 按步进向下取整，并格式化成严格等于步进小数位的字符串。
 ///
 /// 直接用 `:.12f` 会把 `12417.2` 打成 `12417.200000000001`，币安以 -1111 拒单。
+#[cfg(test)]
 pub fn format_qty(qty: f64, step: f64) -> String {
     if step <= 0.0 {
         return trim_qty(qty);
@@ -192,6 +199,7 @@ pub fn format_qty(qty: f64, step: f64) -> String {
 /// algoType, symbol, side, type, triggerPrice, closePosition, workingType,
 /// priceProtect, clientAlgoId，双向持仓再追加 positionSide。
 /// 顺序错一位，签名就对不上，条件单会被拒，仓位等于裸奔。
+#[cfg(test)]
 pub fn protection_params(
     symbol: &str,
     position_side: &str,
@@ -233,6 +241,7 @@ pub fn protection_params(
 /// 发单结果。`Unknown` 表示请求可能已经到达交易所（超时、连接中断、5xx、429），
 /// 调用方绝不能重发，否则会挂出重复的订单或保护单。
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum SubmitOutcome {
     Accepted,
     Rejected(i64),
@@ -240,6 +249,7 @@ pub enum SubmitOutcome {
 }
 
 /// 写请求的结果分类。只读请求的失败可以换线路重试，写请求不行。
+#[cfg(test)]
 pub fn classify_submit(status: u16, code: i64) -> SubmitOutcome {
     if (200..300).contains(&status) {
         return SubmitOutcome::Accepted;
@@ -259,6 +269,7 @@ pub fn classify_submit(status: u16, code: i64) -> SubmitOutcome {
 ///
 /// 只有 -4120（必须走 Algo）、-1121（交易对无效）、-1102（缺参数）这三种明确拒绝才回落。
 /// 结果未知一律不回落：请求可能已经挂上，再走老接口就会挂出第二套保护单。
+#[cfg(test)]
 pub fn protection_should_fallback(outcome: &SubmitOutcome) -> bool {
     matches!(outcome, SubmitOutcome::Rejected(code) if matches!(code, -4120 | -1121 | -1102))
 }

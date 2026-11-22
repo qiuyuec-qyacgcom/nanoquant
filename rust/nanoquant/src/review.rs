@@ -13,6 +13,8 @@ pub(crate) struct ReviewDecision {
     pub stop_price: Option<f64>,
     pub take_profit: Option<f64>,
     pub reason: String,
+    /// AI 自报的置信度（0~1）；没有就 0。
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +39,38 @@ pub(crate) struct ReviewedEntry {
     pub stop_price: f64,
     pub take_profit: f64,
     pub reason: String,
+    /// 归一化后的动作：open_long / open_short / tighten。
+    pub action: String,
+    pub confidence: f64,
+}
+
+/// AI 复核没给出可执行结论：原因、动作、置信度都要留痕，
+/// 信号审计要能回答「为什么这一刀没开」。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReviewError {
+    pub reason: String,
+    /// none / reject / error。
+    pub action: String,
+    pub confidence: f64,
+}
+
+impl ReviewError {
+    fn new(reason: impl Into<String>, action: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            action: action.to_string(),
+            confidence: 0.0,
+        }
+    }
+}
+
+/// 方向 → AI 动作名。信号审计按这个字段还原「AI 站在哪一边」。
+fn action_for(side: &str) -> String {
+    match side {
+        "long" => "open_long".to_string(),
+        "short" => "open_short".to_string(),
+        _ => "hold".to_string(),
+    }
 }
 
 pub(crate) trait AiReviewer: Send + Sync {
@@ -47,16 +81,19 @@ pub(crate) fn apply_review(
     proposal: &EntryProposal,
     reviewer: Option<&dyn AiReviewer>,
     required: bool,
-) -> Result<ReviewedEntry, String> {
+) -> Result<ReviewedEntry, ReviewError> {
     if !proposal.leverage.is_finite() || proposal.leverage <= 0.0 {
-        return Err("原始杠杆无效".to_string());
+        return Err(ReviewError::new("原始杠杆无效", "reject"));
     }
     if !proposal.stop_price.is_finite() || proposal.stop_price <= 0.0 {
-        return Err("原始止损价无效".to_string());
+        return Err(ReviewError::new("原始止损价无效", "reject"));
     }
     let Some(reviewer) = reviewer else {
         if required {
-            return Err("AI 复核不可用，按 fail-closed 跳过".to_string());
+            return Err(ReviewError::new(
+                "AI 复核不可用，按 fail-closed 跳过",
+                "none",
+            ));
         }
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
@@ -64,11 +101,16 @@ pub(crate) fn apply_review(
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
+            action: action_for(&proposal.side),
+            confidence: 0.0,
         });
     };
-    let decision = reviewer
-        .review(proposal)
-        .map_err(|error| format!("AI 复核失败，按 fail-closed 跳过: {error}"))?;
+    let decision = reviewer.review(proposal).map_err(|error| {
+        ReviewError::new(
+            format!("AI 复核失败，按 fail-closed 跳过: {error}"),
+            "error",
+        )
+    })?;
     apply_decision(proposal, decision)
 }
 
@@ -85,36 +127,45 @@ fn clamp_leverage(proposal: &EntryProposal, requested: Option<f64>) -> Result<f6
 fn apply_decision(
     proposal: &EntryProposal,
     decision: ReviewDecision,
-) -> Result<ReviewedEntry, String> {
+) -> Result<ReviewedEntry, ReviewError> {
     let side = decision
         .side
         .clone()
         .unwrap_or_else(|| proposal.side.clone());
     let take_profit = decision.take_profit.unwrap_or(proposal.take_profit);
     if !take_profit.is_finite() || take_profit <= 0.0 {
-        return Err("AI 返回的止盈价无效".to_string());
+        return Err(ReviewError::new("AI 返回的止盈价无效", "reject"));
     }
+    let confidence = decision.confidence;
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
-            side,
+            side: side.clone(),
             leverage: clamp_leverage(
                 proposal,
                 decision.leverage.filter(|v| v.is_finite() && *v > 0.0),
-            )?,
+            )
+            .map_err(|error| ReviewError::new(error, "reject"))?,
             stop_price: proposal.stop_price,
             take_profit,
             reason: decision.reason,
+            action: action_for(&side),
+            confidence,
         }),
-        ReviewAction::Reject => Err(if decision.reason.is_empty() {
-            "AI 拒绝".to_string()
-        } else {
-            decision.reason
+        ReviewAction::Reject => Err(ReviewError {
+            reason: if decision.reason.is_empty() {
+                "AI 拒绝".to_string()
+            } else {
+                decision.reason
+            },
+            action: "reject".to_string(),
+            confidence,
         }),
         ReviewAction::Tighten => {
-            let leverage = clamp_leverage(proposal, decision.leverage)?;
+            let leverage = clamp_leverage(proposal, decision.leverage)
+                .map_err(|error| ReviewError::new(error, "reject"))?;
             let stop_price = match decision.stop_price {
                 Some(stop) if !stop.is_finite() || stop <= 0.0 => {
-                    return Err("AI 返回的止损价无效".to_string())
+                    return Err(ReviewError::new("AI 返回的止损价无效", "reject"))
                 }
                 Some(stop) if side != proposal.side => stop,
                 Some(stop) if side == "long" => stop.max(proposal.stop_price),
@@ -130,11 +181,13 @@ fn apply_decision(
                 }
             };
             Ok(ReviewedEntry {
-                side,
+                side: side.clone(),
                 leverage,
                 stop_price,
                 take_profit,
                 reason: decision.reason,
+                action: "tighten".to_string(),
+                confidence,
             })
         }
     }
@@ -174,6 +227,7 @@ mod tests {
             stop_price: None,
             take_profit: None,
             reason: String::new(),
+            confidence: 0.0,
         }
     }
 
@@ -194,6 +248,7 @@ mod tests {
             stop_price: Some(90.0),
             take_profit: None,
             reason: "tighten".to_string(),
+            confidence: 0.0,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
@@ -206,6 +261,7 @@ mod tests {
             stop_price: Some(97.0),
             take_profit: None,
             reason: "raise within bounds".to_string(),
+            confidence: 0.0,
         }));
         let reviewed = apply_review(&proposal(), Some(&raised), true).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
@@ -217,6 +273,7 @@ mod tests {
             stop_price: Some(97.0),
             take_profit: None,
             reason: "tighten".to_string(),
+            confidence: 0.0,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_low), true).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
@@ -240,6 +297,7 @@ mod tests {
             stop_price: None,
             take_profit: None,
             reason: "行情不匹配".to_string(),
+            confidence: 0.0,
         }));
         assert!(apply_review(&proposal(), Some(&reject), false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
@@ -257,6 +315,7 @@ mod tests {
             stop_price: Some(0.0),
             take_profit: None,
             reason: "bad".to_string(),
+            confidence: 0.0,
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
     }

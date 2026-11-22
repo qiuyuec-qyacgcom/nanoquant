@@ -29,6 +29,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("p99-real", "实盘链路口径 p99"),
     ("rtt-probe", "RTT 探针"),
     ("verify-sidecar", "执行内核签名逐字节比对"),
+    (
+        "show-exec-secret",
+        "输出当前交易环境的交易所 Secret（部署 sidecar 用，只打到标准输出）",
+    ),
+    (
+        "seed-symbols",
+        "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
+    ),
     ("mock-exec-sidecar", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
     ("verify-partial-tp", "部分止盈复核"),
@@ -348,6 +356,8 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "mock-exchange" => mock_service(&options, true),
         "mock-exec-sidecar" => mock_service(&options, false),
         "verify-sidecar" => verify_sidecar_command(&options),
+        "show-exec-secret" => show_exec_secret(&options, config),
+        "seed-symbols" => seed_symbols(&options),
         "contract-diff" => contract_diff_command(&options, config),
         "zero-python" => zero_python(&options, config),
         _ => Err((
@@ -395,6 +405,17 @@ fn print_help() {
 }
 
 fn print_human(value: &Value) {
+    // 密钥类命令要的是「纯文本一行」，脚本直接捕获就能用。
+    if let Some(secret) = value.get("raw_secret").and_then(Value::as_str) {
+        println!("{secret}");
+        return;
+    }
+    if value.get("seeded").is_some() {
+        if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+            println!("{detail}");
+            return;
+        }
+    }
     if value.get("graded").is_some() {
         print_zero_python_human(value);
         return;
@@ -468,6 +489,61 @@ fn print_zero_python_human(value: &Value) {
             value["archive"]["exec_in_archive"].as_u64().unwrap_or(0),
         );
     }
+}
+
+/// 为既有数据库补默认标的池。
+///
+/// bootstrap 只在「新建数据库」时写默认标的池，老库的池一直是空的：
+/// 引擎扫不到标的 → 每轮信号审计都是空的。这里对老库做一次幂等回填：
+/// 池为空才写入，非空一律不动（尊重用户自己增删过的池子）。
+fn seed_symbols(options: &Options) -> Result<(i32, Value), (i32, String)> {
+    let db = open_db(&options.db_path)?;
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| (1, "数据库连接锁被占用".to_string()))?;
+    let existing: i64 = conn
+        .query_row("SELECT COUNT(*) FROM trading_symbols", [], |row| row.get(0))
+        .map_err(|error| (1, format!("读取标的池失败: {error}")))?;
+    if existing > 0 {
+        return Ok((
+            0,
+            json!({
+                "ok": true,
+                "seeded": 0,
+                "dry_run": !options.apply,
+                "skipped": true,
+                "existing": existing,
+                "detail": format!("标的池已有 {existing} 个标的，未做任何改动"),
+            }),
+        ));
+    }
+    if !options.apply {
+        return Ok((
+            0,
+            json!({
+                "ok": true,
+                "seeded": 0,
+                "dry_run": true,
+                "skipped": false,
+                "existing": existing,
+                "detail": "标的池为空；加 --apply 执行写入".to_string(),
+            }),
+        ));
+    }
+    let seeded =
+        crate::bootstrap::seed_default_symbols(&conn, crate::now()).map_err(|error| (1, error))?;
+    Ok((
+        0,
+        json!({
+            "ok": true,
+            "seeded": seeded,
+            "dry_run": false,
+            "skipped": false,
+            "existing": existing,
+            "detail": format!("已写入 {seeded} 个默认标的（币安 U 本位规格）"),
+        }),
+    ))
 }
 
 fn open_db(path: &str) -> Result<Db, (i32, String)> {
@@ -555,6 +631,54 @@ fn preflight(options: &Options) -> Result<(i32, Value), (i32, String)> {
 fn master_key_path(options: &Options) -> Option<PathBuf> {
     let db = Path::new(&options.db_path);
     db.parent().map(|dir| dir.join(".master_key"))
+}
+
+/// 输出当前交易环境的交易所 Secret：sidecar 部署脚本要它才能签名。
+/// 只打到标准输出，不写日志、不进事件流。
+fn show_exec_secret(options: &Options, config: &Config) -> Result<(i32, Value), (i32, String)> {
+    let db = open_db(&options.db_path)?;
+    let mode = options
+        .mode
+        .clone()
+        .filter(|value| value == "live" || value == "demo")
+        .or_else(|| {
+            db.conn.lock().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM engine_state WHERE key='mode'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+        })
+        .unwrap_or_else(|| "demo".to_string());
+    let data = db
+        .setting("data")
+        .map_err(|error| (1, error.to_string()))?
+        .unwrap_or(Value::Null);
+    let field = if mode == "live" {
+        "live_api_secret_enc"
+    } else {
+        "demo_api_secret_enc"
+    };
+    let ciphertext = data[field].as_str().unwrap_or("").trim().to_string();
+    if ciphertext.is_empty() {
+        return Err((
+            1,
+            format!("{mode} 环境没有配置交易所 Secret（先在参数页填写 API 凭证）"),
+        ));
+    }
+    let key_raw = std::fs::read_to_string(&config.key_file)
+        .map_err(|error| (1, format!("读取主密钥失败: {error}")))?;
+    let secret =
+        crate::secret::decrypt_secret(key_raw.trim(), &ciphertext).map_err(|error| (1, error))?;
+    if secret.trim().is_empty() {
+        return Err((
+            1,
+            format!("{mode} 环境没有配置交易所 Secret（先在参数页填写 API 凭证）"),
+        ));
+    }
+    Ok((0, json!({"ok": true, "mode": mode, "raw_secret": secret})))
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -1620,22 +1744,18 @@ mod tests {
             home: PathBuf::from("."),
             data_dir: PathBuf::from("."),
             db_path: String::new(),
-            log_dir: PathBuf::from("."),
             key_file: PathBuf::from(".master_key"),
             host: "127.0.0.1".to_string(),
             port: 8899,
             admin_password: None,
             frontend: None,
-            exec_socket: None,
-            exec_secret: None,
-            exec_tcp: None,
         }
     }
 
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 18);
+        assert_eq!(text.len(), 20);
         for name in [
             "preflight",
             "reconcile",
@@ -1650,6 +1770,8 @@ mod tests {
             "p99-real",
             "rtt-probe",
             "verify-sidecar",
+            "show-exec-secret",
+            "seed-symbols",
             "mock-exec-sidecar",
             "mock-exchange",
             "verify-partial-tp",
@@ -1700,6 +1822,54 @@ mod tests {
         ));
         assert_eq!(security["token_version"], 1);
         assert_eq!(security["password_is_default"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_symbols_backfills_an_empty_pool_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("nq-cli-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        crate::bootstrap::initialize(&db_path, &dir.join(".master_key"), Some("test-password"))
+            .unwrap();
+        {
+            // 模拟老库：建库后清空标的池
+            let db = Db::open(db_path.to_string_lossy().as_ref()).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("DELETE FROM trading_symbols").unwrap();
+        }
+        let mut cfg = config();
+        cfg.db_path = db_path.to_string_lossy().into_owned();
+        let args = [
+            "ops".to_string(),
+            "seed-symbols".to_string(),
+            "--db".to_string(),
+            cfg.db_path.clone(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        let apply_args = [
+            "ops".to_string(),
+            "seed-symbols".to_string(),
+            "--apply".to_string(),
+            "--db".to_string(),
+            cfg.db_path.clone(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        let count = |db_path: &str| -> i64 {
+            let db = Db::open(db_path).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM trading_symbols", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(run(&args, &cfg), 0, "dry-run 应成功");
+        assert_eq!(count(&cfg.db_path), 0, "dry-run 不应写入");
+        assert_eq!(run(&apply_args, &cfg), 0, "空池应该被回填");
+        assert_eq!(count(&cfg.db_path), 3, "默认池应为 3 个标的");
+        assert_eq!(run(&apply_args, &cfg), 0, "重复执行应仍成功");
+        assert_eq!(count(&cfg.db_path), 3, "重复执行不应重复写入");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

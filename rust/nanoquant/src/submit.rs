@@ -19,10 +19,12 @@ pub struct Outcome {
     /// 结果未知：订单可能已经生效，必须查询确认，禁止重发。
     pub uncertain: bool,
     /// 可以换线路重试。只对没有副作用的只读请求为真。
+    #[allow(dead_code)]
     pub retry: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum ReplyClass {
     Filled,
     Accepted,
@@ -36,11 +38,13 @@ const UNCERTAIN_CODES: [i64; 4] = [-1000, -1006, -1007, -1021];
 
 /// 交易所线路。只读请求失败时切到下一条出口；写请求失败保持不动，
 /// 因为结果未知时换线路重发就是重复下单。只有一条线路时无处可换。
+#[cfg(test)]
 pub struct EndpointLine {
     bases: Vec<String>,
     pos: usize,
 }
 
+#[cfg(test)]
 impl EndpointLine {
     pub fn new(bases: &[&str]) -> Self {
         let bases: Vec<String> = bases
@@ -80,6 +84,7 @@ const BACKOFF_MAX_MS: i64 = 1_800_000;
 const BACKOFF_MAX_STREAK: u32 = 6;
 
 impl BanGate {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             until_ms: 0,
@@ -266,6 +271,7 @@ impl Transport {
         }
     }
 
+    #[cfg(test)]
     pub async fn send(&self, req: &PreparedRequest) -> Outcome {
         match self.send_raw(req).await {
             Ok((status, body)) => interpret(&req.method, status, &body),

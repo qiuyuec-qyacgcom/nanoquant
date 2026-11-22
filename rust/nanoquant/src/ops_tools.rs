@@ -497,6 +497,8 @@ fn handle_exchange_keepalive(
     }
 }
 
+/// 开发用 mock 交易所的连接入口；尚未接到任何自检命令，接线后取消豁免。
+#[allow(dead_code)]
 fn handle_exchange(
     mut stream: TcpStream,
     delay_ms: u64,

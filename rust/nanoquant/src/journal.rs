@@ -428,14 +428,6 @@ fn ranked_experiences(
         .collect()
 }
 
-fn retrieve_error(error: impl std::fmt::Display) -> JournalError {
-    tracing::warn!(%error, "读取场景经验失败");
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"detail": "读取场景经验失败"})),
-    )
-}
-
 fn scenario_similarity(
     symbol: &str,
     scenario: &Value,
@@ -726,36 +718,11 @@ fn lesson_text(
     format!("{symbol}{ctx} {side}{verdict} Δ{actual_pct:+.2}% →{target_pct:+.2}% c{confidence:.2}")
 }
 
-fn count_stats(
-    conn: &rusqlite::Connection,
-    where_sql: &str,
-    args: &[Box<dyn rusqlite::types::ToSql>],
-) -> Value {
-    let sql = format!("SELECT status, outcome FROM decision_journal {where_sql}");
-    let mut stmt = conn.prepare(&sql).expect("prepare stats");
-    let rows: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .expect("stats query")
-        .collect::<Result<_, _>>()
-        .expect("stats rows");
-    let total = rows.len();
-    let pending = rows.iter().filter(|(s, _)| s == "pending").count();
-    let labeled = rows.iter().filter(|(s, _)| s == "labeled").count();
-    let correct = rows.iter().filter(|(_, o)| o == "correct").count();
-    let wrong = rows.iter().filter(|(_, o)| o == "wrong").count();
-    let partial = rows.iter().filter(|(_, o)| o == "partial").count();
-    let judged = correct + wrong;
-    let accuracy = if judged == 0 {
-        0.0
-    } else {
-        (correct as f64 / judged as f64 * 10000.0).round() / 100.0
-    };
-    json!({ "total": total, "pending": pending, "labeled": labeled, "correct": correct, "wrong": wrong, "partial": partial, "accuracy": accuracy })
-}
-
-pub fn seed(path: &std::path::Path) -> Db {
+/// 测试夹具：建一张只含本模块用到的表的最小库。
+///
+/// 仅测试可见；正式构建不编译，避免把夹具当成可用 API。
+#[cfg(test)]
+fn seed(path: &std::path::Path) -> Db {
     let _ = std::fs::remove_file(path);
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(

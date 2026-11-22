@@ -1,20 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-#[allow(dead_code)]
 pub struct Config {
     pub home: PathBuf,
     pub data_dir: PathBuf,
     pub db_path: String,
-    pub log_dir: PathBuf,
     pub key_file: PathBuf,
     pub host: String,
     pub port: u16,
     pub admin_password: Option<String>,
     pub frontend: Option<PathBuf>,
-    pub exec_socket: Option<String>,
-    pub exec_secret: Option<String>,
-    pub exec_tcp: Option<String>,
 }
 
 impl Config {
@@ -32,9 +27,6 @@ impl Config {
             .unwrap_or_else(|| home.join("data"));
         let db_path = env::var("NANOQUANT_DB")
             .unwrap_or_else(|_| data_dir.join("nanoquant.db").to_string_lossy().into_owned());
-        let log_dir = env::var_os("NANOQUANT_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("logs"));
         let key_file = env::var_os("NANOQUANT_KEY_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join(".master_key"));
@@ -55,15 +47,11 @@ impl Config {
             home,
             data_dir,
             db_path,
-            log_dir,
             key_file,
             host,
             port,
             admin_password,
             frontend,
-            exec_socket: env::var("EXEC_SOCKET").ok().filter(|v| !v.is_empty()),
-            exec_secret: env::var("EXEC_SECRET").ok().filter(|v| !v.is_empty()),
-            exec_tcp: env::var("EXEC_TCP").ok().filter(|v| !v.is_empty()),
         }
     }
 }

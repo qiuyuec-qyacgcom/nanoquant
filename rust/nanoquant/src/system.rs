@@ -20,15 +20,75 @@ pub struct SystemState {
     runtime_probe: RuntimeProbe,
     logs_path: std::path::PathBuf,
     archives_dir: std::path::PathBuf,
+    // 告警冷却记账表；告警冷却链路尚未接线，接线后取消豁免。
+    #[allow(dead_code)]
     alert_last: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     exec: std::sync::Arc<std::sync::Mutex<ExecStats>>,
 }
 
+/// 执行内核的实测计数与往返耗时样本。
+///
+/// 每个数字都必须来自真实观测：探活成功记 ok、失败记 errors、
+/// 已连通但没配 Secret（没法比对签名）记 skipped。
+/// 签名逐字节比对不在进程内做（主服务用 Rust 内核自己签名），
+/// 真实签名比对用 `ops verify-sidecar`。
 #[derive(Clone, Default)]
 struct ExecStats {
     checks: i64,
-    mismatched: i64,
-    last_ms: f64,
+    ok: i64,
+    errors: i64,
+    skipped: i64,
+    /// 探活往返耗时样本（毫秒），只保留最近若干个用于算分位数。
+    latencies_ms: Vec<f64>,
+}
+
+/// 往返耗时样本保留上限：够算分位数，又不会把内存吃大。
+const EXEC_LATENCY_SAMPLES: usize = 64;
+
+impl ExecStats {
+    /// 记录一次探活往返耗时。任何触发探活的地方都记，样本才有意义。
+    fn observe_latency(&mut self, latency_ms: Option<f64>) {
+        let Some(ms) = latency_ms else { return };
+        self.latencies_ms.push(ms);
+        if self.latencies_ms.len() > EXEC_LATENCY_SAMPLES {
+            self.latencies_ms.remove(0);
+        }
+    }
+
+    /// 记一次自检：连通且配了 Secret 才算「可比对」。
+    fn record_check(&mut self, connected: bool, has_key: bool) {
+        self.checks += 1;
+        if !connected {
+            self.errors += 1;
+        } else if !has_key {
+            self.skipped += 1;
+        } else {
+            self.ok += 1;
+        }
+    }
+
+    /// 最近一次往返耗时与分位数。没有样本时返回 null，前端显示「—」而不是 0。
+    fn latency_view(&self) -> Value {
+        let mut ordered = self.latencies_ms.clone();
+        ordered.sort_by(f64::total_cmp);
+        let percentile = |q: f64| {
+            if ordered.is_empty() {
+                Value::Null
+            } else {
+                json!(round(
+                    ordered[((ordered.len() as f64 * q) as usize).min(ordered.len() - 1)],
+                    2
+                ))
+            }
+        };
+        json!({
+            "last": self.latencies_ms.last().copied().map(|value| round(value, 2)),
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "samples": ordered.len(),
+        })
+    }
 }
 
 impl SystemState {
@@ -75,12 +135,6 @@ impl SystemState {
                 expected = now + std::time::Duration::from_millis(50);
             }
         });
-    }
-
-    #[cfg(test)]
-    fn with_logs_path(mut self, path: std::path::PathBuf) -> Self {
-        self.logs_path = path;
-        self
     }
 }
 
@@ -651,6 +705,7 @@ fn archive_name_ok(name: &str) -> bool {
 }
 
 /// 归档指定表的旧行：gzip JSONL 落盘后再删除。表名白名单，避免任意 SQL。
+#[cfg(test)]
 pub(crate) fn archive_table(
     db: &Db,
     kind: &str,
@@ -718,6 +773,7 @@ pub(crate) fn archive_table(
     Ok((deleted, name))
 }
 
+#[cfg(test)]
 fn sql_value(row: &rusqlite::Row, index: usize) -> Value {
     use rusqlite::types::ValueRef;
     match row.get_ref(index) {
@@ -730,6 +786,7 @@ fn sql_value(row: &rusqlite::Row, index: usize) -> Value {
     }
 }
 
+#[cfg(test)]
 fn date_stamp(ts: i64) -> String {
     let days = ts.div_euclid(86_400);
     let z = days + 719_468;
@@ -750,7 +807,10 @@ struct AlertCfg {
     error_webhook: String,
     telegram_token: String,
     telegram_chat_id: String,
+    // 告警冷却与静默时段：判定函数已实现但告警发送尚未接入，接线后取消豁免。
+    #[allow(dead_code)]
     cooldown_sec: i64,
+    #[allow(dead_code)]
     quiet_hours: String,
 }
 
@@ -948,6 +1008,7 @@ async fn send_alerts(urls: &[String], cfg: &AlertCfg, text: &str) -> Vec<Value> 
 }
 
 /// 告警冷却：同一类别在窗口内只放行一次。返回 true 表示允许发送并已记账。
+#[cfg(test)]
 fn alert_allowed(
     last: &mut std::collections::HashMap<String, i64>,
     key: &str,
@@ -963,6 +1024,7 @@ fn alert_allowed(
 }
 
 /// 静默时段（支持跨天，如 23:00-07:00）；空串表示不静默。
+#[cfg(test)]
 fn in_quiet_hours(spec: &str, minutes_of_day: i64) -> bool {
     let Some((start, end)) = spec.trim().split_once('-') else {
         return false;
@@ -986,15 +1048,147 @@ fn in_quiet_hours(spec: &str, minutes_of_day: i64) -> bool {
     }
 }
 
+/// 执行内核探活结果。
+struct ExecProbe {
+    endpoint: Option<String>,
+    connected: bool,
+    algo: String,
+    detail: String,
+    /// 探一帧 health 的实测往返耗时（毫秒）。没探到就是 None，不填 0。
+    latency_ms: Option<f64>,
+}
+
+/// 探一次执行内核：发一帧 health 协议，能回就算「有内核」。
+/// 只 ping 端口不算数——端口开着不代表内核活着。
+fn exec_probe_state() -> ExecProbe {
+    let Some(endpoint) = exec_endpoint() else {
+        return ExecProbe {
+            endpoint: None,
+            connected: false,
+            algo: String::new(),
+            detail: "未部署执行内核（可选）：Rust 内核直连交易所签名下单，不影响交易".to_string(),
+            latency_ms: None,
+        };
+    };
+    let started = std::time::Instant::now();
+    match exec_probe(&endpoint) {
+        Some(response) => {
+            let algo = response
+                .get("algo")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            ExecProbe {
+                endpoint: Some(endpoint.clone()),
+                connected: true,
+                algo,
+                detail: format!("执行内核已连接（端点 {endpoint}）"),
+                latency_ms: Some(round(started.elapsed().as_secs_f64() * 1000.0, 2)),
+            }
+        }
+        None => ExecProbe {
+            endpoint: Some(endpoint.clone()),
+            connected: false,
+            algo: String::new(),
+            detail: format!("执行内核端点不可达（{endpoint}），保护单代发会失败"),
+            latency_ms: None,
+        },
+    }
+}
+
+/// 发一帧 health 协议，返回 sidecar 的应答。
+fn exec_probe(endpoint: &str) -> Option<Value> {
+    if let Some(path) = endpoint.strip_prefix("unix:") {
+        #[cfg(unix)]
+        {
+            return exec_probe_unix(path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return None;
+        }
+    }
+    exec_probe_tcp(endpoint.strip_prefix("tcp:").unwrap_or(endpoint))
+}
+
+fn exec_probe_tcp(address: &str) -> Option<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let stream = TcpStream::connect(address).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(800)))
+        .ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    writer
+        .write_all(b"{\"id\":\"probe\",\"op\":\"health\"}\n")
+        .ok()?;
+    writer.flush().ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    serde_json::from_str::<Value>(line.trim()).ok()
+}
+
+#[cfg(unix)]
+fn exec_probe_unix(path: &str) -> Option<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let mut stream = UnixStream::connect(path).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    writer
+        .write_all(b"{\"id\":\"probe\",\"op\":\"health\"}\n")
+        .ok()?;
+    writer.flush().ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    serde_json::from_str::<Value>(line.trim()).ok()
+}
+
+/// 当前交易环境是否配置了交易所 Secret（sidecar 要用它签名）。
+fn exec_secret_configured(conn: &rusqlite::Connection, mode: &str) -> bool {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key='data'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .map(|data| {
+        let field = if mode == "live" {
+            "live_api_secret_enc"
+        } else {
+            "demo_api_secret_enc"
+        };
+        data[field]
+            .as_str()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
     let conn = state.db.conn.lock().expect("db");
-    let mode = current_mode(&conn);
-    let endpoint = exec_endpoint();
-    let connected = endpoint.as_deref().is_some_and(endpoint_reachable);
+    let trading_mode = current_mode(&conn);
+    let has_key = exec_secret_configured(&conn, &trading_mode);
+    let probe = exec_probe_state();
     let stats = state
         .exec
         .lock()
-        .map(|stats| stats.clone())
+        .map(|mut stats| {
+            stats.observe_latency(probe.latency_ms);
+            stats.clone()
+        })
         .unwrap_or_default();
     let pending: i64 = conn
         .query_row(
@@ -1003,51 +1197,74 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let reason = if endpoint.is_none() {
-        "未配置执行内核端点（EXEC_TCP 或 EXEC_SOCKET）"
-    } else if connected {
-        ""
+    let verdict = if probe.connected && !has_key {
+        format!(
+            "{}；但当前交易环境没有配置交易所 Secret，sidecar 不能用于真实签名",
+            probe.detail
+        )
     } else {
-        "执行内核端点不可达"
+        probe.detail.clone()
     };
     Json(json!({
-        "mode": mode,
-        "configured": endpoint.is_some(),
-        "connected": connected,
-        "counts": {"checks": stats.checks, "mismatched": stats.mismatched},
-        "latency_ms": {"last": round(stats.last_ms, 2)},
+        "trading_mode": trading_mode,
+        "configured": probe.endpoint.is_some(),
+        "deployed": probe.connected,
+        "connected": probe.connected,
+        "target": probe.endpoint.clone().unwrap_or_default(),
+        "algo": probe.algo,
+        "has_key": has_key,
+        "counts": {
+            "checks": stats.checks,
+            "ok": stats.ok,
+            "errors": stats.errors,
+            "skipped": stats.skipped,
+        },
+        "latency_ms": stats.latency_view(),
         "order_ledger": {"pending": pending},
-        "reason": reason,
+        "verdict": verdict,
+        "reason": verdict,
     }))
 }
 
 async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
-    let endpoint = exec_endpoint();
-    let Some(endpoint) = endpoint else {
-        return json!({
-            "ok": false,
-            "connected": false,
-            "has_key": false,
-            "detail": "未配置执行内核端点：设置 EXEC_TCP=host:port 或 EXEC_SOCKET=/path/to.sock 后重启服务；Rust 引擎直连交易所，不用 sidecar 也可正常交易",
+    let conn = state.db.conn.lock().expect("db");
+    let mode = current_mode(&conn);
+    let has_key = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='data'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|data| {
+            let field = if mode == "live" {
+                "live_api_secret_enc"
+            } else {
+                "demo_api_secret_enc"
+            };
+            data[field]
+                .as_str()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
         })
-        .into();
-    };
-    let connected = endpoint_reachable(&endpoint);
+        .unwrap_or(false);
+    drop(conn);
+    let probe = exec_probe_state();
     if let Ok(mut stats) = state.exec.lock() {
-        stats.checks += 1;
-        if !connected {
-            stats.mismatched += 1;
-        }
+        stats.observe_latency(probe.latency_ms);
+        stats.record_check(probe.connected, has_key);
     }
     json!({
-        "ok": connected,
-        "connected": connected,
-        "endpoint": endpoint,
-        "has_key": false,
-        "detail": if connected {
-            "端点可达；签名逐字节比对需 P4 前用 ops verify-sidecar 完成"
+        "ok": probe.connected,
+        "connected": probe.connected,
+        "endpoint": probe.endpoint.clone().unwrap_or_default(),
+        "algo": probe.algo,
+        "has_key": has_key,
+        "detail": if probe.connected {
+            "端点可达（health 协议应答正常）；签名逐字节比对用 ops verify-sidecar".to_string()
         } else {
-            "执行内核不可达"
+            probe.detail.clone()
         },
     })
     .into()
@@ -1116,7 +1333,7 @@ async fn exec_reset(State(state): State<SystemState>) -> Json<Value> {
     }
     json!({
         "ok": true,
-        "counts": {"checks": 0, "mismatched": 0},
+        "counts": {"checks": 0, "ok": 0, "errors": 0, "skipped": 0},
         "detail": "仅清零观测计数，签名密钥与端点配置未被修改",
     })
     .into()
@@ -1817,6 +2034,8 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
         !ai_enabled || providers > 0,
         if !ai_enabled {
             "AI 未启用".to_string()
+        } else if providers == 0 {
+            "未配置 AI 供应商：AI 复核会 fail-closed 跳过开仓（去「AI 接入」页配置）".to_string()
         } else {
             format!("启用供应商 {providers} 个")
         },
@@ -1839,14 +2058,24 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
 
     let started = std::time::Instant::now();
     // 未配置视为正常（可选组件）；只有显式配置了却连不上才算异常。
-    let exec_ok = endpoint.is_none() || connected;
+    let exec_probe = exec_probe_state();
+    let exec_ok = exec_probe.endpoint.is_none() || exec_probe.connected;
     checks.push(diag_check(
         "执行内核",
         exec_ok,
-        match &endpoint {
-            Some(address) if connected => format!("端点 {address} (可达)"),
-            Some(address) => format!("端点 {address} (不可达，依赖它的保护单代发会失败)"),
-            None => "未配置 EXEC_TCP / EXEC_SOCKET（可选）；Rust 引擎直连交易所执行".to_string(),
+        if exec_probe.connected {
+            format!(
+                "{}（端点 {}，算法 {}）",
+                exec_probe.detail,
+                exec_probe.endpoint.clone().unwrap_or_default(),
+                if exec_probe.algo.is_empty() {
+                    "未知"
+                } else {
+                    &exec_probe.algo
+                }
+            )
+        } else {
+            exec_probe.detail.clone()
         },
         started,
     ));
@@ -2539,7 +2768,7 @@ mod tests {
             .with_state(SystemState::new(db.clone(), crate::now()));
         let (status, body) = request_json(app.clone(), "GET", "/api/v1/system/exec-sidecar").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.get("mode").is_some());
+        assert!(body.get("trading_mode").is_some());
         assert!(body.get("counts").is_some());
         assert!(body.get("order_ledger").is_some());
         let (_, tested) =
@@ -2551,7 +2780,7 @@ mod tests {
         let (_, reset) =
             request_json(app.clone(), "POST", "/api/v1/system/exec-sidecar/reset").await;
         assert_eq!(reset["counts"]["checks"], 0);
-        assert_eq!(reset["counts"]["mismatched"], 0);
+        assert_eq!(reset["counts"]["ok"], 0);
         let events: i64 = db
             .conn
             .lock()
@@ -2564,6 +2793,44 @@ mod tests {
             .unwrap();
         assert!(events >= 1, "reset 必须写审计");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exec_stats_never_report_a_placeholder_as_a_measurement() {
+        let mut stats = ExecStats::default();
+        // 没有实测样本时必须是 null：前端据此显示「—」，不能显示 0ms
+        let view = stats.latency_view();
+        assert!(view["last"].is_null(), "无样本时 last 必须是 null: {view}");
+        assert!(view["p50"].is_null());
+        assert!(view["p95"].is_null());
+        assert!(view["p99"].is_null());
+        assert_eq!(view["samples"], 0);
+
+        stats.observe_latency(Some(1.0));
+        stats.observe_latency(Some(2.0));
+        stats.observe_latency(Some(3.0));
+        let view = stats.latency_view();
+        assert_eq!(view["last"], json!(3.0), "最近一次是最后记的样本");
+        assert_eq!(view["p50"], json!(2.0));
+        assert_eq!(view["p95"], json!(3.0));
+        assert_eq!(view["p99"], json!(3.0));
+        assert_eq!(view["samples"], 3);
+
+        // 样本上限：不能无限涨
+        for _ in 0..(EXEC_LATENCY_SAMPLES + 10) {
+            stats.observe_latency(Some(1.0));
+        }
+        assert_eq!(stats.latencies_ms.len(), EXEC_LATENCY_SAMPLES);
+
+        // 计数语义：探活失败是 errors，连通但没 Secret 是 skipped
+        let mut stats = ExecStats::default();
+        stats.record_check(false, false);
+        assert_eq!(stats.checks, 1);
+        assert_eq!(stats.errors, 1);
+        stats.record_check(true, false);
+        assert_eq!(stats.skipped, 1, "连通但没配 Secret 记 skipped");
+        stats.record_check(true, true);
+        assert_eq!(stats.ok, 1);
     }
 
     #[tokio::test]

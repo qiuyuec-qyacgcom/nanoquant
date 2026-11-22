@@ -43,6 +43,12 @@ pub fn initialize(
         .map_err(|e| format!("写入默认配置 {key} 失败: {e}"))?;
     }
 
+    if created_database {
+        // 新库没有标的池 = 引擎没有可扫的标的 = 每轮信号审计都是空的。
+        // 先给一份默认池（合约规格取自币安在线表），用户可在「标的池」页增删。
+        seed_default_symbols(&conn, now)?;
+    }
+
     let existing_security = conn
         .query_row(
             "SELECT value FROM app_settings WHERE key='security'",
@@ -138,6 +144,38 @@ pub fn initialize(
         generated_password,
         tables: tables as usize,
     })
+}
+
+/// 默认标的池。规格对齐币安 U 本位在线合约表（2026-11 采样）：
+/// BTCUSDT tick 0.1 / step 0.001 / 最小名义 50，ETHUSDT 0.01 / 0.001 / 20，
+/// SOLUSDT 0.01 / 0.01 / 5。
+pub(crate) fn seed_default_symbols(conn: &Connection, now: i64) -> Result<usize, String> {
+    const DEFAULTS: &[(&str, &str, &str, &str, &str, f64, i64, i64)] = &[
+        // symbol, name, tier, tick_sz, min_sz, min_notional, max_leverage, sort_order
+        ("BTCUSDT", "BTC", "tier_1", "0.10", "0.001", 50.0, 20, 1),
+        ("ETHUSDT", "ETH", "tier_1", "0.01", "0.001", 20.0, 20, 2),
+        ("SOLUSDT", "SOL", "tier_2", "0.01", "0.01", 5.0, 10, 3),
+    ];
+    for (symbol, name, tier, tick_sz, min_sz, min_notional, max_leverage, order) in DEFAULTS {
+        conn.execute(
+            "INSERT OR IGNORE INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,\
+             precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) \
+             VALUES(?1,?2,?3,2.2,1,?4,3,?5,?6,?7,1,0,'',?8,?9,?9)",
+            params![
+                symbol,
+                name,
+                tier,
+                max_leverage,
+                tick_sz,
+                min_sz,
+                min_notional,
+                order,
+                now
+            ],
+        )
+        .map_err(|e| format!("写入默认标的 {symbol} 失败: {e}"))?;
+    }
+    Ok(DEFAULTS.len())
 }
 
 fn validate_master_key(path: &Path) -> Result<(), String> {

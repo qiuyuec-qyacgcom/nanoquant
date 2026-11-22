@@ -5,6 +5,7 @@
 //! R / ATR / 百分比等分析性数值原样保留。
 
 /// 只匹配「杠杆」与「N倍 / Nx」同时出现的表述，替换成中性提示。
+#[cfg(test)]
 pub fn strip_leverage_hint(rule: &str) -> String {
     let mut out = String::with_capacity(rule.len());
     let chars: Vec<char> = rule.chars().collect();
@@ -21,6 +22,7 @@ pub fn strip_leverage_hint(rule: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn starts_with_word(chars: &[char], i: usize, word: &str) -> bool {
     let w: Vec<char> = word.chars().collect();
     chars[i..].len() >= w.len()
@@ -30,11 +32,13 @@ fn starts_with_word(chars: &[char], i: usize, word: &str) -> bool {
             .all(|(a, b)| a.to_lowercase().next() == b.to_lowercase().next())
 }
 
+#[cfg(test)]
 fn is_unit(c: char) -> bool {
     matches!(c, '倍' | 'x' | 'X' | '×')
 }
 
 /// 从 i 起是否是一段杠杆倍数表述，返回其结束位置。
+#[cfg(test)]
 fn leverage_span(chars: &[char], i: usize) -> Option<usize> {
     // 「杠杆/leverage」在前，数字在后
     for word in ["杠杆", "leverage"] {

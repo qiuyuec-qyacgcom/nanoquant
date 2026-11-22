@@ -260,9 +260,9 @@ cat <<EOF
 
 接下来（按顺序）：
   1) 确认 socket：ls -l /run/nanoquant/exec.sock
-  2) 逐字节比对（与 legacy 内核（已退役）同密钥）：
+  2) 逐字节比对（与主服务自己的签名对齐）：
        EXEC_SECRET='<密钥>' $APP_HOME/rust/nanoquant/target/release/nanoquant ops verify-sidecar --target unix:/run/nanoquant/exec.sock
   3) 后台「系统诊断 → 执行内核」：确认 target=unix:/run/nanoquant/exec.sock、connected=true
-  4) 点「自检」→ 两侧 88 字符 base64 一致后，exec_mode 先设 shadow 观察 → mismatched 恒 0 再切 enforce（灰度 24h）
-  5) 换 Secret 后必须点「清零」，否则切换窗口内会残留不一致计数
+  4) 点「自检」：面板会记下探活一帧 health 的实测往返耗时（没有样本时显示「—」而不是 0ms）
+  5) 换 Secret 后点「清零」，清掉上一把密钥留下的观测计数
 EOF
