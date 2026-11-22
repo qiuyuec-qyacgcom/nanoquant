@@ -306,23 +306,95 @@ async fn main() {
             ai_market::BinanceMarketSource::new(db.clone()),
         ))
     });
+    // 执行内核端点：EXEC_TCP 优先，其次 EXEC_SOCKET（与旧 exec_endpoint 同口径）。
+    let exec_endpoint = std::env::var("EXEC_TCP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|addr| format!("tcp:{addr}"))
+        .or_else(|| {
+            std::env::var("EXEC_SOCKET")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|path| format!("unix:{path}"))
+        });
+    let mut core_client: Option<std::sync::Arc<exec_client::ExecClient>> = None;
+    let mut core_ready = false;
+    match exec_endpoint {
+        Some(endpoint) => {
+            let client = exec_client::ExecClient::new(&endpoint);
+            match client.handshake().await {
+                Ok(hello) => {
+                    info!(
+                        endpoint = %endpoint,
+                        kernel_version = hello["kernel_version"].as_str().unwrap_or("?"),
+                        "执行内核握手成功"
+                    );
+                    client.spawn_maintainer();
+                    client.spawn_reporter();
+                    exec_client::install(client.clone());
+                    core_client = Some(client);
+                    core_ready = true;
+                }
+                Err(error) => {
+                    // 强依赖：握手失败 → 交易引擎不启动（HTTP 查询/前端照常）。
+                    eprintln!("执行内核握手失败：{error}，交易引擎不启动");
+                    if let Some(db) = database.as_ref() {
+                        if let Ok(conn) = db.conn.lock() {
+                            let _ = conn.execute(
+                                "INSERT INTO engine_events(ts, level, category, message, payload) \
+                                 VALUES(?1, 'error', 'exec', ?2, '{}')",
+                                (
+                                    now(),
+                                    format!("执行内核握手失败，交易引擎未启动：{error}"),
+                                ),
+                            );
+                        }
+                    }
+                    exec_client::install(client.clone());
+                    core_client = Some(client);
+                }
+            }
+        }
+        None => {
+            eprintln!("未配置 EXEC_TCP/EXEC_SOCKET，交易引擎不启动（默认执行内核为必选组件）");
+            if let Some(db) = database.as_ref() {
+                if let Ok(conn) = db.conn.lock() {
+                    let _ = conn.execute(
+                        "INSERT INTO engine_events(ts, level, category, message, payload) \
+                         VALUES(?1, 'error', 'exec', ?2, '{}')",
+                        (now(), "未配置执行内核端点（EXEC_TCP/EXEC_SOCKET），交易引擎未启动"),
+                    );
+                }
+            }
+        }
+    }
     // 先落一个「准备中」：任务真正跑起来会改成 alive，锁没拿到会改成 lock_failed。
     // 面板靠这个字段区分「引擎停了」和「引擎压根没起来」。
     set_runtime_task(database.as_ref(), "starting");
     let runtime_task = match (database.clone(), ai_state.clone()) {
-        (Some(db), Some(ai)) => match runtime::acquire_lock(&data_dir) {
-            Ok(lock) => Some(tokio::spawn(
-                runtime::EngineRuntime::new(db, lock, master_key, events_bus)
+        (Some(db), Some(ai)) if core_ready => match runtime::acquire_lock(&data_dir) {
+            Ok(lock) => {
+                let mut engine = runtime::EngineRuntime::new(db, lock, master_key, events_bus)
                     .with_reviewer(std::sync::Arc::new(ai_review::EngineAiReviewer::new(ai)))
-                    .with_cycle(cycle_signal, cycle_busy, runtime_active)
-                    .run(stop_rx),
-            )),
+                    .with_cycle(cycle_signal, cycle_busy, runtime_active);
+                if let Some(client) = core_client.clone() {
+                    engine = engine.with_exec_client(client);
+                }
+                Some(tokio::spawn(engine.run(stop_rx)))
+            }
             Err(error) => {
                 tracing::warn!(%error, "无法获取引擎锁，仅启动 HTTP 服务");
                 set_runtime_task(database.as_ref(), "lock_failed");
                 None
             }
         },
+        (Some(_), Some(_)) => {
+            tracing::warn!("执行内核未连接，交易引擎不启动");
+            set_runtime_task(database.as_ref(), "exec_unavailable");
+            None
+        }
         _ => {
             set_runtime_task(database.as_ref(), "no_runtime");
             None
@@ -391,6 +463,10 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
 
         let system_state = system::SystemState::new(database.clone(), state.started_at)
             .with_auth(state.auth.clone());
+        let system_state = match exec_client::global() {
+            Some(client) => system_state.with_exec_client(client),
+            None => system_state,
+        };
         system_state.start_runtime_probe();
         system::spawn_alert_task(system_state.clone());
         api = api.merge(system::routes().with_state(system_state));

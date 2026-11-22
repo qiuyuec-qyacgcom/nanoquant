@@ -129,6 +129,8 @@ pub struct PreparedRequest {
     pub method: String,
     pub url: String,
     pub headers: std::collections::BTreeMap<String, String>,
+    /// 签名净耗时（毫秒，观测用，不参与序列化）
+    pub sign_ms: f64,
 }
 
 /// 组装一笔签名请求。
@@ -150,13 +152,16 @@ pub fn build_request(
         .filter(|(_, v)| !v.is_empty())
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    let sign_started = std::time::Instant::now();
     let signed = crate::sign::signed_query(&kept, secret, timestamp_ms, recv_window_ms);
+    let sign_ms = sign_started.elapsed().as_secs_f64() * 1000.0;
     let mut headers = std::collections::BTreeMap::new();
     headers.insert("X-MBX-APIKEY".to_string(), api_key.to_string());
     PreparedRequest {
         method: method.to_string(),
         url: format!("{}{path}?{}", base.trim_end_matches('/'), signed.wire),
         headers,
+        sign_ms,
     }
 }
 
@@ -502,6 +507,7 @@ mod tests {
             method: "POST".to_string(),
             url: format!("http://{addr}/fapi/v1/order"),
             headers: std::collections::BTreeMap::new(),
+            sign_ms: 0.0,
         };
         let outcome = transport.send(&req).await;
         assert!(outcome.uncertain, "连接被掐断时订单可能已受理，禁止重发");
@@ -528,6 +534,7 @@ mod tests {
             method: "POST".to_string(),
             url: format!("http://{addr}/fapi/v1/order"),
             headers: std::collections::BTreeMap::new(),
+            sign_ms: 0.0,
         };
         let outcome = transport.send(&req).await;
         assert!(!outcome.uncertain, "400 带 -2019 是明确拒单，不是结果未知");

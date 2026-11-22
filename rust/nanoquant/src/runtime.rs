@@ -24,6 +24,11 @@ pub(crate) fn liveness_threshold_sec(interval_sec: u64) -> i64 {
     (interval_sec as i64 * 2 + 60).max(MIN_THRESHOLD_SEC)
 }
 
+/// Instant 到现在的毫秒数（f64，用于七段延迟样本）。
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 /// 当前扫描周期（秒）。读不到配置就用最小值。
 pub(crate) fn cycle_interval_sec(conn: &rusqlite::Connection) -> u64 {
     conn.query_row(
@@ -192,6 +197,8 @@ pub(crate) struct EngineRuntime {
     ai: Option<crate::ai_providers::AiState>,
     /// 同一笔成交的复盘可能被平仓与补扫同时命中，进程内去重。
     reviewing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    /// 七段延迟样本的异步上报通道；None = 执行内核未连接。
+    exec_client: Option<Arc<crate::exec_client::ExecClient>>,
 }
 
 #[derive(Clone)]
@@ -1215,6 +1222,7 @@ impl EngineRuntime {
             reviewer,
             ai,
             reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            exec_client: None,
         }
     }
 
@@ -1288,6 +1296,23 @@ impl EngineRuntime {
         self.cycle_busy = cycle_busy;
         self.runtime_active = runtime_active;
         self
+    }
+
+    pub(crate) fn with_exec_client(
+        mut self,
+        client: Arc<crate::exec_client::ExecClient>,
+    ) -> Self {
+        self.exec_client = Some(client);
+        self
+    }
+
+    /// 把一段下单延迟样本投进有界上报队列；队列满由客户端计数丢弃，绝不阻塞下单。
+    fn report_segments(&self, samples: &[(&'static str, f64)]) {
+        if let Some(client) = &self.exec_client {
+            for (segment, ms) in samples {
+                client.record(segment, *ms);
+            }
+        }
     }
 
     fn record_equity_point(
@@ -3195,11 +3220,14 @@ impl EngineRuntime {
         let mut gate = self.ban_gate();
         let mut failures = Vec::new();
         for (index, plan) in plans.into_iter().enumerate() {
+            let t_total = Instant::now();
+            let t_plan = Instant::now();
             let filter = filters.get(&plan.symbol).copied().unwrap_or_default();
             let qty = match crate::live::admit_qty(plan.qty, plan.mark_price, &filter, buffer) {
                 Ok(qty) => qty,
                 Err(error) => {
                     failures.push(format!("{} {error}", plan.symbol));
+                    self.report_segments(&[("total", elapsed_ms(t_total))]);
                     continue;
                 }
             };
@@ -3216,6 +3244,10 @@ impl EngineRuntime {
                     Ok(request) => request,
                     Err(error) => {
                         failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
+                        self.report_segments(&[
+                            ("total", elapsed_ms(t_total)),
+                            ("plan", elapsed_ms(t_plan)),
+                        ]);
                         continue;
                     }
                 };
@@ -3230,11 +3262,24 @@ impl EngineRuntime {
                     || body["leverage"].as_i64() != Some(leverage)
                 {
                     failures.push(format!("{} 无法确认交易所杠杆，跳过开仓", plan.symbol));
+                    self.report_segments(&[
+                        ("total", elapsed_ms(t_total)),
+                        ("plan", elapsed_ms(t_plan)),
+                    ]);
                     continue;
                 }
             }
             let client_order_id = crate::live::client_order_id("nq", &plan.purpose, index);
-            self.reserve_order(&plan, &client_order_id, qty)?;
+            let t_persist = Instant::now();
+            if let Err(error) = self.reserve_order(&plan, &client_order_id, qty) {
+                self.report_segments(&[
+                    ("total", elapsed_ms(t_total)),
+                    ("plan", elapsed_ms(t_plan)),
+                    ("persist", elapsed_ms(t_persist)),
+                ]);
+                return Err(error);
+            }
+            let reserve_ms = elapsed_ms(t_persist);
             let spec = crate::live::OrderSpec {
                 symbol: plan.symbol.clone(),
                 side: plan.side.clone(),
@@ -3257,12 +3302,23 @@ impl EngineRuntime {
             {
                 Ok(request) => request,
                 Err(error) => {
-                    self.update_order_status(&client_order_id, "REJECTED", "")?;
+                    let update = self.update_order_status(&client_order_id, "REJECTED", "");
                     failures.push(format!("{} 发单前被拦截：{error}", plan.symbol));
+                    self.report_segments(&[
+                        ("total", elapsed_ms(t_total)),
+                        ("plan", elapsed_ms(t_plan)),
+                        ("persist", reserve_ms),
+                    ]);
+                    update?;
                     continue;
                 }
             };
+            let plan_at_build = elapsed_ms(t_plan);
+            let sign_ms = request.sign_ms;
+            let plan_ms = (plan_at_build - reserve_ms - sign_ms).max(0.0);
+            let t_http = Instant::now();
             let mut reply = crate::live::submit(gateway, &request).await;
+            let http_ms = elapsed_ms(t_http);
             if let crate::live::Reply::Rejected {
                 code: -1003,
                 message,
@@ -3271,16 +3327,38 @@ impl EngineRuntime {
                 // 限频封禁：记进熔断，后面的请求在本地就拦下，避免续期。
                 gate.observe(message, crate::now_millis());
             }
+            let t_wait = Instant::now();
             if reply == crate::live::Reply::Unknown {
                 reply = self
                     .resolve_live(creds, gateway, &plan.symbol, &client_order_id)
                     .await;
             }
-            if let Some(failure) =
-                self.settle_live(&plan, &client_order_id, qty, fee_rate, &reply)?
-            {
-                failures.push(failure);
+            let wait_ms = elapsed_ms(t_wait);
+            let t_settle = Instant::now();
+            match self.settle_live(&plan, &client_order_id, qty, fee_rate, &reply) {
+                Ok(Some(failure)) => failures.push(failure),
+                Ok(None) => {}
+                Err(error) => {
+                    self.report_segments(&[
+                        ("total", elapsed_ms(t_total)),
+                        ("plan", plan_ms),
+                        ("sign", sign_ms),
+                        ("http", http_ms),
+                        ("wait", wait_ms),
+                        ("persist", reserve_ms + elapsed_ms(t_settle)),
+                    ]);
+                    return Err(error);
+                }
             }
+            let persist_ms = reserve_ms + elapsed_ms(t_settle);
+            self.report_segments(&[
+                ("total", elapsed_ms(t_total)),
+                ("plan", plan_ms),
+                ("sign", sign_ms),
+                ("http", http_ms),
+                ("wait", wait_ms),
+                ("persist", persist_ms),
+            ]);
         }
         failures.extend(
             self.reconcile_pending(creds, gateway, fee_rate)
@@ -3288,7 +3366,10 @@ impl EngineRuntime {
                 .into_iter()
                 .map(|failure| format!("对账: {failure}")),
         );
-        failures.extend(self.ensure_protection(creds, gateway, dual_side).await?);
+        let t_protect = Instant::now();
+        let protect_failures = self.ensure_protection(creds, gateway, dual_side).await?;
+        self.report_segments(&[("protect", elapsed_ms(t_protect))]);
+        failures.extend(protect_failures);
         self.save_ban_gate(&gate);
         Ok(failures)
     }

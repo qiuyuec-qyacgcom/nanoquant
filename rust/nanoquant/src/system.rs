@@ -25,6 +25,7 @@ pub struct SystemState {
     /// 告警冷却记账表：同一类别在冷却窗口内只推一次。
     alert_last: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     exec: std::sync::Arc<std::sync::Mutex<ExecStats>>,
+    exec_client: Option<std::sync::Arc<crate::exec_client::ExecClient>>,
 }
 
 /// 执行内核的实测计数与往返耗时样本。
@@ -133,11 +134,20 @@ impl SystemState {
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
             exec: std::sync::Arc::new(std::sync::Mutex::new(ExecStats::default())),
+            exec_client: None,
         }
     }
 
     pub fn with_auth(mut self, auth: AuthState) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_exec_client(
+        mut self,
+        client: std::sync::Arc<crate::exec_client::ExecClient>,
+    ) -> Self {
+        self.exec_client = Some(client);
         self
     }
 

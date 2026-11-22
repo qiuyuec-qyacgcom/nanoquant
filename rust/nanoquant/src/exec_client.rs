@@ -18,6 +18,17 @@ const RECONNECT_BASE: Duration = Duration::from_millis(250);
 const RECONNECT_CAP: Duration = Duration::from_secs(8);
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(800);
 
+static GLOBAL: std::sync::OnceLock<Arc<ExecClient>> = std::sync::OnceLock::new();
+
+/// 主服务进程内唯一的执行内核客户端（供 engine 等只持有 Db 的路由读取）。
+pub fn install(client: Arc<ExecClient>) {
+    let _ = GLOBAL.set(client);
+}
+
+pub fn global() -> Option<Arc<ExecClient>> {
+    GLOBAL.get().cloned()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnState {
     Connected,
