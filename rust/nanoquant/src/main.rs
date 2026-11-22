@@ -291,7 +291,7 @@ async fn main() {
     // 与交易引擎解耦：引擎停用时同样要备份。
     let auto_backup_state = state.clone();
     tokio::spawn(backup::spawn_auto_backup_task(auto_backup_state));
-    let app = router(state, config.frontend.clone());
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("绑定 {addr} 失败: {e}"));
@@ -370,6 +370,7 @@ async fn main() {
             }
         }
     }
+    let app = router(state, config.frontend.clone());
     // 先落一个「准备中」：任务真正跑起来会改成 alive，锁没拿到会改成 lock_failed。
     // 面板靠这个字段区分「引擎停了」和「引擎压根没起来」。
     set_runtime_task(database.as_ref(), "starting");

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 pub const SEGMENTS: [&str; 7] = ["total", "plan", "sign", "http", "wait", "protect", "persist"];
 const QUEUE_BOUND: usize = 8192;
 const BATCH_MAX: usize = 64;
