@@ -1,3 +1,4 @@
+mod metrics;
 mod model;
 mod sign;
 
