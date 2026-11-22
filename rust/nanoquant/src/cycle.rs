@@ -229,6 +229,7 @@ mod tests {
             quote_volume: 1e8,
             spread_bps: 2.0,
             strength: 0.9,
+            preview_side: None,
         }];
         input.positions = std::slice::from_ref(&pos);
         input.candidates = &candidates;
@@ -267,6 +268,7 @@ mod tests {
             quote_volume: 1e8,
             spread_bps: 2.0,
             strength: 0.9,
+            preview_side: None,
         }];
         input.local = &local;
         input.exit_prices = &exit_prices;

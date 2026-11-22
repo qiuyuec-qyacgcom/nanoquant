@@ -2007,6 +2007,47 @@ impl EngineRuntime {
                 .unwrap_or(2.0)
                 .clamp(1.0, 20.0);
         let max_gaps = strategy["max_data_gaps"].as_u64().unwrap_or(1).min(20) as usize;
+        let relative_strength: std::collections::BTreeMap<String, f64> = {
+            let mut returns = Vec::new();
+            for market in &snapshot.markets {
+                if market.candles.len() < 21 {
+                    continue;
+                }
+                let last = market.candles.last().map(|candle| candle.close);
+                let previous = market.candles[market.candles.len() - 21].close;
+                if let Some(last) = last.filter(|value| value.is_finite() && previous > 0.0) {
+                    returns.push((market.symbol.clone(), last / previous - 1.0));
+                }
+            }
+            let mean = if returns.is_empty() {
+                0.0
+            } else {
+                returns.iter().map(|(_, value)| value).sum::<f64>() / returns.len() as f64
+            };
+            let sd = if returns.is_empty() {
+                0.0
+            } else {
+                (returns
+                    .iter()
+                    .map(|(_, value)| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / returns.len() as f64)
+                    .sqrt()
+            };
+            returns
+                .into_iter()
+                .map(|(symbol, value)| {
+                    (
+                        symbol,
+                        if sd > 0.0 {
+                            ((value - mean) / sd).clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        },
+                    )
+                })
+                .collect()
+        };
         let candidates: Vec<_> = snapshot
             .markets
             .iter()
@@ -2023,6 +2064,24 @@ impl EngineRuntime {
                         pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms
                     })
                     .count();
+                let preview = crate::trade_policy::preview(
+                    &market.candles,
+                    market.mark_price,
+                    metric.atr,
+                    crate::trade_policy::MarketFeatures {
+                        funding_rate: market.funding_rate,
+                        open_interest_change_pct: market.open_interest_change_pct,
+                        relative_strength: relative_strength
+                            .get(&market.symbol)
+                            .copied()
+                            .unwrap_or(0.0),
+                        relative_strength_available: relative_strength.contains_key(&market.symbol),
+                    },
+                );
+                let (strength, preview_side) = match preview {
+                    Some(preview) => (preview.score.abs(), Some(preview.side)),
+                    None => (0.0, None),
+                };
                 crate::scan::Candidate {
                     symbol: market.symbol.clone(),
                     data_ok: fresh && gaps <= max_gaps,
@@ -2030,7 +2089,8 @@ impl EngineRuntime {
                     vol_ratio: metric.vol_ratio,
                     quote_volume: market.quote_volume,
                     spread_bps: market.spread_bps,
-                    strength: 0.0,
+                    strength,
+                    preview_side,
                 }
             })
             .collect();
@@ -2133,8 +2193,9 @@ impl EngineRuntime {
                 }
                 Some(
                     crate::signal_audit::AuditSignal::new(&candidate.symbol)
-                        .with_direction("flat")
+                        .with_direction(candidate.preview_side.unwrap_or("flat"))
                         .with_score(candidate.strength)
+                        .with_stage("gate")
                         .with_features(serde_json::json!({
                             "atr_pct": candidate.atr_pct,
                             "vol_ratio": candidate.vol_ratio,
@@ -4280,6 +4341,35 @@ mod tests {
                 || rows.iter().any(|(_, decision, _, _)| decision == "opened")),
             "被拒的行必须写清楚原因: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn gate_rejections_keep_preview_direction_score_and_stage() {
+        let (db, mut snapshot) = entry_fixture().await;
+        let market = &mut snapshot.markets[0];
+        let len = market.candles.len();
+        for candle in market.candles.iter_mut().take(len - 1).skip(len - 20) {
+            candle.volume = 100.0;
+        }
+        market.candles.last_mut().unwrap().volume = 0.01;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (direction, score, features): (String, f64, String) = conn
+            .query_row(
+                "SELECT direction, score, features FROM signals WHERE mode='demo' AND decision='rejected' \
+                 AND reject_reason LIKE '%量能%' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            direction == "long" || direction == "short",
+            "初筛拒绝行应保留预览方向: {direction}"
+        );
+        assert!(score.abs() > 0.0, "初筛拒绝行应保留预览评分: {score}");
+        let value: serde_json::Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["stage"], "gate");
     }
 
     #[tokio::test]

@@ -24,13 +24,32 @@ pub(crate) struct TradeSignal {
     pub reason: String,
 }
 
-pub(crate) fn evaluate(
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Preview {
+    pub side: &'static str,
+    pub score: f64,
+}
+
+struct Core {
+    volume_ratio: f64,
+    atr_pct: f64,
+    regime: &'static str,
+    rs: f64,
+    breakout: f64,
+    carry: f64,
+    flow: f64,
+    score: f64,
+    agreement: usize,
+    coverage: f64,
+    confidence: f64,
+}
+
+fn core(
     candles: &[crate::providers::CandleSnapshot],
     mark: f64,
     atr: f64,
-    policy: TradePolicy,
     features: MarketFeatures,
-) -> Option<TradeSignal> {
+) -> Option<Core> {
     if candles.len() < 30 || !mark.is_finite() || mark <= 0.0 || !atr.is_finite() || atr <= 0.0 {
         return None;
     }
@@ -49,13 +68,7 @@ pub(crate) fn evaluate(
     } else {
         0.0
     };
-    if volume_ratio < policy.volume_ratio_min {
-        return None;
-    }
     let atr_pct = atr / last * 100.0;
-    if !(0.05..=4.0).contains(&atr_pct) {
-        return None;
-    }
     let adx_value = adx(candles, 14)?;
     let fast = ema(&closes, 9)?;
     let slow = ema(&closes, 21)?;
@@ -113,7 +126,7 @@ pub(crate) fn evaluate(
     };
     let raw = w_rs * rs + w_break * breakout + w_carry * carry + w_flow * flow;
     let score = (raw * 1.2).tanh();
-    if score.abs() < policy.base_threshold {
+    if !score.is_finite() {
         return None;
     }
     let direction = score.signum();
@@ -121,9 +134,6 @@ pub(crate) fn evaluate(
         .iter()
         .filter(|factor| factor.abs() > 0.15 && factor.signum() == direction)
         .count();
-    if agreement < 2 {
-        return None;
-    }
     let mut coverage: f64 = 0.60;
     if features.relative_strength_available {
         coverage += 0.15;
@@ -136,7 +146,63 @@ pub(crate) fn evaluate(
     }
     let coverage = coverage.min(1.0);
     let confidence = (0.55 + 0.10 * agreement as f64) * coverage;
-    if confidence < 0.55 {
+    Some(Core {
+        volume_ratio,
+        atr_pct,
+        regime,
+        rs,
+        breakout,
+        carry,
+        flow,
+        score,
+        agreement,
+        coverage,
+        confidence,
+    })
+}
+
+pub(crate) fn preview(
+    candles: &[crate::providers::CandleSnapshot],
+    mark: f64,
+    atr: f64,
+    features: MarketFeatures,
+) -> Option<Preview> {
+    let core = core(candles, mark, atr, features)?;
+    let side = if core.score > 0.0 {
+        "long"
+    } else if core.score < 0.0 {
+        "short"
+    } else {
+        "flat"
+    };
+    Some(Preview {
+        side,
+        score: core.score,
+    })
+}
+
+pub(crate) fn evaluate(
+    candles: &[crate::providers::CandleSnapshot],
+    mark: f64,
+    atr: f64,
+    policy: TradePolicy,
+    features: MarketFeatures,
+) -> Option<TradeSignal> {
+    let core = core(candles, mark, atr, features)?;
+    if core.volume_ratio < policy.volume_ratio_min {
+        return None;
+    }
+    if !(0.05..=4.0).contains(&core.atr_pct) {
+        return None;
+    }
+    if core.score.abs() < policy.base_threshold {
+        return None;
+    }
+    let direction = core.score.signum();
+    if core.agreement < 2 {
+        return None;
+    }
+    if core.confidence < 0.55 {
         return None;
     }
     let sl_distance = (atr * policy.sl_atr_mult.max(0.2)).max(mark * 0.0018);
@@ -148,12 +214,21 @@ pub(crate) fn evaluate(
         return None;
     }
     Some(TradeSignal {
-        side: if score > 0.0 { "long" } else { "short" },
-        score,
+        side: if core.score > 0.0 { "long" } else { "short" },
+        score: core.score,
         stop_price,
         take_profit,
         reason: format!(
-            "fusion:score={score:.4}:vol={volume_ratio:.2}:regime={regime},rs={rs:.2},break={breakout:.2},carry={carry:.2},flow={flow:.2},conf={confidence:.2},coverage={coverage:.2}"
+            "fusion:score={:.4}:vol={:.2}:regime={},rs={:.2},break={:.2},carry={:.2},flow={:.2},conf={:.2},coverage={:.2}",
+            core.score,
+            core.volume_ratio,
+            core.regime,
+            core.rs,
+            core.breakout,
+            core.carry,
+            core.flow,
+            core.confidence,
+            core.coverage
         ),
     })
 }
@@ -333,5 +408,32 @@ mod tests {
             },
         );
         assert!(signal.is_none(), "缺失 RS 与 OI 时覆盖率不足应保持空仓");
+    }
+
+    #[test]
+    fn preview_keeps_direction_and_score_when_volume_gate_rejects() {
+        let mut data = candles(&(1..=50).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
+        for candle in data.iter_mut().rev().take(20) {
+            candle.volume = 1.0;
+        }
+        let policy = TradePolicy {
+            volume_ratio_min: 1.5,
+            ..cfg()
+        };
+        let mark = data.last().unwrap().close;
+        assert!(
+            evaluate(&data, mark, 1.0, policy, MarketFeatures::default()).is_none(),
+            "正式判定必须尊重量能门槛"
+        );
+        let preview = preview(&data, mark, 1.0, MarketFeatures::default())
+            .expect("量能不足时仍应给出预览评分");
+        assert_eq!(preview.side, "long");
+        assert!(preview.score > 0.0);
+    }
+
+    #[test]
+    fn preview_returns_none_without_enough_candles() {
+        let data = candles(&(0..20).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
+        assert!(preview(&data, 120.0, 1.0, MarketFeatures::default()).is_none());
     }
 }

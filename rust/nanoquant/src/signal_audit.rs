@@ -26,6 +26,8 @@ pub struct AuditSignal {
     /// opened / rejected / flat / pending。
     pub decision: String,
     pub reject_reason: String,
+    /// gate：行情闸门初筛拒绝，未进入评分与 AI 复核；空串表示已进入后续阶段。
+    pub stage: String,
 }
 
 impl AuditSignal {
@@ -40,6 +42,7 @@ impl AuditSignal {
             ai_reason: String::new(),
             decision: "flat".to_string(),
             reject_reason: String::new(),
+            stage: String::new(),
         }
     }
 
@@ -72,6 +75,11 @@ impl AuditSignal {
 
     pub fn with_reject_reason(mut self, reason: &str) -> Self {
         self.reject_reason = reason.to_string();
+        self
+    }
+
+    pub fn with_stage(mut self, stage: &str) -> Self {
+        self.stage = stage.to_string();
         self
     }
 }
@@ -117,6 +125,9 @@ pub fn record(
         let mut features = row.features.clone();
         if let Some(object) = features.as_object_mut() {
             object.insert("reason_key".to_string(), Value::from(key.clone()));
+            if !row.stage.is_empty() {
+                object.insert("stage".to_string(), Value::from(row.stage.clone()));
+            }
         }
         let features_text = serde_json::to_string(&features).unwrap_or_else(|_| "{}".to_string());
         if let Some(id) = find_mergeable(tx, mode, row, ts, &key)? {
@@ -305,6 +316,28 @@ mod tests {
         record(&tx, "demo", 1000 + MERGE_WINDOW_SEC + 1, &[row]).unwrap();
         tx.commit().unwrap();
         assert_eq!(count(&conn), 2);
+    }
+
+    #[test]
+    fn gate_stage_is_recorded_in_features() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        record(
+            &tx,
+            "demo",
+            1000,
+            &[AuditSignal::new("BTCUSDT")
+                .with_stage("gate")
+                .with_decision("rejected")
+                .with_reject_reason("量能不足")],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["stage"], "gate");
     }
 
     #[test]

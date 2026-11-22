@@ -15,7 +15,7 @@ interface SignalRow {
   symbol: string
   direction: string
   score: number
-  features: Record<string, number> | null
+  features: Record<string, number | string> | null
   ai_action: string
   ai_confidence: number
   ai_reason: string
@@ -40,10 +40,20 @@ const DECISION_LABELS: Record<string, { text: string; cls: string }> = {
 
 const DIRECTION_LABELS: Record<string, string> = { long: '多', short: '空', flat: '—' }
 
+/** 行情闸门初筛拒绝：只有量化预评分，未进入 AI 复核。 */
+function isGate(row: SignalRow): boolean {
+  return row.features?.stage === 'gate'
+}
+
+function decisionLabel(row: SignalRow): { text: string; cls: string } {
+  if (isGate(row)) return { text: '初筛拒', cls: 'tag-warn' }
+  return DECISION_LABELS[row.decision] || { text: row.decision, cls: 'tag-dim' }
+}
+
 function displayDirection(row: SignalRow): { text: string; cls: string } {
   if (row.direction && row.direction !== 'flat') {
     return {
-      text: DIRECTION_LABELS[row.direction] || row.direction,
+      text: (DIRECTION_LABELS[row.direction] || row.direction) + (isGate(row) ? '(预)' : ''),
       cls: row.direction === 'long' ? 'up' : 'down',
     }
   }
@@ -56,6 +66,9 @@ function displayDirection(row: SignalRow): { text: string; cls: string } {
 function displayScore(row: SignalRow): { text: string; cls: string } {
   if (row.score) {
     return { text: row.score.toFixed(2), cls: numClass(row.score) }
+  }
+  if (isGate(row)) {
+    return { text: '—', cls: 'flat' }
   }
   if (row.ai_confidence > 0) {
     return { text: `${(row.ai_confidence * 100).toFixed(0)}%`, cls: 'up' }
@@ -119,11 +132,12 @@ onMounted(load)
           <span class="tag tag-dim">AI 复核</span>
           <span class="tag tag-dim">拒绝原因可解释</span>
           <div class="spacer" />
-          <span class="muted" style="font-size: 11px">每 5 秒一轮扫描，仅当前交易环境</span>
+          <span class="muted" style="font-size: 11px">每轮扫描 · 周期见总览，仅当前交易环境</span>
         </div>
         <div class="hint" style="margin-top: 8px">
           引擎每一轮对标的池逐标的计算五因子得分，过闸门、过 AI 复核后才可能开仓。
           任何一步不通过都会写入「拒绝原因」，本页按时间倒序摊开。
+          初筛行只保留量化预评分方向，评分是预评分，AI 列显示「未进入」。
         </div>
       </div>
     </div>
@@ -132,7 +146,7 @@ onMounted(load)
       <div class="kpi">
         <div class="kpi-label">扫描信号</div>
         <div class="kpi-value">{{ summary?.scans ?? summary?.total ?? '--' }}</div>
-        <div class="kpi-foot">合并后 {{ summary?.total ?? 0 }} 行 · 相同 flat 60s 合并</div>
+        <div class="kpi-foot">合并后 {{ summary?.total ?? 0 }} 行 · 相同信号合并计 repeats</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">已开仓</div>
@@ -202,7 +216,8 @@ onMounted(load)
                 <td class="mono" :class="displayScore(row).cls">{{ displayScore(row).text }}</td>
                 <td class="mono muted" style="font-size: 10.5px">{{ featureLine(row) }}</td>
                 <td>
-                  <div class="stack" style="gap: 2px">
+                  <span v-if="isGate(row)" class="muted" style="font-size: 10.5px">— 未进入</span>
+                  <div v-else class="stack" style="gap: 2px">
                     <span class="mono" style="font-size: 10.5px">{{ row.ai_action || '—' }}</span>
                     <span v-if="row.ai_confidence" class="muted" style="font-size: 9.5px">
                       conf {{ (row.ai_confidence * 100).toFixed(0) }}%
@@ -210,9 +225,7 @@ onMounted(load)
                   </div>
                 </td>
                 <td>
-                  <span class="tag" :class="(DECISION_LABELS[row.decision] || { cls: 'tag-dim' }).cls">
-                    {{ (DECISION_LABELS[row.decision] || { text: row.decision }).text }}
-                  </span>
+                  <span class="tag" :class="decisionLabel(row).cls">{{ decisionLabel(row).text }}</span>
                 </td>
                 <td class="muted" style="font-size: 11px">{{ row.reject_reason || '—' }}</td>
               </tr>

@@ -17,6 +17,8 @@ pub struct Candidate {
     pub spread_bps: f64,
     /// 方向分的绝对值。均值回归模式下改传 |z|。
     pub strength: f64,
+    /// 融合策略的预览方向，仅用于审计与排序，不参与下单决策。
+    pub preview_side: Option<&'static str>,
 }
 
 /// 筛选门槛。
@@ -97,6 +99,7 @@ mod tests {
             quote_volume: quote,
             spread_bps: 2.0,
             strength,
+            preview_side: None,
         }
     }
 
