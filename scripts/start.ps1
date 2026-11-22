@@ -5,7 +5,7 @@
 param(
   [int]$Port = 0,
   [switch]$Debug,
-  [switch]$NoSidecar,
+
   [string]$ExecAddr = '127.0.0.1:9101'
 )
 
@@ -32,19 +32,20 @@ foreach ($d in @('data', 'logs', 'data\backups')) {
   New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null
 }
 
-# 执行内核 sidecar（可选）：主服务靠 EXEC_TCP 找到它，
-# 系统诊断里的「执行内核」才会显示已连接。没有交易所 Secret 时跳过，不影响交易。
-if (-not $NoSidecar) {
-  $sidecarScript = Join-Path $Root 'scripts\start-sidecar.ps1'
-  if (Test-Path $sidecarScript) {
-    & $sidecarScript -Addr $ExecAddr -Detach | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-      $env:EXEC_TCP = $ExecAddr
-      Write-Host "执行内核 sidecar 已就绪 ($ExecAddr)" -ForegroundColor DarkGray
-    } else {
-      Write-Host '执行内核 sidecar 未启动（缺交易所 Secret 或二进制）；Rust 内核直连交易所，交易不受影响' -ForegroundColor Yellow
-    }
+# 执行内核 exec-core（默认必选）：先起内核，主服务靠 EXEC_TCP 完成握手。
+# 内核起不来时主服务仍启动（HTTP/前端可用），但交易引擎不会启动。
+$coreScript = Join-Path $Root 'scripts\start-core.ps1'
+Remove-Item Env:EXEC_TCP -ErrorAction SilentlyContinue
+if (Test-Path $coreScript) {
+  & $coreScript -Addr $ExecAddr -Detach | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    $env:EXEC_TCP = $ExecAddr
+    Write-Host "执行内核已就绪 ($ExecAddr)" -ForegroundColor DarkGray
+  } else {
+    Write-Host '执行内核未启动（缺交易所 Secret 或二进制）；主服务仍可启动，但交易引擎不会启动' -ForegroundColor Yellow
   }
+} else {
+  Write-Host '未找到 scripts\start-core.ps1；主服务启动后交易引擎不会启动' -ForegroundColor Yellow
 }
 
 $bin = Join-Path $Root 'rust\nanoquant\target\release\nanoquant.exe'
