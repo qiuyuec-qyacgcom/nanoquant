@@ -49,15 +49,14 @@ const EXEC_LATENCY_SAMPLES: usize = 64;
 
 /// 执行内核自检的三种结论。
 ///
-/// 执行内核是**可选**组件：没部署是这套部署的正常形态，不是故障。
-/// 只有「配了端点却连不上」才是真失败。
+/// 执行内核是**默认必选**组件：未连接就是故障，不再有「没部署也算通过」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExecCheck {
-    /// 通过：端点可达且配了 Secret（可逐字节比对）；或压根没配端点（本环境不需要）。
+    /// 通过：已连接且配了 Secret（可逐字节比对）。
     Ok,
     /// 跳过：端点可达但没配交易所 Secret，只能探活、不能比对签名。
     Skipped,
-    /// 失败：配了端点却连不上。
+    /// 失败：未连接（默认执行内核必选）。
     Error,
 }
 
@@ -278,10 +277,10 @@ pub fn routes() -> Router<SystemState> {
         .route("/system/archives/{name}", get(preview_archive))
         .route("/system/alerts/logs", get(alert_logs))
         .route("/system/alerts/test", post(alert_test))
-        .route("/system/exec-sidecar", get(exec_sidecar))
-        .route("/system/exec-sidecar/self-test", post(exec_self_test))
-        .route("/system/exec-sidecar/reconcile", get(exec_reconcile))
-        .route("/system/exec-sidecar/reset", post(exec_reset))
+        .route("/system/exec-core", get(exec_core))
+        .route("/system/exec-core/self-test", post(exec_self_test))
+        .route("/system/exec-core/reconcile", get(exec_reconcile))
+        .route("/system/exec-core/reset", post(exec_reset))
         .route(
             "/settings/credentials/exchange",
             get(get_exchange_credentials)
@@ -1402,43 +1401,75 @@ fn exec_secret_configured(conn: &rusqlite::Connection, mode: &str) -> bool {
     .unwrap_or(false)
 }
 
-async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
-    let trading_mode = current_mode(&conn);
-    let has_key = exec_secret_configured(&conn, &trading_mode);
-    let probe = exec_probe_state();
+async fn exec_core(State(state): State<SystemState>) -> Json<Value> {
+    let (trading_mode, has_key, pending) = {
+        let conn = state.db.conn.lock().expect("db");
+        let trading_mode = current_mode(&conn);
+        let has_key = exec_secret_configured(&conn, &trading_mode);
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE status NOT IN ('FILLED','REJECTED','CANCELED','EXPIRED')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        (trading_mode, has_key, pending)
+    };
+    let client = state.exec_client.clone();
+    let connected = client
+        .as_ref()
+        .map(|client| client.state() == crate::exec_client::ConnState::Connected)
+        .unwrap_or(false);
+    let mut algo: Option<String> = None;
+    let mut probe_ms: Option<f64> = None;
+    let mut segments = Value::Null;
+    if connected {
+        if let Some(client) = client.as_ref() {
+            if let Ok((value, ms)) = client.probe().await {
+                algo = Some(value);
+                probe_ms = Some(round(ms as f64, 2));
+            }
+            if let Ok(view) = client.query_segments().await {
+                segments = view;
+            }
+        }
+    }
     let stats = state
         .exec
         .lock()
         .map(|mut stats| {
-            stats.observe_latency(probe.latency_ms);
+            stats.observe_latency(probe_ms);
             stats.clone()
         })
         .unwrap_or_default();
-    let pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM orders WHERE status NOT IN ('FILLED','REJECTED','CANCELED','EXPIRED')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let verdict = if probe.endpoint.is_none() {
-        format!("{}，自检照常通过", probe.detail)
-    } else if probe.connected && !has_key {
+    let state_text = client
+        .as_ref()
+        .map(|client| format!("{:?}", client.state()))
+        .unwrap_or_else(|| "Disconnected".to_string());
+    let last_error = client.as_ref().and_then(|client| client.last_error());
+    let target = client
+        .as_ref()
+        .map(|client| client.endpoint().to_string())
+        .unwrap_or_default();
+    let dropped = client.as_ref().map(|client| client.dropped()).unwrap_or(0);
+    let verdict = if connected {
         format!(
-            "{}；但当前交易环境没有配置交易所 Secret，sidecar 不能用于真实签名",
-            probe.detail
+            "执行内核已连接（algo={}），探活与七段指标正常",
+            algo.as_deref().unwrap_or("?")
         )
     } else {
-        probe.detail.clone()
+        "默认执行内核未连接：主服务启动需完成握手，请检查 EXEC_TCP/EXEC_SOCKET 与内核进程"
+            .to_string()
     };
     Json(json!({
         "trading_mode": trading_mode,
-        "configured": probe.endpoint.is_some(),
-        "deployed": probe.connected,
-        "connected": probe.connected,
-        "target": probe.endpoint.clone().unwrap_or_default(),
-        "algo": probe.algo,
+        "configured": client.is_some(),
+        "deployed": connected,
+        "connected": connected,
+        "state": state_text,
+        "last_error": last_error,
+        "target": target,
+        "algo": algo.unwrap_or_default(),
         "has_key": has_key,
         "counts": {
             "checks": stats.checks,
@@ -1447,6 +1478,8 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
             "skipped": stats.skipped,
         },
         "latency_ms": stats.latency_view(),
+        "segments": segments,
+        "dropped": dropped,
         "order_ledger": {"pending": pending},
         "verdict": verdict,
         "reason": verdict,
@@ -1455,71 +1488,69 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
 
 /// 把一次探活结果归到自检结论里。
 ///
-/// 端点没配 = 可选组件没部署 = 本环境不需要，检查通过（不是失败）。
-/// 这条区分很关键：否则每点一次「自检」都会记一次失败，看着像故障。
-fn exec_check_outcome(probe: &ExecProbe, has_key: bool) -> ExecCheck {
-    match &probe.endpoint {
-        None => ExecCheck::Ok,
-        Some(_) if !probe.connected => ExecCheck::Error,
-        Some(_) if !has_key => ExecCheck::Skipped,
-        Some(_) => ExecCheck::Ok,
+/// 执行内核是默认必选组件：未连接就是故障（Error），不再有「没部署也算通过」。
+fn exec_check_outcome(connected: bool, has_key: bool) -> ExecCheck {
+    if !connected {
+        ExecCheck::Error
+    } else if !has_key {
+        ExecCheck::Skipped
+    } else {
+        ExecCheck::Ok
     }
 }
 
 async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
-    let mode = current_mode(&conn);
-    let has_key = conn
-        .query_row(
-            "SELECT value FROM app_settings WHERE key='data'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .map(|data| {
-            let field = if mode == "live" {
-                "live_api_secret_enc"
-            } else {
-                "demo_api_secret_enc"
-            };
-            data[field]
-                .as_str()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-        })
+    let has_key = {
+        let conn = state.db.conn.lock().expect("db");
+        exec_secret_configured(&conn, &current_mode(&conn))
+    };
+    let client = state.exec_client.clone();
+    let connected = client
+        .as_ref()
+        .map(|client| client.state() == crate::exec_client::ConnState::Connected)
         .unwrap_or(false);
-    drop(conn);
-    let probe = exec_probe_state();
-    let outcome = exec_check_outcome(&probe, has_key);
+    let mut algo = String::new();
+    let mut latency_ms = None;
+    if connected {
+        if let Some(client) = client.as_ref() {
+            if let Ok((value, ms)) = client.probe().await {
+                algo = value;
+                latency_ms = Some(round(ms as f64, 2));
+            }
+        }
+    }
+    let outcome = exec_check_outcome(connected, has_key);
     if let Ok(mut stats) = state.exec.lock() {
-        stats.observe_latency(probe.latency_ms);
+        stats.observe_latency(latency_ms);
         stats.record_check(outcome);
     }
     let detail = match outcome {
-        ExecCheck::Ok if probe.connected => {
-            "端点可达（health 协议应答正常）；签名逐字节比对用 ops verify-sidecar".to_string()
-        }
         ExecCheck::Ok => {
-            "未部署执行内核（可选组件）：本环境由 Rust 内核直连交易所签名下单，无需执行内核，检查通过"
-                .to_string()
+            format!("执行内核已连接（algo={algo}）；签名逐字节比对用 ops verify-exec-core")
         }
         ExecCheck::Skipped => {
-            "端点可达但当前交易环境没有配置交易所 Secret，只能探活、不能比对签名".to_string()
+            "执行内核已连接但当前交易环境没有配置交易所 Secret，只能探活、不能比对签名"
+                .to_string()
         }
-        ExecCheck::Error => probe.detail.clone(),
+        ExecCheck::Error => client
+            .as_ref()
+            .and_then(|client| client.last_error())
+            .unwrap_or_else(|| {
+                "默认执行内核未连接：主服务启动需完成握手，请检查 EXEC_TCP/EXEC_SOCKET 与内核进程"
+                    .to_string()
+            }),
     };
-    json!({
+    Json(json!({
         "ok": outcome == ExecCheck::Ok,
         "outcome": outcome.as_str(),
-        "connected": probe.connected,
-        "configured": probe.endpoint.is_some(),
-        "endpoint": probe.endpoint.clone().unwrap_or_default(),
-        "algo": probe.algo,
+        "connected": connected,
+        "configured": client.is_some(),
+        "endpoint": client.as_ref().map(|client| client.endpoint().to_string()).unwrap_or_default(),
+        "algo": algo,
         "has_key": has_key,
+        "latency_ms": latency_ms,
         "detail": detail,
-    })
-    .into()
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1576,19 +1607,25 @@ async fn exec_reset(State(state): State<SystemState>) -> Json<Value> {
     if let Ok(mut stats) = state.exec.lock() {
         *stats = ExecStats::default();
     }
+    let core_reset = match state.exec_client.as_ref() {
+        Some(client) if client.state() == crate::exec_client::ConnState::Connected => {
+            client.reset_metrics().await.is_ok()
+        }
+        _ => false,
+    };
     if let Ok(conn) = state.db.conn.lock() {
         let _ = conn.execute(
             "INSERT INTO engine_events(ts, level, category, message, payload) \
-             VALUES(?1, 'info', 'exec', '清零执行内核比对计数', '{}')",
+             VALUES(?1, 'info', 'exec', '清零执行内核探活与分段计数', '{}')",
             [crate::now()],
         );
     }
-    json!({
+    Json(json!({
         "ok": true,
+        "core_reset": core_reset,
         "counts": {"checks": 0, "ok": 0, "errors": 0, "skipped": 0},
-        "detail": "仅清零观测计数，签名密钥与端点配置未被修改",
-    })
-    .into()
+        "detail": "已清零探活计数；内核已连接时同时转发 metrics_reset",
+    }))
 }
 
 /// 执行内核端点。Linux 生产用 UDS（EXEC_SOCKET），Windows/容器联调用 TCP（EXEC_TCP）；
@@ -3166,46 +3203,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_sidecar_status_self_test_and_reset() {
-        let path = std::env::temp_dir().join("nq-exec-sidecar.db");
+    async fn exec_core_status_self_test_and_reset() {
+        let path = std::env::temp_dir().join("nq-exec-core.db");
         let db = dead_fixture(&path);
         let app = Router::new()
             .nest("/api/v1", routes())
             .with_state(SystemState::new(db.clone(), crate::now()));
-        let (status, body) = request_json(app.clone(), "GET", "/api/v1/system/exec-sidecar").await;
+        let (status, body) = request_json(app.clone(), "GET", "/api/v1/system/exec-core").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.get("trading_mode").is_some());
         assert!(body.get("counts").is_some());
         assert!(body.get("order_ledger").is_some());
+        assert_eq!(body["connected"], json!(false));
+        assert_eq!(body["configured"], json!(false));
+        assert!(body["segments"].is_null(), "未连接时七段指标为 null: {body}");
         let (_, tested) =
-            request_json(app.clone(), "POST", "/api/v1/system/exec-sidecar/self-test").await;
+            request_json(app.clone(), "POST", "/api/v1/system/exec-core/self-test").await;
         assert!(
             tested.get("detail").is_some(),
             "自检必须给出逐项结论: {tested}"
         );
-        // 没配端点 = 可选组件没部署 = 本环境不需要：必须算通过，不能记失败
+        // 默认执行内核为必选组件：未连接就是故障，不能再算通过
         assert_eq!(
             tested["ok"],
-            json!(true),
-            "未部署执行内核时自检应通过: {tested}"
+            json!(false),
+            "未连接时自检必须失败: {tested}"
         );
-        assert_eq!(tested["outcome"], json!("ok"));
+        assert_eq!(tested["outcome"], json!("error"));
         assert_eq!(tested["configured"], json!(false));
-        let (_, after) = request_json(app.clone(), "GET", "/api/v1/system/exec-sidecar").await;
-        assert_eq!(
-            after["counts"]["ok"],
-            json!(1),
-            "未部署时的自检应计入成功: {after}"
-        );
+        let (_, after) = request_json(app.clone(), "GET", "/api/v1/system/exec-core").await;
         assert_eq!(
             after["counts"]["errors"],
-            json!(0),
-            "未部署不是失败: {after}"
+            json!(1),
+            "未连接的自检应计入失败: {after}"
         );
         let (_, reset) =
-            request_json(app.clone(), "POST", "/api/v1/system/exec-sidecar/reset").await;
+            request_json(app.clone(), "POST", "/api/v1/system/exec-core/reset").await;
         assert_eq!(reset["counts"]["checks"], 0);
-        assert_eq!(reset["counts"]["ok"], 0);
+        assert_eq!(reset["counts"]["errors"], 0);
+        assert_eq!(reset["core_reset"], json!(false), "未连接时无内核可清零");
         let events: i64 = db
             .conn
             .lock()

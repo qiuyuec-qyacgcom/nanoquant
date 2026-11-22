@@ -631,8 +631,28 @@ fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+/// 执行质量视图：延迟读数来自执行内核七段指标（未连接时保持 null，前端显示「—」）。
+fn execution_view(segments: &Value) -> Value {
+    let total = &segments["total"];
+    json!({
+        "latency_p50_ms": total["p50"].clone(),
+        "latency_p95_ms": total["p95"].clone(),
+        "latency_p99_ms": total["p99"].clone(),
+        "order_count": total["count"].as_u64().unwrap_or(0),
+        "segments": segments,
+    })
+}
+
 async fn stats(State(db): State<Db>) -> Json<Value> {
     let mode = current_mode(&db);
+    let segments = match crate::exec_client::global() {
+        Some(client) => client
+            .query_segments()
+            .await
+            .ok()
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    };
     let rows: Vec<(String, f64, i64, String)> = {
         let conn = db.conn.lock().expect("db");
         let mut stmt = conn
@@ -709,36 +729,29 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         "by_symbol": symbols,
         "by_reason": reasons,
         "engine": read_status(&db),
+        "execution": execution_view(&segments),
     }))
 }
 
-async fn execution(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
-    let mut stmt = conn
-        .prepare("SELECT value FROM engine_state WHERE key LIKE 'execution.%'")
-        .expect("prepare execution");
-    let mut samples = Vec::new();
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query execution");
-    for row in rows.flatten() {
-        if let Ok(value) = row.parse::<f64>() {
-            if value.is_finite() && value >= 0.0 {
-                samples.push(value);
-            }
-        }
-    }
-    samples.sort_by(f64::total_cmp);
-    let percentile = |q: f64| -> f64 {
-        if samples.is_empty() {
-            return 0.0;
-        }
-        let index = ((samples.len() as f64 * q).floor() as usize).min(samples.len() - 1);
-        round_n(samples[index], 2)
+async fn execution(State(_db): State<Db>) -> Json<Value> {
+    let segments = match crate::exec_client::global() {
+        Some(client) => client
+            .query_segments()
+            .await
+            .ok()
+            .unwrap_or(Value::Null),
+        None => Value::Null,
     };
+    let total = &segments["total"];
     Json(json!({
-        "count": samples.len(),
-        "latency_ms": {"p50": percentile(0.50), "p95": percentile(0.95), "p99": percentile(0.99), "max": samples.last().copied().map(|v| round_n(v, 2)).unwrap_or(0.0)}
+        "count": total["count"].as_u64().unwrap_or(0),
+        "latency_ms": {
+            "p50": total["p50"].clone(),
+            "p95": total["p95"].clone(),
+            "p99": total["p99"].clone(),
+            "max": total["max"].clone(),
+        },
+        "segments": segments,
     }))
 }
 
@@ -1610,39 +1623,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_reports_percentiles_and_ignores_invalid_samples() {
+    async fn execution_without_kernel_returns_nulls_instead_of_zeroes() {
         let path = std::env::temp_dir().join("nq-execution.db");
-        let db = seed(&path);
-        {
-            let conn = db.conn.lock().unwrap();
-            conn.execute_batch("INSERT INTO engine_state VALUES ('execution.a','10.0',0), ('execution.b','20.0',0), ('execution.c','40.0',0), ('execution.bad','nan',0), ('other','999',0);").unwrap();
-        }
-        let app = Router::new().nest("/api/v1", routes()).with_state(db);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/engine/execution")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(body["count"], 3);
-        assert_eq!(body["latency_ms"]["p50"], 20.0);
-        assert_eq!(body["latency_ms"]["p95"], 40.0);
-        assert_eq!(body["latency_ms"]["max"], 40.0);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn execution_with_no_samples_returns_zeroes() {
-        let path = std::env::temp_dir().join("nq-execution-empty.db");
         let db = seed(&path);
         let app = Router::new().nest("/api/v1", routes()).with_state(db);
         let response = app
@@ -1661,11 +1643,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["count"], 0);
-        assert_eq!(body["latency_ms"]["p99"], 0.0);
+        assert!(
+            body["latency_ms"]["p50"].is_null(),
+            "没有内核样本时不能用 0 冒充: {body}"
+        );
+        assert!(body["latency_ms"]["p95"].is_null());
+        assert!(body["latency_ms"]["p99"].is_null());
+        assert!(body["latency_ms"]["max"].is_null());
+        assert!(body["segments"].is_null());
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
+
     async fn live_switch_requires_confirm_and_persists_both_stores() {
         let path = std::env::temp_dir().join("nq-engine.db");
         let db = seed(&path);

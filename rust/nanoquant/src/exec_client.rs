@@ -344,6 +344,10 @@ impl ExecClient {
         *self.state.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.last_error
             .lock()
