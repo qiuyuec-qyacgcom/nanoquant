@@ -5,7 +5,7 @@
 [Unit]
 Description=NanoQuant (Rust trading engine)
 Documentation=https://github.com/qiuyuec-qyacgcom/nanoquant
-After=network-online.target nanoquant-exec.service
+After=network-online.target nanoquant-exec-core.service
 Wants=network-online.target
 
 [Service]
@@ -15,6 +15,7 @@ Group=nanoquant
 WorkingDirectory=<REPO_ROOT>
 Environment=NANOQUANT_HOME=<REPO_ROOT>
 Environment=NANOQUANT_PORT=8899
+Environment=EXEC_SOCKET=/run/nanoquant/exec.sock
 EnvironmentFile=-/etc/nanoquant/nanoquant.env
 ExecStart=<REPO_ROOT>/rust/nanoquant/target/release/nanoquant
 Restart=always

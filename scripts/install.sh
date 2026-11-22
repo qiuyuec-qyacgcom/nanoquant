@@ -807,6 +807,7 @@ systemd_unit() {
   printf 'WorkingDirectory=%s\n' "$ROOT"
   printf 'Environment=NANOQUANT_HOME=%s\n' "$ROOT"
   printf 'Environment=NANOQUANT_PORT=%s\n' "$PORT"
+  printf 'Environment=EXEC_SOCKET=/run/nanoquant/exec.sock\n'
   printf 'EnvironmentFile=-%s\n' "$ENV_FILE"
   printf 'ExecStart=%s\n' "$BIN"
   printf 'Restart=always\n'
