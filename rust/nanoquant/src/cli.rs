@@ -28,16 +28,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("p99-bench", "签名 p99 基准"),
     ("p99-real", "实盘链路口径 p99"),
     ("rtt-probe", "RTT 探针"),
-    ("verify-sidecar", "执行内核签名逐字节比对"),
+    ("verify-exec-core", "执行内核签名逐字节比对"),
     (
         "show-exec-secret",
-        "输出当前交易环境的交易所 Secret（部署 sidecar 用，只打到标准输出）",
+        "输出当前交易环境的交易所 Secret（部署执行内核用，只打到标准输出）",
     ),
     (
         "seed-symbols",
         "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
     ),
-    ("mock-exec-sidecar", "模拟执行内核"),
+    ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
     ("verify-partial-tp", "部分止盈复核"),
     ("contract-diff", "契约对照：与 P0 基线逐端点比对"),
@@ -354,8 +354,8 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "bench-exec" => bench_exec_command(&options),
         "p99-real" => p99_real_command(&options),
         "mock-exchange" => mock_service(&options, true),
-        "mock-exec-sidecar" => mock_service(&options, false),
-        "verify-sidecar" => verify_sidecar_command(&options),
+        "mock-exec-core" => mock_service(&options, false),
+        "verify-exec-core" => verify_exec_core_command(&options),
         "show-exec-secret" => show_exec_secret(&options, config),
         "seed-symbols" => seed_symbols(&options),
         "contract-diff" => contract_diff_command(&options, config),
@@ -1111,7 +1111,7 @@ fn mock_service(options: &Options, exchange: bool) -> Result<(i32, Value), (i32,
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or((2, "缺少 --secret".to_string()))?;
-        let output = crate::ops_tools::mock_exec_sidecar(port, &secret, running)
+        let output = crate::ops_tools::mock_exec_core(port, &secret, running)
             .map_err(|error| (1, error))?;
         Ok((0, output))
     }
@@ -1131,9 +1131,9 @@ fn contract_diff_command(
     Ok((if ok { 0 } else { 1 }, output))
 }
 
-fn verify_sidecar_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
+fn verify_exec_core_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
     let output =
-        crate::ops_tools::verify_sidecar(options.target.as_deref(), options.secret.as_deref())
+        crate::ops_tools::verify_exec_core(options.target.as_deref(), options.secret.as_deref())
             .map_err(|error| (1, error))?;
     let ok = output["ok"].as_bool().unwrap_or(false);
     Ok((if ok { 0 } else { 1 }, output))
@@ -1769,10 +1769,10 @@ mod tests {
             "p99-bench",
             "p99-real",
             "rtt-probe",
-            "verify-sidecar",
+            "verify-exec-core",
             "show-exec-secret",
             "seed-symbols",
-            "mock-exec-sidecar",
+            "mock-exec-core",
             "mock-exchange",
             "verify-partial-tp",
             "contract-diff",

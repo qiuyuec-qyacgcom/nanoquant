@@ -33,7 +33,7 @@ pub struct SystemState {
 /// 每个数字都必须来自真实观测：探活成功记 ok、失败记 errors、
 /// 已连通但没配 Secret（没法比对签名）记 skipped。
 /// 签名逐字节比对不在进程内做（主服务用 Rust 内核自己签名），
-/// 真实签名比对用 `ops verify-sidecar`。
+/// 真实签名比对用 `ops verify-exec-core`。
 #[derive(Clone, Default)]
 struct ExecStats {
     checks: i64,

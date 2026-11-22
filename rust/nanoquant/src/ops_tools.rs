@@ -589,7 +589,7 @@ pub async fn bench_exec(orders: usize, delay_ms: u64) -> Result<Value, String> {
     }))
 }
 
-// ---------------------------------------------------------------- mock sidecar
+// ---------------------------------------------------------------- mock exec-core
 
 fn algo_of(secret: &str) -> &'static str {
     if crate::sign::sign_query(secret, "probe").len() == 88 {
@@ -599,11 +599,7 @@ fn algo_of(secret: &str) -> &'static str {
     }
 }
 
-pub fn mock_exec_sidecar(
-    port: u16,
-    secret: &str,
-    running: Arc<AtomicBool>,
-) -> Result<Value, String> {
+pub fn mock_exec_core(port: u16, secret: &str, running: Arc<AtomicBool>) -> Result<Value, String> {
     if secret.trim().is_empty() {
         return Err("--secret 不能为空".to_string());
     }
@@ -622,7 +618,7 @@ pub fn mock_exec_sidecar(
             Ok((stream, _)) => {
                 let secret = secret.to_string();
                 std::thread::spawn(move || {
-                    let _ = handle_sidecar(stream, &secret, algo);
+                    let _ = handle_exec_core(stream, &secret, algo);
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -634,7 +630,7 @@ pub fn mock_exec_sidecar(
     Ok(json!({"ok": true, "port": actual, "algo": algo}))
 }
 
-fn handle_sidecar(mut stream: TcpStream, secret: &str, algo: &str) -> std::io::Result<()> {
+fn handle_exec_core(mut stream: TcpStream, secret: &str, algo: &str) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let reader = BufReader::new(stream.try_clone()?);
@@ -656,15 +652,40 @@ fn handle_sidecar(mut stream: TcpStream, secret: &str, algo: &str) -> std::io::R
         let op = request["op"].as_str().unwrap_or("");
         let query = request["query"].as_str().unwrap_or("");
         let response = match op {
-            "health" => json!({"id": id, "ok": true, "algo": algo}),
-            "plan" | "sign" if !query.is_empty() => json!({
+            "hello" => json!({
+                "id": id,
+                "ok": true,
+                "kernel_version": "1.0.0",
+                "capabilities": ["health", "sign", "metrics_ingest", "metrics_query", "metrics_reset"],
+                "metrics_capacity": 2000,
+            }),
+            "health" => json!({
+                "id": id,
+                "ok": true,
+                "algo": algo,
+                "uptime_ms": 0,
+                "sessions": 1,
+            }),
+            "sign" if !query.is_empty() => json!({
                 "id": id,
                 "ok": true,
                 "signature": crate::sign::sign_query(secret, query),
                 "algo": algo,
                 "query": query,
             }),
-            "plan" | "sign" => json!({"id": id, "ok": false, "error": "query 不能为空"}),
+            "sign" => json!({"id": id, "ok": false, "error": "empty query"}),
+            "metrics_ingest" => {
+                let accepted = request["samples"]
+                    .as_array()
+                    .map(|samples| samples.len())
+                    .unwrap_or(0);
+                json!({"id": id, "ok": true, "accepted": accepted, "dropped": 0})
+            }
+            "metrics_query" => json!({"id": id, "ok": true, "segments": {}}),
+            "metrics_reset" => json!({"id": id, "ok": true}),
+            "order_open" | "order_close" | "protection_place" => {
+                json!({"id": id, "ok": false, "error": "reserved for phase 2"})
+            }
             other => json!({"id": id, "ok": false, "error": format!("unknown op: {other}")}),
         };
         stream.write_all(format!("{response}\n").as_bytes())?;
@@ -673,7 +694,7 @@ fn handle_sidecar(mut stream: TcpStream, secret: &str, algo: &str) -> std::io::R
     Ok(())
 }
 
-fn sidecar_roundtrip(target: &str, request: &Value) -> Result<Value, String> {
+fn exec_core_roundtrip(target: &str, request: &Value) -> Result<Value, String> {
     let mut stream: Box<dyn ReadWrite> = if let Some(address) = target.strip_prefix("tcp:") {
         Box::new(
             TcpStream::connect(address).map_err(|error| format!("连接 {target} 失败: {error}"))?,
@@ -699,23 +720,23 @@ fn sidecar_roundtrip(target: &str, request: &Value) -> Result<Value, String> {
     };
     stream
         .write_all(format!("{request}\n").as_bytes())
-        .map_err(|error| format!("写入 sidecar 失败: {error}"))?;
+        .map_err(|error| format!("写入执行内核失败: {error}"))?;
     stream.flush().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
         .read_line(&mut line)
-        .map_err(|error| format!("读取 sidecar 失败: {error}"))?;
-    serde_json::from_str(&line).map_err(|error| format!("sidecar 回包非法: {error}"))
+        .map_err(|error| format!("读取执行内核失败: {error}"))?;
+    serde_json::from_str(&line).map_err(|error| format!("执行内核回包非法: {error}"))
 }
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
-pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Value, String> {
+pub fn verify_exec_core(target: Option<&str>, secret: Option<&str>) -> Result<Value, String> {
     let mut embedded = None;
     let effective_secret: Option<String> = match (target, secret) {
-        (None, None) => Some("verify-sidecar-default-secret".to_string()),
+        (None, None) => Some("verify-exec-core-default-secret".to_string()),
         (None, Some(value)) => Some(value.to_string()),
         (Some(_), value) => value.map(str::to_string),
     };
@@ -725,12 +746,13 @@ pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Valu
             let running = Arc::new(AtomicBool::new(true));
             let stop = running.clone();
             let secret = effective_secret.clone().unwrap_or_default();
+            let algo = algo_of(&secret);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let listener = match TcpListener::bind(("127.0.0.1", 0)) {
                     Ok(listener) => listener,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(format!("mock sidecar 监听失败: {error}")));
+                        let _ = ready_tx.send(Err(format!("mock exec-core 监听失败: {error}")));
                         return;
                     }
                 };
@@ -747,7 +769,7 @@ pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Valu
                         Ok((stream, _)) => {
                             let secret = secret.clone();
                             std::thread::spawn(move || {
-                                let _ = handle_sidecar(stream, &secret, "hmac-sha256");
+                                let _ = handle_exec_core(stream, &secret, algo);
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -759,13 +781,19 @@ pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Valu
             });
             let port = ready_rx
                 .recv()
-                .map_err(|_| "mock sidecar 未就绪".to_string())??;
+                .map_err(|_| "mock exec-core 未就绪".to_string())??;
             embedded = Some((running, handle));
             format!("tcp:127.0.0.1:{port}")
         }
     };
     let mut checks = Vec::new();
-    let health = sidecar_roundtrip(&target, &json!({"id": "1", "op": "health"}))?;
+    let hello = exec_core_roundtrip(&target, &json!({"id": "1", "op": "hello", "version": "verify"}))?;
+    checks.push(json!({
+        "name": "hello",
+        "ok": hello["ok"] == true && !hello["kernel_version"].as_str().unwrap_or("").is_empty(),
+        "detail": hello["kernel_version"],
+    }));
+    let health = exec_core_roundtrip(&target, &json!({"id": "2", "op": "health"}))?;
     checks.push(json!({
         "name": "health",
         "ok": health["ok"] == true && !health["algo"].as_str().unwrap_or("").is_empty(),
@@ -776,9 +804,9 @@ pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Valu
         "symbol=ETHUSDT&side=SELL&type=STOP_MARKET&triggerPrice=2000&closePosition=true&timestamp=1700000001000",
     ];
     for (index, query) in queries.iter().enumerate() {
-        let response = sidecar_roundtrip(
+        let response = exec_core_roundtrip(
             &target,
-            &json!({"id": (index + 2).to_string(), "op": "sign", "query": query}),
+            &json!({"id": (index + 3).to_string(), "op": "sign", "query": query}),
         )?;
         let signature = response["signature"].as_str().unwrap_or("");
         let expected = effective_secret
@@ -793,7 +821,7 @@ pub fn verify_sidecar(target: Option<&str>, secret: Option<&str>) -> Result<Valu
             "detail": format!("algo={} len={}", response["algo"], signature.len()),
         }));
     }
-    let empty = sidecar_roundtrip(&target, &json!({"id": "9", "op": "sign", "query": ""}))?;
+    let empty = exec_core_roundtrip(&target, &json!({"id": "5", "op": "sign", "query": ""}))?;
     checks.push(json!({
         "name": "空 query 拒绝",
         "ok": empty["ok"] == false,
@@ -1163,8 +1191,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_sidecar_passes_against_the_embedded_mock() {
-        let output = verify_sidecar(None, None).unwrap();
+    fn verify_exec_core_passes_against_the_embedded_mock() {
+        let output = verify_exec_core(None, None).unwrap();
         assert_eq!(output["ok"], true, "{output}");
         let checks = output["checks"].as_array().unwrap();
         assert!(checks.len() >= 4);
@@ -1183,9 +1211,9 @@ mod tests {
     }
 
     #[test]
-    fn mock_sidecar_rejects_an_empty_secret() {
+    fn mock_exec_core_rejects_an_empty_secret() {
         let running = Arc::new(AtomicBool::new(false));
-        assert!(mock_exec_sidecar(0, "", running).is_err());
+        assert!(mock_exec_core(0, "", running).is_err());
     }
 
     #[test]
