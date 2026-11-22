@@ -44,6 +44,30 @@ struct ExecStats {
 /// 往返耗时样本保留上限：够算分位数，又不会把内存吃大。
 const EXEC_LATENCY_SAMPLES: usize = 64;
 
+/// 执行内核自检的三种结论。
+///
+/// 执行内核是**可选**组件：没部署是这套部署的正常形态，不是故障。
+/// 只有「配了端点却连不上」才是真失败。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExecCheck {
+    /// 通过：端点可达且配了 Secret（可逐字节比对）；或压根没配端点（本环境不需要）。
+    Ok,
+    /// 跳过：端点可达但没配交易所 Secret，只能探活、不能比对签名。
+    Skipped,
+    /// 失败：配了端点却连不上。
+    Error,
+}
+
+impl ExecCheck {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExecCheck::Ok => "ok",
+            ExecCheck::Skipped => "skipped",
+            ExecCheck::Error => "error",
+        }
+    }
+}
+
 impl ExecStats {
     /// 记录一次探活往返耗时。任何触发探活的地方都记，样本才有意义。
     fn observe_latency(&mut self, latency_ms: Option<f64>) {
@@ -54,15 +78,13 @@ impl ExecStats {
         }
     }
 
-    /// 记一次自检：连通且配了 Secret 才算「可比对」。
-    fn record_check(&mut self, connected: bool, has_key: bool) {
+    /// 记一次自检：三种结论分别落到「成功 / 跳过 / 失败」三个计数里。
+    fn record_check(&mut self, outcome: ExecCheck) {
         self.checks += 1;
-        if !connected {
-            self.errors += 1;
-        } else if !has_key {
-            self.skipped += 1;
-        } else {
-            self.ok += 1;
+        match outcome {
+            ExecCheck::Ok => self.ok += 1,
+            ExecCheck::Skipped => self.skipped += 1,
+            ExecCheck::Error => self.errors += 1,
         }
     }
 
@@ -1251,7 +1273,8 @@ fn exec_probe_state() -> ExecProbe {
             endpoint: None,
             connected: false,
             algo: String::new(),
-            detail: "未部署执行内核（可选）：Rust 内核直连交易所签名下单，不影响交易".to_string(),
+            detail: "未部署执行内核（可选组件）：Rust 内核直连交易所签名下单，本环境无需部署"
+                .to_string(),
             latency_ms: None,
         };
     };
@@ -1275,7 +1298,11 @@ fn exec_probe_state() -> ExecProbe {
             endpoint: Some(endpoint.clone()),
             connected: false,
             algo: String::new(),
-            detail: format!("执行内核端点不可达（{endpoint}），保护单代发会失败"),
+            // sidecar 的保护单 op 主服务并未接线：下单与保护单都由 Rust 内核自己签名发出，
+            // 端点不可达只丢签名旁证与探活样本，不是下单故障。
+            detail: format!(
+                "执行内核端点不可达（{endpoint}），签名旁证与探活样本缺失；主服务下单不受影响"
+            ),
             latency_ms: None,
         },
     }
@@ -1382,7 +1409,9 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let verdict = if probe.connected && !has_key {
+    let verdict = if probe.endpoint.is_none() {
+        format!("{}，自检照常通过", probe.detail)
+    } else if probe.connected && !has_key {
         format!(
             "{}；但当前交易环境没有配置交易所 Secret，sidecar 不能用于真实签名",
             probe.detail
@@ -1411,6 +1440,19 @@ async fn exec_sidecar(State(state): State<SystemState>) -> Json<Value> {
     }))
 }
 
+/// 把一次探活结果归到自检结论里。
+///
+/// 端点没配 = 可选组件没部署 = 本环境不需要，检查通过（不是失败）。
+/// 这条区分很关键：否则每点一次「自检」都会记一次失败，看着像故障。
+fn exec_check_outcome(probe: &ExecProbe, has_key: bool) -> ExecCheck {
+    match &probe.endpoint {
+        None => ExecCheck::Ok,
+        Some(_) if !probe.connected => ExecCheck::Error,
+        Some(_) if !has_key => ExecCheck::Skipped,
+        Some(_) => ExecCheck::Ok,
+    }
+}
+
 async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
     let conn = state.db.conn.lock().expect("db");
     let mode = current_mode(&conn);
@@ -1436,21 +1478,33 @@ async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
         .unwrap_or(false);
     drop(conn);
     let probe = exec_probe_state();
+    let outcome = exec_check_outcome(&probe, has_key);
     if let Ok(mut stats) = state.exec.lock() {
         stats.observe_latency(probe.latency_ms);
-        stats.record_check(probe.connected, has_key);
+        stats.record_check(outcome);
     }
+    let detail = match outcome {
+        ExecCheck::Ok if probe.connected => {
+            "端点可达（health 协议应答正常）；签名逐字节比对用 ops verify-sidecar".to_string()
+        }
+        ExecCheck::Ok => {
+            "未部署执行内核（可选组件）：本环境由 Rust 内核直连交易所签名下单，无需执行内核，检查通过"
+                .to_string()
+        }
+        ExecCheck::Skipped => {
+            "端点可达但当前交易环境没有配置交易所 Secret，只能探活、不能比对签名".to_string()
+        }
+        ExecCheck::Error => probe.detail.clone(),
+    };
     json!({
-        "ok": probe.connected,
+        "ok": outcome == ExecCheck::Ok,
+        "outcome": outcome.as_str(),
         "connected": probe.connected,
+        "configured": probe.endpoint.is_some(),
         "endpoint": probe.endpoint.clone().unwrap_or_default(),
         "algo": probe.algo,
         "has_key": has_key,
-        "detail": if probe.connected {
-            "端点可达（health 协议应答正常）；签名逐字节比对用 ops verify-sidecar".to_string()
-        } else {
-            probe.detail.clone()
-        },
+        "detail": detail,
     })
     .into()
 }
@@ -3085,6 +3139,25 @@ mod tests {
             tested.get("detail").is_some(),
             "自检必须给出逐项结论: {tested}"
         );
+        // 没配端点 = 可选组件没部署 = 本环境不需要：必须算通过，不能记失败
+        assert_eq!(
+            tested["ok"],
+            json!(true),
+            "未部署执行内核时自检应通过: {tested}"
+        );
+        assert_eq!(tested["outcome"], json!("ok"));
+        assert_eq!(tested["configured"], json!(false));
+        let (_, after) = request_json(app.clone(), "GET", "/api/v1/system/exec-sidecar").await;
+        assert_eq!(
+            after["counts"]["ok"],
+            json!(1),
+            "未部署时的自检应计入成功: {after}"
+        );
+        assert_eq!(
+            after["counts"]["errors"],
+            json!(0),
+            "未部署不是失败: {after}"
+        );
         let (_, reset) =
             request_json(app.clone(), "POST", "/api/v1/system/exec-sidecar/reset").await;
         assert_eq!(reset["counts"]["checks"], 0);
@@ -3130,14 +3203,14 @@ mod tests {
         }
         assert_eq!(stats.latencies_ms.len(), EXEC_LATENCY_SAMPLES);
 
-        // 计数语义：探活失败是 errors，连通但没 Secret 是 skipped
+        // 计数语义：真失败记 errors，连通但没 Secret 记 skipped，其余记 ok
         let mut stats = ExecStats::default();
-        stats.record_check(false, false);
+        stats.record_check(ExecCheck::Error);
         assert_eq!(stats.checks, 1);
         assert_eq!(stats.errors, 1);
-        stats.record_check(true, false);
+        stats.record_check(ExecCheck::Skipped);
         assert_eq!(stats.skipped, 1, "连通但没配 Secret 记 skipped");
-        stats.record_check(true, true);
+        stats.record_check(ExecCheck::Ok);
         assert_eq!(stats.ok, 1);
     }
 

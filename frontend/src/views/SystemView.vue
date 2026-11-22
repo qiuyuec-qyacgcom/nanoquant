@@ -40,12 +40,13 @@ const filteredEvents = computed(() =>
   levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
 )
 
-/** 执行内核状态：已连接 / 未连接 / 未部署（Rust 内核直连交易所，未部署不影响下单） */
+/** 执行内核状态：已连接 / 未连接 / 未部署。
+ *  执行内核是可选组件：没部署是这套部署的正常形态，标「正常」而不是看着像故障的灰色「未部署」。 */
 const execTag = computed(() => {
   if (!sidecar.value) return { text: '读取中…', cls: 'tag-dim' }
   if (sidecar.value.connected) return { text: '已连接', cls: 'tag-long' }
   if (sidecar.value.configured) return { text: '未连接', cls: 'tag-warn' }
-  return { text: '未部署', cls: 'tag-dim' }
+  return { text: '正常 · 未部署', cls: 'tag-long' }
 })
 
 /** K 线流状态：没订阅时上游本来就不连，标「空闲」而不是「未连接」 */
@@ -96,9 +97,14 @@ async function selfTestSidecar() {
   testing.value = true
   try {
     const res = await http.post('/system/exec-sidecar/self-test', {})
-    if (res.ok) {
+    if (res.outcome === 'ok') {
       // 这里只验证 health 协议能应答；逐字节签名比对要用 ops verify-sidecar
-      app.notify('执行内核端点可达（' + res.endpoint + '）', 'ok')
+      app.notify(
+        res.connected ? '执行内核端点可达（' + res.endpoint + '）' : res.detail || '自检通过',
+        'ok'
+      )
+    } else if (res.outcome === 'skipped') {
+      app.notify(res.detail || '自检跳过（未配置交易所 Secret）', 'info')
     } else {
       app.notify(res.detail || '自检失败', 'error')
     }
@@ -183,7 +189,7 @@ useSilentRefresh(load, 15000)
         <div class="hint">
           端点通过环境变量配置：<code>EXEC_TCP=host:port</code> 或 <code>EXEC_SOCKET=/path/to.sock</code>
           （Windows 可执行 <code>scripts\start-sidecar.ps1</code> 拉起 sidecar）；
-          Rust 内核直连交易所，未部署执行内核时自检失败不影响下单。
+          Rust 内核直连交易所签名下单；执行内核是可选组件，未部署时本环境自检照常通过。
         </div>
         <table v-if="sidecar" class="table">
           <tbody>
@@ -191,7 +197,7 @@ useSilentRefresh(load, 15000)
               <td class="muted">通道</td>
               <td class="mono" style="white-space: normal">
                 {{ sidecar.target || '未配置' }}
-                <span class="muted">（{{ sidecar.connected ? '已连接' : sidecar.configured ? '未连接' : '未部署' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
+                <span class="muted">（{{ sidecar.connected ? '已连接' : sidecar.configured ? '未连接' : '无需部署（可选）' }}{{ sidecar.algo ? ' · ' + sidecar.algo : '' }}）</span>
               </td>
             </tr>
             <tr>
@@ -205,9 +211,14 @@ useSilentRefresh(load, 15000)
             <tr>
               <td class="muted">往返耗时</td>
               <td class="mono">
-                最近 {{ msText(sidecar.latency_ms?.last) }} · p50 {{ msText(sidecar.latency_ms?.p50) }} ·
-                p95 {{ msText(sidecar.latency_ms?.p95) }} · p99 {{ msText(sidecar.latency_ms?.p99) }}
-                <span class="muted">（探活一帧 health 的往返）</span>
+                <template v-if="sidecar.configured">
+                  最近 {{ msText(sidecar.latency_ms?.last) }} · p50 {{ msText(sidecar.latency_ms?.p50) }} ·
+                  p95 {{ msText(sidecar.latency_ms?.p95) }} · p99 {{ msText(sidecar.latency_ms?.p99) }}
+                  <span class="muted">（探活一帧 health 的往返）</span>
+                </template>
+                <template v-else>
+                  不适用<span class="muted">（未部署执行内核，没有探活样本）</span>
+                </template>
               </td>
             </tr>
           </tbody>

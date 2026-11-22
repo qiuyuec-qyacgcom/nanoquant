@@ -76,7 +76,7 @@
 | 端点 | 用途 |
 |---|---|
 | `GET /system/exec-sidecar` | 连接状态、algo、自检计数（成功/失败/跳过）、往返耗时 p50/p95/p99、verdict |
-| `POST /system/exec-sidecar/self-test` | 探活一次并记入计数（不消耗权重、不下单） |
+| `POST /system/exec-sidecar/self-test` | 探活一次并记入计数（不消耗权重、不下单）；未配置端点时记为「通过」——可选组件没部署不是故障 |
 | `POST /system/exec-sidecar/reset` | 清零观测计数（换密钥/换环境后重新统计） |
 | `GET /system/exec-sidecar/reconcile` | 只读对账：本地 `orders` 与执行死信 |
 
