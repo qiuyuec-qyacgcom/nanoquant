@@ -39,6 +39,7 @@ mod evolution;
 mod evolution_api;
 mod evolution_review;
 mod exchange_time;
+mod exec_client;
 mod execution;
 mod history;
 mod interpreter_refs;
