@@ -27,7 +27,7 @@ frontend/dist
 .superpowers
 
 # 执行侧 crate 与前端测试产物（Dockerfile 只构建主服务与本目录前端）
-rust/exec-service
+rust/exec-core
 frontend/e2e
 frontend/test-results
 **/*.bak

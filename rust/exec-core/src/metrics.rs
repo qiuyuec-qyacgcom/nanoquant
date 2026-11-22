@@ -5,7 +5,9 @@ use crate::model::SampleIn;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
-pub const SEGMENTS: [&str; 7] = ["total", "plan", "sign", "http", "wait", "protect", "persist"];
+pub const SEGMENTS: [&str; 7] = [
+    "total", "plan", "sign", "http", "wait", "protect", "persist",
+];
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
@@ -20,7 +22,12 @@ struct Ring {
 
 impl Ring {
     fn new(cap: usize) -> Self {
-        Self { buf: Vec::new(), cap: cap.max(1), next: 0, last: None }
+        Self {
+            buf: Vec::new(),
+            cap: cap.max(1),
+            next: 0,
+            last: None,
+        }
     }
 
     fn push(&mut self, ms: f64) {
@@ -100,6 +107,7 @@ impl MetricsHub {
         (accepted, dropped)
     }
 
+    #[allow(dead_code)]
     pub fn total_rejected(&self) -> u64 {
         self.rejected.lock().map(|v| *v).unwrap_or(0)
     }
@@ -177,8 +185,16 @@ mod tests {
     fn hub_ingest_unknown_segment_rejected() {
         let hub = MetricsHub::new(8);
         let (accepted, dropped) = hub.ingest_batch(&[
-            SampleIn { segment: "total".into(), ms: 1.0, ts: 0 },
-            SampleIn { segment: "nope".into(), ms: 2.0, ts: 0 },
+            SampleIn {
+                segment: "total".into(),
+                ms: 1.0,
+                ts: 0,
+            },
+            SampleIn {
+                segment: "nope".into(),
+                ms: 2.0,
+                ts: 0,
+            },
         ]);
         assert_eq!((accepted, dropped), (1, 1));
     }
@@ -192,18 +208,26 @@ mod tests {
             assert!(view[seg]["p50"].is_null());
             assert!(view[seg]["max"].is_null());
         }
-        hub.ingest_batch(&[SampleIn { segment: "sign".into(), ms: 3.5, ts: 0 }]);
+        hub.ingest_batch(&[SampleIn {
+            segment: "sign".into(),
+            ms: 3.5,
+            ts: 0,
+        }]);
         let view = hub.view();
         assert_eq!(view["sign"]["count"], serde_json::json!(1));
         assert_eq!(view["sign"]["p50"], serde_json::json!(3.5));
         assert_eq!(view["sign"]["last"], serde_json::json!(3.5));
-        assert!(view["sign"]["p95"].is_null() == false);
+        assert!(!view["sign"]["p95"].is_null());
     }
 
     #[test]
     fn hub_reset_clears_all() {
         let hub = MetricsHub::new(8);
-        hub.ingest_batch(&[SampleIn { segment: "http".into(), ms: 9.0, ts: 0 }]);
+        hub.ingest_batch(&[SampleIn {
+            segment: "http".into(),
+            ms: 9.0,
+            ts: 0,
+        }]);
         hub.reset();
         let view = hub.view();
         assert!(view["http"]["count"].as_u64() == Some(0));

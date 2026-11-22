@@ -10,6 +10,7 @@ pub struct Request {
     pub id: String,
     pub op: String,
     /// hello：调用方版本号
+    #[allow(dead_code)]
     #[serde(default)]
     pub version: String,
     /// sign：待签名的 query（不含 signature）
@@ -25,6 +26,7 @@ pub struct SampleIn {
     /// total | plan | sign | http | wait | protect | persist
     pub segment: String,
     pub ms: f64,
+    #[allow(dead_code)]
     #[serde(default)]
     pub ts: i64,
 }

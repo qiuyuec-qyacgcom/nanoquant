@@ -15,7 +15,7 @@ updates:
         update-types: ["patch"]
 
   - package-ecosystem: cargo
-    directory: /rust/exec-service
+    directory: /rust/exec-core
     schedule:
       interval: weekly
       day: monday

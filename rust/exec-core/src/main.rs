@@ -65,7 +65,9 @@ impl Config {
                 .unwrap_or_else(|_| "/run/nanoquant/exec.sock".into())
                 .into(),
             secret,
-            tcp: std::env::var("EXEC_TCP").ok().filter(|s| !s.trim().is_empty()),
+            tcp: std::env::var("EXEC_TCP")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             metrics_capacity: std::env::var("EXEC_METRICS_CAPACITY")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -370,7 +372,11 @@ mod tests {
                 op: "metrics_ingest".into(),
                 version: String::new(),
                 query: String::new(),
-                samples: vec![SampleIn { segment: "http".into(), ms: 12.5, ts: 1 }],
+                samples: vec![SampleIn {
+                    segment: "http".into(),
+                    ms: 12.5,
+                    ts: 1,
+                }],
             },
             &signer,
             &metrics,
@@ -397,7 +403,10 @@ mod tests {
         )
         .await;
         assert!(resp.ok);
-        assert_eq!(resp.segments.unwrap()["http"]["count"], serde_json::json!(1));
+        assert_eq!(
+            resp.segments.unwrap()["http"]["count"],
+            serde_json::json!(1)
+        );
 
         let resp = dispatch(
             Request {

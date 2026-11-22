@@ -2,7 +2,7 @@ name: CI
 
 # 验证门禁命令矩阵（设计 2.4.8，tasks.md 11.5 固化）：
 #   编译与静态检查   cargo fmt --check；cargo clippy --all-targets -- -D warnings   P1~P5
-#   Rust 单测        cargo test --release --locked（nanoquant / exec-service）      P1~P5
+#   Rust 单测        cargo test --release --locked（nanoquant / exec-core）         P1~P5
 #   前端             npm run typecheck / npm test / npm run build                   P1~P5
 #   契约对照         nanoquant ops contract-diff --baseline <file>                   P1~P5
 #   端到端           构建 Rust 二进制 → 启动 → Playwright                           P2~P5
@@ -55,12 +55,12 @@ jobs:
         # 逐域迁移中的主服务：每个域先用契约测试钉住响应形状再切换
         run: cargo test --release --locked
 
-  rust-exec-service:
-    name: rust (exec-service)
+  rust-exec-core:
+    name: rust (exec-core)
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: rust/exec-service
+        working-directory: rust/exec-core
     steps:
       - uses: actions/checkout@v4
 
@@ -181,7 +181,7 @@ jobs:
         run: cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
 
       - name: Zero-python runtime gate
-        # P2~P5 硬门禁：进程列表只允许 Rust 主服务与 exec-service
+        # P2~P5 硬门禁：进程列表只允许 Rust 主服务与 exec-core
         run: |
           export NANOQUANT_HOME="$GITHUB_WORKSPACE"
           rust/nanoquant/target/release/nanoquant ops zero-python --scope runtime --format json
