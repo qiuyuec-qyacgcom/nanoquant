@@ -379,36 +379,6 @@ pub(crate) fn catalog() -> Value {
     json!({ "groups": groups })
 }
 
-/// 只给 AI 看的可写字段边界：不暴露 visible/hidden 标志，避免模型猜测可见性。
-pub(crate) fn writable_catalog() -> Value {
-    let mut groups = Map::new();
-    for (group, object) in defaults().as_object().unwrap() {
-        let Some(object) = object.as_object() else {
-            continue;
-        };
-        let mut fields = Map::new();
-        for (key, default) in object {
-            if !is_ai_writable(group, key) {
-                continue;
-            }
-            let (min, max, step) = range_of(group, key);
-            fields.insert(
-                key.clone(),
-                json!({
-                    "kind": kind_of(default),
-                    "min": min,
-                    "max": max,
-                    "step": step,
-                }),
-            );
-        }
-        if !fields.is_empty() {
-            groups.insert(group.clone(), Value::Object(fields));
-        }
-    }
-    json!({ "groups": groups })
-}
-
 pub(crate) fn find(group: &str, key: &str) -> Option<ParamMeta> {
     if is_sensitive(group, key) {
         return None;
@@ -646,22 +616,5 @@ mod tests {
         assert_eq!(ai_bounds("risk", "max_leverage"), None);
         assert_eq!(ai_bounds("strategy", "ema_fast"), None);
         assert_eq!(ai_bounds("parameter_set", "min_oos_trades"), None);
-    }
-
-    #[test]
-    fn writable_catalog_only_lists_writable_fields() {
-        let catalog = writable_catalog();
-        let groups = catalog["groups"].as_object().unwrap();
-        let field = &groups["strategy"]["entry_threshold"];
-        assert_eq!(field["kind"], "number");
-        assert!(field.get("min").is_some());
-        assert!(field.get("hidden").is_none(), "不暴露可见性标志");
-        assert!(field.get("ai_writable").is_none(), "不暴露可写标志");
-        let engine = groups.get("engine").and_then(Value::as_object);
-        assert!(
-            engine.is_none_or(|fields| !fields.contains_key("cycle_interval_sec")),
-            "可见运行参数不该出现在写目录里"
-        );
-        assert!(groups.get("ai").is_none(), "ai 组不可写，不应出现");
     }
 }

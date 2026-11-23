@@ -29,7 +29,15 @@ pub(crate) fn spawn_tuning_task(
 ) -> impl std::future::Future<Output = ()> {
     async move {
         // 首次检查延迟 5 分钟：服务刚启动时行情、regime 与信号审计都还没稳定。
-        tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SEC)).await;
+        // 期间也监听停止信号，服务退出时不必等满 5 分钟。
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SEC)) => {}
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+        }
         loop {
             if *stop.borrow() {
                 break;
@@ -76,41 +84,59 @@ pub(crate) async fn run_once(state: &AiState) -> Result<(), String> {
         .lock()
         .map_err(|_| "数据库连接锁不可用".to_string())?;
     let now = crate::now();
-    if decision.params.is_empty() {
-        write_last_tuning_ts(&conn, now)?;
-        record_event(
-            &conn,
-            "info",
-            "调参未产生候选",
-            json!({
-                "event": "parameter_set.no_candidate",
-                "regime": prepared.regime,
-                "timeframe": prepared.active.timeframe,
-            }),
-        )?;
-        return Ok(());
+    // 校验是纯函数，先做：失败时不会开启事务，也不会留下半条记录。
+    let next = if decision.params.is_empty() {
+        None
+    } else {
+        Some(validate_candidate(
+            &prepared.active.params,
+            &decision.params,
+        )?)
+    };
+    // 候选、调参时间戳与事件必须同进同退：事件失败时整轮回滚，下一轮还能重试。
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("开启调参事务失败: {error}"))?;
+    match next {
+        None => {
+            write_last_tuning_ts(&tx, now)?;
+            record_event(
+                &tx,
+                "info",
+                "调参未产生候选",
+                json!({
+                    "event": "parameter_set.no_candidate",
+                    "regime": prepared.regime,
+                    "timeframe": prepared.active.timeframe,
+                }),
+            )?;
+        }
+        Some(next) => {
+            let name = format!("{}-ai-{}", prepared.regime, now);
+            let set_id = insert_candidate(
+                &tx,
+                &name,
+                &prepared.regime,
+                prepared.active.timeframe.as_str(),
+                &next,
+                Some(prepared.active.id),
+            )?;
+            write_last_tuning_ts(&tx, now)?;
+            record_event(
+                &tx,
+                "info",
+                "生成参数集候选",
+                json!({
+                    "event": "parameter_set.candidate",
+                    "set_id": set_id,
+                    "regime": prepared.regime,
+                    "timeframe": prepared.active.timeframe,
+                }),
+            )?;
+        }
     }
-    let next = validate_candidate(&prepared.active.params, &decision.params)?;
-    let name = format!("{}-ai-{}", prepared.regime, now);
-    let set_id = insert_candidate(
-        &conn,
-        &name,
-        &prepared.regime,
-        prepared.active.timeframe.as_str(),
-        &next,
-        Some(prepared.active.id),
-    )?;
-    write_last_tuning_ts(&conn, now)?;
-    record_event(
-        &conn,
-        "info",
-        "生成参数集候选",
-        json!({
-            "set_id": set_id,
-            "regime": prepared.regime,
-            "timeframe": prepared.active.timeframe,
-        }),
-    )?;
+    tx.commit()
+        .map_err(|error| format!("提交调参事务失败: {error}"))?;
     Ok(())
 }
 
@@ -240,28 +266,56 @@ fn tuning_context(
             "gate_rejected": gate_rejected,
             "ai_hold": ai_hold,
         },
-        "writable_params": crate::param_registry::writable_catalog(),
-        "ai_bounds": ai_bounds_of(&active.params),
+        "writable_parameters": writable_strategy_parameters(&active.params),
     }))
 }
 
-/// 只暴露 active 快照里真的存在、且 AI 可写的数字键的专用边界。
-fn ai_bounds_of(params: &Value) -> Value {
-    let mut bounds = Map::new();
-    if let Some(object) = params.as_object() {
-        for key in object.keys() {
-            let Some(meta) = crate::param_registry::find("strategy", key) else {
-                continue;
-            };
-            if meta.kind != "number" || !meta.ai_writable {
-                continue;
-            }
-            if let Some((low, high)) = crate::param_registry::ai_bounds("strategy", key) {
-                bounds.insert(key.clone(), json!([low, high]));
-            }
+/// 只暴露 strategy 组里 AI 可写的数字字段，并附带当前值与人工范围/专用边界。
+/// 不注入 risk/engine/parameter_set/ai，也不暴露 timeframe、字符串、数组字段。
+fn writable_strategy_parameters(active: &Value) -> Value {
+    let catalog = crate::param_registry::catalog();
+    let Some(meta) = catalog
+        .get("groups")
+        .and_then(|groups| groups.get("strategy"))
+        .and_then(|strategy| strategy.get("meta"))
+        .and_then(Value::as_object)
+    else {
+        return json!({});
+    };
+    let mut fields = Map::new();
+    for (key, field) in meta {
+        if key == "timeframe" {
+            continue;
         }
+        if field.get("kind").and_then(Value::as_str) != Some("number") {
+            continue;
+        }
+        if field.get("ai_writable").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let mut entry = Map::new();
+        entry.insert(
+            "current".into(),
+            active.get(key.as_str()).cloned().unwrap_or(Value::Null),
+        );
+        entry.insert(
+            "min".into(),
+            field.get("min").cloned().unwrap_or(Value::Null),
+        );
+        entry.insert(
+            "max".into(),
+            field.get("max").cloned().unwrap_or(Value::Null),
+        );
+        entry.insert(
+            "step".into(),
+            field.get("step").cloned().unwrap_or(Value::Null),
+        );
+        if let Some((low, high)) = crate::param_registry::ai_bounds("strategy", key) {
+            entry.insert("ai_bounds".into(), json!([low, high]));
+        }
+        fields.insert(key.clone(), Value::Object(entry));
     }
-    Value::Object(bounds)
+    Value::Object(fields)
 }
 
 fn record_failure(state: &AiState, error: &str) {
@@ -659,6 +713,7 @@ mod tests {
         assert_eq!(message, "生成参数集候选");
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert!(payload["set_id"].as_i64().unwrap() > 0);
+        assert_eq!(payload["event"], "parameter_set.candidate");
         assert_eq!(payload["regime"], "range");
         assert_eq!(payload["timeframe"], "1h");
         drop(conn);
@@ -696,6 +751,73 @@ mod tests {
             "间隔未到不应重复调用 AI 或生成候选"
         );
         assert!(event_payloads(&db).is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_params_records_no_candidate_without_touching_strategy() {
+        let db = memory_db();
+        seed_settings(&db, true);
+        seed_provider(&db);
+        seed_regime(&db, "range");
+        {
+            let conn = db.conn.lock().unwrap();
+            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+        }
+        let before = strategy_value(&db);
+        let state = state(
+            db.clone(),
+            vec![chat_reply("{\"a\":\"H\",\"c\":0.5,\"p\":[]}")],
+        );
+
+        run_once(&state).await.unwrap();
+
+        assert_eq!(candidate_count(&db), 0, "p:[] 不应生成候选");
+        let payloads = event_payloads(&db);
+        assert_eq!(payloads.len(), 1, "只应写一条无候选事件");
+        assert_eq!(payloads[0]["event"], "parameter_set.no_candidate");
+
+        let last_ts: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.last_tuning_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(last_ts.parse::<i64>().unwrap() > 0, "无候选也要推进时间戳");
+        assert_eq!(
+            strategy_value(&db),
+            before,
+            "无候选路径同样不能改写 app_settings.strategy"
+        );
+    }
+
+    #[test]
+    fn tuning_context_only_exposes_strategy_numeric_fields() {
+        let active = json!(strategy_snapshot());
+        let writable = writable_strategy_parameters(&active);
+        let fields = writable.as_object().unwrap();
+        for key in [
+            "atr_pct_min",
+            "atr_pct_max",
+            "volume_ratio_min",
+            "entry_threshold",
+            "sl_atr_mult",
+        ] {
+            assert!(fields.contains_key(key), "strategy.{key} 应出现在可调目录");
+        }
+        assert!(!fields.contains_key("timeframe"), "timeframe 不可由 AI 调");
+        assert!(!fields.contains_key("mode"), "非数值字段不应出现");
+        assert!(!fields.contains_key("roi_table"), "数组字段不应出现");
+        for forbidden in ["risk", "engine", "parameter_set", "ai"] {
+            assert!(writable.get(forbidden).is_none(), "{forbidden} 组不应出现");
+        }
+        assert_eq!(fields["atr_pct_min"]["current"], 1.5);
+        assert_eq!(fields["atr_pct_min"]["ai_bounds"], json!([0.0, 1.0]));
+        assert!(fields["atr_pct_min"]["min"].is_number());
+        assert!(fields["sl_atr_mult"].get("ai_bounds").is_none());
     }
 
     #[test]

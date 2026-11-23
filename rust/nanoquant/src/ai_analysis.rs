@@ -323,7 +323,7 @@ pub(crate) fn tuning_messages(context: &Value) -> Vec<ChatMessage> {
                 "a 固定为 H（本任务不执行交易）；c 是 0..1 的置信度；p 是参数增量数组，没有合适调整就返回 \"p\":[]。",
                 "只允许 g=\"strategy\"；不得修改 risk、parameter_set、timeframe 或 engine 参数；最多 3 个键。",
                 "硬边界：atr_pct_min <= 1.0，atr_pct_max >= 6，volume_ratio_min <= 1.0，entry_threshold <= 0.5；单键相对变化不得超过 25%。",
-                "参数键必须来自 active_params 当前快照；ai_bounds 给出每个键的 AI 专用区间；w 用中文简述调整理由。",
+                "参数键必须来自 writable_parameters 当前快照：每项含 current 当前值、min/max/step 人工范围，若存在 ai_bounds 则是 AI 专用区间；w 用中文简述调整理由。",
             ]
             .join("\n"),
         ),
