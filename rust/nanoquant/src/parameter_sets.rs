@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 const BOOTSTRAP_TIMEFRAME: &str = "1h";
@@ -283,6 +283,263 @@ pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, Strin
         row_to_set,
     )
     .map_err(|e| format!("读取参数集 {id} 失败: {e}"))
+}
+
+const ACTIVATABLE_STATUSES: &[&str] = &["approved", "active", "bootstrap", "manual"];
+
+/// 激活指定参数集：切换 active 状态、物化 strategy、记录逐键变更与激活审计。
+///
+/// 使用 SAVEPOINT 包裹，以便既能独立调用，也能嵌入 runtime 周期事务。
+pub(crate) fn activate(
+    conn: &Connection,
+    set_id: i64,
+    trigger: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let set = load_set(conn, set_id)?;
+    conn.execute_batch("SAVEPOINT parameter_set_activate")
+        .map_err(|e| format!("开启参数集激活事务失败: {e}"))?;
+    match activate_in_savepoint(conn, &set, trigger, mode) {
+        Ok(()) => conn
+            .execute_batch("RELEASE parameter_set_activate")
+            .map_err(|e| format!("提交参数集激活事务失败: {e}")),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO parameter_set_activate; RELEASE parameter_set_activate",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn activate_in_savepoint(
+    conn: &Connection,
+    set: &ParameterSet,
+    trigger: &str,
+    mode: &str,
+) -> Result<(), String> {
+    if !ACTIVATABLE_STATUSES.contains(&set.status.as_str()) {
+        return Err(format!("参数集 {} 状态 {} 不允许激活", set.id, set.status));
+    }
+    let before = crate::settings_api::group_value_public(conn, "strategy");
+    let current_timeframe = before
+        .get("timeframe")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if set.timeframe != current_timeframe {
+        return Err(format!(
+            "参数集 {} timeframe {} 与当前策略 {current_timeframe} 不一致",
+            set.id, set.timeframe
+        ));
+    }
+    let after = merged_strategy(&before, &set.params)?;
+    crate::settings_api::validate_group("strategy", &after)?;
+
+    let previous_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM parameter_sets \
+             WHERE regime=?1 AND status='active' AND id<>?2 ORDER BY id DESC LIMIT 1",
+            params![set.regime, set.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取 {} active 参数集失败: {e}", set.regime))?;
+
+    let now = crate::now();
+    conn.execute(
+        "UPDATE parameter_sets SET status='retired' \
+         WHERE regime=?1 AND status='active' AND id<>?2",
+        params![set.regime, set.id],
+    )
+    .map_err(|e| format!("退役旧参数集失败: {e}"))?;
+    conn.execute(
+        "UPDATE parameter_sets SET status='active', activated_at=?1 WHERE id=?2",
+        params![now, set.id],
+    )
+    .map_err(|e| format!("激活参数集 {} 失败: {e}", set.id))?;
+
+    conn.execute(
+        "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![
+            serde_json::to_string(&after).map_err(|e| e.to_string())?,
+            now
+        ],
+    )
+    .map_err(|e| format!("物化 strategy 失败: {e}"))?;
+    crate::settings_api::record_set_changes(
+        conn,
+        &before,
+        &after,
+        &set.regime,
+        set.id,
+        mode,
+        "parameter_set",
+    )?;
+    insert_activation(conn, set.id, &set.regime, previous_id, trigger, now)?;
+    record_event(
+        conn,
+        "info",
+        &format!("参数集 {} 已激活（{}）", set.name, trigger),
+        json!({
+            "set_id": set.id,
+            "regime": set.regime,
+            "mode": mode,
+            "trigger": trigger,
+            "previous_set_id": previous_id,
+        }),
+        now,
+    )
+}
+
+/// 按当前 regime 查 active 集并激活；trend 无集时回退 range，其余缺失直接报错。
+pub(crate) fn activate_for_regime(
+    conn: &Connection,
+    regime: &str,
+    trigger: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let target = match active_for_regime(conn, regime)? {
+        Some(set) => Some(set),
+        None if regime == "trend" => active_for_regime(conn, "range")?,
+        None => None,
+    };
+    let Some(set) = target else {
+        return Err(format!("{regime} 没有可用的 active 参数集"));
+    };
+    activate(conn, set.id, trigger, mode)
+}
+
+/// 回滚到该参数集最近一次激活前的上一套；没有上一套时返回 Err（调用方只告警）。
+#[allow(dead_code)]
+pub(crate) fn rollback(conn: &Connection, current_id: i64, mode: &str) -> Result<(), String> {
+    let current = load_set(conn, current_id)?;
+    let previous_id: Option<i64> = conn
+        .query_row(
+            "SELECT previous_set_id FROM parameter_set_activations \
+             WHERE set_id=?1 AND previous_set_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [current_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取参数集 {current_id} 激活历史失败: {e}"))?;
+    let Some(previous_id) = previous_id else {
+        return Err(format!("参数集 {} 没有上一套可回滚", current_id));
+    };
+    let previous = load_set(conn, previous_id)?;
+    if previous.regime != current.regime {
+        return Err(format!(
+            "上一套参数集 regime {} 与当前 {} 不一致，拒绝回滚",
+            previous.regime, current.regime
+        ));
+    }
+    conn.execute_batch("SAVEPOINT parameter_set_rollback")
+        .map_err(|e| format!("开启参数集回滚事务失败: {e}"))?;
+    match rollback_in_savepoint(conn, &current, &previous, mode) {
+        Ok(()) => conn
+            .execute_batch("RELEASE parameter_set_rollback")
+            .map_err(|e| format!("提交参数集回滚事务失败: {e}")),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO parameter_set_rollback; RELEASE parameter_set_rollback",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn rollback_in_savepoint(
+    conn: &Connection,
+    current: &ParameterSet,
+    previous: &ParameterSet,
+    mode: &str,
+) -> Result<(), String> {
+    let before = crate::settings_api::group_value_public(conn, "strategy");
+    let after = merged_strategy(&before, &previous.params)?;
+    crate::settings_api::validate_group("strategy", &after)?;
+
+    let now = crate::now();
+    conn.execute(
+        "UPDATE parameter_sets SET status='retired' \
+         WHERE regime=?1 AND status='active' AND id<>?2",
+        params![previous.regime, previous.id],
+    )
+    .map_err(|e| format!("退役当前参数集失败: {e}"))?;
+    conn.execute(
+        "UPDATE parameter_sets SET status='active', activated_at=?1 WHERE id=?2",
+        params![now, previous.id],
+    )
+    .map_err(|e| format!("恢复上一套参数集 {} 失败: {e}", previous.id))?;
+
+    conn.execute(
+        "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![
+            serde_json::to_string(&after).map_err(|e| e.to_string())?,
+            now
+        ],
+    )
+    .map_err(|e| format!("恢复 strategy 失败: {e}"))?;
+    crate::settings_api::record_set_changes(
+        conn,
+        &before,
+        &after,
+        &previous.regime,
+        previous.id,
+        mode,
+        "parameter_set_rollback",
+    )?;
+    insert_activation(
+        conn,
+        previous.id,
+        &previous.regime,
+        Some(current.id),
+        "rollback",
+        now,
+    )?;
+    record_event(
+        conn,
+        "info",
+        &format!("参数集 {} 回滚到 {}", current.name, previous.name),
+        json!({
+            "set_id": previous.id,
+            "previous_set_id": current.id,
+            "regime": previous.regime,
+            "mode": mode,
+            "trigger": "rollback",
+        }),
+        now,
+    )
+}
+
+/// 把参数集快照覆盖到当前 strategy 上，缺失键沿用当前/默认值，保证物化后仍是完整配置。
+fn merged_strategy(before: &Value, params: &Value) -> Result<Value, String> {
+    let params = params
+        .as_object()
+        .ok_or_else(|| "参数集 params 必须是对象快照".to_string())?;
+    let mut merged = before.clone();
+    let Some(object) = merged.as_object_mut() else {
+        return Err("当前 strategy 配置不是对象".to_string());
+    };
+    for (key, value) in params {
+        object.insert(key.clone(), value.clone());
+    }
+    Ok(merged)
+}
+
+fn record_event(
+    conn: &Connection,
+    level: &str,
+    message: &str,
+    payload: Value,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,?2,'parameter_set',?3,?4)",
+        params![now, level, message, payload.to_string()],
+    )
+    .map_err(|e| format!("写入参数集事件失败: {e}"))?;
+    Ok(())
 }
 
 /// 只写候选记录：不激活、不写配置，应用参数集属于 C 期行为。
@@ -1105,5 +1362,249 @@ mod tests {
         assert_eq!(set.status, "rejected");
         assert_eq!(set.source, "ai");
         assert_eq!(set.evidence, evidence);
+    }
+
+    fn set_id_by_name(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM parameter_sets WHERE name=?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn strategy_value(conn: &Connection) -> Value {
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn activate_materializes_strategy_and_retires_previous() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        let (candidate_id, parent_id) = pending_candidate(&conn, "range-ai-approved");
+        assert_eq!(parent_id, range_id);
+        mark_evidence(&conn, candidate_id, true, &json!({"gate":{"pass":true}})).unwrap();
+
+        activate(&conn, candidate_id, "regime", "demo").unwrap();
+
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            candidate_id
+        );
+        assert_eq!(
+            load_set(&conn, range_id).unwrap().status,
+            "retired",
+            "同 regime 旧 active 必须退役"
+        );
+        assert!(
+            load_set(&conn, candidate_id)
+                .unwrap()
+                .activated_at
+                .is_some(),
+            "激活后应写入 activated_at"
+        );
+
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy["entry_threshold"], 0.40, "候选参数必须物化");
+        assert_eq!(strategy["timeframe"], "1h");
+
+        let changes: Vec<(String, String, String, String, i64, String)> = conn
+            .prepare(
+                "SELECT key, new_value, mode, source, set_id, regime FROM parameter_changes \
+                 WHERE source='parameter_set' ORDER BY key",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            changes
+                .iter()
+                .any(|(key, new_value, mode, source, set_id, regime)| {
+                    key == "entry_threshold"
+                        && new_value == "0.4"
+                        && mode == "demo"
+                        && source == "parameter_set"
+                        && *set_id == candidate_id
+                        && regime == "range"
+                }),
+            "逐键变更必须带 mode/source/set_id/regime: {changes:?}"
+        );
+        let decision_ids: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameter_changes \
+                 WHERE source='parameter_set' AND decision_id=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision_ids as usize, changes.len());
+
+        let (set_id, previous_id, trigger): (i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT set_id, previous_set_id, trigger FROM parameter_set_activations \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(set_id, candidate_id);
+        assert_eq!(previous_id, Some(range_id));
+        assert_eq!(trigger, "regime");
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='info' AND category='parameter_set' AND message LIKE '%已激活%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn activate_rejects_rejected_retired_and_timeframe_mismatch() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let (candidate_id, _) = pending_candidate(&conn, "range-ai-rejected");
+        mark_evidence(&conn, candidate_id, false, &json!({"gate":{"pass":false}})).unwrap();
+        assert!(
+            activate(&conn, candidate_id, "regime", "demo").is_err(),
+            "rejected 集不允许激活"
+        );
+
+        let retired_id = set_id_by_name(&conn, "chaos-live-2026-11-23");
+        assert!(
+            activate(&conn, retired_id, "regime", "demo").is_err(),
+            "retired 审计集不允许激活"
+        );
+
+        let range = active_for_regime(&conn, "range").unwrap().unwrap();
+        let mismatched = insert_set(
+            &conn,
+            "range-4h-approved",
+            "range",
+            "4h",
+            &range.params,
+            "approved",
+            "manual",
+            "{}",
+            None,
+            crate::now(),
+        )
+        .unwrap();
+        assert!(
+            activate(&conn, mismatched, "regime", "demo").is_err(),
+            "timeframe 与当前策略不一致必须拒绝"
+        );
+        let active = active_for_regime(&conn, "range").unwrap().unwrap();
+        assert_eq!(active.id, range.id, "失败的激活不得改变 active");
+    }
+
+    #[test]
+    fn activate_for_regime_uses_active_set_and_falls_back_trend_to_range() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+
+        activate_for_regime(&conn, "range", "regime", "demo").unwrap();
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            range_id
+        );
+
+        assert!(
+            active_for_regime(&conn, "trend").unwrap().is_none(),
+            "trend 没有自己的 active 集"
+        );
+        activate_for_regime(&conn, "trend", "regime", "demo").unwrap();
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            range_id,
+            "trend 应回退到 range active 集"
+        );
+
+        let fresh = conn_with_strategy("1h");
+        assert!(
+            activate_for_regime(&fresh, "chaos", "regime", "demo").is_err(),
+            "无 active 集必须报错"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_previous_strategy_and_records_source() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        let (candidate_id, _) = pending_candidate(&conn, "range-ai-approved");
+        mark_evidence(&conn, candidate_id, true, &json!({"gate":{"pass":true}})).unwrap();
+        activate(&conn, candidate_id, "regime", "demo").unwrap();
+        assert_eq!(strategy_value(&conn)["entry_threshold"], 0.40);
+
+        rollback(&conn, candidate_id, "demo").unwrap();
+
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            range_id,
+            "回滚应恢复上一套 active"
+        );
+        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "retired");
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy["entry_threshold"], 0.45, "应恢复 range 快照参数");
+        assert_eq!(strategy["atr_pct_min"], 0.6);
+
+        let rollback_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameter_changes \
+                 WHERE source='parameter_set_rollback' AND set_id=?1 AND regime='range' AND mode='demo'",
+                [range_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rollback_changes > 0, "回滚必须逐键记录变更");
+
+        let (set_id, previous_id, trigger): (i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT set_id, previous_set_id, trigger FROM parameter_set_activations \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(set_id, range_id);
+        assert_eq!(previous_id, Some(candidate_id));
+        assert_eq!(trigger, "rollback");
+    }
+
+    #[test]
+    fn rollback_without_previous_activation_errors() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        assert!(
+            rollback(&conn, range_id, "demo").is_err(),
+            "bootstrap 首次激活没有上一套，只能告警"
+        );
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            range_id
+        );
     }
 }

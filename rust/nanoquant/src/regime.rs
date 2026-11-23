@@ -40,6 +40,98 @@ pub(crate) fn classify(adx: f64, gap_pct: f64, atr_pct: f64, volume_ratio: f64) 
     }
 }
 
+/// regime 确认与冷却状态机。纯内存，调用方负责读写 `engine_state`。
+///
+/// 首个有 quorum 的 regime 不做确认窗口；之后必须连续保持 `confirm_sec`
+/// 且距上次切换不短于 `cooldown_sec` 才生效。
+#[derive(Debug, Clone)]
+pub(crate) struct RegimeTracker {
+    current: Option<Regime>,
+    pending: Option<Regime>,
+    pending_since: Option<i64>,
+    changed_at: i64,
+    confirm_sec: i64,
+    cooldown_sec: i64,
+}
+
+impl RegimeTracker {
+    #[allow(dead_code)]
+    pub(crate) fn new(confirm_sec: i64, cooldown_sec: i64) -> Self {
+        Self {
+            current: None,
+            pending: None,
+            pending_since: None,
+            changed_at: 0,
+            confirm_sec,
+            cooldown_sec,
+        }
+    }
+
+    /// 从 `engine_state` 恢复状态；`current` 为空等价于首次启动。
+    pub(crate) fn restore(
+        current: Option<Regime>,
+        pending: Option<Regime>,
+        pending_since: Option<i64>,
+        changed_at: i64,
+        confirm_sec: i64,
+        cooldown_sec: i64,
+    ) -> Self {
+        Self {
+            current,
+            pending,
+            pending_since,
+            changed_at,
+            confirm_sec,
+            cooldown_sec,
+        }
+    }
+
+    pub(crate) fn current(&self) -> Option<Regime> {
+        self.current
+    }
+
+    pub(crate) fn pending(&self) -> Option<Regime> {
+        self.pending
+    }
+
+    pub(crate) fn pending_since(&self) -> Option<i64> {
+        self.pending_since
+    }
+
+    pub(crate) fn changed_at(&self) -> i64 {
+        self.changed_at
+    }
+
+    /// 观察本轮的 `market_regime`；返回 `Some` 表示本轮完成一次切换。
+    pub(crate) fn observe(&mut self, next: Regime, now: i64) -> Option<Regime> {
+        let Some(current) = self.current else {
+            self.current = Some(next);
+            self.pending = None;
+            self.pending_since = None;
+            self.changed_at = now;
+            return Some(next);
+        };
+        if next == current {
+            self.pending = None;
+            self.pending_since = None;
+            return None;
+        }
+        if self.pending != Some(next) {
+            self.pending = Some(next);
+            self.pending_since = Some(now);
+        }
+        let since = self.pending_since.unwrap_or(now);
+        if now - since >= self.confirm_sec && now - self.changed_at >= self.cooldown_sec {
+            self.current = Some(next);
+            self.changed_at = now;
+            self.pending = None;
+            self.pending_since = None;
+            return Some(next);
+        }
+        None
+    }
+}
+
 /// 启用标的池的等权多数 regime；少于 quorum 无结果，平票取 range。
 pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
     if regimes.len() < MARKET_QUORUM {
@@ -221,5 +313,101 @@ mod tests {
             assert_eq!(Regime::from_str(regime.as_str()), Some(regime));
         }
         assert_eq!(Regime::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn regime_tracker_first_observation_is_immediate() {
+        let mut tracker = RegimeTracker::new(1_800, 1_800);
+        assert_eq!(tracker.current(), None);
+        assert_eq!(tracker.observe(Regime::Range, 1_000), Some(Regime::Range));
+        assert_eq!(tracker.current(), Some(Regime::Range));
+        assert_eq!(tracker.changed_at(), 1_000);
+        assert_eq!(tracker.pending(), None, "首次生效不应留下 pending");
+    }
+
+    #[test]
+    fn regime_tracker_requires_confirmation_window() {
+        let mut tracker = RegimeTracker::new(1_800, 0);
+        assert_eq!(tracker.observe(Regime::Range, 0), Some(Regime::Range));
+
+        assert_eq!(
+            tracker.observe(Regime::Trend, 60),
+            None,
+            "刚出现的新 regime 不能立即切换"
+        );
+        assert_eq!(tracker.current(), Some(Regime::Range));
+        assert_eq!(tracker.pending(), Some(Regime::Trend));
+        assert_eq!(tracker.pending_since(), Some(60));
+
+        assert_eq!(
+            tracker.observe(Regime::Trend, 1_859),
+            None,
+            "确认窗口未满 1800 秒"
+        );
+        assert_eq!(
+            tracker.observe(Regime::Trend, 1_860),
+            Some(Regime::Trend),
+            "连续保持达到 confirm_sec 应切换"
+        );
+        assert_eq!(tracker.changed_at(), 1_860);
+        assert_eq!(tracker.pending(), None);
+    }
+
+    #[test]
+    fn regime_tracker_resets_pending_when_regime_returns() {
+        let mut tracker = RegimeTracker::new(1_800, 0);
+        tracker.observe(Regime::Range, 0);
+        tracker.observe(Regime::Chaos, 60);
+        assert_eq!(tracker.pending(), Some(Regime::Chaos));
+
+        assert_eq!(tracker.observe(Regime::Range, 120), None);
+        assert_eq!(tracker.pending(), None, "回到当前 regime 应清空 pending");
+        assert_eq!(tracker.pending_since(), None);
+    }
+
+    #[test]
+    fn regime_tracker_respects_cooldown_after_switch() {
+        let mut tracker = RegimeTracker::new(1_800, 3_600);
+        tracker.observe(Regime::Range, 0);
+        tracker.observe(Regime::Trend, 60);
+        assert_eq!(
+            tracker.observe(Regime::Trend, 1_860),
+            None,
+            "确认窗口已满但冷却未到，仍保持当前"
+        );
+        assert_eq!(tracker.current(), Some(Regime::Range));
+        assert_eq!(
+            tracker.observe(Regime::Trend, 3_600),
+            Some(Regime::Trend),
+            "冷却期满后允许切换"
+        );
+    }
+
+    #[test]
+    fn regime_tracker_keeps_state_when_quorum_missing() {
+        let mut tracker = RegimeTracker::new(0, 0);
+        tracker.observe(Regime::Range, 0);
+        // 本轮 market_regime 无结果时调用方不调用 observe，状态必须原样保留。
+        assert_eq!(tracker.current(), Some(Regime::Range));
+        assert_eq!(tracker.pending(), None);
+        assert_eq!(tracker.changed_at(), 0);
+    }
+
+    #[test]
+    fn regime_tracker_restore_continues_pending_window() {
+        let mut tracker = RegimeTracker::restore(
+            Some(Regime::Range),
+            Some(Regime::Trend),
+            Some(60),
+            0,
+            1_800,
+            0,
+        );
+        assert_eq!(
+            tracker.observe(Regime::Trend, 1_860),
+            Some(Regime::Trend),
+            "跨周期恢复后仍按原 pending_since 计算确认窗口"
+        );
+        assert_eq!(tracker.changed_at(), 1_860);
     }
 }

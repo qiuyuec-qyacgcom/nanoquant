@@ -595,6 +595,57 @@ pub(crate) fn validate_group(group: &str, value: &Value) -> Result<(), String> {
     validate(group, value)
 }
 
+/// 供参数集物化时读取合并了默认值的完整配置快照。
+pub(crate) fn group_value_public(conn: &rusqlite::Connection, name: &str) -> Value {
+    group_value(conn, name)
+}
+
+/// 参数集激活/回滚时逐键记录到 `parameter_changes`，与人工/AI 调参共用审计表。
+pub(crate) fn record_set_changes(
+    conn: &rusqlite::Connection,
+    before: &Value,
+    after: &Value,
+    regime: &str,
+    set_id: i64,
+    mode: &str,
+    source: &str,
+) -> Result<(), String> {
+    let Some(after) = after.as_object() else {
+        return Err("参数集 strategy 快照必须是对象".to_string());
+    };
+    let before = before.as_object().cloned().unwrap_or_default();
+    let reason = if source == "parameter_set_rollback" {
+        "参数集回滚"
+    } else {
+        "参数集切换"
+    };
+    let now = crate::now();
+    for (key, new) in after {
+        let old = before.get(key).cloned().unwrap_or(Value::Null);
+        if &old == new {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO parameter_changes(\
+             ts, group_name, key, old_value, new_value, reason, decision_id, mode, source, set_id, regime) \
+             VALUES(?1,'strategy',?2,?3,?4,?5,0,?6,?7,?8,?9)",
+            rusqlite::params![
+                now,
+                key,
+                serde_json::to_string(&old).unwrap_or_else(|_| "null".to_string()),
+                serde_json::to_string(new).unwrap_or_default(),
+                reason,
+                mode,
+                source,
+                set_id,
+                regime,
+            ],
+        )
+        .map_err(|error| format!("写入参数集变更记录失败: {error}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rollback_param_change(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
     let _ = crate::schema::ensure_parameter_changes(conn);
     let (group, key, old_text, mode): (String, String, Option<String>, String) = conn

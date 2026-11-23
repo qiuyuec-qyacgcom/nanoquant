@@ -1572,6 +1572,10 @@ impl EngineRuntime {
         preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
         preview_value["executed"] = serde_json::json!(executed);
         preview_value["venue_closed"] = serde_json::json!(venue_closed);
+        // 周期尾推进 regime 状态机并切换参数集；失败只告警，不阻断本轮。
+        if let Err(error) = apply_regime_transition(&tx, mode) {
+            tracing::warn!(%error, %mode, "regime 切换处理失败，不影响本轮周期");
+        }
         upsert_state(
             &tx,
             &format!("cycle_preview.{mode}"),
@@ -4206,6 +4210,95 @@ fn upsert_state(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(
         "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         (key, value, crate::now()),
     ).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 读取某 mode 的 regime 状态机并推进一轮；切换时按新 regime 激活参数集。
+///
+/// C 期只做 regime 切换触发激活，不实现 C3 的自动启用与无候选回滚。
+fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<(), String> {
+    let read_state = |key: String| -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let Some(next) = read_state(format!("market_regime.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw))
+    else {
+        // 本轮有效标的不足 quorum：保持当前 regime，不重置 pending。
+        return Ok(());
+    };
+    let config = crate::settings_api::group_value_public(conn, "parameter_set");
+    let confirm_sec = config
+        .get("regime_confirm_sec")
+        .and_then(Value::as_i64)
+        .unwrap_or(1_800)
+        .max(0);
+    let cooldown_sec = config
+        .get("regime_cooldown_sec")
+        .and_then(Value::as_i64)
+        .unwrap_or(1_800)
+        .max(0);
+    let current = read_state(format!("regime.current.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw));
+    let pending = read_state(format!("regime.pending.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw));
+    let pending_since =
+        read_state(format!("regime.pending_since.{mode}")).and_then(|raw| raw.parse::<i64>().ok());
+    let changed_at = read_state(format!("regime.changed_at.{mode}"))
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0);
+    let mut tracker = crate::regime::RegimeTracker::restore(
+        current,
+        pending,
+        pending_since,
+        changed_at,
+        confirm_sec,
+        cooldown_sec,
+    );
+    let switched = tracker.observe(next, crate::now());
+    upsert_state(
+        conn,
+        &format!("regime.current.{mode}"),
+        tracker.current().map(|r| r.as_str()).unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.pending.{mode}"),
+        tracker.pending().map(|r| r.as_str()).unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.pending_since.{mode}"),
+        &tracker
+            .pending_since()
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.changed_at.{mode}"),
+        &tracker.changed_at().to_string(),
+    )?;
+    if let Some(regime) = switched {
+        if let Err(error) =
+            crate::parameter_sets::activate_for_regime(conn, regime.as_str(), "regime", mode)
+        {
+            tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
+            let _ = conn.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) \
+                 VALUES(?1,'warn','parameter_set',?2,?3)",
+                (
+                    crate::now(),
+                    format!("regime 切换激活参数集失败: {error}"),
+                    json!({ "mode": mode, "regime": regime.as_str() }).to_string(),
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn acquire_lock(data_dir: &Path) -> io::Result<File> {
