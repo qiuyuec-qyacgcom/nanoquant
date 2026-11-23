@@ -164,7 +164,8 @@ pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS parameter_set_activations(\
          id INTEGER PRIMARY KEY, set_id INTEGER NOT NULL, regime TEXT NOT NULL, previous_set_id INTEGER, \
          ts INTEGER NOT NULL, trigger TEXT NOT NULL); \
-         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_ts ON parameter_set_activations(ts);",
+         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_ts ON parameter_set_activations(ts); \
+         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_set_id ON parameter_set_activations(set_id);",
     )
     .map_err(|e| format!("建表 parameter_sets 失败: {e}"))?;
     if !column_exists(conn, "parameter_changes", "set_id")? {
@@ -179,10 +180,15 @@ pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
         conn.execute_batch("ALTER TABLE trades ADD COLUMN parameter_set_id INTEGER;")
             .map_err(|e| format!("补列 trades.parameter_set_id 失败: {e}"))?;
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ix_parameter_changes_set_id ON parameter_changes(set_id); \
+         CREATE INDEX IF NOT EXISTS ix_trades_parameter_set_id ON trades(parameter_set_id);",
+    )
+    .map_err(|e| format!("建索引 parameter_set 关联列失败: {e}"))?;
     Ok(())
 }
 
-pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
     Ok(column_names(conn, table)?.contains(column))
 }
 

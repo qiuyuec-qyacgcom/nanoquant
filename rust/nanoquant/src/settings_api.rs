@@ -565,13 +565,15 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         }
         if group == "parameter_set" && key == "auto_apply_timeframes" {
             let allowed = candidate.as_str().is_some_and(|text| {
-                !text.trim().is_empty()
-                    && text
+                let text = text.trim();
+                // 空串表示不自动切换；非空项仍只接受 1h。
+                text.is_empty()
+                    || text
                         .split(',')
                         .all(|part| part.trim().eq_ignore_ascii_case("1h"))
             });
             if !allowed {
-                return Err(format!("{key}: v1 仅允许 1h"));
+                return Err(format!("{key}: v1 仅允许 1h 或空串"));
             }
         }
         let (Some(low), Some(high)) = (meta.min, meta.max) else {
@@ -895,13 +897,35 @@ mod tests {
 
         for patch in [
             r#"{"auto_apply_timeframes":"1h, 4h"}"#,
-            r#"{"auto_apply_timeframes":""}"#,
             r#"{"auto_apply_timeframes":null}"#,
             r#"{"enabled":null}"#,
         ] {
             let (status, body) = put_settings(app.clone(), "parameter_set", patch).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}: {body}");
         }
+
+        let (status, body) = put_settings(
+            app.clone(),
+            "parameter_set",
+            r#"{"auto_apply_timeframes":""}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["auto_apply_timeframes"], "");
+        let stored: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored).unwrap()["auto_apply_timeframes"],
+            ""
+        );
         let _ = std::fs::remove_file(&path);
     }
 

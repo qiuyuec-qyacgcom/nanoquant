@@ -2,9 +2,14 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 const BOOTSTRAP_TIMEFRAME: &str = "1h";
+const CURRENT_SNAPSHOT_EVIDENCE: &str =
+    "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\"}";
+const INCIDENT_EVIDENCE: &str = "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\",\"incident_date\":\"2026-11-23\",\"known_keys\":[\"atr_pct_min\",\"atr_pct_max\",\"volume_ratio_min\",\"entry_threshold\"]}";
+const AUTO_SWITCH_DISABLED: &str = "strategy.timeframe 不在自动切换白名单，已禁用自动切换";
 
 /// A 期迁移种子化：只建参数集记录，绝不改写 `app_settings.strategy`（C 期才物化）。
-/// 幂等：`parameter_sets` 已有任何数据即跳过；`strategy` 缺失时直接返回，允许单独调用。
+/// 幂等：`parameter_sets` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
+/// 全部写入放在一个事务里：中途失败整体回滚，避免留下半套数据导致下次跳过。
 pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
     let exists: i64 = conn
         .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
@@ -26,6 +31,19 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         // 配置损坏时跳过种子化：审计种子不值得阻断整次启动。
         return Ok(());
     };
+    let now = crate::now();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("开启参数集种子化事务失败: {e}"))?;
+    if let Err(error) = seed_in_transaction(&tx, &current, now) {
+        let _ = tx.rollback();
+        return Err(error);
+    }
+    tx.commit()
+        .map_err(|e| format!("提交参数集种子化事务失败: {e}"))
+}
+
+fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(), String> {
     let timeframe = current["timeframe"].as_str().unwrap_or("4h");
     if timeframe != BOOTSTRAP_TIMEFRAME {
         let retired = current.clone();
@@ -37,13 +55,15 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
             &retired,
             "retired",
             "manual",
-            "{\"kind\":\"historical\"}",
+            CURRENT_SNAPSHOT_EVIDENCE,
             None,
+            now,
         )?;
+        disable_auto_switch(conn, now)?;
         return Ok(());
     }
     let range = with_overrides(
-        &current,
+        current,
         &[
             ("atr_pct_min", json!(0.6)),
             ("atr_pct_max", json!(10.0)),
@@ -52,7 +72,7 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         ],
     );
     let chaos = with_overrides(
-        &current,
+        current,
         &[
             ("atr_pct_min", json!(1.0)),
             ("atr_pct_max", json!(8.0)),
@@ -60,9 +80,9 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
             ("entry_threshold", json!(0.5)),
         ],
     );
-    // 事故审计集固定为事故当天线上值，不能跟随部署时的 strategy 快照。
+    // 四个已知事故值覆盖；其余键来自部署快照，审计标记 partial。
     let live = with_overrides(
-        &current,
+        current,
         &[
             ("atr_pct_min", json!(1.5)),
             ("atr_pct_max", json!(8.0)),
@@ -80,8 +100,9 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         "bootstrap",
         "{\"kind\":\"bootstrap\"}",
         None,
+        now,
     )?;
-    insert_activation(conn, range_id, "range", None, "bootstrap")?;
+    insert_activation(conn, range_id, "range", None, "bootstrap", now)?;
     let chaos_id = insert_set(
         conn,
         "chaos-bootstrap",
@@ -92,8 +113,9 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         "bootstrap",
         "{\"kind\":\"bootstrap\"}",
         None,
+        now,
     )?;
-    insert_activation(conn, chaos_id, "chaos", None, "bootstrap")?;
+    insert_activation(conn, chaos_id, "chaos", None, "bootstrap", now)?;
     insert_set(
         conn,
         "chaos-live-2026-11-23",
@@ -102,9 +124,28 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         &live,
         "retired",
         "manual",
-        "{\"kind\":\"historical\"}",
+        INCIDENT_EVIDENCE,
         None,
+        now,
     )?;
+    Ok(())
+}
+
+/// 非白名单 timeframe 下按规格关闭自动切换，并留下一条告警事件。
+fn disable_auto_switch(conn: &Connection, now: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE app_settings \
+         SET value = json_patch(value, '{\"auto_apply\":false,\"auto_apply_timeframes\":\"\"}') \
+         WHERE key='parameter_set'",
+        [],
+    )
+    .map_err(|e| format!("禁用参数集自动切换失败: {e}"))?;
+    conn.execute(
+        "INSERT INTO engine_events(ts,level,category,message,payload) \
+         VALUES(?1,'warn','parameter_set',?2,?3)",
+        params![now, AUTO_SWITCH_DISABLED, "{}"],
+    )
+    .map_err(|e| format!("写入参数集告警事件失败: {e}"))?;
     Ok(())
 }
 
@@ -129,8 +170,8 @@ fn insert_set(
     source: &str,
     evidence: &str,
     parent_id: Option<i64>,
+    now: i64,
 ) -> Result<i64, String> {
-    let now = crate::now();
     let activated_at = if status == "active" { Some(now) } else { None };
     let raw = serde_json::to_string(params_value).map_err(|e| e.to_string())?;
     conn.execute(
@@ -159,11 +200,12 @@ fn insert_activation(
     regime: &str,
     previous_set_id: Option<i64>,
     trigger: &str,
+    now: i64,
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO parameter_set_activations(set_id,regime,previous_set_id,ts,trigger) \
          VALUES(?1,?2,?3,?4,?5)",
-        params![set_id, regime, previous_set_id, crate::now(), trigger],
+        params![set_id, regime, previous_set_id, now, trigger],
     )
     .map_err(|e| format!("写入参数集激活记录失败: {e}"))?;
     Ok(())
@@ -173,6 +215,17 @@ fn insert_activation(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    struct SetRow {
+        name: String,
+        regime: String,
+        timeframe: String,
+        status: String,
+        source: String,
+        evidence: Value,
+        parent_id: Option<i64>,
+        params: Value,
+    }
 
     fn conn_with_strategy(timeframe: &str) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -192,19 +245,44 @@ mod tests {
             .to_string()],
         )
         .unwrap();
+        // 非 1h 分支需要既有 parameter_set 配置来验证白名单被清空。
+        conn.execute(
+            "INSERT INTO app_settings VALUES('parameter_set',?1,0)",
+            [serde_json::json!({
+                "enabled": true,
+                "auto_apply": true,
+                "auto_apply_timeframes": "1h"
+            })
+            .to_string()],
+        )
+        .unwrap();
         crate::schema::migrate(&conn).unwrap();
         conn
     }
 
-    fn set_params(conn: &Connection, name: &str) -> serde_json::Value {
-        let raw: String = conn
-            .query_row(
-                "SELECT params FROM parameter_sets WHERE name=?1",
-                [name],
-                |r| r.get(0),
-            )
-            .unwrap();
-        serde_json::from_str(&raw).unwrap()
+    fn all_sets(conn: &Connection) -> Vec<SetRow> {
+        conn.prepare(
+            "SELECT name,regime,timeframe,status,source,evidence,parent_id,params \
+             FROM parameter_sets ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let evidence: String = row.get(5)?;
+            let params: String = row.get(7)?;
+            Ok(SetRow {
+                name: row.get(0)?,
+                regime: row.get(1)?,
+                timeframe: row.get(2)?,
+                status: row.get(3)?,
+                source: row.get(4)?,
+                evidence: serde_json::from_str(&evidence).unwrap(),
+                parent_id: row.get(6)?,
+                params: serde_json::from_str(&params).unwrap(),
+            })
+        })
+        .unwrap()
+        .flatten()
+        .collect()
     }
 
     #[test]
@@ -226,44 +304,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before, after);
-        let rows: Vec<(String, String, String, String)> = conn
-            .prepare("SELECT name,regime,timeframe,status FROM parameter_sets ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .unwrap()
-            .flatten()
-            .collect();
-        assert!(rows.contains(&(
-            "range-bootstrap".into(),
-            "range".into(),
-            "1h".into(),
-            "active".into()
-        )));
-        assert!(rows.contains(&(
-            "chaos-bootstrap".into(),
-            "chaos".into(),
-            "1h".into(),
-            "active".into()
-        )));
-        assert!(rows.contains(&(
-            "chaos-live-2026-11-23".into(),
-            "chaos".into(),
-            "1h".into(),
-            "retired".into()
-        )));
-        let range_params = set_params(&conn, "range-bootstrap");
-        assert_eq!(range_params["atr_pct_min"], 0.6);
-        assert_eq!(range_params["atr_pct_max"], 10.0);
-        assert_eq!(range_params["volume_ratio_min"], 0.8);
-        assert_eq!(range_params["entry_threshold"], 0.45);
-        assert_eq!(range_params["timeframe"], "1h");
 
-        let chaos_params = set_params(&conn, "chaos-bootstrap");
-        assert_eq!(chaos_params["atr_pct_min"], 1.0);
-        assert_eq!(chaos_params["atr_pct_max"], 8.0);
-        assert_eq!(chaos_params["volume_ratio_min"], 1.0);
-        assert_eq!(chaos_params["entry_threshold"], 0.5);
-        assert_eq!(chaos_params["timeframe"], "1h");
+        let sets = all_sets(&conn);
+        assert_eq!(sets.len(), 3);
+
+        let range = &sets[0];
+        assert_eq!(range.name, "range-bootstrap");
+        assert_eq!(range.regime, "range");
+        assert_eq!(range.timeframe, "1h");
+        assert_eq!(range.params["timeframe"], range.timeframe);
+        assert_eq!(range.status, "active");
+        assert_eq!(range.source, "bootstrap");
+        assert_eq!(range.evidence, json!({ "kind": "bootstrap" }));
+        assert!(range.parent_id.is_none(), "种子集不应有父集");
+        assert_eq!(range.params["atr_pct_min"], 0.6);
+        assert_eq!(range.params["atr_pct_max"], 10.0);
+        assert_eq!(range.params["volume_ratio_min"], 0.8);
+        assert_eq!(range.params["entry_threshold"], 0.45);
+
+        let chaos = &sets[1];
+        assert_eq!(chaos.name, "chaos-bootstrap");
+        assert_eq!(chaos.regime, "chaos");
+        assert_eq!(chaos.timeframe, "1h");
+        assert_eq!(chaos.params["timeframe"], chaos.timeframe);
+        assert_eq!(chaos.status, "active");
+        assert_eq!(chaos.source, "bootstrap");
+        assert_eq!(chaos.evidence, json!({ "kind": "bootstrap" }));
+        assert!(chaos.parent_id.is_none(), "种子集不应有父集");
+        assert_eq!(chaos.params["atr_pct_min"], 1.0);
+        assert_eq!(chaos.params["atr_pct_max"], 8.0);
+        assert_eq!(chaos.params["volume_ratio_min"], 1.0);
+        assert_eq!(chaos.params["entry_threshold"], 0.5);
+
+        let live = &sets[2];
+        assert_eq!(live.name, "chaos-live-2026-11-23");
+        assert_eq!(live.regime, "chaos");
+        assert_eq!(live.timeframe, "1h");
+        assert_eq!(live.params["timeframe"], live.timeframe);
+        assert_eq!(live.status, "retired");
+        assert_eq!(live.source, "manual");
+        assert_eq!(live.evidence["kind"], "manual");
+        assert_eq!(live.evidence["historical"], true);
+        assert_eq!(live.evidence["snapshot"], "partial");
+        assert_eq!(live.evidence["incident_date"], "2026-11-23");
+        assert_eq!(
+            live.evidence["known_keys"],
+            json!([
+                "atr_pct_min",
+                "atr_pct_max",
+                "volume_ratio_min",
+                "entry_threshold"
+            ])
+        );
+        assert!(live.parent_id.is_none());
+        assert_eq!(live.params["atr_pct_min"], 1.5);
+        assert_eq!(live.params["atr_pct_max"], 8.0);
+        assert_eq!(live.params["volume_ratio_min"], 1.1);
+        assert_eq!(live.params["entry_threshold"], 0.55);
 
         let activations: Vec<(i64, String, Option<i64>, String, String)> = conn
             .prepare(
@@ -298,21 +395,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total_activations, 2, "retired 审计集不应产生激活记录");
-
-        let live: (String, String) = conn
-            .query_row(
-                "SELECT params,status FROM parameter_sets WHERE name='chaos-live-2026-11-23'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(live.1, "retired");
-        let live_params: serde_json::Value = serde_json::from_str(&live.0).unwrap();
-        assert_eq!(live_params["atr_pct_min"], 1.5);
-        assert_eq!(live_params["atr_pct_max"], 8.0);
-        assert_eq!(live_params["volume_ratio_min"], 1.1);
-        assert_eq!(live_params["entry_threshold"], 0.55);
-        assert_eq!(live_params["timeframe"], "1h");
     }
 
     #[test]
@@ -333,20 +415,69 @@ mod tests {
     }
 
     #[test]
-    fn non_1h_seeds_only_retired_snapshot() {
+    fn seed_bootstrap_rolls_back_all_writes_on_failure() {
+        let conn = conn_with_strategy("1h");
+        conn.execute_batch(
+            "CREATE TRIGGER seed_boom BEFORE INSERT ON parameter_sets \
+             WHEN NEW.name='chaos-bootstrap' BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+        assert!(seed_bootstrap(&conn).is_err());
+        let sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 0, "种子化失败必须整体回滚");
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 0, "激活记录也必须回滚");
+    }
+
+    #[test]
+    fn non_1h_seeds_only_retired_snapshot_and_disables_auto_switch() {
         let conn = conn_with_strategy("4h");
         seed_bootstrap(&conn).unwrap();
-        let rows: Vec<(String, String)> = conn
-            .prepare("SELECT name,status FROM parameter_sets")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .flatten()
-            .collect();
-        assert_eq!(
-            rows,
-            vec![("current-snapshot".to_string(), "retired".to_string())]
-        );
+        let sets = all_sets(&conn);
+        assert_eq!(sets.len(), 1);
+        let snapshot = &sets[0];
+        assert_eq!(snapshot.name, "current-snapshot");
+        assert_eq!(snapshot.status, "retired");
+        assert_eq!(snapshot.source, "manual");
+        assert_eq!(snapshot.evidence["kind"], "manual");
+        assert_eq!(snapshot.evidence["historical"], true);
+        assert_eq!(snapshot.evidence["snapshot"], "partial");
+        assert!(snapshot.parent_id.is_none());
+        assert_eq!(snapshot.params["timeframe"], snapshot.timeframe);
+
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let config: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(config["auto_apply"], false);
+        assert_eq!(config["auto_apply_timeframes"], "");
+
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 0);
+
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='warn' AND category='parameter_set' AND message=?1",
+                [AUTO_SWITCH_DISABLED],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
     }
 
     #[test]

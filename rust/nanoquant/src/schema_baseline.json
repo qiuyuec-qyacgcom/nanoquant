@@ -3130,6 +3130,19 @@
               "name": "closed_at"
             }
           ]
+        },
+        {
+          "name": "ix_trades_parameter_set_id",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 25,
+              "name": "parameter_set_id"
+            }
+          ]
         }
       ],
       "foreign_keys": []
