@@ -57,7 +57,16 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
             ("entry_threshold", json!(0.5)),
         ],
     );
-    let live = with_overrides(&current, &[]);
+    // 事故审计集固定为事故当天线上值，不能跟随部署时的 strategy 快照。
+    let live = with_overrides(
+        &current,
+        &[
+            ("atr_pct_min", json!(1.5)),
+            ("atr_pct_max", json!(8.0)),
+            ("volume_ratio_min", json!(1.1)),
+            ("entry_threshold", json!(0.55)),
+        ],
+    );
     let range_id = insert_set(
         conn,
         "range-bootstrap",
@@ -236,6 +245,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(activations, 2);
+
+        let live: (String, String) = conn
+            .query_row(
+                "SELECT params,status FROM parameter_sets WHERE name='chaos-live-2026-11-23'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live.1, "retired");
+        let live_params: serde_json::Value = serde_json::from_str(&live.0).unwrap();
+        assert_eq!(live_params["atr_pct_min"], 1.5);
+        assert_eq!(live_params["atr_pct_max"], 8.0);
+        assert_eq!(live_params["volume_ratio_min"], 1.1);
+        assert_eq!(live_params["entry_threshold"], 0.55);
+        assert_eq!(live_params["timeframe"], "1h");
     }
 
     #[test]
