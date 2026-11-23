@@ -4287,13 +4287,31 @@ fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<()
             crate::parameter_sets::activate_for_regime(conn, regime.as_str(), "regime", mode)
         {
             tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
+            // 激活失败不能把 regime 留在“已切换”状态：否则下轮不再触发激活，
+            // 策略与 regime 永久错位。恢复旧 current/changed_at，并清空 pending，
+            // 让下一轮按 market_regime 重新累计确认后重试。
+            let previous = current.map(|r| r.as_str()).unwrap_or_default();
+            let _ = upsert_state(conn, &format!("regime.current.{mode}"), previous);
+            let _ = upsert_state(conn, &format!("regime.pending.{mode}"), "");
+            let _ = upsert_state(conn, &format!("regime.pending_since.{mode}"), "");
+            let _ = upsert_state(
+                conn,
+                &format!("regime.changed_at.{mode}"),
+                &changed_at.to_string(),
+            );
             let _ = conn.execute(
                 "INSERT INTO engine_events(ts,level,category,message,payload) \
                  VALUES(?1,'warn','parameter_set',?2,?3)",
                 (
                     crate::now(),
-                    format!("regime 切换激活参数集失败: {error}"),
-                    json!({ "mode": mode, "regime": regime.as_str() }).to_string(),
+                    format!("parameter_set.regime_activation_failed: {error}"),
+                    json!({
+                        "mode": mode,
+                        "regime": regime.as_str(),
+                        "previous": previous,
+                        "error": error,
+                    })
+                    .to_string(),
                 ),
             );
         }
@@ -6186,6 +6204,98 @@ mod tests {
             seen,
             "平仓提交后必须触发复盘并留下事件（样本不足时记录跳过原因）"
         );
+    }
+
+    #[test]
+    fn apply_regime_transition_restores_previous_regime_when_activation_fails() {
+        let conn = regime_transition_fixture(Some("range"), 100);
+
+        apply_regime_transition(&conn, "demo").expect("激活失败不能阻断周期");
+
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "range",
+            "激活失败必须恢复旧 regime，下轮才能重新触发"
+        );
+        assert_eq!(regime_state(&conn, "regime.pending.demo"), "");
+        assert_eq!(regime_state(&conn, "regime.pending_since.demo"), "");
+        assert_eq!(
+            regime_state(&conn, "regime.changed_at.demo"),
+            "100",
+            "changed_at 必须恢复激活前的值"
+        );
+        let failures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='warn' AND category='parameter_set' \
+                 AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn apply_regime_transition_clears_current_when_first_activation_fails() {
+        let conn = regime_transition_fixture(None, 0);
+
+        apply_regime_transition(&conn, "demo").expect("首次激活失败不能阻断周期");
+
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "",
+            "首次激活失败必须清空 current，下轮按首次初始化重试"
+        );
+        assert_eq!(regime_state(&conn, "regime.pending.demo"), "");
+        assert_eq!(regime_state(&conn, "regime.pending_since.demo"), "");
+        let failures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    fn regime_transition_fixture(current: Option<&str>, changed_at: i64) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); \
+             CREATE TABLE trades(id INTEGER PRIMARY KEY, parameter_set_id INTEGER); \
+             INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\"}',0); \
+             INSERT INTO app_settings VALUES('parameter_set','{\"regime_confirm_sec\":0,\"regime_cooldown_sec\":0}',0); \
+             INSERT INTO engine_state VALUES('market_regime.demo','chaos',0);",
+        )
+        .unwrap();
+        if let Some(current) = current {
+            conn.execute(
+                "INSERT INTO engine_state VALUES('regime.current.demo',?1,0)",
+                [current],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO engine_state VALUES('regime.changed_at.demo',?1,0)",
+                [changed_at.to_string()],
+            )
+            .unwrap();
+        }
+        crate::schema::ensure_parameter_changes(&conn).unwrap();
+        crate::schema::ensure_parameter_sets(&conn).unwrap();
+        conn
+    }
+
+    fn regime_state(conn: &rusqlite::Connection, key: &str) -> String {
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn test_db() -> Db {

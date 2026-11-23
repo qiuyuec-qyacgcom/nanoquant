@@ -321,6 +321,11 @@ fn activate_in_savepoint(
     if !ACTIVATABLE_STATUSES.contains(&set.status.as_str()) {
         return Err(format!("参数集 {} 状态 {} 不允许激活", set.id, set.status));
     }
+    if set.status == "active" {
+        // 同 regime 唯一 active 由唯一索引保证：再次激活同一 id 是 no-op，
+        // 不重复写 activated_at/strategy/变更/激活记录/事件。
+        return Ok(());
+    }
     let before = crate::settings_api::group_value_public(conn, "strategy");
     let current_timeframe = before
         .get("timeframe")
@@ -1606,5 +1611,109 @@ mod tests {
             active_for_regime(&conn, "range").unwrap().unwrap().id,
             range_id
         );
+    }
+
+    #[test]
+    fn activate_active_set_is_noop() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        let before_strategy = strategy_value(&conn);
+        let before_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let before_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        let before_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        activate(&conn, range_id, "regime", "demo").unwrap();
+
+        assert_eq!(
+            strategy_value(&conn),
+            before_strategy,
+            "重复激活 active 集不得改写 strategy"
+        );
+        let after_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_activations, before_activations, "不得新增激活记录");
+        let after_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_changes, before_changes, "不得新增参数变更");
+        let after_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_events, before_events, "不得新增激活事件");
+        assert_eq!(load_set(&conn, range_id).unwrap().status, "active");
+    }
+
+    #[test]
+    fn activate_rolls_back_savepoint_when_audit_write_fails() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        let (candidate_id, _) = pending_candidate(&conn, "range-ai-approved");
+        mark_evidence(&conn, candidate_id, true, &json!({"gate":{"pass":true}})).unwrap();
+        let before_strategy = strategy_value(&conn);
+        let before_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_parameter_changes BEFORE INSERT ON parameter_changes \
+             BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+
+        assert!(
+            activate(&conn, candidate_id, "regime", "demo").is_err(),
+            "审计写入失败必须让激活整体失败"
+        );
+
+        assert_eq!(
+            load_set(&conn, candidate_id).unwrap().status,
+            "approved",
+            "目标集必须回到原状态"
+        );
+        assert!(
+            load_set(&conn, candidate_id)
+                .unwrap()
+                .activated_at
+                .is_none(),
+            "目标集不得留下 activated_at"
+        );
+        assert_eq!(
+            load_set(&conn, range_id).unwrap().status,
+            "active",
+            "旧 active 不得被 retired"
+        );
+        assert_eq!(
+            strategy_value(&conn),
+            before_strategy,
+            "strategy 必须回滚到激活前"
+        );
+        let after_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_activations, before_activations, "不得留下激活记录");
     }
 }
