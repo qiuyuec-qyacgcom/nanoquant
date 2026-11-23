@@ -2476,6 +2476,10 @@ impl EngineRuntime {
             let features_text = serde_json::to_string(&serde_json::json!({
                 "injected_mantra_ids": injected_mantra_ids,
                 "injected_experience_ids": injected_experience_ids,
+                "atr_pct": metric.atr_pct,
+                "vol_ratio": metric.vol_ratio,
+                "quote_volume": market.quote_volume,
+                "spread_bps": market.spread_bps,
                 "journal_snapshot": journal_snapshot,
                 "quant_side": quant_side,
                 "quant_score": quant_score,
@@ -4946,6 +4950,10 @@ mod tests {
         assert_eq!(value["preview_side"], "long");
         assert!(value["quant_side"].is_null());
         assert_eq!(value["quant_passed"], false);
+        assert!(value["atr_pct"].as_f64().is_some_and(|v| v > 0.0), "AI 复核行要带顶层 ATR");
+        assert!(value["vol_ratio"].as_f64().is_some(), "AI 复核行要带顶层量比");
+        assert!(value["quote_volume"].as_f64().is_some(), "AI 复核行要带顶层 24h 成交额");
+        assert!(value["spread_bps"].as_f64().is_some(), "AI 复核行要带顶层点差");
         let preview_score = value["preview_score"].as_f64().unwrap();
         assert!((preview_score - score).abs() < 1e-9);
         assert_eq!(ai_action, "hold");
