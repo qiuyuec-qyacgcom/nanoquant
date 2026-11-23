@@ -1090,6 +1090,8 @@ mod tests {
             policy: TradePolicy {
                 base_threshold: 0.05,
                 volume_ratio_min: 0.0,
+                atr_pct_min: 0.05,
+                atr_pct_max: 4.0,
                 sl_atr_mult: 1.0,
                 tp_atr_mult: 10.0,
                 min_risk_reward: 0.5,

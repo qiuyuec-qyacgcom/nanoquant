@@ -1187,6 +1187,8 @@ impl EngineRuntime {
         crate::trade_policy::TradePolicy {
             base_threshold: num(strategy, "entry_threshold", 0.3),
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
+            atr_pct_min: num(strategy, "atr_pct_min", 0.05),
+            atr_pct_max: num(strategy, "atr_pct_max", 4.0),
             sl_atr_mult: num(strategy, "sl_atr_mult", 1.2),
             tp_atr_mult: num(strategy, "tp_atr_mult", 2.0),
             min_risk_reward: num(strategy, "min_risk_reward", 2.0),

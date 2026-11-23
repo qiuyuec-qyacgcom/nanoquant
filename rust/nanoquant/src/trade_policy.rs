@@ -2,6 +2,8 @@
 pub(crate) struct TradePolicy {
     pub base_threshold: f64,
     pub volume_ratio_min: f64,
+    pub atr_pct_min: f64,
+    pub atr_pct_max: f64,
     pub sl_atr_mult: f64,
     pub tp_atr_mult: f64,
     pub min_risk_reward: f64,
@@ -195,7 +197,7 @@ pub(crate) fn evaluate(
     if core.volume_ratio < policy.volume_ratio_min {
         return None;
     }
-    if !(0.05..=4.0).contains(&core.atr_pct) {
+    if core.atr_pct < policy.atr_pct_min || core.atr_pct > policy.atr_pct_max {
         return None;
     }
     if core.score.abs() < policy.base_threshold {
@@ -284,6 +286,8 @@ mod tests {
         TradePolicy {
             base_threshold: 0.1,
             volume_ratio_min: 0.5,
+            atr_pct_min: 0.05,
+            atr_pct_max: 4.0,
             sl_atr_mult: 1.2,
             tp_atr_mult: 2.0,
             min_risk_reward: 2.0,
@@ -432,6 +436,37 @@ mod tests {
             .expect("量能不足时仍应给出预览评分");
         assert_eq!(preview.side, "long");
         assert!(preview.score > 0.0);
+    }
+
+    #[test]
+    fn evaluate_uses_policy_atr_bounds() {
+        let values: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        let data = candles(&values);
+        let mark = *values.last().unwrap();
+        let features = MarketFeatures {
+            funding_rate: 0.0,
+            open_interest_change_pct: 5.0,
+            relative_strength: 0.8,
+            relative_strength_available: true,
+        };
+        let atr_for = |pct: f64| mark * pct / 100.0;
+        let policy = TradePolicy {
+            atr_pct_min: 1.4,
+            atr_pct_max: 1.6,
+            ..cfg()
+        };
+        assert!(
+            evaluate(&data, mark, atr_for(1.5), policy, features).is_some(),
+            "atr_pct≈1.5 落在 policy 上下界内时应给出信号"
+        );
+        let wider = TradePolicy {
+            atr_pct_min: 1.4,
+            ..policy
+        };
+        assert!(
+            evaluate(&data, mark, atr_for(0.8), wider, features).is_none(),
+            "atr_pct≈0.8 低于 policy 下界时必须拒绝"
+        );
     }
 
     #[test]
