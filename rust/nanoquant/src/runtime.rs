@@ -1421,6 +1421,29 @@ impl EngineRuntime {
             &format!("candle_metrics.{mode}"),
             &serde_json::to_string(&metrics).map_err(|error| error.to_string())?,
         )?;
+        let mut regimes = Vec::new();
+        let mut symbol_regimes = serde_json::Map::new();
+        for market in &snapshot.markets {
+            if let Some(metric) = metrics.get(market.symbol.as_str()) {
+                if let Some(regime) = crate::trade_policy::regime_for(
+                    &market.candles,
+                    market.mark_price,
+                    metric.atr,
+                    crate::trade_policy::MarketFeatures::default(),
+                ) {
+                    regimes.push(regime);
+                    symbol_regimes.insert(market.symbol.clone(), json!(regime.as_str()));
+                }
+            }
+        }
+        upsert_state(
+            &tx,
+            "symbol_regime",
+            &Value::Object(symbol_regimes).to_string(),
+        )?;
+        if let Some(regime) = crate::regime::market_regime(&regimes) {
+            upsert_state(&tx, "market_regime", regime.as_str())?;
+        }
         upsert_state(
             &tx,
             &format!("snapshot_ts.{mode}"),
@@ -4377,6 +4400,47 @@ mod tests {
             )
             .unwrap();
         assert!(audited > 0, "行情闸门挡下的标的也要进信号审计");
+    }
+
+    #[tokio::test]
+    async fn snapshot_records_symbol_regime_without_market_regime_below_quorum() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        let mut snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        for candle in &mut snapshot.markets[0].candles {
+            candle.high = 100.5;
+            candle.low = 99.5;
+        }
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'symbol_regime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let symbol_regimes: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            symbol_regimes.get("BTCUSDT").is_some(),
+            "单标的 regime 应按标的记录: {raw}"
+        );
+        let market_regime: Option<String> = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'market_regime'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            market_regime.is_none(),
+            "有效标的不足 6 个时不应写出 market_regime"
+        );
     }
 
     #[tokio::test]

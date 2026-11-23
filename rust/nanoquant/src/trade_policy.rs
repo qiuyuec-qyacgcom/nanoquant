@@ -73,13 +73,7 @@ fn core(
     let fast = ema(&closes, 9)?;
     let slow = ema(&closes, 21)?;
     let gap_pct = (fast - slow) / slow * 100.0;
-    let regime = if adx_value >= 25.0 && gap_pct.abs() >= 0.15 {
-        "trend"
-    } else if atr_pct >= 2.0 || volume_ratio >= 2.5 {
-        "chaos"
-    } else {
-        "range"
-    };
+    let regime = crate::regime::classify(adx_value, gap_pct, atr_pct, volume_ratio);
     let prior = &candles[candles.len() - 21..candles.len() - 1];
     let prior_high = prior
         .iter()
@@ -120,8 +114,8 @@ fn core(
         0.0
     };
     let (w_rs, w_break, w_carry, w_flow) = match regime {
-        "trend" => (0.30, 0.35, 0.10, 0.25),
-        "chaos" => (0.20, 0.20, 0.25, 0.35),
+        crate::regime::Regime::Trend => (0.30, 0.35, 0.10, 0.25),
+        crate::regime::Regime::Chaos => (0.20, 0.20, 0.25, 0.35),
         _ => (0.15, 0.15, 0.35, 0.35),
     };
     let raw = w_rs * rs + w_break * breakout + w_carry * carry + w_flow * flow;
@@ -149,7 +143,7 @@ fn core(
     Some(Core {
         volume_ratio,
         atr_pct,
-        regime,
+        regime: regime.as_str(),
         rs,
         breakout,
         carry,
@@ -159,6 +153,16 @@ fn core(
         coverage,
         confidence,
     })
+}
+
+pub(crate) fn regime_for(
+    candles: &[crate::providers::CandleSnapshot],
+    mark: f64,
+    atr: f64,
+    features: MarketFeatures,
+) -> Option<crate::regime::Regime> {
+    core(candles, mark, atr, features)
+        .and_then(|core| crate::regime::Regime::from_str(core.regime))
 }
 
 pub(crate) fn preview(

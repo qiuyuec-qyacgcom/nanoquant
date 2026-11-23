@@ -58,6 +58,7 @@ mod providers;
 mod public;
 mod reasoning;
 mod reconcile;
+mod regime;
 mod review;
 mod risk;
 mod runtime;
