@@ -1079,13 +1079,12 @@ fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnap
 #[allow(dead_code)]
 fn build_market_regime_map(
     basket: &[(String, Vec<HistoryBar>)],
-    interval_ms: i64,
     frame_ms: i64,
 ) -> BTreeMap<i64, crate::regime::Regime> {
     let per_symbol: Vec<BTreeMap<i64, crate::regime::Regime>> = basket
         .iter()
         .map(|(_, bars)| {
-            let candles = candles_from_history(bars, interval_ms);
+            let candles = candles_from_history(bars, frame_ms);
             let series = crate::regime::regime_series(&candles, 14);
             let mut map = BTreeMap::new();
             for (candle, regime) in candles.iter().zip(series) {
@@ -1163,16 +1162,17 @@ pub fn run_walkforward_basket_fixed(
         return Err("有效标的少于 6 个".to_string());
     }
     let frame_ms = timeframe_ms(timeframe);
-    let regimes = build_market_regime_map(basket, base.interval_ms, frame_ms);
+    let regimes = build_market_regime_map(basket, frame_ms);
     let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
     let target = target_regime.as_str();
     let mut all_is = Vec::new();
     let mut all_oos = Vec::new();
     let mut oos_ordered: Vec<(i64, f64)> = Vec::new();
     let mut all_stressed = Vec::new();
-    let mut fold_pnl = vec![0.0_f64; requested_folds];
     let mut used = Vec::new();
     let mut skipped = Vec::new();
+    let mut global_folds = requested_folds;
+    let mut plans: Vec<(&String, &Vec<HistoryBar>, usize)> = Vec::new();
 
     for (symbol, bars) in basket {
         if bars.len() < WARMUP * 4 {
@@ -1190,8 +1190,22 @@ pub fn run_walkforward_basket_fixed(
             skipped.push(symbol.clone());
             continue;
         }
+        global_folds = global_folds.min(local_folds);
+        plans.push((symbol, bars, train_bars));
+    }
+    if global_folds < MIN_FOLDS {
+        return Err("没有可用的折 (训练/测试窗口太短)".to_string());
+    }
+    let mut fold_pnl = vec![0.0_f64; global_folds];
+
+    for (symbol, bars, train_bars) in plans {
+        let step = (bars.len() - WARMUP - train_bars) / global_folds;
+        if step <= WARMUP {
+            skipped.push(symbol.clone());
+            continue;
+        }
         used.push(symbol.clone());
-        for (index, fold_total) in fold_pnl.iter_mut().enumerate().take(local_folds) {
+        for (index, fold_total) in fold_pnl.iter_mut().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(CANCELLED.to_string());
             }
@@ -1259,7 +1273,7 @@ pub fn run_walkforward_basket_fixed(
     let positive_folds = fold_pnl.iter().filter(|value| **value > 0.0).count();
     let bootstrap = bootstrap_ci(&all_oos);
     Ok(BasketMetrics {
-        folds: requested_folds,
+        folds: global_folds,
         oos_trades: all_oos.len(),
         positive_folds,
         oos_avg_return_pct: round(oos_avg, 4),
@@ -1288,6 +1302,7 @@ fn average(values: &[f64]) -> f64 {
 }
 
 fn bootstrap_ci(returns: &[f64]) -> Value {
+    // 少于 10 笔不构建置信区间；B3 证据门的 30 笔门槛由调用方另行保证。
     if returns.len() < 10 {
         return json!({"ci_low":0.0,"ci_high":0.0,"p_positive":0.0,"n_trades":returns.len()});
     }
@@ -1609,6 +1624,31 @@ mod tests {
             .collect()
     }
 
+    fn tagged_regimes_cover_target(basket: &[(String, Vec<HistoryBar>)], target: &str) -> usize {
+        let frame_ms = timeframe_ms("1h");
+        let regimes = build_market_regime_map(basket, frame_ms);
+        assert!(!regimes.is_empty(), "市场 regime map 不应为空");
+        let config = basket_config();
+        let mut tagged = 0;
+        for (_, bars) in basket {
+            let mut result = run(bars, &config).unwrap();
+            tag_trades(&mut result, &regimes, frame_ms);
+            assert!(
+                result
+                    .trades
+                    .iter()
+                    .all(|trade| !trade.market_regime.is_empty()),
+                "每笔成交都应回填 market_regime"
+            );
+            tagged += result
+                .trades
+                .iter()
+                .filter(|trade| trade.market_regime == target)
+                .count();
+        }
+        tagged
+    }
+
     #[test]
     fn basket_fixed_filters_target_market_regime_and_aggregates() {
         let basket = synthetic_basket(6, 700);
@@ -1629,6 +1669,10 @@ mod tests {
         assert!(metrics.oos_trades > 0);
         assert!(metrics.max_drawdown_pct >= 0.0);
         assert!((0.0..=1.0).contains(&metrics.bootstrap_p_positive));
+        assert!(
+            tagged_regimes_cover_target(&basket, "range") > 0,
+            "至少一笔成交的 market_regime 应为 range"
+        );
     }
 
     #[test]
@@ -1650,6 +1694,15 @@ mod tests {
     #[test]
     fn basket_fixed_rejects_when_target_regime_has_no_oos_trades() {
         let basket = synthetic_basket(6, 700);
+        let frame_ms = timeframe_ms("1h");
+        let regimes = build_market_regime_map(&basket, frame_ms);
+        assert!(!regimes.is_empty(), "chaos 用例仍应产生非空 regime map");
+        assert!(
+            regimes
+                .values()
+                .all(|regime| *regime != crate::regime::Regime::Chaos),
+            "合成数据不应出现 chaos，才能覆盖无目标 regime 分支"
+        );
         let error = run_walkforward_basket_fixed(
             &basket,
             &basket_config(),
@@ -1661,5 +1714,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("OOS"));
+    }
+
+    #[test]
+    fn basket_fixed_uses_common_fold_count_for_mixed_coverage() {
+        let mut basket = synthetic_basket(6, 700);
+        basket[0].1.truncate(400);
+        let metrics = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            4,
+            150,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(metrics.folds < 4, "请求 4 折时应统一到短标的可用的 3 折");
+        assert_eq!(metrics.folds, 3);
+        assert!(metrics.positive_folds <= metrics.folds);
+        assert!(metrics.symbols_used.len() >= 6);
     }
 }
