@@ -418,6 +418,18 @@ fn materialize(
     )
 }
 
+/// 按当前 regime 查 active 集；trend 无集时回退 range，其余 regime 缺失返回 None。
+pub(crate) fn active_set_for_regime(
+    conn: &Connection,
+    regime: &str,
+) -> Result<Option<ParameterSet>, String> {
+    match active_for_regime(conn, regime)? {
+        Some(set) => Ok(Some(set)),
+        None if regime == "trend" => active_for_regime(conn, "range"),
+        None => Ok(None),
+    }
+}
+
 /// 按当前 regime 查 active 集并激活；trend 无集时回退 range，其余缺失直接报错。
 pub(crate) fn activate_for_regime(
     conn: &Connection,
@@ -425,19 +437,330 @@ pub(crate) fn activate_for_regime(
     trigger: &str,
     mode: &str,
 ) -> Result<(), String> {
-    let target = match active_for_regime(conn, regime)? {
-        Some(set) => Some(set),
-        None if regime == "trend" => active_for_regime(conn, "range")?,
-        None => None,
-    };
-    let Some(set) = target else {
+    let Some(set) = active_set_for_regime(conn, regime)? else {
         return Err(format!("{regime} 没有可用的 active 参数集"));
     };
     activate(conn, set.id, trigger, mode)
 }
 
+const DEFAULT_NO_CANDIDATE_ROLLBACK_SEC: i64 = 1_800;
+const GUARD_EVENT_THROTTLE_SEC: i64 = 3_600;
+
+/// C 期自动启用：只处理 `source='ai'` 且 `status='approved'` 的候选。
+///
+/// 门槛：`enabled`/`auto_apply` 为真、当前 timeframe 在白名单、`auto_apply_since`
+/// 已由 C6 写入、滚动 24 小时内未超过限速。返回被启用的 set_id。
+pub(crate) fn auto_apply_approved(
+    conn: &Connection,
+    current_regime: &str,
+    mode: &str,
+    live_timeframe: &str,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    let config = crate::settings_api::group_value_public(conn, "parameter_set");
+    if config.get("enabled").and_then(Value::as_bool) != Some(true)
+        || config.get("auto_apply").and_then(Value::as_bool) != Some(true)
+    {
+        return Ok(None);
+    }
+    if !configured_auto_apply_timeframes(&config)
+        .iter()
+        .any(|frame| frame == live_timeframe)
+    {
+        return Ok(None);
+    }
+    let Some(since) = engine_state(conn, "parameter_set.auto_apply_since")
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+    else {
+        // C6 才写入起点；缺失时不能拿 A/B 期旧候选抢先覆盖 bootstrap。
+        return Ok(None);
+    };
+    let per_24h = config
+        .get("max_auto_apply_per_24h")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .max(1);
+    let applied_recently: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM parameter_set_activations \
+             WHERE trigger='auto_apply' AND ts > ?1",
+            [now - 86_400],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("统计自动启用次数失败: {error}"))?;
+    if applied_recently >= per_24h {
+        return Ok(None);
+    }
+    let candidate = match conn.query_row(
+        &format!(
+            "SELECT {SET_COLUMNS} FROM parameter_sets \
+             WHERE status='approved' AND source='ai' AND created_at > ?1 AND timeframe=?2 \
+             ORDER BY id ASC LIMIT 1"
+        ),
+        params![since, live_timeframe],
+        row_to_set,
+    ) {
+        Ok(set) => set,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("读取 approved 候选失败: {error}")),
+    };
+    if candidate.regime == current_regime {
+        activate(conn, candidate.id, "auto_apply", mode)?;
+    } else {
+        // 非当前 regime：只切换 active 状态，strategy 等 regime 切换时再物化。
+        activate_without_materializing(conn, &candidate, mode, now)?;
+    }
+    Ok(Some(candidate.id))
+}
+
+fn configured_auto_apply_timeframes(config: &Value) -> Vec<String> {
+    // 空串/空白/null 都表示不自动启用；v1 仅接受 1h。
+    config
+        .get("auto_apply_timeframes")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            raw.split(',')
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| item == BOOTSTRAP_TIMEFRAME)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn activate_without_materializing(
+    conn: &Connection,
+    set: &ParameterSet,
+    mode: &str,
+    now: i64,
+) -> Result<(), String> {
+    if !set.params.is_object() {
+        return Err(format!("参数集 {} params 必须是对象快照", set.id));
+    }
+    crate::settings_api::validate_group(
+        "strategy",
+        &crate::settings_api::normalized_group_value("strategy", &set.params),
+    )?;
+    conn.execute_batch("SAVEPOINT parameter_set_auto_apply")
+        .map_err(|error| format!("开启自动启用事务失败: {error}"))?;
+    let result = (|| {
+        let previous_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM parameter_sets \
+                 WHERE regime=?1 AND status='active' AND id<>?2 ORDER BY id DESC LIMIT 1",
+                params![set.regime, set.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取 {} active 参数集失败: {error}", set.regime))?;
+        conn.execute(
+            "UPDATE parameter_sets SET status='retired' \
+             WHERE regime=?1 AND status='active' AND id<>?2",
+            params![set.regime, set.id],
+        )
+        .map_err(|error| format!("退役旧参数集失败: {error}"))?;
+        conn.execute(
+            "UPDATE parameter_sets SET status='active', activated_at=?1 WHERE id=?2",
+            params![now, set.id],
+        )
+        .map_err(|error| format!("激活参数集 {} 失败: {error}", set.id))?;
+        insert_activation(
+            conn,
+            set.id,
+            &set.regime,
+            previous_id,
+            "auto_apply",
+            now,
+        )?;
+        record_event(
+            conn,
+            "info",
+            &format!("参数集 {} 已自动启用，等待 regime 切换物化", set.name),
+            json!({
+                "set_id": set.id,
+                "regime": set.regime,
+                "mode": mode,
+                "trigger": "auto_apply",
+                "previous_set_id": previous_id,
+                "materialized": false,
+            }),
+            now,
+        )
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE parameter_set_auto_apply")
+            .map_err(|error| format!("提交自动启用事务失败: {error}")),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO parameter_set_auto_apply; RELEASE parameter_set_auto_apply",
+            );
+            Err(error)
+        }
+    }
+}
+
+/// 每次 regime/auto_apply 激活后初始化守卫；`last_candidate_at=started_at=now`。
+pub(crate) fn set_guard(
+    conn: &Connection,
+    regime: &str,
+    set_id: i64,
+    now: i64,
+) -> Result<(), String> {
+    write_guard(conn, regime, &json!({
+        "set_id": set_id,
+        "last_candidate_at": now,
+        "started_at": now,
+    }))
+}
+
+/// 每轮实跑后推进守卫；触发无候选回滚时返回 true。
+///
+/// `skipped` 轮次只暂停计时；`has_candidate` 重置计时。
+pub(crate) fn update_guard(
+    conn: &Connection,
+    regime: &str,
+    set_id: i64,
+    has_candidate: bool,
+    skipped: bool,
+    now: i64,
+) -> Result<bool, String> {
+    let key = format!("parameter_set.guard.{regime}");
+    let mut guard = engine_state(conn, &key)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(|value| value.get("set_id").and_then(Value::as_i64) == Some(set_id))
+        .unwrap_or_else(|| {
+            json!({
+                "set_id": set_id,
+                "last_candidate_at": now,
+                "started_at": now,
+            })
+        });
+    if skipped {
+        guard["last_candidate_at"] = json!(now);
+        write_guard(conn, regime, &guard)?;
+        record_guard_event(
+            conn,
+            "warn",
+            &format!("parameter_set.guard_paused_ts.{regime}"),
+            &format!("parameter_set.guard_paused: {regime} 本轮未实跑，暂停无候选计时"),
+            json!({"regime": regime, "set_id": set_id, "mode": engine_mode(conn)}),
+            now,
+        )?;
+        return Ok(false);
+    }
+    if has_candidate {
+        guard["last_candidate_at"] = json!(now);
+        write_guard(conn, regime, &guard)?;
+        return Ok(false);
+    }
+    let last_candidate_at = guard["last_candidate_at"].as_i64().unwrap_or(now);
+    let threshold = crate::settings_api::group_value_public(conn, "parameter_set")
+        .get("no_candidate_rollback_sec")
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_NO_CANDIDATE_ROLLBACK_SEC)
+        .max(0);
+    if now - last_candidate_at < threshold {
+        write_guard(conn, regime, &guard)?;
+        return Ok(false);
+    }
+    let mode = engine_mode(conn);
+    match rollback(conn, set_id, &mode) {
+        Ok(()) => {
+            // 回滚成功后守卫归零，指向回滚后的 active 集。
+            let rolled_back_to = active_for_regime(conn, regime)?
+                .map(|set| set.id)
+                .unwrap_or(set_id);
+            write_guard(conn, regime, &json!({
+                "set_id": rolled_back_to,
+                "last_candidate_at": now,
+                "started_at": now,
+            }))?;
+            record_guard_event(
+                conn,
+                "warn",
+                &format!("parameter_set.no_candidate_rollback_ts.{regime}"),
+                &format!(
+                    "parameter_set.no_candidate_rollback: {regime} 长时间无候选，已回滚参数集 {set_id}"
+                ),
+                json!({
+                    "regime": regime,
+                    "set_id": set_id,
+                    "rolled_back_to": rolled_back_to,
+                    "mode": mode,
+                    "elapsed_sec": now - last_candidate_at,
+                }),
+                now,
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            // 首次 bootstrap 等没有上一套：只告警，不能每轮重复轰炸。
+            guard["last_candidate_at"] = json!(now);
+            write_guard(conn, regime, &guard)?;
+            record_guard_event(
+                conn,
+                "warn",
+                &format!("parameter_set.no_candidate_rollback_ts.{regime}"),
+                &format!("parameter_set.no_candidate_rollback: {regime} 无可回滚的上一套参数集"),
+                json!({
+                    "regime": regime,
+                    "set_id": set_id,
+                    "mode": mode,
+                    "error": error,
+                }),
+                now,
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+fn write_guard(conn: &Connection, regime: &str, guard: &Value) -> Result<(), String> {
+    upsert_engine_state(
+        conn,
+        &format!("parameter_set.guard.{regime}"),
+        &guard.to_string(),
+    )
+}
+
+fn record_guard_event(
+    conn: &Connection,
+    level: &str,
+    throttle_key: &str,
+    message: &str,
+    payload: Value,
+    now: i64,
+) -> Result<(), String> {
+    let last = engine_state(conn, throttle_key).and_then(|raw| raw.trim().parse::<i64>().ok());
+    if last.is_some_and(|last| now - last < GUARD_EVENT_THROTTLE_SEC) {
+        return Ok(());
+    }
+    record_event(conn, level, message, payload, now)?;
+    upsert_engine_state(conn, throttle_key, &now.to_string())
+}
+
+fn engine_state(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM engine_state WHERE key=?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+}
+
+fn upsert_engine_state(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![key, value, crate::now()],
+    )
+    .map(|_| ())
+    .map_err(|error| format!("写入 engine_state.{key} 失败: {error}"))
+}
+
+fn engine_mode(conn: &Connection) -> String {
+    engine_state(conn, "mode").unwrap_or_else(|| "demo".to_string())
+}
+
 /// 回滚到该参数集最近一次激活前的上一套；没有上一套时返回 Err（调用方只告警）。
-#[allow(dead_code)]
 pub(crate) fn rollback(conn: &Connection, current_id: i64, mode: &str) -> Result<(), String> {
     let current = load_set(conn, current_id)?;
     let previous_id: Option<i64> = conn
@@ -1956,5 +2279,305 @@ mod tests {
             })
             .unwrap();
         assert_eq!(after_activations, before_activations, "不得留下激活记录");
+    }
+
+    fn approved_candidate(conn: &Connection, name: &str, regime: &str) -> i64 {
+        let parent = active_for_regime(conn, "range").unwrap().unwrap();
+        let snapshot = validate_candidate(
+            &parent.params,
+            &[param_update("entry_threshold", json!(0.40))],
+        )
+        .unwrap();
+        let id = insert_candidate(conn, name, regime, "1h", &snapshot, None).unwrap();
+        mark_evidence(conn, id, true, &json!({"gate":{"pass":true}})).unwrap();
+        id
+    }
+
+    fn set_state(conn: &Connection, key: &str, value: &str) {
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        .unwrap();
+    }
+
+    fn state_value(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row("SELECT value FROM engine_state WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .unwrap()
+    }
+
+    fn set_parameter_set_config(conn: &Connection, value: Value) {
+        conn.execute(
+            "UPDATE app_settings SET value=?1 WHERE key='parameter_set'",
+            [value.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn auto_apply_activations(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM parameter_set_activations WHERE trigger='auto_apply'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_apply_activates_approved_candidate_for_current_regime() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let bootstrap_id = set_id_by_name(&conn, "range-bootstrap");
+        let candidate_id = approved_candidate(&conn, "range-ai-auto", "range");
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+
+        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now()).unwrap();
+
+        assert_eq!(applied, Some(candidate_id));
+        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
+        assert_eq!(load_set(&conn, bootstrap_id).unwrap().status, "retired");
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy["entry_threshold"], json!(0.40), "当前 regime 必须物化");
+        assert_eq!(auto_apply_activations(&conn), 1);
+        let previous_id: Option<i64> = conn
+            .query_row(
+                "SELECT previous_set_id FROM parameter_set_activations WHERE trigger='auto_apply'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous_id, Some(bootstrap_id));
+    }
+
+    #[test]
+    fn auto_apply_non_current_regime_waits_for_regime_switch() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let candidate_id = approved_candidate(&conn, "trend-ai-auto", "trend");
+        let before_strategy = strategy_value(&conn);
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+
+        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now()).unwrap();
+
+        assert_eq!(applied, Some(candidate_id));
+        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
+        assert!(
+            load_set(&conn, candidate_id).unwrap().activated_at.is_some(),
+            "非当前 regime 仍要记录激活时刻"
+        );
+        assert_eq!(
+            strategy_value(&conn),
+            before_strategy,
+            "非当前 regime 不得提前物化 strategy"
+        );
+        assert_eq!(auto_apply_activations(&conn), 1);
+    }
+
+    #[test]
+    fn auto_apply_requires_since_enabled_whitelist_and_approved() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let candidate_id = approved_candidate(&conn, "range-ai-gates", "range");
+        let now = crate::now();
+
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
+            None,
+            "auto_apply_since 缺失时不得自动启用"
+        );
+
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
+        );
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
+            None,
+            "auto_apply=false 不得启用"
+        );
+
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": false, "auto_apply": true, "auto_apply_timeframes": "1h"}),
+        );
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
+            None,
+            "enabled=false 不得启用"
+        );
+
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": ""}),
+        );
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
+            None,
+            "空白名单表示不自动启用"
+        );
+
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
+        );
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "4h", now).unwrap(),
+            None,
+            "白名单与当前 timeframe 不匹配时不得启用"
+        );
+        assert_eq!(
+            load_set(&conn, candidate_id).unwrap().status,
+            "approved",
+            "未启用时候选保持 approved"
+        );
+    }
+
+    #[test]
+    fn auto_apply_ignores_non_approved_or_non_ai_sources() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let parent = active_for_regime(&conn, "range").unwrap().unwrap();
+        let snapshot = validate_candidate(
+            &parent.params,
+            &[param_update("entry_threshold", json!(0.40))],
+        )
+        .unwrap();
+        let pending_id =
+            insert_candidate(&conn, "range-ai-pending", "range", "1h", &snapshot, None).unwrap();
+        let manual_id = insert_set(
+            &conn,
+            "range-manual-approved",
+            "range",
+            "1h",
+            &snapshot,
+            "approved",
+            "manual",
+            "{}",
+            None,
+            crate::now(),
+        )
+        .unwrap();
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+
+        let now = crate::now();
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
+            None
+        );
+        assert_eq!(load_set(&conn, pending_id).unwrap().status, "candidate");
+        assert_eq!(load_set(&conn, manual_id).unwrap().status, "approved");
+    }
+
+    #[test]
+    fn auto_apply_respects_rolling_24h_limit() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        approved_candidate(&conn, "range-ai-first", "range");
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+        let now = crate::now();
+
+        assert!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now)
+                .unwrap()
+                .is_some(),
+            "首个候选应被自动启用"
+        );
+        approved_candidate(&conn, "range-ai-second", "range");
+        assert_eq!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now + 60).unwrap(),
+            None,
+            "滚动 24 小时内已启用一次，不得再启用"
+        );
+        assert_eq!(auto_apply_activations(&conn), 1);
+    }
+
+    fn guard_fixture() -> (Connection, i64, i64) {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let bootstrap_id = set_id_by_name(&conn, "range-bootstrap");
+        let candidate_id = approved_candidate(&conn, "range-ai-guard", "range");
+        activate(&conn, candidate_id, "regime", "demo").unwrap();
+        (conn, bootstrap_id, candidate_id)
+    }
+
+    #[test]
+    fn guard_resets_on_candidate_and_pauses_on_skipped() {
+        let (conn, _, candidate_id) = guard_fixture();
+        set_guard(&conn, "range", candidate_id, 1_000).unwrap();
+
+        assert!(!update_guard(&conn, "range", candidate_id, false, true, 1_100).unwrap());
+        let guard: Value = serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap())
+            .unwrap();
+        assert_eq!(guard["last_candidate_at"], json!(1_100), "熔断轮暂停计时");
+
+        assert!(!update_guard(&conn, "range", candidate_id, true, false, 1_200).unwrap());
+        let guard: Value = serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap())
+            .unwrap();
+        assert_eq!(guard["last_candidate_at"], json!(1_200), "有候选必须重置计时");
+
+        assert!(!update_guard(&conn, "range", candidate_id, false, false, 2_900).unwrap());
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            candidate_id,
+            "未满 30 分钟不得回滚"
+        );
+    }
+
+    #[test]
+    fn guard_rolls_back_after_no_candidate_timeout() {
+        let (conn, bootstrap_id, candidate_id) = guard_fixture();
+        set_guard(&conn, "range", candidate_id, 1_000).unwrap();
+
+        assert!(!update_guard(&conn, "range", candidate_id, false, false, 1_600).unwrap());
+        assert!(update_guard(&conn, "range", candidate_id, false, false, 2_800).unwrap());
+
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            bootstrap_id,
+            "超时后必须回滚到上一套 active"
+        );
+        let guard: Value = serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap())
+            .unwrap();
+        assert_eq!(guard["set_id"], json!(bootstrap_id), "守卫重置到回滚后的 active 集");
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
+                 AND message LIKE 'parameter_set.no_candidate_rollback%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn guard_without_previous_only_warns() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let bootstrap_id = set_id_by_name(&conn, "range-bootstrap");
+        set_guard(&conn, "range", bootstrap_id, 1_000).unwrap();
+
+        assert!(
+            !update_guard(&conn, "range", bootstrap_id, false, false, 2_800).unwrap(),
+            "没有上一套时不得报告回滚成功"
+        );
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            bootstrap_id
+        );
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
+                 AND message LIKE 'parameter_set.no_candidate_rollback%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1, "只写告警，不中断周期");
     }
 }

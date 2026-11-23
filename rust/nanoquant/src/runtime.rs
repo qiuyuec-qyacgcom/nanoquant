@@ -1576,6 +1576,22 @@ impl EngineRuntime {
         if let Err(error) = apply_regime_transition(&tx, mode) {
             tracing::warn!(%error, %mode, "regime 切换处理失败，不影响本轮周期");
         }
+        // 自动启用 approved 候选并推进无候选守卫；失败只告警，不阻断本轮。
+        let live_timeframe = strategy
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Err(error) = apply_parameter_set_governance(
+            &tx,
+            mode,
+            &live_timeframe,
+            !report.ai_symbols.is_empty(),
+            !report.skipped.is_empty(),
+            crate::now(),
+        ) {
+            tracing::warn!(%error, %mode, "参数集自动启用/无候选守卫失败，不影响本轮周期");
+        }
         upsert_state(
             &tx,
             &format!("cycle_preview.{mode}"),
@@ -4334,6 +4350,78 @@ fn apply_regime_transition_at(
                     ),
                 );
             }
+        } else {
+            // 激活成功即初始化守卫，计时从切换时刻开始。
+            match crate::parameter_sets::active_set_for_regime(conn, regime.as_str()) {
+                Ok(Some(set)) => {
+                    if let Err(error) = crate::parameter_sets::set_guard(
+                        conn,
+                        regime.as_str(),
+                        set.id,
+                        now,
+                    ) {
+                        tracing::warn!(%error, regime = regime.as_str(), %mode, "参数集守卫初始化失败");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, regime = regime.as_str(), %mode, "读取激活参数集失败");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 周期尾参数集治理：自动启用 approved 候选，再推进无候选守卫。
+///
+/// 调用方在 regime 切换处理后、同一事务内调用；错误由调用方告警，不阻断周期。
+fn apply_parameter_set_governance(
+    conn: &rusqlite::Connection,
+    mode: &str,
+    live_timeframe: &str,
+    has_candidate: bool,
+    skipped: bool,
+    now: i64,
+) -> Result<(), String> {
+    let current_regime = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [format!("regime.current.{mode}")],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    if current_regime.is_empty() {
+        return Ok(());
+    }
+    if let Some(applied) = crate::parameter_sets::auto_apply_approved(
+        conn,
+        &current_regime,
+        mode,
+        live_timeframe,
+        now,
+    )? {
+        let applied_set = crate::parameter_sets::load_set(conn, applied)?;
+        crate::parameter_sets::set_guard(conn, &applied_set.regime, applied, now)?;
+    }
+    let Some(active) = crate::parameter_sets::active_set_for_regime(conn, &current_regime)? else {
+        return Ok(());
+    };
+    if crate::parameter_sets::update_guard(
+        conn,
+        &current_regime,
+        active.id,
+        has_candidate,
+        skipped,
+        now,
+    )? {
+        // 回滚已把 active 换成上一套，守卫重置到新的 active 集。
+        if let Some(rolled_back) =
+            crate::parameter_sets::active_set_for_regime(conn, &current_regime)?
+        {
+            crate::parameter_sets::set_guard(conn, &current_regime, rolled_back.id, now)?;
         }
     }
     Ok(())
@@ -6351,6 +6439,138 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn parameter_set_governance_fixture() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings VALUES('strategy',?1,0)",
+            [serde_json::json!({
+                "timeframe": "1h",
+                "atr_pct_min": 1.5,
+                "atr_pct_max": 8,
+                "volume_ratio_min": 1.1,
+                "entry_threshold": 0.55
+            })
+            .to_string()],
+        )
+        .unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) VALUES('regime.current.demo','range',0) \
+             ON CONFLICT(key) DO UPDATE SET value='range'",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn governance_approved_candidate(conn: &rusqlite::Connection) -> i64 {
+        let parent = crate::parameter_sets::active_for_regime(conn, "range")
+            .unwrap()
+            .unwrap();
+        let snapshot = crate::parameter_sets::validate_candidate(
+            &parent.params,
+            &[crate::ai_client::ParamUpdate {
+                group: "strategy".to_string(),
+                key: "entry_threshold".to_string(),
+                value: serde_json::json!(0.40),
+                reason: String::new(),
+            }],
+        )
+        .unwrap();
+        let id = crate::parameter_sets::insert_candidate(
+            conn,
+            "range-ai-governance",
+            "range",
+            "1h",
+            &snapshot,
+            Some(parent.id),
+        )
+        .unwrap();
+        crate::parameter_sets::mark_evidence(conn, id, true, &serde_json::json!({"gate":{"pass":true}}))
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_rolls_back_after_no_candidate_window() {
+        let conn = parameter_set_governance_fixture();
+        let bootstrap_id: i64 = conn
+            .query_row(
+                "SELECT id FROM parameter_sets WHERE name='range-bootstrap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_id = governance_approved_candidate(&conn);
+        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        let now = crate::now();
+        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_799)
+            .expect("守卫推进不能阻断周期");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            candidate_id,
+            "未满窗口不得回滚"
+        );
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_800)
+            .expect("守卫回滚不能阻断周期");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            bootstrap_id,
+            "无候选满窗口必须回滚到上一套"
+        );
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
+                 AND message LIKE 'parameter_set.no_candidate_rollback%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_pauses_on_skipped_cycle() {
+        let conn = parameter_set_governance_fixture();
+        let candidate_id = governance_approved_candidate(&conn);
+        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        let now = crate::now();
+        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, true, now + 10_000)
+            .expect("熔断轮不得报错");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            candidate_id,
+            "skipped 轮次必须暂停计时，不得累计零候选"
+        );
+        let paused: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE message LIKE 'parameter_set.guard_paused%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, 1);
     }
 
     fn test_db() -> Db {
