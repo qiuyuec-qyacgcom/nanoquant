@@ -45,6 +45,22 @@ pub(crate) fn spawn_tuning_task(
             if *stop.borrow() {
                 break;
             }
+            // 失败候选重试：先扫描旧候选再生成新候选，避免同轮重复评估刚 spawn 的 id。
+            if crate::evidence_task::sweep_due(&state) {
+                let sweep_state = state.clone();
+                let sweep_stop = stop.clone();
+                tokio::spawn(async move {
+                    if *sweep_stop.borrow() {
+                        return;
+                    }
+                    if let Err(error) = crate::evidence_task::sweep_pending(&sweep_state, 1).await {
+                        tracing::warn!(
+                            error = %sanitize_error(&error),
+                            "候选参数集证据门扫描失败"
+                        );
+                    }
+                });
+            }
             match run_once(&state).await {
                 Ok(Some(set_id)) => {
                     // 证据门独立 spawn：网络回测不阻塞下一轮调参。
@@ -67,22 +83,6 @@ pub(crate) fn spawn_tuning_task(
                 }
                 Ok(None) => {}
                 Err(error) => record_failure(&state, &error),
-            }
-            // 失败候选重试：6h 节流一次扫描，同样独立 spawn 不阻塞循环。
-            if crate::evidence_task::sweep_due(&state) {
-                let sweep_state = state.clone();
-                let sweep_stop = stop.clone();
-                tokio::spawn(async move {
-                    if *sweep_stop.borrow() {
-                        return;
-                    }
-                    if let Err(error) = crate::evidence_task::sweep_pending(&sweep_state, 1).await {
-                        tracing::warn!(
-                            error = %sanitize_error(&error),
-                            "候选参数集证据门扫描失败"
-                        );
-                    }
-                });
             }
             let wait = interval_seconds(&state).max(MIN_INTERVAL_SEC) as u64;
             tokio::select! {

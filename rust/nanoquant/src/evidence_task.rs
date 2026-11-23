@@ -36,11 +36,22 @@ pub(crate) async fn evaluate_candidate(state: AiState, candidate_id: i64) -> Res
 }
 
 /// 注入数据源的实现，测试用 fake history 避免触网。
+///
+/// 所有直接/扫描评估统一在这里先记 attempt：失败候选同样进入 6h 冷却，
+/// 同轮 sweep 不会重复挑中刚 spawn 的 id；写失败直接返回 Err，不进入回测。
 async fn evaluate_with_history(
     state: &AiState,
     candidate_id: i64,
     history_source: &dyn HistorySource,
 ) -> Result<(), String> {
+    {
+        let conn = state
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库连接锁不可用".to_string())?;
+        write_attempt(&conn, candidate_id, crate::now())?;
+    }
     if let Err(error) = run_gate(state, candidate_id, history_source).await {
         record_failed(state, candidate_id, &error);
         return Err(error);
@@ -205,15 +216,24 @@ fn parse_timeframes(parameter_set: &Value) -> Result<Vec<String>, String> {
     let Some(raw) = value.as_str() else {
         return Err("parameter_set.auto_apply_timeframes 必须是逗号分隔字符串".to_string());
     };
-    let frames: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect();
-    if frames.is_empty() {
-        // 配置缺失/空串按默认 1h，避免整条候选因空白名单被永久拒绝。
-        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
+    // 显式空白名单表示「不自动切换」，不能静默补 1h；交由证据门按 §7.3 拒绝。
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut frames: Vec<String> = Vec::new();
+    for item in raw.split(',') {
+        let frame = item.trim();
+        if frame.is_empty() {
+            continue;
+        }
+        if frame != DEFAULT_TIMEFRAME {
+            return Err(format!(
+                "parameter_set.auto_apply_timeframes 仅支持 {DEFAULT_TIMEFRAME}，发现 {frame}"
+            ));
+        }
+        if !frames.iter().any(|existing| existing == frame) {
+            frames.push(frame.to_string());
+        }
     }
     Ok(frames)
 }
@@ -581,14 +601,7 @@ pub(crate) async fn sweep_pending(state: &AiState, limit: usize) -> Result<Optio
     };
     let mut first = None;
     for id in ids {
-        {
-            let conn = state
-                .db
-                .conn
-                .lock()
-                .map_err(|_| "数据库连接锁不可用".to_string())?;
-            write_attempt(&conn, id, now)?;
-        }
+        // attempt 由 evaluate 入口统一写入，扫描侧不再重复写。
         evaluate_candidate(state.clone(), id).await?;
         if first.is_none() {
             first = Some(id);
@@ -918,19 +931,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeframes_defaults_empty_and_rejects_arrays() {
+    fn parse_timeframes_distinguishes_missing_from_empty() {
         assert_eq!(
             parse_timeframes(&json!({})).unwrap(),
+            vec!["1h".to_string()],
+            "缺键按默认 1h"
+        );
+        assert_eq!(
+            parse_timeframes(&json!({"auto_apply_timeframes": null})).unwrap(),
+            vec!["1h".to_string()],
+            "null 按默认 1h"
+        );
+        assert!(
+            parse_timeframes(&json!({"auto_apply_timeframes": ""}))
+                .unwrap()
+                .is_empty(),
+            "显式空串表示不自动切换"
+        );
+        assert!(
+            parse_timeframes(&json!({"auto_apply_timeframes": "   "}))
+                .unwrap()
+                .is_empty(),
+            "纯空白同样表示不自动切换"
+        );
+        assert_eq!(
+            parse_timeframes(&json!({"auto_apply_timeframes": " 1h "})).unwrap(),
             vec!["1h".to_string()]
         );
-        assert_eq!(
-            parse_timeframes(&json!({"auto_apply_timeframes": ""})).unwrap(),
-            vec!["1h".to_string()],
-            "空串按默认 1h"
+        assert!(
+            parse_timeframes(&json!({"auto_apply_timeframes": "1h,4h"})).is_err(),
+            "B 期仅支持 1h，非 1h 条目必须报错"
         );
-        assert_eq!(
-            parse_timeframes(&json!({"auto_apply_timeframes": " 1h , 4h "})).unwrap(),
-            vec!["1h".to_string(), "4h".to_string()]
+        assert!(
+            parse_timeframes(&json!({"auto_apply_timeframes": "4h"})).is_err(),
+            "非法周期必须报错"
         );
         assert!(
             parse_timeframes(&json!({"auto_apply_timeframes": ["1h"]})).is_err(),
@@ -1051,5 +1085,121 @@ mod tests {
         assert_eq!(set.evidence, json!({}), "回滚不得留下证据");
         drop(conn);
         assert!(events(&state).is_empty(), "被触发器拦截的事件不应落库");
+    }
+
+    #[tokio::test]
+    async fn evaluate_records_attempt_and_sweep_skips_it() {
+        // 4h 候选走静态 gate 失败，不触网。
+        let (state, candidate_id) = setup("4h");
+        let history = FakeHistory::unavailable();
+
+        evaluate_with_history(&state, candidate_id, &history)
+            .await
+            .unwrap();
+
+        let conn = state.db.conn.lock().unwrap();
+        let now = crate::now();
+        let attempt: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key=?1",
+                [format!("parameter_set.evidence_attempt.{candidate_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (attempt.parse::<i64>().unwrap() - now).abs() <= 2,
+            "评估入口必须记录 attempt"
+        );
+        assert!(
+            select_pending(&conn, 1, now).unwrap().is_empty(),
+            "同轮 sweep 不得重复选中刚评估的 id"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_evaluation_still_records_attempt() {
+        let (state, candidate_id) = setup("1h");
+        let history = FakeHistory::unavailable();
+
+        assert!(evaluate_with_history(&state, candidate_id, &history)
+            .await
+            .is_err());
+
+        let conn = state.db.conn.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_state WHERE key=?1",
+                [format!("parameter_set.evidence_attempt.{candidate_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "失败候选同样进入 6h 冷却");
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_whitelist_rejects_instead_of_defaulting() {
+        let (state, candidate_id) = setup("1h");
+        {
+            let conn = state.db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='parameter_set'",
+                [json!({
+                    "enabled": true,
+                    "auto_apply": false,
+                    "auto_apply_timeframes": "",
+                    "min_oos_trades": 30
+                })
+                .to_string()],
+            )
+            .unwrap();
+        }
+        let history = FakeHistory::unavailable();
+
+        evaluate_with_history(&state, candidate_id, &history)
+            .await
+            .unwrap();
+
+        assert_eq!(history.calls(), 0, "空白名单应直接失败，不触网");
+        let conn = state.db.conn.lock().unwrap();
+        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "rejected");
+        assert_eq!(set.evidence["gate"]["pass"], false);
+        let reasons = set.evidence["gate"]["reasons"].as_array().unwrap();
+        assert!(
+            reasons.iter().any(|reason| reason
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("timeframe_not_whitelisted")),
+            "空白名单必须由 gate 拒绝"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_timeframe_whitelist_returns_error_and_keeps_candidate() {
+        let (state, candidate_id) = setup("1h");
+        {
+            let conn = state.db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='parameter_set'",
+                [json!({
+                    "enabled": true,
+                    "auto_apply": false,
+                    "auto_apply_timeframes": "4h",
+                    "min_oos_trades": 30
+                })
+                .to_string()],
+            )
+            .unwrap();
+        }
+        let history = FakeHistory::unavailable();
+
+        let result = evaluate_with_history(&state, candidate_id, &history).await;
+
+        assert!(result.is_err(), "非法白名单必须走 evidence_failed");
+        assert_eq!(history.calls(), 0);
+        let conn = state.db.conn.lock().unwrap();
+        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "candidate", "配置错误不得永久拒绝候选");
+        assert_eq!(set.evidence, json!({}));
     }
 }
