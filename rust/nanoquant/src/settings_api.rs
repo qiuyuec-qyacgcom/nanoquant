@@ -1,4 +1,4 @@
-//! 配置组读写。13 个组的默认值与取值范围对齐 `services/settings.py`。
+//! 配置组读写。14 个组的默认值与取值范围对齐 `services/settings.py`。
 //!
 //! 未知组返回 404，不静默建组：前端拼错组名时若返回空对象，
 //! 用户会以为配置丢了再存一次，把别的组覆盖掉。
@@ -31,10 +31,11 @@ pub fn routes() -> Router<Db> {
         .route("/system/system-settings", get(system_settings))
 }
 
-const GROUPS: [&str; 13] = [
+const GROUPS: [&str; 14] = [
     "engine",
     "risk",
     "strategy",
+    "parameter_set",
     "ai",
     "data",
     "news",

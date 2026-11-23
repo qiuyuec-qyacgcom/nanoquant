@@ -13,6 +13,7 @@ export interface SettingSection {
 export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
+  { id: 'parameter_set', label: '参数集', hint: 'regime 参数集、证据门与自动切换' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
   { id: 'data', label: '交易所', hint: '网络、代理与 API 凭证' },
   { id: 'news', label: '资讯', hint: '新闻抓取与情绪' },
@@ -54,6 +55,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       hint: '当前唯一信号模型（fusion）。按趋势/震荡/高波动状态加权相对强弱、波动突破、资金费率与 OI/订单流；至少两个因子同向且置信度达标才开仓。',
       fields: [],
     },
+  ],
+  parameter_set: [
+    { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
+    { title: 'regime 与回滚', fields: ['regime_confirm_sec', 'regime_cooldown_sec', 'no_candidate_rollback_sec'] },
+    { title: '证据门', fields: ['min_oos_trades'] },
   ],
   risk: [
     {
