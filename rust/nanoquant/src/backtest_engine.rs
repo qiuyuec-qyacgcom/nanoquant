@@ -1027,6 +1027,7 @@ pub fn run_walkforward(
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BasketMetrics {
+    /// 已评估的 symbol×fold 单元数；B3 以 positive_folds/folds 比例判定稳健性。
     pub folds: usize,
     pub oos_trades: usize,
     pub positive_folds: usize,
@@ -1043,22 +1044,35 @@ pub struct BasketMetrics {
 }
 
 #[allow(dead_code)]
-fn timeframe_ms(timeframe: &str) -> i64 {
+fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
     let value = timeframe.trim();
+    if value.is_empty() {
+        return Err("timeframe 不能为空".to_string());
+    }
     let split = value
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(value.len());
     let (number, unit) = value.split_at(split);
-    let count = number.parse::<i64>().unwrap_or(1).max(1);
+    if number.is_empty() {
+        return Err(format!("timeframe {timeframe} 缺少数值"));
+    }
+    let count = number
+        .parse::<i64>()
+        .map_err(|_| format!("timeframe {timeframe} 数值非法"))?;
+    if count <= 0 {
+        return Err(format!("timeframe {timeframe} 必须为正数"));
+    }
     let unit_ms = match unit {
         "s" => 1_000,
         "m" => 60_000,
         "h" => 3_600_000,
         "d" => 86_400_000,
         "w" => 604_800_000,
-        _ => 3_600_000,
+        _ => return Err(format!("timeframe {timeframe} 单位非法")),
     };
-    count * unit_ms
+    count
+        .checked_mul(unit_ms)
+        .ok_or_else(|| format!("timeframe {timeframe} 超出范围"))
 }
 
 #[allow(dead_code)]
@@ -1148,6 +1162,21 @@ fn target_returns(trades: &[BacktestTrade], target: &str) -> Vec<f64> {
         .collect()
 }
 
+#[allow(dead_code)]
+fn compounded_max_drawdown(returns: &[(i64, f64)]) -> f64 {
+    let mut ordered = returns.to_vec();
+    ordered.sort_by_key(|(exit_ts, _)| *exit_ts);
+    let mut equity = 1.0_f64;
+    let mut peak = 1.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for (_, value) in ordered {
+        equity *= 1.0 + value / 100.0;
+        peak = peak.max(equity);
+        max_drawdown = max_drawdown.max((peak - equity) / peak * 100.0);
+    }
+    max_drawdown
+}
+
 #[allow(dead_code, clippy::too_many_arguments)]
 pub fn run_walkforward_basket_fixed(
     basket: &[(String, Vec<HistoryBar>)],
@@ -1161,18 +1190,25 @@ pub fn run_walkforward_basket_fixed(
     if basket.len() < 6 {
         return Err("有效标的少于 6 个".to_string());
     }
-    let frame_ms = timeframe_ms(timeframe);
+    let frame_ms = timeframe_ms(timeframe)?;
+    if frame_ms != base.interval_ms {
+        return Err(format!(
+            "timeframe {timeframe} 与 EngineConfig.interval_ms {} 不一致",
+            base.interval_ms
+        ));
+    }
     let regimes = build_market_regime_map(basket, frame_ms);
     let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
     let target = target_regime.as_str();
-    let mut all_is = Vec::new();
+    let mut fold_results = Vec::new();
+    let mut oos_fold_avgs = Vec::new();
+    let mut stressed_fold_avgs = Vec::new();
+    let mut is_fold_avgs = Vec::new();
+    let mut seen_oos: BTreeSet<(String, i64)> = BTreeSet::new();
     let mut all_oos = Vec::new();
     let mut oos_ordered: Vec<(i64, f64)> = Vec::new();
-    let mut all_stressed = Vec::new();
     let mut used = Vec::new();
     let mut skipped = Vec::new();
-    let mut global_folds = requested_folds;
-    let mut plans: Vec<(&String, &Vec<HistoryBar>, usize)> = Vec::new();
 
     for (symbol, bars) in basket {
         if bars.len() < WARMUP * 4 {
@@ -1190,22 +1226,8 @@ pub fn run_walkforward_basket_fixed(
             skipped.push(symbol.clone());
             continue;
         }
-        global_folds = global_folds.min(local_folds);
-        plans.push((symbol, bars, train_bars));
-    }
-    if global_folds < MIN_FOLDS {
-        return Err("没有可用的折 (训练/测试窗口太短)".to_string());
-    }
-    let mut fold_pnl = vec![0.0_f64; global_folds];
-
-    for (symbol, bars, train_bars) in plans {
-        let step = (bars.len() - WARMUP - train_bars) / global_folds;
-        if step <= WARMUP {
-            skipped.push(symbol.clone());
-            continue;
-        }
-        used.push(symbol.clone());
-        for (index, fold_total) in fold_pnl.iter_mut().enumerate() {
+        let mut evaluated = false;
+        for index in 0..local_folds {
             if cancel.load(Ordering::Relaxed) {
                 return Err(CANCELLED.to_string());
             }
@@ -1227,21 +1249,40 @@ pub fn run_walkforward_basket_fixed(
             }
             let is_returns = target_returns(&train_result.trades, target);
             let oos_returns = target_returns(&test_result.trades, target);
+            if oos_returns.is_empty() {
+                continue;
+            }
             let stressed_returns = target_returns(&stressed_result.trades, target);
-            *fold_total += oos_returns.iter().sum::<f64>();
-            all_is.extend(is_returns);
+            fold_results.push(oos_returns.iter().sum::<f64>());
+            oos_fold_avgs.push(average(&oos_returns));
+            stressed_fold_avgs.push(average(&stressed_returns));
+            is_fold_avgs.push(if is_returns.is_empty() {
+                average(&oos_returns)
+            } else {
+                average(&is_returns)
+            });
+            evaluated = true;
             for trade in test_result
                 .trades
                 .iter()
                 .filter(|trade| trade.market_regime == target)
             {
-                oos_ordered.push((trade.exit_ts, trade.pnl_pct));
+                if seen_oos.insert((symbol.clone(), trade.entry_ts)) {
+                    all_oos.push(trade.pnl_pct);
+                    oos_ordered.push((trade.exit_ts, trade.pnl_pct));
+                }
             }
-            all_oos.extend(oos_returns);
-            all_stressed.extend(stressed_returns);
+        }
+        if evaluated {
+            used.push(symbol.clone());
+        } else {
+            skipped.push(symbol.clone());
         }
     }
 
+    if fold_results.len() < MIN_FOLDS {
+        return Err(format!("评估到的 symbol×fold 单元少于 {MIN_FOLDS} 个"));
+    }
     if used.len() < 6 {
         return Err("有效标的少于 6 个".to_string());
     }
@@ -1249,37 +1290,18 @@ pub fn run_walkforward_basket_fixed(
         return Err(format!("目标 regime {target} 的 OOS 成交为 0"));
     }
 
-    oos_ordered.sort_by_key(|(exit_ts, _)| *exit_ts);
-    let mut equity = 0.0_f64;
-    let mut peak = 0.0_f64;
-    let mut max_drawdown = 0.0_f64;
-    for (_, value) in &oos_ordered {
-        equity += value;
-        peak = peak.max(equity);
-        let drawdown = if peak > 0.0 {
-            (peak - equity) / peak * 100.0
-        } else {
-            -equity
-        };
-        max_drawdown = max_drawdown.max(drawdown);
-    }
-
-    let oos_avg = average(&all_oos);
-    let is_avg = if all_is.is_empty() {
-        oos_avg
-    } else {
-        average(&all_is)
-    };
-    let positive_folds = fold_pnl.iter().filter(|value| **value > 0.0).count();
+    let oos_avg = average(&oos_fold_avgs);
+    let is_avg = average(&is_fold_avgs);
+    let positive_folds = fold_results.iter().filter(|value| **value > 0.0).count();
     let bootstrap = bootstrap_ci(&all_oos);
     Ok(BasketMetrics {
-        folds: global_folds,
+        folds: fold_results.len(),
         oos_trades: all_oos.len(),
         positive_folds,
         oos_avg_return_pct: round(oos_avg, 4),
         overfit_gap_pp: round(is_avg - oos_avg, 4),
-        stressed_avg_return_pct: round(average(&all_stressed), 4),
-        max_drawdown_pct: round(max_drawdown, 4),
+        stressed_avg_return_pct: round(average(&stressed_fold_avgs), 4),
+        max_drawdown_pct: round(compounded_max_drawdown(&oos_ordered), 4),
         bootstrap_ci_low: bootstrap["ci_low"].as_f64().unwrap_or_default(),
         bootstrap_p_positive: bootstrap["p_positive"].as_f64().unwrap_or_default(),
         symbols_used: used,
@@ -1625,7 +1647,7 @@ mod tests {
     }
 
     fn tagged_regimes_cover_target(basket: &[(String, Vec<HistoryBar>)], target: &str) -> usize {
-        let frame_ms = timeframe_ms("1h");
+        let frame_ms = timeframe_ms("1h").unwrap();
         let regimes = build_market_regime_map(basket, frame_ms);
         assert!(!regimes.is_empty(), "市场 regime map 不应为空");
         let config = basket_config();
@@ -1694,7 +1716,7 @@ mod tests {
     #[test]
     fn basket_fixed_rejects_when_target_regime_has_no_oos_trades() {
         let basket = synthetic_basket(6, 700);
-        let frame_ms = timeframe_ms("1h");
+        let frame_ms = timeframe_ms("1h").unwrap();
         let regimes = build_market_regime_map(&basket, frame_ms);
         assert!(!regimes.is_empty(), "chaos 用例仍应产生非空 regime map");
         assert!(
@@ -1713,11 +1735,14 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap_err();
-        assert!(error.contains("OOS"));
+        assert!(
+            error.contains("symbol×fold") || error.contains("OOS"),
+            "实际错误: {error}"
+        );
     }
 
     #[test]
-    fn basket_fixed_uses_common_fold_count_for_mixed_coverage() {
+    fn basket_fixed_counts_symbol_fold_units_for_mixed_coverage() {
         let mut basket = synthetic_basket(6, 700);
         basket[0].1.truncate(400);
         let metrics = run_walkforward_basket_fixed(
@@ -1730,9 +1755,47 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert!(metrics.folds < 4, "请求 4 折时应统一到短标的可用的 3 折");
-        assert_eq!(metrics.folds, 3);
+        assert!(
+            metrics.folds >= 6,
+            "6 个标的应至少评估 6 个 symbol×fold 单元"
+        );
         assert!(metrics.positive_folds <= metrics.folds);
-        assert!(metrics.symbols_used.len() >= 6);
+        assert!(metrics.oos_trades > 0);
+    }
+
+    #[test]
+    fn compounded_max_drawdown_follows_compound_returns() {
+        assert!(compounded_max_drawdown(&[]).abs() < 1e-9);
+        assert!(compounded_max_drawdown(&[(1, 5.0), (2, 10.0)]).abs() < 1e-9);
+        assert!((compounded_max_drawdown(&[(2, -20.0), (1, 10.0)]) - 20.0).abs() < 1e-6);
+        assert!((compounded_max_drawdown(&[(1, -50.0), (2, 100.0)]) - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn basket_fixed_rejects_timeframe_mismatch() {
+        let basket = synthetic_basket(6, 700);
+        let mut cfg = basket_config();
+        cfg.interval_ms = 900_000;
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &cfg,
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("不一致"), "实际错误: {error}");
+    }
+
+    #[test]
+    fn timeframe_parser_rejects_invalid_input_and_parses_units() {
+        assert_eq!(timeframe_ms("1h").unwrap(), 3_600_000);
+        assert_eq!(timeframe_ms("15m").unwrap(), 900_000);
+        assert!(timeframe_ms("").is_err());
+        assert!(timeframe_ms("h").is_err());
+        assert!(timeframe_ms("1x").is_err());
+        assert!(timeframe_ms("0h").is_err());
     }
 }
