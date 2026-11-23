@@ -1,16 +1,16 @@
-//! 参数集只读接口。B 期仅暴露列表、当前视图与完整证据；
-//! 启用/回滚属于 C 期，这里不改 `strategy` 也不写任何激活记录。
+//! 参数集接口。B 期只读列表、当前视图与完整证据；C 期追加手动启用/回滚，
+//! 复用 `parameter_sets` 的 SAVEPOINT 事务与审计，不在 API 层另写 `strategy`。
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::Db;
-use crate::parameter_sets::{active_for_regime, row_to_set, ParameterSet};
+use crate::parameter_sets::{activate, active_for_regime, rollback, row_to_set, ParameterSet};
 
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 const LIST_LIMIT: i64 = 100;
@@ -21,6 +21,8 @@ pub fn routes() -> Router<Db> {
         .route("/parameter-sets", get(list_sets))
         .route("/parameter-sets/current", get(current_view))
         .route("/parameter-sets/{id}/evidence", get(set_evidence))
+        .route("/parameter-sets/{id}/activate", post(activate_set))
+        .route("/parameter-sets/{id}/rollback", post(rollback_set))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -37,6 +39,37 @@ fn not_found(message: impl std::fmt::Display) -> ApiError {
         StatusCode::NOT_FOUND,
         json!({ "detail": message.to_string() }).into(),
     )
+}
+
+fn bad_request(message: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({ "detail": message.to_string() }).into(),
+    )
+}
+
+/// 与 runtime 一致：`engine_state.mode` 缺失时回落 `demo`。
+fn current_mode(conn: &Connection) -> String {
+    read_engine_state(conn, "mode")
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "demo".to_string())
+}
+
+fn ensure_set_exists(conn: &Connection, id: i64) -> Result<(), ApiError> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM parameter_sets WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(server_error)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(not_found(format!("参数集 {id} 不存在")))
+    }
 }
 
 fn lock(db: &Db) -> Result<std::sync::MutexGuard<'_, Connection>, ApiError> {
@@ -122,6 +155,27 @@ fn active_entry(regime: &str, set: Option<ParameterSet>) -> Value {
     }
 }
 
+/// 守卫状态按 regime 存 JSON；解析失败视为缺失，不阻断当前视图。
+fn guard_view(conn: &Connection) -> Result<Value, ApiError> {
+    let mut guard = serde_json::Map::new();
+    for regime in ACTIVE_REGIMES {
+        let key = format!("parameter_set.guard.{regime}");
+        if let Some(raw) = read_engine_state(conn, &key).map_err(server_error)? {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                guard.insert(regime.to_string(), parsed);
+            }
+        }
+    }
+    Ok(Value::Object(guard))
+}
+
+fn auto_apply_since(conn: &Connection) -> Result<i64, ApiError> {
+    Ok(read_engine_state(conn, "parameter_set.auto_apply_since")
+        .map_err(server_error)?
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0))
+}
+
 /// 当前视图：`market_regime` 只读诊断键，不触发任何切换；active 缺失按 null 呈现。
 async fn current_view(State(db): State<Db>) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
@@ -144,8 +198,28 @@ async fn current_view(State(db): State<Db>) -> Result<Json<Value>, ApiError> {
     Ok(json!({
         "market_regime": market_regime,
         "active": active,
+        "guard": guard_view(&conn)?,
+        "auto_apply_since": auto_apply_since(&conn)?,
     })
     .into())
+}
+
+/// 手动启用：写 `trigger='manual'`，物化 `strategy` 与逐键变更。
+async fn activate_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let conn = lock(&db)?;
+    ensure_set_exists(&conn, id)?;
+    let mode = current_mode(&conn);
+    activate(&conn, id, "manual", &mode).map_err(bad_request)?;
+    Ok(json!({ "ok": true, "id": id }).into())
+}
+
+/// 手动回滚当前集到上一套，审计来源由 `rollback` 固定为 `parameter_set_rollback`。
+async fn rollback_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let conn = lock(&db)?;
+    ensure_set_exists(&conn, id)?;
+    let mode = current_mode(&conn);
+    rollback(&conn, id, &mode).map_err(bad_request)?;
+    Ok(json!({ "ok": true, "id": id }).into())
 }
 
 async fn set_evidence(
@@ -204,6 +278,92 @@ mod tests {
             params![key, value],
         )
         .unwrap();
+    }
+
+    fn seed_strategy(db: &Db, params: Value) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [params.to_string()],
+        )
+        .unwrap();
+    }
+
+    /// 插入指定 params 快照，供激活/回滚测试构造差异。
+    fn insert_set_with_params(
+        db: &Db,
+        name: &str,
+        regime: &str,
+        status: &str,
+        params: Value,
+    ) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO parameter_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
+             VALUES(?1,?2,'1h',1,?3,?4,'manual','{\"kind\":\"manual\"}',NULL,1000,NULL)",
+            params![name, regime, params.to_string(), status],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn strategy_value(db: &Db) -> Value {
+        let conn = db.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row("SELECT value FROM app_settings WHERE key='strategy'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    async fn post(app: Router, uri: &str) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn params_with_threshold(threshold: f64) -> Value {
+        json!({
+            "timeframe": "1h",
+            "atr_pct_min": 1.2,
+            "atr_pct_max": 8,
+            "volume_ratio_min": 1.1,
+            "entry_threshold": threshold,
+        })
+    }
+
+    fn count_changes(db: &Db, source: &str, set_id: i64) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM parameter_changes WHERE source=?1 AND set_id=?2",
+            params![source, set_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_activations(db: &Db, trigger: &str, set_id: i64) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM parameter_set_activations WHERE trigger=?1 AND set_id=?2",
+            params![trigger, set_id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     async fn get(app: Router, uri: &str) -> (StatusCode, Value) {
@@ -344,5 +504,112 @@ mod tests {
             get(app(db), "/api/v1/parameter-sets/999999/evidence").await;
         assert_eq!(missing_status, StatusCode::NOT_FOUND);
         assert_eq!(missing_body["detail"], "参数集 999999 不存在");
+    }
+
+    #[tokio::test]
+    async fn current_includes_guard_and_auto_apply_since() {
+        let db = memory_db();
+        insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
+        set_engine_state(&db, "mode", "demo");
+        set_engine_state(&db, "market_regime.demo", "range");
+        set_engine_state(
+            &db,
+            "parameter_set.guard.range",
+            "{\"set_id\":1,\"last_candidate_at\":123}",
+        );
+        set_engine_state(&db, "parameter_set.auto_apply_since", "1700000000");
+
+        let (status, body) = get(app(db), "/api/v1/parameter-sets/current").await;
+        assert_eq!(status, StatusCode::OK, "当前视图应成功: {body}");
+        assert_eq!(body["guard"]["range"]["set_id"], 1);
+        assert_eq!(body["guard"]["range"]["last_candidate_at"], 123);
+        assert_eq!(body["auto_apply_since"], 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn activate_route_materializes_strategy_and_audits_manual() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        let id = insert_set_with_params(&db, "range-manual", "range", "manual", params_with_threshold(0.50));
+
+        let (status, body) = post(app(db.clone()), &format!("/api/v1/parameter-sets/{id}/activate")).await;
+        assert_eq!(status, StatusCode::OK, "手动启用应成功: {body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["id"], id);
+        assert_eq!(strategy_value(&db)["entry_threshold"], 0.50);
+        assert!(count_changes(&db, "parameter_set", id) > 0, "应写参数集切换审计");
+        assert_eq!(count_activations(&db, "manual", id), 1, "trigger 应为 manual");
+    }
+
+    #[tokio::test]
+    async fn rollback_route_restores_previous_and_audits_rollback() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        let first = insert_set_with_params(&db, "range-first", "range", "manual", params_with_threshold(0.50));
+        let second = insert_set_with_params(&db, "range-second", "range", "manual", params_with_threshold(0.52));
+
+        let (activate_first, _) =
+            post(app(db.clone()), &format!("/api/v1/parameter-sets/{first}/activate")).await;
+        assert_eq!(activate_first, StatusCode::OK);
+        let (activate_second, activate_body) =
+            post(app(db.clone()), &format!("/api/v1/parameter-sets/{second}/activate")).await;
+        assert_eq!(activate_second, StatusCode::OK, "第二套应可启用: {activate_body}");
+        assert_eq!(strategy_value(&db)["entry_threshold"], 0.52);
+
+        let (status, body) =
+            post(app(db.clone()), &format!("/api/v1/parameter-sets/{second}/rollback")).await;
+        assert_eq!(status, StatusCode::OK, "手动回滚应成功: {body}");
+        assert_eq!(strategy_value(&db)["entry_threshold"], 0.50, "应恢复上一套参数");
+        assert!(
+            count_changes(&db, "parameter_set_rollback", first) > 0,
+            "应写回滚审计"
+        );
+        assert_eq!(count_activations(&db, "rollback", first), 1, "trigger 应为 rollback");
+
+        let conn = db.conn.lock().unwrap();
+        let statuses: Vec<(i64, String)> = conn
+            .prepare("SELECT id,status FROM parameter_sets ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(statuses, vec![(first, "active".to_string()), (second, "retired".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn activate_and_rollback_return_404_or_400() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        let pending = insert_set_with_params(&db, "range-candidate", "range", "candidate", params_with_threshold(0.5));
+        let no_history = insert_set_with_params(&db, "range-manual", "range", "manual", params_with_threshold(0.5));
+
+        let (missing_activate, missing_activate_body) =
+            post(app(db.clone()), "/api/v1/parameter-sets/999999/activate").await;
+        assert_eq!(missing_activate, StatusCode::NOT_FOUND);
+        assert_eq!(missing_activate_body["detail"], "参数集 999999 不存在");
+
+        let (missing_rollback, _) =
+            post(app(db.clone()), "/api/v1/parameter-sets/999999/rollback").await;
+        assert_eq!(missing_rollback, StatusCode::NOT_FOUND);
+
+        let (bad_status, bad_body) =
+            post(app(db.clone()), &format!("/api/v1/parameter-sets/{pending}/activate")).await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        assert!(
+            bad_body["detail"].as_str().unwrap_or("").contains("不允许激活"),
+            "候选状态不可手动启用: {bad_body}"
+        );
+
+        let (no_previous, no_previous_body) =
+            post(app(db), &format!("/api/v1/parameter-sets/{no_history}/rollback")).await;
+        assert_eq!(no_previous, StatusCode::BAD_REQUEST);
+        assert!(
+            no_previous_body["detail"].as_str().unwrap_or("").contains("没有上一套"),
+            "无历史不可回滚: {no_previous_body}"
+        );
     }
 }
