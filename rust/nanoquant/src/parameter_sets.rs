@@ -1,3 +1,7 @@
+// A 期注册表 API（读取、候选写入与候选校验）由后续调参、证据门与切换任务接入；
+// 接入前这些项只由单元测试调用，暂不触发 dead_code 告警。
+#![allow(dead_code)]
+
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -218,9 +222,176 @@ fn insert_activation(
     Ok(())
 }
 
+const MAX_CANDIDATE_KEYS: usize = 3;
+const MAX_RELATIVE_CHANGE: f64 = 0.25;
+const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParameterSet {
+    pub id: i64,
+    pub name: String,
+    pub regime: String,
+    pub timeframe: String,
+    pub version: i64,
+    pub params: Value,
+    pub status: String,
+    pub source: String,
+    pub evidence: Value,
+    pub parent_id: Option<i64>,
+    pub created_at: i64,
+    pub activated_at: Option<i64>,
+}
+
+/// `params` / `evidence` 是历史 JSON 快照；解析失败时降级为 Null，不阻断读取。
+pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterSet> {
+    let params_raw: String = row.get(5)?;
+    let evidence_raw: String = row.get(8)?;
+    Ok(ParameterSet {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        regime: row.get(2)?,
+        timeframe: row.get(3)?,
+        version: row.get(4)?,
+        params: serde_json::from_str(&params_raw).unwrap_or(Value::Null),
+        status: row.get(6)?,
+        source: row.get(7)?,
+        evidence: serde_json::from_str(&evidence_raw).unwrap_or(Value::Null),
+        parent_id: row.get(9)?,
+        created_at: row.get(10)?,
+        activated_at: row.get(11)?,
+    })
+}
+
+pub(crate) fn active_for_regime(conn: &Connection, regime: &str) -> Option<ParameterSet> {
+    conn.query_row(
+        &format!(
+            "SELECT {SET_COLUMNS} FROM parameter_sets \
+             WHERE regime=?1 AND status='active' ORDER BY id DESC LIMIT 1"
+        ),
+        [regime],
+        row_to_set,
+    )
+    .ok()
+}
+
+pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, String> {
+    conn.query_row(
+        &format!("SELECT {SET_COLUMNS} FROM parameter_sets WHERE id=?1"),
+        [id],
+        row_to_set,
+    )
+    .map_err(|e| format!("读取参数集 {id} 失败: {e}"))
+}
+
+/// 只写候选记录，不激活、不写配置：应用参数集是 C 期行为。
+pub(crate) fn insert_candidate(
+    conn: &Connection,
+    name: &str,
+    regime: &str,
+    timeframe: &str,
+    params_value: &Value,
+    parent_id: Option<i64>,
+) -> Result<i64, String> {
+    insert_set(
+        conn,
+        name,
+        regime,
+        timeframe,
+        params_value,
+        "candidate",
+        "ai",
+        "{}",
+        parent_id,
+        crate::now(),
+    )
+}
+
+/// 把 AI 参数增量合并到 active 快照上并校验；返回完整 strategy 快照。
+/// 任何一条不合规都整体拒绝，避免部分写入。
+pub(crate) fn validate_candidate(
+    active: &Value,
+    patch: &[crate::ai_client::ParamUpdate],
+) -> Result<Value, String> {
+    let Some(mut next) = active.as_object().cloned() else {
+        return Err("active 参数集必须是对象".to_string());
+    };
+    let unique_keys: std::collections::HashSet<(&str, &str)> = patch
+        .iter()
+        .map(|update| (update.group.as_str(), update.key.as_str()))
+        .collect();
+    if unique_keys.len() > MAX_CANDIDATE_KEYS {
+        return Err(format!(
+            "候选最多允许 {MAX_CANDIDATE_KEYS} 个键，实际 {}",
+            unique_keys.len()
+        ));
+    }
+    for update in patch {
+        if update.group != "strategy" {
+            return Err(format!(
+                "候选只允许 strategy 组，拒绝 {}.{}",
+                update.group, update.key
+            ));
+        }
+        if update.key == "timeframe" {
+            return Err("候选不允许修改 timeframe".to_string());
+        }
+        let Some(meta) = crate::param_registry::find("strategy", &update.key) else {
+            return Err(format!("候选键 strategy.{} 未注册", update.key));
+        };
+        if !meta.ai_writable {
+            return Err(format!("候选键 strategy.{} 不允许 AI 写入", update.key));
+        }
+        if meta.kind != "number" {
+            return Err(format!(
+                "候选键 strategy.{} 类型为 {}，仅允许数字",
+                update.key, meta.kind
+            ));
+        }
+        if let Some(old) = active.get(update.key.as_str()).and_then(Value::as_f64) {
+            let new = update
+                .value
+                .as_f64()
+                .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
+            if old != 0.0 && ((new - old).abs() / old.abs()) > MAX_RELATIVE_CHANGE {
+                return Err(format!(
+                    "候选键 strategy.{} 相对变化超过 {}%",
+                    update.key,
+                    (MAX_RELATIVE_CHANGE * 100.0) as i64
+                ));
+            }
+        }
+        if let Some((low, high)) = crate::param_registry::ai_bounds("strategy", &update.key) {
+            let new = update
+                .value
+                .as_f64()
+                .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
+            if !(low..=high).contains(&new) {
+                return Err(format!(
+                    "候选键 strategy.{} 超出 AI 边界 [{low},{high}]",
+                    update.key
+                ));
+            }
+        }
+        next.insert(
+            update.key.clone(),
+            crate::param_registry::coerce(&meta, &update.value)?,
+        );
+    }
+    let Some(active_timeframe) = active.get("timeframe").and_then(Value::as_str) else {
+        return Err("active 参数集缺少 timeframe，无法校验候选".to_string());
+    };
+    if next.get("timeframe").and_then(Value::as_str) != Some(active_timeframe) {
+        return Err("候选参数集 timeframe 必须与 active 一致".to_string());
+    }
+    let snapshot = Value::Object(next);
+    crate::settings_api::validate_group("strategy", &snapshot)?;
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_client::ParamUpdate;
     use rusqlite::Connection;
 
     struct SetRow {
@@ -290,6 +461,21 @@ mod tests {
         .unwrap()
         .flatten()
         .collect()
+    }
+
+    fn param_update(key: &str, value: Value) -> ParamUpdate {
+        ParamUpdate {
+            group: "strategy".to_string(),
+            key: key.to_string(),
+            value,
+            reason: String::new(),
+        }
+    }
+
+    fn seeded_snapshot(conn: &Connection, regime: &str) -> Value {
+        active_for_regime(conn, regime)
+            .unwrap_or_else(|| panic!("{regime} 应有 active 参数集"))
+            .params
     }
 
     #[test]
@@ -567,5 +753,147 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn candidate_validation_rejects_risk_and_three_key_limit() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+
+        let risk = ParamUpdate {
+            group: "risk".to_string(),
+            key: "max_leverage".to_string(),
+            value: json!(5),
+            reason: String::new(),
+        };
+        assert!(
+            validate_candidate(&active, &[risk]).is_err(),
+            "risk 组必须拒绝"
+        );
+
+        let keys = [
+            "entry_threshold",
+            "exit_threshold",
+            "sl_atr_mult",
+            "tp_atr_mult",
+        ];
+        let patch: Vec<ParamUpdate> = keys
+            .iter()
+            .map(|key| param_update(key, active[*key].clone()))
+            .collect();
+        assert_eq!(patch.len(), 4);
+        assert!(
+            validate_candidate(&active, &patch).is_err(),
+            "4 个键必须拒绝"
+        );
+    }
+
+    #[test]
+    fn candidate_validation_rejects_timeframe_change() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+
+        let changed = param_update("timeframe", json!("4h"));
+        assert!(
+            validate_candidate(&active, &[changed]).is_err(),
+            "不允许直接改 timeframe"
+        );
+
+        let mut missing = active.clone();
+        missing.as_object_mut().unwrap().remove("timeframe");
+        let patch = [param_update("entry_threshold", json!(0.45))];
+        assert!(
+            validate_candidate(&missing, &patch).is_err(),
+            "无法确认 timeframe 一致时必须拒绝"
+        );
+    }
+
+    #[test]
+    fn candidate_step_over_25_percent_is_rejected() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+        assert_eq!(active["entry_threshold"], 0.45);
+
+        let patch = [param_update("entry_threshold", json!(0.60))];
+        assert!(
+            validate_candidate(&active, &patch).is_err(),
+            "0.45→0.60 超过 25%"
+        );
+    }
+
+    #[test]
+    fn chaos_parent_can_lower_atr_min_within_hard_bound() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "chaos");
+        assert_eq!(active["atr_pct_min"], 1.0);
+
+        let ok = validate_candidate(&active, &[param_update("atr_pct_min", json!(0.75))]).unwrap();
+        assert_eq!(ok["atr_pct_min"], 0.75);
+        assert_eq!(ok["timeframe"], active["timeframe"]);
+
+        assert!(
+            validate_candidate(&active, &[param_update("atr_pct_min", json!(0.5))]).is_err(),
+            "1.0→0.5 超过 25%"
+        );
+        assert!(
+            validate_candidate(&active, &[param_update("atr_pct_min", json!(1.05))]).is_err(),
+            "1.05 超出 ai_bounds 上界 1.0"
+        );
+    }
+
+    #[test]
+    fn insert_candidate_persists_complete_snapshot() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let parent = active_for_regime(&conn, "range").unwrap();
+        let snapshot = validate_candidate(
+            &parent.params,
+            &[param_update("entry_threshold", json!(0.40))],
+        )
+        .unwrap();
+
+        let id = insert_candidate(
+            &conn,
+            "ai-range-1",
+            "range",
+            "1h",
+            &snapshot,
+            Some(parent.id),
+        )
+        .unwrap();
+        let set = load_set(&conn, id).unwrap();
+        assert_eq!(set.name, "ai-range-1");
+        assert_eq!(set.status, "candidate");
+        assert_eq!(set.source, "ai");
+        assert_eq!(set.timeframe, "1h");
+        assert_eq!(set.params["timeframe"], "1h");
+        assert_eq!(set.parent_id, Some(parent.id));
+        assert_eq!(set.params, snapshot, "candidate 必须保存完整快照");
+        assert_eq!(set.evidence, json!({}));
+        assert_eq!(set.version, 1);
+        assert!(set.activated_at.is_none(), "候选不应被激活");
+
+        let active = active_for_regime(&conn, "range").unwrap();
+        assert_eq!(active.id, parent.id, "插入候选不得改变 active");
+    }
+
+    #[test]
+    fn active_for_regime_returns_active_set() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().name,
+            "range-bootstrap"
+        );
+        assert_eq!(
+            active_for_regime(&conn, "chaos").unwrap().name,
+            "chaos-bootstrap"
+        );
+        assert!(active_for_regime(&conn, "trend").is_none());
     }
 }

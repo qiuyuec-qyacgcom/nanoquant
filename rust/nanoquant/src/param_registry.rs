@@ -304,7 +304,7 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     !is_visible(group, key)
 }
 
-/// A 期先定义边界，A3 接入候选校验后移除 allow。
+/// AI 专用边界：调参 prompt 展示该范围，候选校验用同一范围。
 #[allow(dead_code)]
 pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
     match (group, key) {

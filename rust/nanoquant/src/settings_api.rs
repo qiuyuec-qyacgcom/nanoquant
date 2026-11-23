@@ -590,6 +590,12 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// 供参数集候选校验复用同一套配置规则，避免另维护一份边界。
+#[allow(dead_code)]
+pub(crate) fn validate_group(group: &str, value: &Value) -> Result<(), String> {
+    validate(group, value)
+}
+
 pub(crate) fn apply_param_updates(
     conn: &rusqlite::Connection,
     updates: &[crate::ai_client::ParamUpdate],
