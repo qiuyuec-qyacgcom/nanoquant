@@ -381,6 +381,7 @@ pub(crate) fn catalog() -> Value {
 }
 
 /// 只给 AI 看可写字段的边界：不带 visible/hidden 标志，避免模型猜测可见性。
+#[allow(dead_code)]
 pub(crate) fn writable_catalog() -> Value {
     let mut groups = Map::new();
     for (group, object) in defaults().as_object().unwrap() {

@@ -596,6 +596,7 @@ pub(crate) fn validate_group(group: &str, value: &Value) -> Result<(), String> {
     validate(group, value)
 }
 
+#[allow(dead_code)]
 pub(crate) fn apply_param_updates(
     conn: &rusqlite::Connection,
     updates: &[crate::ai_client::ParamUpdate],

@@ -30,129 +30,6 @@ impl AiReviewer for EngineAiReviewer {
     }
 }
 
-fn strip_secrets(value: &mut Value, group: &str) {
-    if let Some(object) = value.as_object_mut() {
-        object.retain(|key, _| !crate::param_registry::is_sensitive(group, key));
-        for child in object.values_mut() {
-            strip_secrets(child, group);
-        }
-    } else if let Some(items) = value.as_array_mut() {
-        for child in items {
-            strip_secrets(child, group);
-        }
-    }
-}
-
-fn review_parameters(conn: &rusqlite::Connection, cfg: &ai_client::AiConfig) -> Value {
-    let mut out = serde_json::Map::new();
-    for group in [
-        "engine",
-        "strategy",
-        "risk",
-        "news",
-        "journal",
-        "evolution",
-        "system",
-        "data",
-        "backup",
-        "public",
-        "signal_follow",
-    ] {
-        let mut value = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key = ?1",
-                [group],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or(Value::Null);
-        strip_secrets(&mut value, group);
-        out.insert(group.to_string(), value);
-    }
-    let tuning_interval = conn
-        .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.get("param_tuning_min_interval_sec").cloned())
-        .unwrap_or_else(|| json!(0));
-    out.insert(
-        "ai".to_string(),
-        json!({
-            "enabled": cfg.enabled,
-            "mode": cfg.mode,
-            "min_confidence": cfg.min_confidence,
-            "max_calls_per_hour": cfg.max_calls_per_hour,
-            "monthly_budget_usd": cfg.monthly_budget_usd,
-            "timeout_sec": cfg.timeout_sec,
-            "temperature": cfg.temperature,
-            "decision_schema_version": cfg.decision_schema_version,
-            "param_tuning_min_interval_sec": tuning_interval,
-        }),
-    );
-    out.insert(
-        "parameter_changes".to_string(),
-        parameter_change_context(conn),
-    );
-    out.insert(
-        "writable_parameters".to_string(),
-        crate::param_registry::writable_catalog()["groups"].clone(),
-    );
-    Value::Object(out)
-}
-
-fn parameter_change_context(conn: &rusqlite::Connection) -> Value {
-    let Ok(mut statement) = conn.prepare(
-        "SELECT id, ts, group_name, key, old_value, new_value, reason, mode, source \
-         FROM parameter_changes ORDER BY ts DESC, id DESC LIMIT 10",
-    ) else {
-        return json!([]);
-    };
-    let Ok(rows) = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-        ))
-    }) else {
-        return json!([]);
-    };
-    let changes = rows.filter_map(Result::ok).collect::<Vec<_>>();
-    let windows = changes
-        .iter()
-        .map(|row| (row.0, row.1, row.7.clone()))
-        .collect::<Vec<_>>();
-    let effects = crate::settings_api::effects_for_changes(conn, &windows);
-    let items = changes
-        .into_iter()
-        .map(
-            |(id, ts, group, key, old_value, new_value, reason, mode, source)| {
-                json!({
-                    "id": id,
-                    "ts": ts,
-                    "group": group,
-                    "key": key,
-                    "old": old_value.and_then(|text| serde_json::from_str::<Value>(&text).ok()),
-                    "new": serde_json::from_str::<Value>(&new_value).ok(),
-                    "reason": reason,
-                    "mode": mode,
-                    "source": source,
-                    "effect": effects.get(&id).cloned().unwrap_or_else(|| json!({"trades": 0, "pnl": 0.0})),
-                })
-            },
-        )
-        .collect::<Vec<_>>();
-    json!(items)
-}
-
 async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewDecision, String> {
     let strategy_cfg = state
         .db
@@ -208,7 +85,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .as_ref()
         .map(crate::strategies::compact)
         .unwrap_or(Value::Null);
-    let (mantra_text, mantra_ids, experiences, parameters) = {
+    let (mantra_text, mantra_ids, experiences) = {
         let conn = state
             .db
             .conn
@@ -228,8 +105,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             &journal_snapshot,
             &proposal.side,
         );
-        let parameters = review_parameters(&conn, &cfg);
-        (mantra_text, mantra_ids, experiences, parameters)
+        (mantra_text, mantra_ids, experiences)
     };
     let news = crate::ai_analysis::news_digest(&state, 8);
     let quant_signal = proposal.quant_side.as_ref().map(|side| {
@@ -246,7 +122,6 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "global_strategy",
             "self_evolving_mantras",
             "decision_experiences",
-            "parameters",
             "symbol_analysis",
             "oi",
             "news_sentiment",
@@ -259,7 +134,6 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "ids": mantra_ids,
         },
         "experiences": experiences,
-        "parameters": parameters,
         "symbol": proposal.symbol,
         "price": market.mark_price,
         "score": features["ema_gap_pct"].as_f64().map(|value| value / 0.22).unwrap_or(0.0),
@@ -303,10 +177,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     if !outcome.ok {
         return Err(format!("AI 复核失败: {}", outcome.error));
     }
-    let mut decision = ai_client::parse_decision(&outcome.text, Some(&context))
+    let decision = ai_client::parse_decision(&outcome.text, Some(&context))
         .map_err(|error| format!("AI 复核结果无效: {error}"))?;
-    let outcome_log_id = outcome.log_id;
-    apply_decision_params(&state, &mut decision, outcome_log_id);
     let side_lock = profile
         .as_ref()
         .and_then(|profile| profile.get("filters"))
@@ -314,137 +186,6 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .and_then(Value::as_str)
         .unwrap_or("any");
     decision_to_review(&proposal, side_lock, &decision, cfg.min_confidence)
-}
-
-fn tuning_enabled(value: Option<&Value>) -> bool {
-    match value {
-        None => true,
-        Some(Value::Bool(flag)) => *flag,
-        Some(Value::Number(number)) => number.as_i64().map(|n| n != 0).unwrap_or(false),
-        Some(Value::String(text)) => matches!(text.as_str(), "true" | "1"),
-        _ => false,
-    }
-}
-
-/// 冷却窗口只拦截窗口内的重复调参；间隔为 0 时保持原有行为。
-fn tuning_cooldown_active(last_ts: Option<i64>, now: i64, interval_sec: i64) -> bool {
-    interval_sec > 0 && last_ts.is_some_and(|last| now - last < interval_sec)
-}
-
-fn apply_decision_params(state: &AiState, decision: &mut ai_client::Decision, decision_id: i64) {
-    if decision.params.is_empty() {
-        return;
-    }
-    let tuning = state
-        .db
-        .setting("ai")
-        .ok()
-        .flatten()
-        .and_then(|value| value.get("allow_param_tuning").cloned());
-    if !tuning_enabled(tuning.as_ref()) {
-        let note = format!(
-            "ai.allow_param_tuning=false，已忽略 {} 项参数更新",
-            decision.params.len()
-        );
-        decision.risk_flags.push(note.clone());
-        if let Ok(conn) = state.db.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO engine_events(ts, level, category, message, payload) \
-                 VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                (
-                    crate::now(),
-                    note,
-                    json!({ "count": decision.params.len() }).to_string(),
-                ),
-            );
-        }
-        return;
-    }
-    let mode = state
-        .db
-        .setting("engine")
-        .ok()
-        .flatten()
-        .and_then(|value| {
-            value
-                .get("mode")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "demo".to_string());
-    // setting() 会再锁一次库，必须在下方的 conn 守卫之前读取
-    let interval_sec = state
-        .db
-        .setting("ai")
-        .ok()
-        .flatten()
-        .and_then(|value| value.get("param_tuning_min_interval_sec").cloned())
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_f64().map(|number| number as i64))
-        })
-        .unwrap_or(0)
-        .max(0);
-    let Ok(conn) = state.db.conn.lock() else {
-        decision
-            .risk_flags
-            .push("参数写回失败：数据库锁不可用".to_string());
-        return;
-    };
-    if interval_sec > 0 {
-        // 表不存在或查询失败都按“没有历史调参”处理，不能中断复核
-        let last_ts = conn
-            .query_row("SELECT MAX(ts) FROM parameter_changes", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })
-            .ok()
-            .flatten();
-        if tuning_cooldown_active(last_ts, crate::now(), interval_sec) {
-            let note = format!("调参冷却中，已忽略 {} 项更新", decision.params.len());
-            decision.risk_flags.push(note.clone());
-            let _ = conn.execute(
-                "INSERT INTO engine_events(ts, level, category, message, payload) \
-                 VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                (
-                    crate::now(),
-                    note,
-                    json!({ "count": decision.params.len(), "interval_sec": interval_sec })
-                        .to_string(),
-                ),
-            );
-            return;
-        }
-    }
-
-    match crate::settings_api::apply_param_updates(&conn, &decision.params, decision_id, &mode) {
-        Ok(report) => {
-            if let Some(skipped) = report.get("skipped").and_then(Value::as_array) {
-                for item in skipped {
-                    let note = format!("AI 调参被拒绝: {item}");
-                    decision.risk_flags.push(note.clone());
-                    let _ = conn.execute(
-                        "INSERT INTO engine_events(ts, level, category, message, payload) \
-                         VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                        (crate::now(), note, item.to_string()),
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            let note = format!("参数写回失败: {error}");
-            decision.risk_flags.push(note.clone());
-            let _ = conn.execute(
-                "INSERT INTO engine_events(ts, level, category, message, payload) \
-                 VALUES(?1, 'warn', 'param_change', ?2, ?3)",
-                (
-                    crate::now(),
-                    note,
-                    json!({ "count": decision.params.len() }).to_string(),
-                ),
-            );
-        }
-    }
 }
 
 fn reject(reason: impl Into<String>) -> ReviewDecision {
@@ -765,9 +506,9 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         }
     }
 
-    struct ParamTransport;
+    struct HoldParamTransport;
 
-    impl crate::ai_client::AiTransport for ParamTransport {
+    impl crate::ai_client::AiTransport for HoldParamTransport {
         fn post_json<'a>(
             &'a self,
             _url: &'a str,
@@ -778,7 +519,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             Box::pin(async move {
                 Ok(crate::ai_client::HttpReply {
                     status: 200,
-                    body: r#"{"choices":[{"message":{"content":"{\"a\":\"L\",\"c\":0.8,\"l\":0,\"s\":0,\"t\":0,\"r\":[1],\"k\":[9],\"x\":2,\"p\":[{\"g\":\"strategy\",\"k\":\"entry_threshold\",\"v\":0.35,\"w\":\"test\"}]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_string(),
+                    body: r#"{"choices":[{"message":{"content":"{\"a\":\"H\",\"c\":0.9,\"p\":[{\"g\":\"strategy\",\"k\":\"atr_pct_min\",\"v\":0.7,\"w\":\"x\"}]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_string(),
                 })
             })
         }
@@ -798,16 +539,6 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         }
     }
 
-    fn param_reviewer(db: &crate::db::Db) -> EngineAiReviewer {
-        let state = AiState::with_transport(
-            db.clone(),
-            MASTER_KEY.as_bytes().to_vec(),
-            std::sync::Arc::new(ParamTransport),
-        )
-        .with_market(std::sync::Arc::new(StaticMarket));
-        EngineAiReviewer::new(state)
-    }
-
     fn stored_strategy(db: &crate::db::Db) -> Value {
         let raw: String = db
             .conn
@@ -822,65 +553,53 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         serde_json::from_str(&raw).unwrap()
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_applies_param_updates_when_enabled() {
-        let path = std::env::temp_dir().join("nq-ai-reviewer-params.db");
-        let db = fixture(&path);
-        let reviewer = param_reviewer(&db);
-        let _ = reviewer.review(&proposal("long")).unwrap();
-        let strategy = stored_strategy(&db);
-        assert_eq!(strategy["entry_threshold"], 0.35, "{strategy}");
-        let changes: i64 = db
-            .conn
+    fn parameter_change_count(db: &crate::db::Db) -> i64 {
+        db.conn
             .lock()
             .unwrap()
             .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
                 row.get(0)
             })
-            .unwrap();
-        assert_eq!(changes, 1);
-    }
-
-    #[test]
-    fn param_tuning_flag_is_fail_closed() {
-        assert!(tuning_enabled(None));
-        assert!(tuning_enabled(Some(&json!(true))));
-        assert!(tuning_enabled(Some(&json!(1))));
-        assert!(tuning_enabled(Some(&json!("1"))));
-        assert!(!tuning_enabled(Some(&json!(false))));
-        assert!(!tuning_enabled(Some(&json!(0))));
-        assert!(!tuning_enabled(Some(&json!("false"))));
-        assert!(!tuning_enabled(Some(&json!(null))));
-        assert!(!tuning_enabled(Some(&json!({ "enabled": true }))));
-    }
-
-    #[test]
-    fn cooldown_only_blocks_inside_the_window() {
-        assert!(!tuning_cooldown_active(None, 1_000, 300));
-        assert!(!tuning_cooldown_active(Some(800), 1_000, 0));
-        assert!(tuning_cooldown_active(Some(800), 1_000, 300));
-        assert!(!tuning_cooldown_active(Some(600), 1_000, 300));
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_skips_param_updates_when_disabled() {
-        let path = std::env::temp_dir().join("nq-ai-reviewer-params-off.db");
+    async fn review_entry_ignores_ai_param_updates() {
+        let path = std::env::temp_dir().join("nq-ai-reviewer-ignores-params.db");
         let db = fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE app_settings SET value=json_set(value,'$.allow_param_tuning',0) WHERE key='ai'",
+        {
+            let conn = db.conn.lock().unwrap();
+            crate::schema::ensure_parameter_changes(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
+                 VALUES(1,'strategy','entry_threshold','null','0.3','seed',0,'demo','manual')",
                 [],
             )
             .unwrap();
-        let reviewer = param_reviewer(&db);
-        let _ = reviewer.review(&proposal("long")).unwrap();
+        }
+        let before = parameter_change_count(&db);
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            std::sync::Arc::new(HoldParamTransport),
+        )
+        .with_market(std::sync::Arc::new(StaticMarket));
+        let reviewed = EngineAiReviewer::new(state)
+            .review(&proposal("long"))
+            .unwrap();
+        assert_eq!(reviewed.action, ReviewAction::Hold);
+        assert!((reviewed.confidence - 0.9).abs() < 1e-9);
+        assert_eq!(
+            parameter_change_count(&db),
+            before,
+            "开仓复核不得写入 parameter_changes"
+        );
         let strategy = stored_strategy(&db);
         assert!(
-            strategy.get("entry_threshold").is_none(),
-            "关闭后不得写入参数: {strategy}"
+            strategy.get("atr_pct_min").is_none(),
+            "开仓复核不得改写 strategy 参数: {strategy}"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
