@@ -22,7 +22,10 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
     let Some(raw) = raw else {
         return Ok(());
     };
-    let current: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let Ok(current) = serde_json::from_str::<Value>(&raw) else {
+        // 配置损坏时跳过种子化：审计种子不值得阻断整次启动。
+        return Ok(());
+    };
     let timeframe = current["timeframe"].as_str().unwrap_or("4h");
     if timeframe != BOOTSTRAP_TIMEFRAME {
         let retired = current.clone();
@@ -193,6 +196,17 @@ mod tests {
         conn
     }
 
+    fn set_params(conn: &Connection, name: &str) -> serde_json::Value {
+        let raw: String = conn
+            .query_row(
+                "SELECT params FROM parameter_sets WHERE name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
     #[test]
     fn bootstrap_seeds_range_and_chaos_only_for_1h_and_keeps_strategy() {
         let conn = conn_with_strategy("1h");
@@ -237,14 +251,53 @@ mod tests {
             "1h".into(),
             "retired".into()
         )));
-        let activations: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM parameter_set_activations WHERE trigger='bootstrap'",
-                [],
-                |r| r.get(0),
+        let range_params = set_params(&conn, "range-bootstrap");
+        assert_eq!(range_params["atr_pct_min"], 0.6);
+        assert_eq!(range_params["atr_pct_max"], 10.0);
+        assert_eq!(range_params["volume_ratio_min"], 0.8);
+        assert_eq!(range_params["entry_threshold"], 0.45);
+        assert_eq!(range_params["timeframe"], "1h");
+
+        let chaos_params = set_params(&conn, "chaos-bootstrap");
+        assert_eq!(chaos_params["atr_pct_min"], 1.0);
+        assert_eq!(chaos_params["atr_pct_max"], 8.0);
+        assert_eq!(chaos_params["volume_ratio_min"], 1.0);
+        assert_eq!(chaos_params["entry_threshold"], 0.5);
+        assert_eq!(chaos_params["timeframe"], "1h");
+
+        let activations: Vec<(i64, String, Option<i64>, String, String)> = conn
+            .prepare(
+                "SELECT a.set_id, a.regime, a.previous_set_id, p.regime, p.status \
+                 FROM parameter_set_activations a JOIN parameter_sets p ON p.id = a.set_id \
+                 WHERE a.trigger='bootstrap' ORDER BY a.id",
             )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(activations.len(), 2);
+        for (set_id, regime, previous_set_id, set_regime, status) in &activations {
+            assert!(*set_id > 0);
+            assert!(previous_set_id.is_none(), "首次种子化不应有上一套参数集");
+            assert_eq!(regime, set_regime, "激活记录 regime 必须与参数集一致");
+            assert_eq!(status, "active");
+        }
+        assert_eq!(
+            activations
+                .iter()
+                .map(|(_, regime, _, _, _)| regime.as_str())
+                .collect::<Vec<_>>(),
+            vec!["range", "chaos"]
+        );
+        let total_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(activations, 2);
+        assert_eq!(total_activations, 2, "retired 审计集不应产生激活记录");
 
         let live: (String, String) = conn
             .query_row(
@@ -271,6 +324,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3);
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 2);
     }
 
     #[test]
@@ -303,5 +362,25 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         assert!(seed_bootstrap(&conn).is_ok());
+    }
+
+    #[test]
+    fn corrupt_strategy_json_is_skipped_without_failing_bootstrap() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings VALUES('strategy','{not valid json',0)",
+            [],
+        )
+        .unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        assert!(seed_bootstrap(&conn).is_ok());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
