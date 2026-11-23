@@ -4396,35 +4396,53 @@ fn apply_parameter_set_governance(
     if current_regime.is_empty() {
         return Ok(());
     }
-    if let Some(applied) = crate::parameter_sets::auto_apply_approved(
+    let auto_apply_error = match crate::parameter_sets::auto_apply_approved(
         conn,
         &current_regime,
         mode,
         live_timeframe,
         now,
-    )? {
-        let applied_set = crate::parameter_sets::load_set(conn, applied)?;
-        crate::parameter_sets::set_guard(conn, &applied_set.regime, applied, now)?;
-    }
-    let Some(active) = crate::parameter_sets::active_set_for_regime(conn, &current_regime)? else {
-        return Ok(());
+    ) {
+        Ok(Some(applied)) => {
+            let applied_set = crate::parameter_sets::load_set(conn, applied)?;
+            crate::parameter_sets::set_guard(conn, &applied_set.regime, applied, now)?;
+            None
+        }
+        Ok(None) => None,
+        Err(error) => {
+            // 自动启用失败要留事件，不能只靠日志；guard 仍继续推进。
+            if let Err(record_error) = conn.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) \
+                 VALUES(?1,'warn','parameter_set',?2,?3)",
+                (
+                    now,
+                    format!("parameter_set.auto_apply_failed: {error}"),
+                    json!({
+                        "mode": mode,
+                        "regime": current_regime,
+                        "error": &error,
+                    })
+                    .to_string(),
+                ),
+            ) {
+                tracing::warn!(%record_error, "写入参数集自动启用失败事件失败");
+            }
+            Some(error)
+        }
     };
-    if crate::parameter_sets::update_guard(
+    let Some(active) = crate::parameter_sets::active_set_for_regime(conn, &current_regime)? else {
+        return auto_apply_error.map_or(Ok(()), Err);
+    };
+    // 守卫已把 active 集回滚标记写进自己的状态，这里不能再 set_guard 覆盖。
+    crate::parameter_sets::update_guard(
         conn,
         &current_regime,
         active.id,
         has_candidate,
         skipped,
         now,
-    )? {
-        // 回滚已把 active 换成上一套，守卫重置到新的 active 集。
-        if let Some(rolled_back) =
-            crate::parameter_sets::active_set_for_regime(conn, &current_regime)?
-        {
-            crate::parameter_sets::set_guard(conn, &current_regime, rolled_back.id, now)?;
-        }
-    }
-    Ok(())
+    )?;
+    auto_apply_error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn acquire_lock(data_dir: &Path) -> io::Result<File> {
@@ -6498,6 +6516,74 @@ mod tests {
         id
     }
 
+    fn enable_auto_apply(conn: &rusqlite::Connection, since: &str) {
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('parameter_set',?1,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::json!({
+                "enabled": true,
+                "auto_apply": true,
+                "auto_apply_timeframes": "1h",
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) \
+             VALUES('parameter_set.auto_apply_since',?1,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [since],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_materializes_approved_candidate() {
+        let conn = parameter_set_governance_fixture();
+        let candidate_id = governance_approved_candidate(&conn);
+        enable_auto_apply(&conn, "0");
+        let now = crate::now();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", true, false, now)
+            .expect("自动启用不能阻断周期");
+
+        let active = crate::parameter_sets::active_for_regime(&conn, "range")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, candidate_id, "当前 regime 必须直接启用候选");
+        let strategy_raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let strategy: serde_json::Value = serde_json::from_str(&strategy_raw).unwrap();
+        assert_eq!(
+            strategy["entry_threshold"],
+            serde_json::json!(0.40),
+            "当前 regime 必须物化 strategy"
+        );
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM parameter_set_activations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "auto_apply");
+        let guard_raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.guard.range'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let guard: serde_json::Value = serde_json::from_str(&guard_raw).unwrap();
+        assert_eq!(guard["set_id"], serde_json::json!(candidate_id));
+        assert_eq!(guard["rollback_done"], serde_json::json!(false));
+    }
+
     #[test]
     fn apply_parameter_set_governance_rolls_back_after_no_candidate_window() {
         let conn = parameter_set_governance_fixture();
@@ -6534,6 +6620,15 @@ mod tests {
             bootstrap_id,
             "无候选满窗口必须回滚到上一套"
         );
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM parameter_set_activations WHERE set_id=?1 \
+                 ORDER BY id DESC LIMIT 1",
+                [bootstrap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "no_candidate");
         let warnings: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_events WHERE level='warn' \

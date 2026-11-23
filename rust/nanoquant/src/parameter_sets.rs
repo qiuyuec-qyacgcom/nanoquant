@@ -599,23 +599,32 @@ fn activate_without_materializing(
     }
 }
 
-/// 每次 regime/auto_apply 激活后初始化守卫；`last_candidate_at=started_at=now`。
+/// 每次 regime/auto_apply/manual 激活后初始化守卫；`last_candidate_at=started_at=now`。
+///
+/// 新激活必须清除 `rollback_done`，否则新集第一轮零候选就会永久停摆。
 pub(crate) fn set_guard(
     conn: &Connection,
     regime: &str,
     set_id: i64,
     now: i64,
 ) -> Result<(), String> {
-    write_guard(conn, regime, &json!({
+    write_guard(conn, regime, &guard_value(set_id, now, false))
+}
+
+fn guard_value(set_id: i64, now: i64, rollback_done: bool) -> Value {
+    json!({
         "set_id": set_id,
         "last_candidate_at": now,
         "started_at": now,
-    }))
+        "rollback_done": rollback_done,
+    })
 }
 
 /// 每轮实跑后推进守卫；触发无候选回滚时返回 true。
 ///
-/// `skipped` 轮次只暂停计时；`has_candidate` 重置计时。
+/// `skipped` 轮次只暂停计时；`has_candidate` 重置计时并清除回滚标记。
+/// `rollback_done=true` 表示该 active 集已自动回滚过一次：再零候选只告警不动作，
+/// 避免每 30 分钟在两套参数集之间来回抖动。
 pub(crate) fn update_guard(
     conn: &Connection,
     regime: &str,
@@ -628,13 +637,11 @@ pub(crate) fn update_guard(
     let mut guard = engine_state(conn, &key)
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .filter(|value| value.get("set_id").and_then(Value::as_i64) == Some(set_id))
-        .unwrap_or_else(|| {
-            json!({
-                "set_id": set_id,
-                "last_candidate_at": now,
-                "started_at": now,
-            })
-        });
+        .unwrap_or_else(|| guard_value(set_id, now, false));
+    let rollback_done = guard
+        .get("rollback_done")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if skipped {
         guard["last_candidate_at"] = json!(now);
         write_guard(conn, regime, &guard)?;
@@ -643,14 +650,36 @@ pub(crate) fn update_guard(
             "warn",
             &format!("parameter_set.guard_paused_ts.{regime}"),
             &format!("parameter_set.guard_paused: {regime} 本轮未实跑，暂停无候选计时"),
-            json!({"regime": regime, "set_id": set_id, "mode": engine_mode(conn)}),
+            json!({
+                "regime": regime,
+                "set_id": set_id,
+                "mode": engine_mode(conn),
+                "reason": "skipped",
+            }),
             now,
         )?;
         return Ok(false);
     }
     if has_candidate {
         guard["last_candidate_at"] = json!(now);
+        guard["rollback_done"] = json!(false);
         write_guard(conn, regime, &guard)?;
+        return Ok(false);
+    }
+    if rollback_done {
+        record_guard_event(
+            conn,
+            "warn",
+            &format!("parameter_set.guard_rollback_hold_ts.{regime}"),
+            &format!("parameter_set.guard_rollback_hold: {regime} 已回滚过，暂停无候选回滚"),
+            json!({
+                "regime": regime,
+                "set_id": set_id,
+                "mode": engine_mode(conn),
+                "reason": "no_candidate",
+            }),
+            now,
+        )?;
         return Ok(false);
     }
     let last_candidate_at = guard["last_candidate_at"].as_i64().unwrap_or(now);
@@ -664,17 +693,17 @@ pub(crate) fn update_guard(
         return Ok(false);
     }
     let mode = engine_mode(conn);
-    match rollback(conn, set_id, &mode) {
+    match rollback_with_trigger(conn, set_id, &mode, "no_candidate") {
         Ok(()) => {
-            // 回滚成功后守卫归零，指向回滚后的 active 集。
-            let rolled_back_to = active_for_regime(conn, regime)?
-                .map(|set| set.id)
-                .unwrap_or(set_id);
-            write_guard(conn, regime, &json!({
-                "set_id": rolled_back_to,
-                "last_candidate_at": now,
-                "started_at": now,
-            }))?;
+            // 回滚成功后守卫指向回滚后的 active 集，并标记该集已回滚过。
+            // trend 回退时 active 集在 range，必须用含回退的查询，不能指向已退役集。
+            match active_set_for_regime(conn, regime)? {
+                Some(set) => write_guard(conn, regime, &guard_value(set.id, now, true))?,
+                None => {
+                    guard["rollback_done"] = json!(true);
+                    write_guard(conn, regime, &guard)?;
+                }
+            }
             record_guard_event(
                 conn,
                 "warn",
@@ -685,8 +714,10 @@ pub(crate) fn update_guard(
                 json!({
                     "regime": regime,
                     "set_id": set_id,
-                    "rolled_back_to": rolled_back_to,
+                    "regime_after": active_set_for_regime(conn, regime)?
+                        .map(|set| set.id),
                     "mode": mode,
+                    "trigger": "no_candidate",
                     "elapsed_sec": now - last_candidate_at,
                 }),
                 now,
@@ -706,6 +737,7 @@ pub(crate) fn update_guard(
                     "regime": regime,
                     "set_id": set_id,
                     "mode": mode,
+                    "trigger": "no_candidate",
                     "error": error,
                 }),
                 now,
@@ -760,8 +792,21 @@ fn engine_mode(conn: &Connection) -> String {
     engine_state(conn, "mode").unwrap_or_else(|| "demo".to_string())
 }
 
-/// 回滚到该参数集最近一次激活前的上一套；没有上一套时返回 Err（调用方只告警）。
+/// 手动回滚：写 `trigger='rollback'` 的 activation 与事件。
+/// C4 手动 API 才会调用，C3 自动守卫走 `rollback_with_trigger(...,\"no_candidate\")`。
+#[allow(dead_code)]
 pub(crate) fn rollback(conn: &Connection, current_id: i64, mode: &str) -> Result<(), String> {
+    rollback_with_trigger(conn, current_id, mode, "rollback")
+}
+
+/// 回滚到该参数集最近一次激活前的上一套；`trigger` 决定审计来源
+/// （手动 `rollback`、自动守卫 `no_candidate`）。
+pub(crate) fn rollback_with_trigger(
+    conn: &Connection,
+    current_id: i64,
+    mode: &str,
+    trigger: &str,
+) -> Result<(), String> {
     let current = load_set(conn, current_id)?;
     let previous_id: Option<i64> = conn
         .query_row(
@@ -784,7 +829,7 @@ pub(crate) fn rollback(conn: &Connection, current_id: i64, mode: &str) -> Result
     }
     conn.execute_batch("SAVEPOINT parameter_set_rollback")
         .map_err(|e| format!("开启参数集回滚事务失败: {e}"))?;
-    match rollback_in_savepoint(conn, &current, &previous, mode) {
+    match rollback_in_savepoint(conn, &current, &previous, mode, trigger) {
         Ok(()) => conn
             .execute_batch("RELEASE parameter_set_rollback")
             .map_err(|e| format!("提交参数集回滚事务失败: {e}")),
@@ -802,6 +847,7 @@ fn rollback_in_savepoint(
     current: &ParameterSet,
     previous: &ParameterSet,
     mode: &str,
+    trigger: &str,
 ) -> Result<(), String> {
     if !previous.params.is_object() {
         return Err(format!("参数集 {} params 必须是对象快照", previous.id));
@@ -846,7 +892,7 @@ fn rollback_in_savepoint(
         previous.id,
         &previous.regime,
         Some(current.id),
-        "rollback",
+        trigger,
         now,
     )?;
     record_event(
@@ -858,7 +904,7 @@ fn rollback_in_savepoint(
             "previous_set_id": current.id,
             "regime": previous.regime,
             "mode": mode,
-            "trigger": "rollback",
+            "trigger": trigger,
         }),
         now,
     )
@@ -1928,6 +1974,19 @@ mod tests {
         assert_eq!(set_id, range_id);
         assert_eq!(previous_id, Some(candidate_id));
         assert_eq!(trigger, "rollback");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM engine_events WHERE message LIKE '%回滚到%' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["trigger"],
+            json!("rollback"),
+            "手动回滚事件的 trigger 必须与 activation 一致"
+        );
     }
 
     #[test]
@@ -2375,6 +2434,10 @@ mod tests {
             "非当前 regime 不得提前物化 strategy"
         );
         assert_eq!(auto_apply_activations(&conn), 1);
+        let changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(changes, 0, "非当前 regime 不得写 strategy 变更记录");
     }
 
     #[test]
@@ -2496,6 +2559,55 @@ mod tests {
         assert_eq!(auto_apply_activations(&conn), 1);
     }
 
+    fn insert_activation_row(
+        conn: &Connection,
+        set_id: i64,
+        regime: &str,
+        trigger: &str,
+        ts: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO parameter_set_activations(set_id,regime,previous_set_id,ts,trigger) \
+             VALUES(?1,?2,NULL,?3,?4)",
+            (set_id, regime, ts, trigger),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn auto_apply_rate_limit_ignores_regime_activations() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        approved_candidate(&conn, "range-ai-quota", "range");
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+        let now = crate::now();
+        insert_activation_row(&conn, 1, "range", "regime", now);
+
+        assert!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now)
+                .unwrap()
+                .is_some(),
+            "regime 激活不占自动启用配额"
+        );
+    }
+
+    #[test]
+    fn auto_apply_rate_limit_recovers_after_window() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        approved_candidate(&conn, "range-ai-window", "range");
+        set_state(&conn, "parameter_set.auto_apply_since", "0");
+        let now = crate::now();
+        insert_activation_row(&conn, 1, "range", "auto_apply", now - 86_401);
+
+        assert!(
+            auto_apply_approved(&conn, "range", "demo", "1h", now)
+                .unwrap()
+                .is_some(),
+            "超过 24 小时窗口后应恢复自动启用"
+        );
+    }
+
     fn guard_fixture() -> (Connection, i64, i64) {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
@@ -2544,6 +2656,29 @@ mod tests {
         let guard: Value = serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap())
             .unwrap();
         assert_eq!(guard["set_id"], json!(bootstrap_id), "守卫重置到回滚后的 active 集");
+        assert_eq!(guard["rollback_done"], json!(true), "回滚后必须打标记防止抖动");
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM parameter_set_activations WHERE set_id=?1 \
+                 ORDER BY id DESC LIMIT 1",
+                [bootstrap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "no_candidate", "自动守卫回滚必须写 no_candidate");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM engine_events WHERE message LIKE 'parameter_set.no_candidate_rollback%' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["trigger"],
+            json!("no_candidate"),
+            "事件 payload 必须与 activation trigger 一致"
+        );
         let warnings: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
@@ -2553,6 +2688,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn guard_rollback_does_not_repeat_until_candidate_returns() {
+        let (conn, bootstrap_id, candidate_id) = guard_fixture();
+        set_guard(&conn, "range", candidate_id, 1_000).unwrap();
+        assert!(update_guard(&conn, "range", candidate_id, false, false, 2_800).unwrap());
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let guard: Value =
+            serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap()).unwrap();
+        assert_eq!(guard["rollback_done"], json!(true));
+
+        // 再过 30 分钟仍零候选：只 hold 告警，不得产生反向回滚。
+        assert!(!update_guard(&conn, "range", bootstrap_id, false, false, 4_600).unwrap());
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            bootstrap_id,
+            "回滚标记必须阻止抖动"
+        );
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, activations, "不得产生反向 activation");
+        let holds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE message LIKE 'parameter_set.guard_rollback_hold%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holds, 1);
+
+        // 候选恢复后清除标记，守卫重新开始计时。
+        assert!(!update_guard(&conn, "range", bootstrap_id, true, false, 4_700).unwrap());
+        let guard: Value =
+            serde_json::from_str(&state_value(&conn, "parameter_set.guard.range").unwrap()).unwrap();
+        assert_eq!(guard["rollback_done"], json!(false));
+        assert_eq!(guard["last_candidate_at"], json!(4_700));
     }
 
     #[test]
