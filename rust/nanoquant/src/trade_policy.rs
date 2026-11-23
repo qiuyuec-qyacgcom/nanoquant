@@ -197,7 +197,7 @@ pub(crate) fn evaluate(
     if core.volume_ratio < policy.volume_ratio_min {
         return None;
     }
-    if core.atr_pct < policy.atr_pct_min || core.atr_pct > policy.atr_pct_max {
+    if !(policy.atr_pct_min..=policy.atr_pct_max).contains(&core.atr_pct) {
         return None;
     }
     if core.score.abs() < policy.base_threshold {
@@ -459,13 +459,26 @@ mod tests {
             evaluate(&data, mark, atr_for(1.5), policy, features).is_some(),
             "atr_pct≈1.5 落在 policy 上下界内时应给出信号"
         );
-        let wider = TradePolicy {
-            atr_pct_min: 1.4,
-            ..policy
+        assert!(
+            evaluate(&data, mark, atr_for(0.8), policy, features).is_none(),
+            "atr_pct≈0.8 低于 policy 下界时必须拒绝"
+        );
+        let capped = TradePolicy {
+            atr_pct_max: 1.2,
+            ..cfg()
         };
         assert!(
-            evaluate(&data, mark, atr_for(0.8), wider, features).is_none(),
-            "atr_pct≈0.8 低于 policy 下界时必须拒绝"
+            evaluate(&data, mark, atr_for(1.5), capped, features).is_none(),
+            "atr_pct≈1.5 高于 policy 上界时必须拒绝"
+        );
+        let inverted = TradePolicy {
+            atr_pct_min: 1.6,
+            atr_pct_max: 1.4,
+            ..cfg()
+        };
+        assert!(
+            evaluate(&data, mark, atr_for(1.5), inverted, features).is_none(),
+            "上下界反转时闭区间恒为空，必须拒绝而不是钳制"
         );
     }
 
