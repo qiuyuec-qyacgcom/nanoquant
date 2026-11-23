@@ -52,6 +52,7 @@ mod news;
 mod oi_regime;
 mod ops_tools;
 mod param_registry;
+mod parameter_sets;
 mod protection_api;
 mod providers;
 mod public;

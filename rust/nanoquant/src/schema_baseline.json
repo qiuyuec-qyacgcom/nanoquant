@@ -2835,7 +2835,7 @@
     },
     {
       "name": "trades",
-      "sql": "CREATE TABLE trades (\n\tid INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tqty FLOAT NOT NULL, \n\tentry_price FLOAT NOT NULL, \n\texit_price FLOAT NOT NULL, \n\tleverage FLOAT NOT NULL, \n\tnotional FLOAT NOT NULL, \n\tpnl FLOAT NOT NULL, \n\tpnl_pct FLOAT NOT NULL, \n\troi_pct FLOAT NOT NULL, \n\tfees FLOAT NOT NULL, \n\topened_at INTEGER NOT NULL, \n\tclosed_at INTEGER NOT NULL, \n\thold_seconds INTEGER NOT NULL, \n\texit_reason VARCHAR(32) NOT NULL, \n\tai_confidence FLOAT NOT NULL, \n\tai_reason TEXT NOT NULL, \n\tsignal_score FLOAT NOT NULL, \n\tslippage_bps FLOAT NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\treviewed BOOLEAN NOT NULL, \n\treview_note TEXT NOT NULL, \n\tfeatures JSON, \n\tmantra_ids JSON, \n\tPRIMARY KEY (id)\n)",
+      "sql": "CREATE TABLE trades (\n\tid INTEGER NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tqty FLOAT NOT NULL, \n\tentry_price FLOAT NOT NULL, \n\texit_price FLOAT NOT NULL, \n\tleverage FLOAT NOT NULL, \n\tnotional FLOAT NOT NULL, \n\tpnl FLOAT NOT NULL, \n\tpnl_pct FLOAT NOT NULL, \n\troi_pct FLOAT NOT NULL, \n\tfees FLOAT NOT NULL, \n\topened_at INTEGER NOT NULL, \n\tclosed_at INTEGER NOT NULL, \n\thold_seconds INTEGER NOT NULL, \n\texit_reason VARCHAR(32) NOT NULL, \n\tai_confidence FLOAT NOT NULL, \n\tai_reason TEXT NOT NULL, \n\tsignal_score FLOAT NOT NULL, \n\tslippage_bps FLOAT NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\treviewed BOOLEAN NOT NULL, \n\treview_note TEXT NOT NULL, \n\tfeatures JSON, \n\tmantra_ids JSON, \n\tparameter_set_id INTEGER, \n\tPRIMARY KEY (id)\n)",
       "row_count": 0,
       "columns": [
         {
@@ -3034,6 +3034,14 @@
           "cid": 24,
           "name": "mantra_ids",
           "type": "JSON",
+          "notnull": false,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 25,
+          "name": "parameter_set_id",
+          "type": "INTEGER",
           "notnull": false,
           "default": null,
           "pk": false

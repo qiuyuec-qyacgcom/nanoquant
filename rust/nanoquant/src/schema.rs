@@ -132,6 +132,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         }
         backfill_sort_order(conn)?;
         ensure_parameter_changes(conn)?;
+        ensure_parameter_sets(conn)?;
         normalize_ai_tuning_interval(conn)?;
         drop_legacy_default_leverage(conn)?;
         Ok(())
@@ -150,6 +151,39 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
          CREATE INDEX IF NOT EXISTS ix_parameter_changes_ts ON parameter_changes(ts);",
     )
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
+}
+
+pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parameter_sets(\
+         id INTEGER PRIMARY KEY, name TEXT NOT NULL, regime TEXT NOT NULL, timeframe TEXT NOT NULL, \
+         version INTEGER NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, \
+         evidence TEXT NOT NULL DEFAULT '{}', parent_id INTEGER, created_at INTEGER NOT NULL, activated_at INTEGER); \
+         CREATE UNIQUE INDEX IF NOT EXISTS ix_parameter_sets_active_regime ON parameter_sets(regime) WHERE status='active'; \
+         CREATE INDEX IF NOT EXISTS ix_parameter_sets_regime_status ON parameter_sets(regime,status); \
+         CREATE TABLE IF NOT EXISTS parameter_set_activations(\
+         id INTEGER PRIMARY KEY, set_id INTEGER NOT NULL, regime TEXT NOT NULL, previous_set_id INTEGER, \
+         ts INTEGER NOT NULL, trigger TEXT NOT NULL); \
+         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_ts ON parameter_set_activations(ts);",
+    )
+    .map_err(|e| format!("建表 parameter_sets 失败: {e}"))?;
+    if !column_exists(conn, "parameter_changes", "set_id")? {
+        conn.execute_batch("ALTER TABLE parameter_changes ADD COLUMN set_id INTEGER;")
+            .map_err(|e| format!("补列 parameter_changes.set_id 失败: {e}"))?;
+    }
+    if !column_exists(conn, "parameter_changes", "regime")? {
+        conn.execute_batch("ALTER TABLE parameter_changes ADD COLUMN regime TEXT;")
+            .map_err(|e| format!("补列 parameter_changes.regime 失败: {e}"))?;
+    }
+    if !column_exists(conn, "trades", "parameter_set_id")? {
+        conn.execute_batch("ALTER TABLE trades ADD COLUMN parameter_set_id INTEGER;")
+            .map_err(|e| format!("补列 trades.parameter_set_id 失败: {e}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    Ok(column_names(conn, table)?.contains(column))
 }
 
 /// 存量库的调参间隔 0 表示「每轮复核都可调参」，A 期解耦后语义变为独立任务间隔，
@@ -264,7 +298,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let report = migrate(&conn).unwrap();
         assert_eq!(report.created_tables.len(), 23);
-        assert_eq!(table_count(&conn), 24);
+        assert_eq!(table_count(&conn), 26);
     }
 
     #[test]
@@ -275,7 +309,7 @@ mod tests {
         assert!(second.created_tables.is_empty());
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
-        assert_eq!(table_count(&conn), 24);
+        assert_eq!(table_count(&conn), 26);
     }
 
     #[test]
