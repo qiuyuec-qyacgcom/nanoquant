@@ -75,6 +75,7 @@ mod submit;
 mod symbols;
 mod system;
 mod trade_policy;
+mod tuning;
 mod ws;
 mod wsauth;
 
@@ -308,6 +309,10 @@ async fn main() {
             ai_market::BinanceMarketSource::new(db.clone()),
         ))
     });
+    // 独立调参任务：只在有数据库时启动，只生成候选参数集，与交易引擎完全解耦。
+    if let Some(ai) = ai_state.clone() {
+        tokio::spawn(crate::tuning::spawn_tuning_task(ai, stop_tx.subscribe()));
+    }
     // 执行内核端点：EXEC_TCP 优先，其次 EXEC_SOCKET（与旧 exec_endpoint 同口径）。
     let exec_endpoint = std::env::var("EXEC_TCP")
         .ok()

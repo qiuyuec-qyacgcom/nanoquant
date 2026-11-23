@@ -218,12 +218,8 @@ fn insert_activation(
     Ok(())
 }
 
-// A3 注册表 API 由 A6 调参/证据任务接入；接入前仅测试使用，逐项豁免 dead_code。
-#[allow(dead_code)]
 const MAX_CANDIDATE_KEYS: usize = 3;
-#[allow(dead_code)]
 const MAX_RELATIVE_CHANGE: f64 = 0.25;
-#[allow(dead_code)]
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 
 #[allow(dead_code)]
@@ -243,8 +239,7 @@ pub(crate) struct ParameterSet {
     pub activated_at: Option<i64>,
 }
 
-/// `params` / `evidence` 是历史 JSON 快照；解析失败时降级为 Null，不阻断读取。
-#[allow(dead_code)]
+/// `params` / `evidence` 是历史 JSON 快照；解析失败时降级为 Null，读取不中断。
 pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterSet> {
     let params_raw: String = row.get(5)?;
     let evidence_raw: String = row.get(8)?;
@@ -264,7 +259,7 @@ pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterS
     })
 }
 
-#[allow(dead_code)]
+/// 读取某 regime 当前唯一的 active 参数集。
 pub(crate) fn active_for_regime(
     conn: &Connection,
     regime: &str,
@@ -280,7 +275,7 @@ pub(crate) fn active_for_regime(
     }
 }
 
-#[allow(dead_code)]
+/// 按 id 读取参数集，候选父集校验也复用它。
 pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, String> {
     conn.query_row(
         &format!("SELECT {SET_COLUMNS} FROM parameter_sets WHERE id=?1"),
@@ -290,8 +285,7 @@ pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, Strin
     .map_err(|e| format!("读取参数集 {id} 失败: {e}"))
 }
 
-/// 只写候选记录，不激活、不写配置：应用参数集是 C 期行为。
-#[allow(dead_code)]
+/// 只写候选记录：不激活、不写配置，应用参数集属于 C 期行为。
 pub(crate) fn insert_candidate(
     conn: &Connection,
     name: &str,
@@ -329,9 +323,8 @@ pub(crate) fn insert_candidate(
     )
 }
 
-/// 把 AI 参数增量合并到 active 快照上并校验；返回完整 strategy 快照。
+/// 把 AI 参数增量合并到 active 快照上并校验，返回完整 strategy 快照。
 /// 任何一条不合规都整体拒绝，避免部分写入。
-#[allow(dead_code)]
 pub(crate) fn validate_candidate(
     active: &Value,
     patch: &[crate::ai_client::ParamUpdate],

@@ -304,8 +304,7 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     !is_visible(group, key)
 }
 
-/// AI 专用边界：调参 prompt 展示该范围，候选校验用同一范围。
-#[allow(dead_code)]
+/// AI 调参专用边界：prompt 展示与候选校验共用同一区间。
 pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
     match (group, key) {
         ("strategy", "atr_pct_min") => Some((0.0, 1.0)),
@@ -380,8 +379,7 @@ pub(crate) fn catalog() -> Value {
     json!({ "groups": groups })
 }
 
-/// 只给 AI 看可写字段的边界：不带 visible/hidden 标志，避免模型猜测可见性。
-#[allow(dead_code)]
+/// 只给 AI 看的可写字段边界：不暴露 visible/hidden 标志，避免模型猜测可见性。
 pub(crate) fn writable_catalog() -> Value {
     let mut groups = Map::new();
     for (group, object) in defaults().as_object().unwrap() {
