@@ -6,7 +6,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::ai_providers::AiState;
@@ -24,10 +24,14 @@ const MIN_SYMBOLS: usize = 6;
 const DEFAULT_MIN_OOS_TRADES: f64 = 30.0;
 const DEFAULT_TIMEFRAME: &str = "1h";
 const EVENT_CATEGORY: &str = "parameter_set";
+const PENDING_WINDOW_SEC: i64 = 7 * 24 * 3600;
+const ATTEMPT_COOLDOWN_SEC: i64 = 6 * 3600;
+const SWEEP_INTERVAL_SEC: i64 = 6 * 3600;
 
 /// 候选证据门入口：真实币安历史 + 真实回测。
 pub(crate) async fn evaluate_candidate(state: AiState, candidate_id: i64) -> Result<(), String> {
-    let store = BinanceHistory::new(live_mode(&state));
+    let live = live_mode(&state)?;
+    let store = BinanceHistory::new(live);
     evaluate_with_history(&state, candidate_id, &store).await
 }
 
@@ -79,8 +83,8 @@ async fn run_gate(
 
     let interval_ms = history::interval_ms(&prepared.candidate.timeframe)
         .ok_or_else(|| format!("不支持的回测周期: {}", prepared.candidate.timeframe))?;
-    let end_ms = crate::now_millis();
-    let start_ms = end_ms - BARS_LIMIT * interval_ms;
+    // 排除当前未收盘 bar，并按 warmup 扩窗后再截取最近 BARS_LIMIT 根。
+    let (start_ms, end_ms) = aligned_window(crate::now_millis(), interval_ms);
     let (basket, data_skipped) = load_basket(
         history_source,
         &prepared.symbols,
@@ -159,20 +163,21 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
     if candidate.source != "ai" || candidate.status != "candidate" {
         return Ok(None);
     }
-    let strategy = group_json(&conn, "strategy");
-    let risk = group_json(&conn, "risk");
-    let parameter_set = group_json(&conn, "parameter_set");
+    let strategy = group_json(&conn, "strategy")?;
+    let risk = group_json(&conn, "risk")?;
+    let parameter_set = group_json(&conn, "parameter_set")?;
     let live_timeframe = strategy
         .get("timeframe")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_TIMEFRAME)
+        .ok_or_else(|| "strategy.timeframe 缺失或非法".to_string())?
         .to_string();
     let min_oos_trades = parameter_set
         .get("min_oos_trades")
         .and_then(Value::as_f64)
-        .unwrap_or(DEFAULT_MIN_OOS_TRADES)
-        .max(1.0) as usize;
-    let auto_apply_timeframes = parse_timeframes(&parameter_set);
+        .filter(|value| *value >= 1.0)
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_MIN_OOS_TRADES as usize);
+    let auto_apply_timeframes = parse_timeframes(&parameter_set)?;
     // 同 regime 的 active 作为基线；该 regime 没有 active 时回退 range-bootstrap。
     let mut baseline = parameter_sets::active_for_regime(&conn, &candidate.regime)?;
     if baseline.is_none() {
@@ -190,18 +195,27 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
     }))
 }
 
-fn parse_timeframes(parameter_set: &Value) -> Vec<String> {
-    parameter_set
-        .get("auto_apply_timeframes")
-        .and_then(Value::as_str)
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn parse_timeframes(parameter_set: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = parameter_set.get("auto_apply_timeframes") else {
+        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
+    };
+    if value.is_null() {
+        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
+    }
+    let Some(raw) = value.as_str() else {
+        return Err("parameter_set.auto_apply_timeframes 必须是逗号分隔字符串".to_string());
+    };
+    let frames: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if frames.is_empty() {
+        // 配置缺失/空串按默认 1h，避免整条候选因空白名单被永久拒绝。
+        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
+    }
+    Ok(frames)
 }
 
 fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
@@ -218,44 +232,65 @@ fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
         .map_err(|error| format!("读取启用标的失败: {error}"))
 }
 
+/// 请求窗口：结束时间对齐到上一根已收盘 bar，起点额外覆盖 2 段 warmup。
+fn aligned_window(now_ms: i64, step_ms: i64) -> (i64, i64) {
+    let step = step_ms.max(1);
+    let end = (now_ms / step) * step - step;
+    let requested = BARS_LIMIT + 2 * backtest_engine::WARMUP as i64;
+    (end - requested * step, end)
+}
+
+/// 只保留最近 `BARS_LIMIT` 根；升序时间序列直接截尾部。
+fn trim_bars(bars: Vec<HistoryBar>) -> Vec<HistoryBar> {
+    let keep = BARS_LIMIT as usize;
+    if bars.len() <= keep {
+        return bars;
+    }
+    bars[bars.len() - keep..].to_vec()
+}
+
 async fn load_basket(
     source: &dyn HistorySource,
     symbols: &[String],
     timeframe: &str,
     start_ms: i64,
     end_ms: i64,
-) -> (Vec<(String, Vec<HistoryBar>)>, Vec<String>) {
+) -> (Vec<(String, Vec<HistoryBar>)>, Vec<(String, String)>) {
     let mut basket = Vec::new();
     let mut skipped = Vec::new();
     for symbol in symbols {
         match source.load(symbol, timeframe, start_ms, end_ms).await {
-            Ok(series) if series.bars.len() >= BARS_LIMIT as usize => {
-                basket.push((symbol.clone(), series.bars));
+            Ok(series) if series.truncated => {
+                skipped.push((symbol.clone(), "历史区间被截断".to_string()));
+            }
+            Ok(series) if series.bars.len() < BARS_LIMIT as usize => {
+                skipped.push((
+                    symbol.clone(),
+                    format!("历史 K 线不足: {} < {BARS_LIMIT}", series.bars.len()),
+                ));
             }
             Ok(series) => {
-                tracing::warn!(
-                    symbol = %symbol,
-                    bars = series.bars.len(),
-                    limit = BARS_LIMIT,
-                    "证据门历史 K 线不足，跳过标的"
-                );
-                skipped.push(symbol.clone());
+                if !series.gaps.is_empty() {
+                    // 缺口只记录不插值，也不因此排除标的；回测内核按缺口原样跳过。
+                    tracing::info!(
+                        symbol = %symbol,
+                        gaps = series.gaps.len(),
+                        "证据门历史存在缺口，按原样回测"
+                    );
+                }
+                basket.push((symbol.clone(), trim_bars(series.bars)));
             }
             Err(error) => {
-                tracing::warn!(
-                    symbol = %symbol,
-                    error = %error,
-                    "证据门历史 K 线不可用，跳过标的"
-                );
-                skipped.push(symbol.clone());
+                skipped.push((symbol.clone(), format!("历史不可用: {error}")));
             }
         }
     }
     (basket, skipped)
 }
 
-fn merge_skipped(metrics: &mut BasketMetrics, data_skipped: &[String]) {
-    for symbol in data_skipped {
+fn merge_skipped(metrics: &mut BasketMetrics, data_skipped: &[(String, String)]) {
+    for (symbol, reason) in data_skipped {
+        tracing::info!(symbol = %symbol, reason = %reason, "证据门跳过标的");
         if !metrics.symbols_skipped.contains(symbol) {
             metrics.symbols_skipped.push(symbol.clone());
         }
@@ -329,14 +364,18 @@ fn write_outcome(
         .conn
         .lock()
         .map_err(|_| "数据库连接锁不可用".to_string())?;
-    parameter_sets::mark_evidence(&conn, set_id, report.pass, evidence)?;
+    // 状态与事件必须同进同退：事件写失败时回滚，candidate 保持待评估。
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("开启证据门事务失败: {error}"))?;
+    parameter_sets::mark_evidence(&tx, set_id, report.pass, evidence)?;
     let (level, message, event) = if report.pass {
         ("info", "参数集证据门通过", "parameter_set.evidence_pass")
     } else {
         ("warn", "参数集证据门未通过", "parameter_set.evidence_fail")
     };
     record_event(
-        &conn,
+        &tx,
         level,
         message,
         json!({
@@ -346,7 +385,9 @@ fn write_outcome(
             "baseline_set_id": evidence["baseline_set_id"],
             "reasons": report.reasons,
         }),
-    )
+    )?;
+    tx.commit()
+        .map_err(|error| format!("提交证据门事务失败: {error}"))
 }
 
 fn record_failed(state: &AiState, set_id: i64, error: &str) {
@@ -355,6 +396,19 @@ fn record_failed(state: &AiState, set_id: i64, error: &str) {
     let Ok(conn) = state.db.conn.lock() else {
         return;
     };
+    // 只有回滚后仍是 candidate 才写失败事件；已 approved/rejected 的不能再被覆盖语义。
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM parameter_sets WHERE id=?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if status.as_deref() != Some("candidate") {
+        return;
+    }
     let _ = record_event(
         &conn,
         "warn",
@@ -388,42 +442,159 @@ fn record_event(
     Ok(())
 }
 
-fn group_json(conn: &Connection, key: &str) -> Value {
-    conn.query_row(
-        "SELECT value FROM app_settings WHERE key=?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    .unwrap_or(Value::Null)
+/// 配置组读取：缺行回退默认值，损坏 JSON 直接 Err（走 evidence_failed，不判 rejected）。
+fn group_json(conn: &Connection, key: &str) -> Result<Value, String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取配置组 {key} 失败: {error}"))?;
+    match raw {
+        None => Ok(crate::settings_api::defaults_of(key)),
+        Some(text) => serde_json::from_str::<Value>(&text)
+            .map_err(|error| format!("配置组 {key} 不是合法 JSON: {error}")),
+    }
 }
 
-fn live_mode(state: &AiState) -> bool {
-    let Ok(conn) = state.db.conn.lock() else {
-        return false;
-    };
-    current_mode(&conn) == "live"
+fn is_live_mode(mode: &str) -> bool {
+    let value = mode.trim();
+    value.eq_ignore_ascii_case("live") || value.eq_ignore_ascii_case("mainnet")
+}
+
+fn live_mode(state: &AiState) -> Result<bool, String> {
+    let conn = state
+        .db
+        .conn
+        .lock()
+        .map_err(|_| "数据库连接锁不可用".to_string())?;
+    Ok(is_live_mode(&current_mode(&conn)?))
 }
 
 /// `engine_state.mode` 优先，其次 `engine.mode`，最后 demo。
-fn current_mode(conn: &Connection) -> String {
+fn current_mode(conn: &Connection) -> Result<String, String> {
     let stored = conn
         .query_row(
             "SELECT value FROM engine_state WHERE key='mode'",
             [],
             |row| row.get::<_, String>(0),
         )
-        .ok()
-        .filter(|mode| !mode.is_empty());
+        .optional()
+        .map_err(|error| format!("读取交易模式失败: {error}"))?
+        .filter(|mode| !mode.trim().is_empty());
     if let Some(mode) = stored {
-        return mode;
+        return Ok(mode);
     }
-    group_json(conn, "engine")
+    Ok(group_json(conn, "engine")?
         .get("mode")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "demo".to_string())
+        .unwrap_or("demo")
+        .to_string())
+}
+
+/// 证据门扫描节流：`parameter_set.evidence_sweep_ts` 每 6h 最多一次。
+pub(crate) fn sweep_due(state: &AiState) -> bool {
+    let Ok(conn) = state.db.conn.lock() else {
+        return false;
+    };
+    sweep_due_at(&conn, crate::now()).unwrap_or(false)
+}
+
+fn sweep_due_at(conn: &Connection, now: i64) -> Result<bool, String> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key='parameter_set.evidence_sweep_ts'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取证据门扫描时间失败: {error}"))?
+        .and_then(|raw| raw.parse::<i64>().ok());
+    if last
+        .map(|ts| now - ts < SWEEP_INTERVAL_SEC)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) \
+         VALUES('parameter_set.evidence_sweep_ts',?1,?1) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        [now.to_string()],
+    )
+    .map_err(|error| format!("写入证据门扫描时间失败: {error}"))?;
+    Ok(true)
+}
+
+/// 选取最近 7 天内、冷却已过的最早待评估候选（`limit` 由调用方控制）。
+fn select_pending(conn: &Connection, limit: usize, now: i64) -> Result<Vec<i64>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let window_start = now - PENDING_WINDOW_SEC;
+    let cooldown_before = now - ATTEMPT_COOLDOWN_SEC;
+    let mut statement = conn
+        .prepare(
+            "SELECT p.id FROM parameter_sets p \
+             LEFT JOIN engine_state e \
+               ON e.key = 'parameter_set.evidence_attempt.' || p.id \
+             WHERE p.source='ai' AND p.status='candidate' AND p.created_at > ?1 \
+               AND (e.value IS NULL OR CAST(e.value AS INTEGER) <= ?2) \
+             ORDER BY p.id ASC LIMIT ?3",
+        )
+        .map_err(|error| format!("查询待评估候选失败: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![window_start, cooldown_before, limit as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("查询待评估候选失败: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("查询待评估候选失败: {error}"))
+}
+
+fn write_attempt(conn: &Connection, id: i64, now: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![
+            format!("parameter_set.evidence_attempt.{id}"),
+            now.to_string()
+        ],
+    )
+    .map_err(|error| format!("写入证据门尝试时间失败: {error}"))?;
+    Ok(())
+}
+
+/// 扫描重试入口：失败候选保持 candidate，由 6h 冷却后的下一轮扫描继续尝试。
+pub(crate) async fn sweep_pending(state: &AiState, limit: usize) -> Result<Option<i64>, String> {
+    let now = crate::now();
+    let ids = {
+        let conn = state
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库连接锁不可用".to_string())?;
+        select_pending(&conn, limit, now)?
+    };
+    let mut first = None;
+    for id in ids {
+        {
+            let conn = state
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库连接锁不可用".to_string())?;
+            write_attempt(&conn, id, now)?;
+        }
+        evaluate_candidate(state.clone(), id).await?;
+        if first.is_none() {
+            first = Some(id);
+        }
+    }
+    Ok(first)
 }
 
 #[cfg(test)]
@@ -698,5 +869,187 @@ mod tests {
 
         assert_eq!(history.calls(), 0);
         assert!(events(&state).is_empty(), "非候选不应写证据事件");
+    }
+
+    fn bar(open_time: i64) -> HistoryBar {
+        HistoryBar {
+            open_time,
+            close_time: open_time + 3_599_999,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        }
+    }
+
+    #[test]
+    fn aligned_window_excludes_current_bar_and_covers_warmup() {
+        let step = 3_600_000;
+        let now = 10 * step + 1_234;
+        let (start, end) = aligned_window(now, step);
+
+        assert_eq!(end, 9 * step, "end 必须是上一根已收盘 bar");
+        assert!(end < now);
+        let requested = BARS_LIMIT + 2 * crate::backtest_engine::WARMUP as i64;
+        assert_eq!(end - start, requested * step, "窗口要额外覆盖 warmup");
+    }
+
+    #[test]
+    fn trim_bars_keeps_newest_limit() {
+        let bars: Vec<HistoryBar> = (0..BARS_LIMIT + 7).map(bar).collect();
+        let trimmed = trim_bars(bars);
+
+        assert_eq!(trimmed.len(), BARS_LIMIT as usize);
+        assert_eq!(trimmed.first().unwrap().open_time, 7);
+        assert_eq!(trimmed.last().unwrap().open_time, BARS_LIMIT + 6);
+
+        let short = vec![bar(1), bar(2)];
+        assert_eq!(trim_bars(short).len(), 2, "不足上限时原样保留");
+    }
+
+    #[test]
+    fn live_mode_recognizes_aliases_case_insensitively() {
+        assert!(is_live_mode("live"));
+        assert!(is_live_mode("MAINNET"));
+        assert!(is_live_mode(" Mainnet "));
+        assert!(!is_live_mode("demo"));
+        assert!(!is_live_mode(""));
+    }
+
+    #[test]
+    fn parse_timeframes_defaults_empty_and_rejects_arrays() {
+        assert_eq!(
+            parse_timeframes(&json!({})).unwrap(),
+            vec!["1h".to_string()]
+        );
+        assert_eq!(
+            parse_timeframes(&json!({"auto_apply_timeframes": ""})).unwrap(),
+            vec!["1h".to_string()],
+            "空串按默认 1h"
+        );
+        assert_eq!(
+            parse_timeframes(&json!({"auto_apply_timeframes": " 1h , 4h "})).unwrap(),
+            vec!["1h".to_string(), "4h".to_string()]
+        );
+        assert!(
+            parse_timeframes(&json!({"auto_apply_timeframes": ["1h"]})).is_err(),
+            "数组不是合法白名单"
+        );
+    }
+
+    #[test]
+    fn select_pending_respects_window_and_cooldown() {
+        let (state, candidate_id) = setup("1h");
+        let conn = state.db.conn.lock().unwrap();
+        let now = crate::now();
+
+        assert_eq!(select_pending(&conn, 1, now).unwrap(), vec![candidate_id]);
+        write_attempt(&conn, candidate_id, now).unwrap();
+        assert!(
+            select_pending(&conn, 1, now).unwrap().is_empty(),
+            "6h 冷却期内不应重试"
+        );
+        assert_eq!(
+            select_pending(&conn, 1, now + ATTEMPT_COOLDOWN_SEC).unwrap(),
+            vec![candidate_id],
+            "冷却结束后应重新入选"
+        );
+
+        conn.execute(
+            "DELETE FROM engine_state WHERE key=?1",
+            [format!("parameter_set.evidence_attempt.{candidate_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE parameter_sets SET created_at=?1 WHERE id=?2",
+            params![now - PENDING_WINDOW_SEC - 1, candidate_id],
+        )
+        .unwrap();
+        assert!(
+            select_pending(&conn, 1, now).unwrap().is_empty(),
+            "7 天窗口外的候选不参与扫描"
+        );
+    }
+
+    #[test]
+    fn sweep_due_throttles_to_six_hours() {
+        let (state, _) = setup("1h");
+        let conn = state.db.conn.lock().unwrap();
+        let now = crate::now();
+
+        assert!(sweep_due_at(&conn, now).unwrap());
+        assert!(!sweep_due_at(&conn, now + 60).unwrap(), "6h 内不应重复扫描");
+        assert!(sweep_due_at(&conn, now + SWEEP_INTERVAL_SEC).unwrap());
+    }
+
+    #[test]
+    fn missing_parameter_set_row_falls_back_to_defaults() {
+        let (state, candidate_id) = setup("1h");
+        {
+            let conn = state.db.conn.lock().unwrap();
+            conn.execute("DELETE FROM app_settings WHERE key='parameter_set'", [])
+                .unwrap();
+        }
+
+        let prepared = prepare(&state, candidate_id).unwrap().unwrap();
+
+        assert_eq!(prepared.min_oos_trades, 30, "缺配置时默认 30 笔");
+        assert_eq!(
+            prepared.auto_apply_timeframes,
+            vec!["1h".to_string()],
+            "缺配置时默认 1h 白名单"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_parameter_set_returns_error_and_keeps_candidate() {
+        let (state, candidate_id) = setup("1h");
+        {
+            let conn = state.db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value='{invalid' WHERE key='parameter_set'",
+                [],
+            )
+            .unwrap();
+        }
+        let history = FakeHistory::unavailable();
+
+        let result = evaluate_with_history(&state, candidate_id, &history).await;
+
+        assert!(
+            result.is_err(),
+            "损坏配置必须走 evidence_failed 而非 gate 失败"
+        );
+        assert_eq!(history.calls(), 0);
+        let conn = state.db.conn.lock().unwrap();
+        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "candidate", "配置错误不得把候选永久拒绝");
+        assert_eq!(set.evidence, json!({}));
+    }
+
+    #[tokio::test]
+    async fn event_failure_rolls_back_status_and_keeps_candidate() {
+        let (state, candidate_id) = setup("4h");
+        {
+            let conn = state.db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_parameter_set_events BEFORE INSERT ON engine_events \
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+        }
+        let history = FakeHistory::unavailable();
+
+        let result = evaluate_with_history(&state, candidate_id, &history).await;
+
+        assert!(result.is_err(), "事件写失败必须整体失败");
+        assert_eq!(history.calls(), 0);
+        let conn = state.db.conn.lock().unwrap();
+        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "candidate", "事务回滚后候选必须保持待评估");
+        assert_eq!(set.evidence, json!({}), "回滚不得留下证据");
+        drop(conn);
+        assert!(events(&state).is_empty(), "被触发器拦截的事件不应落库");
     }
 }

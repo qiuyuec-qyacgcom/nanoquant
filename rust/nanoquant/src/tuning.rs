@@ -47,19 +47,42 @@ pub(crate) fn spawn_tuning_task(
             }
             match run_once(&state).await {
                 Ok(Some(set_id)) => {
-                    // 候选先提交，再串行跑证据门：证伪/失败都不影响下一轮调参。
-                    if let Err(error) =
-                        crate::evidence_task::evaluate_candidate(state.clone(), set_id).await
-                    {
-                        tracing::warn!(
-                            set_id,
-                            error = %sanitize_error(&error),
-                            "候选参数集证据门失败, 保留 candidate 待重试"
-                        );
-                    }
+                    // 证据门独立 spawn：网络回测不阻塞下一轮调参。
+                    let evidence_state = state.clone();
+                    let evidence_stop = stop.clone();
+                    tokio::spawn(async move {
+                        if *evidence_stop.borrow() {
+                            return;
+                        }
+                        if let Err(error) =
+                            crate::evidence_task::evaluate_candidate(evidence_state, set_id).await
+                        {
+                            tracing::warn!(
+                                set_id,
+                                error = %sanitize_error(&error),
+                                "候选参数集证据门失败, 保留 candidate 待重试"
+                            );
+                        }
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => record_failure(&state, &error),
+            }
+            // 失败候选重试：6h 节流一次扫描，同样独立 spawn 不阻塞循环。
+            if crate::evidence_task::sweep_due(&state) {
+                let sweep_state = state.clone();
+                let sweep_stop = stop.clone();
+                tokio::spawn(async move {
+                    if *sweep_stop.borrow() {
+                        return;
+                    }
+                    if let Err(error) = crate::evidence_task::sweep_pending(&sweep_state, 1).await {
+                        tracing::warn!(
+                            error = %sanitize_error(&error),
+                            "候选参数集证据门扫描失败"
+                        );
+                    }
+                });
             }
             let wait = interval_seconds(&state).max(MIN_INTERVAL_SEC) as u64;
             tokio::select! {
