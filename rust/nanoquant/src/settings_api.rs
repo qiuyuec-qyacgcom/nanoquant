@@ -596,131 +596,6 @@ pub(crate) fn validate_group(group: &str, value: &Value) -> Result<(), String> {
     validate(group, value)
 }
 
-#[allow(dead_code)]
-pub(crate) fn apply_param_updates(
-    conn: &rusqlite::Connection,
-    updates: &[crate::ai_client::ParamUpdate],
-    decision_id: i64,
-    mode: &str,
-) -> Result<Value, String> {
-    let _ = crate::schema::ensure_parameter_changes(conn);
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("开启参数事务失败: {error}"))?;
-    let mut applied = Vec::new();
-    let mut skipped = Vec::new();
-    for update in updates {
-        let Some(meta) = crate::param_registry::find(&update.group, &update.key) else {
-            skipped.push(json!({
-                "group": update.group,
-                "key": update.key,
-                "reason": "未注册或敏感参数",
-            }));
-            continue;
-        };
-        if !meta.ai_writable {
-            skipped.push(json!({
-                "group": update.group,
-                "key": update.key,
-                "reason": "AI 不可写",
-            }));
-            continue;
-        }
-        let new_value = match crate::param_registry::coerce(&meta, &update.value) {
-            Ok(value) => value,
-            Err(reason) => {
-                skipped.push(json!({
-                    "group": update.group,
-                    "key": update.key,
-                    "reason": reason,
-                }));
-                continue;
-            }
-        };
-        let mut candidate = group_value(&tx, &update.group);
-        let Some(object) = candidate.as_object_mut() else {
-            skipped.push(json!({
-                "group": update.group,
-                "key": update.key,
-                "reason": "配置分组不是对象",
-            }));
-            continue;
-        };
-        let old_value = object.insert(update.key.clone(), new_value.clone());
-        if let Err(reason) = validate(&update.group, &candidate) {
-            skipped.push(json!({
-                "group": update.group,
-                "key": update.key,
-                "reason": reason,
-            }));
-            continue;
-        }
-        let payload = serde_json::to_string(&candidate).unwrap_or_default();
-        tx.execute(
-            "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (&update.group, &payload, crate::now()),
-        )
-        .map_err(|error| format!("写入 {}.{} 失败: {error}", update.group, update.key))?;
-        let old_text = old_value
-            .as_ref()
-            .and_then(|value| serde_json::to_string(value).ok());
-        let new_text = serde_json::to_string(&new_value).unwrap_or_default();
-        let reason = if update.reason.trim().is_empty() {
-            "AI 调参".to_string()
-        } else {
-            update.reason.trim().to_string()
-        };
-        tx.execute(
-            "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ai')",
-            (
-                crate::now(),
-                &update.group,
-                &update.key,
-                &old_text,
-                &new_text,
-                &reason,
-                decision_id,
-                mode,
-            ),
-        )
-        .map_err(|error| format!("记录 {}.{} 审计失败: {error}", update.group, update.key))?;
-        tx.execute(
-            "INSERT INTO engine_events(ts, level, category, message, payload) VALUES(?1, 'info', 'param_change', ?2, ?3)",
-            (
-                crate::now(),
-                format!(
-                    "AI 调整 {}.{}: {} -> {}",
-                    update.group,
-                    update.key,
-                    old_text.as_deref().unwrap_or("null"),
-                    new_text
-                ),
-                json!({
-                    "group": update.group,
-                    "key": update.key,
-                    "old": old_value.clone(),
-                    "new": new_value.clone(),
-                    "reason": reason,
-                })
-                .to_string(),
-            ),
-        )
-        .map_err(|error| format!("记录 {}.{} 事件失败: {error}", update.group, update.key))?;
-        applied.push(json!({
-            "group": update.group,
-            "key": update.key,
-            "old": old_value,
-            "new": new_value,
-            "reason": reason,
-        }));
-    }
-    tx.commit()
-        .map_err(|error| format!("提交参数事务失败: {error}"))?;
-    Ok(json!({ "applied": applied, "skipped": skipped }))
-}
-
 pub(crate) fn rollback_param_change(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
     let _ = crate::schema::ensure_parameter_changes(conn);
     let (group, key, old_text, mode): (String, String, Option<String>, String) = conn
@@ -946,80 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_param_updates_is_atomic_when_audit_fails() {
-        let conn = test_conn();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_param_changes BEFORE INSERT ON parameter_changes \
-             BEGIN SELECT RAISE(ABORT, 'audit down'); END;",
-        )
-        .unwrap();
-        let result = apply_param_updates(
-            &conn,
-            &[crate::ai_client::ParamUpdate {
-                group: "strategy".into(),
-                key: "entry_threshold".into(),
-                value: json!(0.35),
-                reason: "测试".into(),
-            }],
-            1,
-            "demo",
-        );
-        assert!(result.is_err(), "审计失败必须整体失败");
-        let stored: String = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='strategy'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let parsed: Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(parsed["entry_threshold"], 0.3);
-    }
 
-    #[test]
-    fn apply_param_updates_writes_valid_and_skips_invalid() {
-        let conn = test_conn();
-        let updates = vec![
-            crate::ai_client::ParamUpdate {
-                group: "strategy".into(),
-                key: "entry_threshold".into(),
-                value: json!(9.0),
-                reason: "放宽入场".into(),
-            },
-            crate::ai_client::ParamUpdate {
-                group: "security".into(),
-                key: "api_key".into(),
-                value: json!("x"),
-                reason: "越权".into(),
-            },
-            crate::ai_client::ParamUpdate {
-                group: "risk".into(),
-                key: "risk_per_trade_pct".into(),
-                value: json!("bad"),
-                reason: "类型错误".into(),
-            },
-        ];
-        let result = apply_param_updates(&conn, &updates, 7, "demo").unwrap();
-        assert_eq!(result["applied"].as_array().unwrap().len(), 1, "{result}");
-        assert_eq!(result["skipped"].as_array().unwrap().len(), 2, "{result}");
-        let stored: String = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='strategy'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let parsed: Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(parsed["entry_threshold"], 1.0);
-        let changes: i64 = conn
-            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(changes, 1);
-    }
-
-    #[test]
     fn effects_are_computed_per_change_window() {
         let conn = test_conn();
         conn.execute_batch(
@@ -1050,13 +852,17 @@ mod tests {
     #[test]
     fn rollback_restores_the_previous_value() {
         let conn = test_conn();
-        let updates = vec![crate::ai_client::ParamUpdate {
-            group: "strategy".into(),
-            key: "entry_threshold".into(),
-            value: json!(0.5),
-            reason: "测试".into(),
-        }];
-        apply_param_updates(&conn, &updates, 1, "demo").unwrap();
+        conn.execute(
+            "UPDATE app_settings SET value=json_set(value,'$.entry_threshold',0.5) WHERE key='strategy'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
+             VALUES(1,'strategy','entry_threshold','0.3','0.5','测试',1,'demo','manual')",
+            [],
+        )
+        .unwrap();
         let id: i64 = conn
             .query_row(
                 "SELECT id FROM parameter_changes ORDER BY id DESC LIMIT 1",
