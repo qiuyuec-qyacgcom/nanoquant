@@ -2,10 +2,10 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 const BOOTSTRAP_TIMEFRAME: &str = "1h";
-const CURRENT_SNAPSHOT_EVIDENCE: &str =
-    "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\"}";
+const CURRENT_SNAPSHOT_EVIDENCE: &str = "{\"kind\":\"manual\",\"reason\":\"timeframe_not_in_auto_apply_whitelist\",\"snapshot\":\"full\"}";
 const INCIDENT_EVIDENCE: &str = "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\",\"incident_date\":\"2026-11-23\",\"known_keys\":[\"atr_pct_min\",\"atr_pct_max\",\"volume_ratio_min\",\"entry_threshold\"]}";
 const AUTO_SWITCH_DISABLED: &str = "strategy.timeframe 不在自动切换白名单，已禁用自动切换";
+const AUTO_SWITCH_SKIPPED: &str = "parameter_set 配置缺失或无效，未能清空自动切换白名单";
 
 /// A 期迁移种子化：只建参数集记录，绝不改写 `app_settings.strategy`（C 期才物化）。
 /// 幂等：`parameter_sets` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
@@ -133,17 +133,24 @@ fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(
 
 /// 非白名单 timeframe 下按规格关闭自动切换，并留下一条告警事件。
 fn disable_auto_switch(conn: &Connection, now: i64) -> Result<(), String> {
-    conn.execute(
-        "UPDATE app_settings \
-         SET value = json_patch(value, '{\"auto_apply\":false,\"auto_apply_timeframes\":\"\"}') \
-         WHERE key='parameter_set'",
-        [],
-    )
-    .map_err(|e| format!("禁用参数集自动切换失败: {e}"))?;
+    let updated = conn
+        .execute(
+            "UPDATE app_settings \
+             SET value = json_patch(value, '{\"auto_apply\":false,\"auto_apply_timeframes\":\"\"}') \
+             WHERE key='parameter_set' AND json_valid(value)",
+            [],
+        )
+        .map_err(|e| format!("禁用参数集自动切换失败: {e}"))?;
+    // 0 行说明配置缺失或非法：不能谎报“已禁用”，但同样不能阻断启动。
+    let message = if updated > 0 {
+        AUTO_SWITCH_DISABLED
+    } else {
+        AUTO_SWITCH_SKIPPED
+    };
     conn.execute(
         "INSERT INTO engine_events(ts,level,category,message,payload) \
          VALUES(?1,'warn','parameter_set',?2,?3)",
-        params![now, AUTO_SWITCH_DISABLED, "{}"],
+        params![now, message, "{}"],
     )
     .map_err(|e| format!("写入参数集告警事件失败: {e}"))?;
     Ok(())
@@ -446,8 +453,15 @@ mod tests {
         assert_eq!(snapshot.status, "retired");
         assert_eq!(snapshot.source, "manual");
         assert_eq!(snapshot.evidence["kind"], "manual");
-        assert_eq!(snapshot.evidence["historical"], true);
-        assert_eq!(snapshot.evidence["snapshot"], "partial");
+        assert_eq!(snapshot.evidence["snapshot"], "full");
+        assert_eq!(
+            snapshot.evidence["reason"],
+            "timeframe_not_in_auto_apply_whitelist"
+        );
+        assert!(
+            snapshot.evidence.get("historical").is_none(),
+            "非 1h 快照不是历史审计，不应带 historical"
+        );
         assert!(snapshot.parent_id.is_none());
         assert_eq!(snapshot.params["timeframe"], snapshot.timeframe);
 
@@ -478,6 +492,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn non_1h_with_corrupt_parameter_set_config_keeps_going() {
+        let conn = conn_with_strategy("4h");
+        conn.execute(
+            "UPDATE app_settings SET value='not-json' WHERE key='parameter_set'",
+            [],
+        )
+        .unwrap();
+        assert!(seed_bootstrap(&conn).is_ok(), "脏配置不能阻断种子化");
+
+        let sets = all_sets(&conn);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].name, "current-snapshot");
+        assert_eq!(sets[0].status, "retired");
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 0);
+
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='warn' AND category='parameter_set' AND message LIKE '%缺失或无效%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "not-json", "脏配置保持原样，不做半更新");
     }
 
     #[test]
