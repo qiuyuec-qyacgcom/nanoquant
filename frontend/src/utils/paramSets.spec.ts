@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { evidenceSummary, formatPercent, gateTag, regimeLabel, statusTag } from './paramSets'
+import {
+  canManuallyActivate,
+  evidenceSummary,
+  formatPercent,
+  gateTag,
+  regimeLabel,
+  statusTag,
+} from './paramSets'
 
 describe('paramSets formatting', () => {
   it('summarizes evidence gate', () => {
@@ -39,7 +46,19 @@ describe('paramSets formatting', () => {
     expect(statusTag('active').text).toBe('生效中')
     expect(statusTag('candidate').text).toBe('候选')
     expect(statusTag('rejected').text).toBe('已拒绝')
+    expect(statusTag('bootstrap').text).toBe('基线')
     expect(statusTag('unknown').text).toBe('unknown')
+  })
+
+  it('only allows manual activation in the current regime', () => {
+    expect(canManuallyActivate('approved', 'range', 'range')).toBe(true)
+    expect(canManuallyActivate('manual', 'range', 'range')).toBe(true)
+    expect(canManuallyActivate('approved', 'trend', 'range')).toBe(false)
+    expect(canManuallyActivate('manual', 'chaos', 'trend')).toBe(false)
+    expect(canManuallyActivate('candidate', 'range', 'range')).toBe(false)
+    expect(canManuallyActivate('active', 'range', 'range')).toBe(false)
+    expect(canManuallyActivate('approved', 'range', null)).toBe(true)
+    expect(canManuallyActivate('approved', 'range', '')).toBe(true)
   })
 
   it('maps regime labels', () => {

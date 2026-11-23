@@ -9,6 +9,7 @@ import { http } from '../api/client'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { ago, timeStr } from '../utils/format'
 import {
+  canManuallyActivate,
   evidenceSummary,
   formatPercent,
   gateTag,
@@ -90,6 +91,10 @@ const autoApplySinceText = computed(() => {
 const marketRegimeText = computed(() => regimeLabel(current.value?.market_regime))
 
 function canActivate(item: SetItem): boolean {
+  return canManuallyActivate(item.status, item.regime, current.value?.market_regime)
+}
+
+function isActivatableStatus(item: SetItem): boolean {
   return item.status === 'approved' || item.status === 'manual'
 }
 
@@ -120,8 +125,8 @@ async function load(silent = false) {
 async function act(item: SetItem, action: 'activate' | 'rollback') {
   const tip =
     action === 'activate'
-      ? `确认启用参数集「${item.name}」？将立即物化到当前 strategy。`
-      : `确认将 ${regimeLabel(item.regime)} 的当前集回滚到上一套？`
+      ? `确认启用参数集「${item.name}」？仅当前 regime 可手动启用，启用后将立即物化到当前 strategy。`
+      : `确认将 ${regimeLabel(item.regime)} 的当前集回滚到上一套？若该集没有上一套会失败。`
   if (!confirm(tip)) return
   busyId.value = item.id
   error.value = ''
@@ -253,9 +258,10 @@ useSilentRefresh(() => load(true), 30000)
                 <div class="row" style="gap: 6px; flex-wrap: wrap">
                   <button class="btn btn-sm btn-ghost" @click="openEvidence(item)">证据</button>
                   <button
-                    v-if="canActivate(item)"
+                    v-if="isActivatableStatus(item)"
                     class="btn btn-sm"
-                    :disabled="busyId === item.id"
+                    :disabled="busyId === item.id || !canActivate(item)"
+                    :title="canActivate(item) ? '' : `仅当前 regime（${marketRegimeText}）可手动启用；其他 regime 由自动切换处理`"
                     @click="act(item, 'activate')"
                   >
                     {{ busyId === item.id ? '处理中…' : '启用' }}

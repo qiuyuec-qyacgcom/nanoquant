@@ -61,8 +61,19 @@ export function statusTag(status: string): { text: string; cls: string } {
     candidate: { text: '候选', cls: 'tag-dim' },
     rejected: { text: '已拒绝', cls: 'tag-short' },
     retired: { text: '已退役', cls: 'tag-dim' },
+    bootstrap: { text: '基线', cls: 'tag-blue' },
   }
   return map[status] || { text: status, cls: 'tag-dim' }
+}
+
+/** 手动启用只允许当前 regime；缺失 regime 时与后端一致回退 range。 */
+export function canManuallyActivate(
+  status: string,
+  regime: string,
+  currentRegime: string | null | undefined
+): boolean {
+  if (status !== 'approved' && status !== 'manual') return false
+  return regime === (currentRegime || 'range')
 }
 
 export function gateTag(evidence: EvidenceLike): { text: string; cls: string } {

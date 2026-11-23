@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::Db;
-use crate::parameter_sets::{activate, active_for_regime, rollback, row_to_set, ParameterSet};
+use crate::parameter_sets::{
+    activate, active_for_regime, load_set, rollback, row_to_set, ParameterSet,
+};
 
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 const LIST_LIMIT: i64 = 100;
@@ -55,6 +57,15 @@ fn current_mode(conn: &Connection) -> String {
         .flatten()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "demo".to_string())
+}
+
+/// 当前 regime 缺失时沿用 C 期 `market_regime` 的口径回退 `range`。
+fn current_regime(conn: &Connection, mode: &str) -> String {
+    read_engine_state(conn, &format!("market_regime.{mode}"))
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "range".to_string())
 }
 
 fn ensure_set_exists(conn: &Connection, id: i64) -> Result<(), ApiError> {
@@ -204,11 +215,19 @@ async fn current_view(State(db): State<Db>) -> Result<Json<Value>, ApiError> {
     .into())
 }
 
-/// 手动启用：写 `trigger='manual'`，物化 `strategy` 与逐键变更。
+/// 手动启用只允许当前 regime：跨 regime 切换交给自动流程，避免人工绕过 regime 状态机。
 async fn activate_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
     ensure_set_exists(&conn, id)?;
     let mode = current_mode(&conn);
+    let regime = current_regime(&conn, &mode);
+    let set = load_set(&conn, id).map_err(server_error)?;
+    if set.regime != regime {
+        return Err(bad_request(format!(
+            "只能启用当前 regime 的参数集；非当前 regime 由自动切换处理（参数集 {} 属于 {}，当前为 {}）",
+            id, set.regime, regime
+        )));
+    }
     activate(&conn, id, "manual", &mode).map_err(bad_request)?;
     Ok(json!({ "ok": true, "id": id }).into())
 }
@@ -585,7 +604,7 @@ mod tests {
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
         let pending = insert_set_with_params(&db, "range-candidate", "range", "candidate", params_with_threshold(0.5));
-        let no_history = insert_set_with_params(&db, "range-manual", "range", "manual", params_with_threshold(0.5));
+        let no_history = insert_set_with_params(&db, "range-manual", "range", "active", params_with_threshold(0.5));
 
         let (missing_activate, missing_activate_body) =
             post(app(db.clone()), "/api/v1/parameter-sets/999999/activate").await;
@@ -611,5 +630,57 @@ mod tests {
             no_previous_body["detail"].as_str().unwrap_or("").contains("没有上一套"),
             "无历史不可回滚: {no_previous_body}"
         );
+    }
+
+    #[tokio::test]
+    async fn activate_rejects_non_current_regime_without_writes() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        set_engine_state(&db, "market_regime.demo", "range");
+        let trend_id = insert_set_with_params(&db, "trend-manual", "trend", "manual", params_with_threshold(0.50));
+        let before = strategy_value(&db);
+
+        let (status, body) =
+            post(app(db.clone()), &format!("/api/v1/parameter-sets/{trend_id}/activate")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "跨 regime 应拒绝: {body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("只能启用当前 regime 的参数集"),
+            "文案应说明仅当前 regime 可启用: {body}"
+        );
+        assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");
+        assert_eq!(count_changes(&db, "parameter_set", trend_id), 0, "不得写切换审计");
+        assert_eq!(count_activations(&db, "manual", trend_id), 0, "不得写激活记录");
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_non_active_set_without_writes() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        let retired =
+            insert_set_with_params(&db, "range-retired", "range", "retired", params_with_threshold(0.50));
+        let approved =
+            insert_set_with_params(&db, "range-approved", "range", "approved", params_with_threshold(0.50));
+        let before = strategy_value(&db);
+
+        for id in [retired, approved] {
+            let (status, body) =
+                post(app(db.clone()), &format!("/api/v1/parameter-sets/{id}/rollback")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "非 active 不可回滚: {body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("只能回滚当前 active"),
+                "文案应说明只能回滚 active: {body}"
+            );
+            assert_eq!(count_changes(&db, "parameter_set_rollback", id), 0);
+            assert_eq!(count_activations(&db, "rollback", id), 0);
+        }
+        assert_eq!(strategy_value(&db), before, "拒绝时不得改动 strategy");
     }
 }

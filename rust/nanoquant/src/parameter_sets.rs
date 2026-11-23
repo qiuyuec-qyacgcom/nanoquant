@@ -808,6 +808,12 @@ pub(crate) fn rollback_with_trigger(
     trigger: &str,
 ) -> Result<(), String> {
     let current = load_set(conn, current_id)?;
+    if current.status != "active" {
+        return Err(format!(
+            "只能回滚当前 active 参数集（{} 当前状态 {}）",
+            current_id, current.status
+        ));
+    }
     let previous_id: Option<i64> = conn
         .query_row(
             "SELECT previous_set_id FROM parameter_set_activations \
@@ -2002,6 +2008,47 @@ mod tests {
             active_for_regime(&conn, "range").unwrap().unwrap().id,
             range_id
         );
+    }
+
+    #[test]
+    fn rollback_rejects_non_active_set_without_writes() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let (candidate_id, _) = pending_candidate(&conn, "range-ai-rollback-guard");
+        mark_evidence(&conn, candidate_id, true, &json!({"gate":{"pass":true}})).unwrap();
+        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "approved");
+
+        let before_strategy = strategy_value(&conn);
+        let before_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let before_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .unwrap();
+
+        let error = rollback(&conn, candidate_id, "demo").unwrap_err();
+        assert!(
+            error.contains("只能回滚当前 active"),
+            "非 active 应明确拒绝: {error}"
+        );
+        assert_eq!(
+            load_set(&conn, candidate_id).unwrap().status,
+            "approved",
+            "拒绝回滚不得改状态"
+        );
+        assert_eq!(strategy_value(&conn), before_strategy, "拒绝回滚不得改 strategy");
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, before_activations, "拒绝回滚不得写激活记录");
+        let changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(changes, before_changes, "拒绝回滚不得写变更记录");
     }
 
     #[test]
