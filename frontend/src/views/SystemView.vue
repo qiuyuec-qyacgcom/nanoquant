@@ -5,6 +5,7 @@ import { http } from '../api/client'
 import EventFeed from '../components/EventFeed.vue'
 import { useAppStore } from '../stores/app'
 import type { EventItem } from '../types'
+import { visibleEvents } from '../utils/events'
 import { timeStr } from '../utils/format'
 
 const app = useAppStore()
@@ -36,9 +37,12 @@ const core = ref<any>(null)
 const testing = ref(false)
 const klines = ref<any>(null)
 
-const filteredEvents = computed(() =>
-  levelFilter.value ? events.value.filter((e) => e.level === levelFilter.value) : events.value
-)
+const filteredEvents = computed(() => {
+  const byLevel = levelFilter.value
+    ? events.value.filter((e) => e.level === levelFilter.value)
+    : events.value
+  return visibleEvents(byLevel)
+})
 
 /** 执行内核状态：已连接 / 重连中 / 未连接。默认必选组件，未连接即异常。 */
 const execTag = computed(() => {

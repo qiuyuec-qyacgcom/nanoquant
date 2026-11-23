@@ -6,12 +6,14 @@ import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import EventFeed from '../components/EventFeed.vue'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
+import { visibleEvents } from '../utils/events'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
 import { displayDirection, displayScore } from '../utils/signalAudit'
 
 interface EquityPoint { ts: number; wallet: number; unrealized: number; available: number; margin_used: number; positions: number }
 
 const app = useAppStore()
+const visibleAppEvents = computed(() => visibleEvents(app.events))
 const equity = ref<EquityPoint[]>([])
 const trades = ref<any[]>([])
 const signals = ref<any[]>([])
@@ -545,9 +547,9 @@ useSilentRefresh(load, 30000)
       <div class="panel">
         <div class="panel-hd">
           <span class="panel-title">实时事件</span>
-          <div class="right"><span class="tag tag-dim">{{ app.events.length }}</span></div>
+          <div class="right"><span class="tag tag-dim">{{ visibleAppEvents.length }}</span></div>
         </div>
-        <div class="panel-body"><EventFeed :events="app.events" height="260px" /></div>
+        <div class="panel-body"><EventFeed :events="visibleAppEvents" height="260px" /></div>
       </div>
     </div>
 
