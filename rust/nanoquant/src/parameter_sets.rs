@@ -1,7 +1,3 @@
-// A 期注册表 API（读取、候选写入与候选校验）由后续调参、证据门与切换任务接入；
-// 接入前这些项只由单元测试调用，暂不触发 dead_code 告警。
-#![allow(dead_code)]
-
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -222,10 +218,15 @@ fn insert_activation(
     Ok(())
 }
 
+// A3 注册表 API 由 A6 调参/证据任务接入；接入前仅测试使用，逐项豁免 dead_code。
+#[allow(dead_code)]
 const MAX_CANDIDATE_KEYS: usize = 3;
+#[allow(dead_code)]
 const MAX_RELATIVE_CHANGE: f64 = 0.25;
+#[allow(dead_code)]
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParameterSet {
     pub id: i64,
@@ -243,6 +244,7 @@ pub(crate) struct ParameterSet {
 }
 
 /// `params` / `evidence` 是历史 JSON 快照；解析失败时降级为 Null，不阻断读取。
+#[allow(dead_code)]
 pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterSet> {
     let params_raw: String = row.get(5)?;
     let evidence_raw: String = row.get(8)?;
@@ -262,18 +264,23 @@ pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterS
     })
 }
 
-pub(crate) fn active_for_regime(conn: &Connection, regime: &str) -> Option<ParameterSet> {
-    conn.query_row(
-        &format!(
-            "SELECT {SET_COLUMNS} FROM parameter_sets \
-             WHERE regime=?1 AND status='active' ORDER BY id DESC LIMIT 1"
-        ),
-        [regime],
-        row_to_set,
-    )
-    .ok()
+#[allow(dead_code)]
+pub(crate) fn active_for_regime(
+    conn: &Connection,
+    regime: &str,
+) -> Result<Option<ParameterSet>, String> {
+    let query = format!(
+        "SELECT {SET_COLUMNS} FROM parameter_sets \
+         WHERE regime=?1 AND status='active' ORDER BY id DESC LIMIT 1"
+    );
+    match conn.query_row(&query, [regime], row_to_set) {
+        Ok(set) => Ok(Some(set)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("读取 {regime} active 参数集失败: {error}")),
+    }
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, String> {
     conn.query_row(
         &format!("SELECT {SET_COLUMNS} FROM parameter_sets WHERE id=?1"),
@@ -284,6 +291,7 @@ pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, Strin
 }
 
 /// 只写候选记录，不激活、不写配置：应用参数集是 C 期行为。
+#[allow(dead_code)]
 pub(crate) fn insert_candidate(
     conn: &Connection,
     name: &str,
@@ -292,6 +300,21 @@ pub(crate) fn insert_candidate(
     params_value: &Value,
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
+    if !params_value.is_object() {
+        return Err("候选参数必须是对象快照".to_string());
+    }
+    if params_value.get("timeframe").and_then(Value::as_str) != Some(timeframe) {
+        return Err(format!("候选快照 timeframe 必须等于 {timeframe}"));
+    }
+    if let Some(parent_id) = parent_id {
+        let parent = load_set(conn, parent_id)?;
+        if parent.regime != regime {
+            return Err(format!(
+                "父集 regime {} 与候选 regime {regime} 不一致",
+                parent.regime
+            ));
+        }
+    }
     insert_set(
         conn,
         name,
@@ -308,6 +331,7 @@ pub(crate) fn insert_candidate(
 
 /// 把 AI 参数增量合并到 active 快照上并校验；返回完整 strategy 快照。
 /// 任何一条不合规都整体拒绝，避免部分写入。
+#[allow(dead_code)]
 pub(crate) fn validate_candidate(
     active: &Value,
     patch: &[crate::ai_client::ParamUpdate],
@@ -347,24 +371,23 @@ pub(crate) fn validate_candidate(
                 update.key, meta.kind
             ));
         }
-        if let Some(old) = active.get(update.key.as_str()).and_then(Value::as_f64) {
-            let new = update
-                .value
-                .as_f64()
-                .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
-            if old != 0.0 && ((new - old).abs() / old.abs()) > MAX_RELATIVE_CHANGE {
-                return Err(format!(
-                    "候选键 strategy.{} 相对变化超过 {}%",
-                    update.key,
-                    (MAX_RELATIVE_CHANGE * 100.0) as i64
-                ));
-            }
+        // 基线始终取自不可变 active：重复键不得相对中间 next 复算。
+        let old = active
+            .get(update.key.as_str())
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("候选键 strategy.{} 缺少基线值，拒绝调参", update.key))?;
+        let new = update
+            .value
+            .as_f64()
+            .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
+        if old != 0.0 && ((new - old).abs() / old.abs()) > MAX_RELATIVE_CHANGE {
+            return Err(format!(
+                "候选键 strategy.{} 相对变化超过 {}%",
+                update.key,
+                (MAX_RELATIVE_CHANGE * 100.0) as i64
+            ));
         }
         if let Some((low, high)) = crate::param_registry::ai_bounds("strategy", &update.key) {
-            let new = update
-                .value
-                .as_f64()
-                .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
             if !(low..=high).contains(&new) {
                 return Err(format!(
                     "候选键 strategy.{} 超出 AI 边界 [{low},{high}]",
@@ -372,10 +395,20 @@ pub(crate) fn validate_candidate(
                 ));
             }
         }
-        next.insert(
-            update.key.clone(),
-            crate::param_registry::coerce(&meta, &update.value)?,
-        );
+        let coerced = crate::param_registry::coerce(&meta, &update.value)?;
+        // coerce 按 RANGES 收敛；若未来 RANGES 与 ai_bounds 区间漂移，这里再兜底一次。
+        if let Some((low, high)) = crate::param_registry::ai_bounds("strategy", &update.key) {
+            let value = coerced
+                .as_f64()
+                .ok_or_else(|| format!("候选键 strategy.{} 必须是数字", update.key))?;
+            if !(low..=high).contains(&value) {
+                return Err(format!(
+                    "候选键 strategy.{} 超出 AI 边界 [{low},{high}]",
+                    update.key
+                ));
+            }
+        }
+        next.insert(update.key.clone(), coerced);
     }
     let Some(active_timeframe) = active.get("timeframe").and_then(Value::as_str) else {
         return Err("active 参数集缺少 timeframe，无法校验候选".to_string());
@@ -474,6 +507,7 @@ mod tests {
 
     fn seeded_snapshot(conn: &Connection, regime: &str) -> Value {
         active_for_regime(conn, regime)
+            .unwrap()
             .unwrap_or_else(|| panic!("{regime} 应有 active 参数集"))
             .params
     }
@@ -849,7 +883,7 @@ mod tests {
     fn insert_candidate_persists_complete_snapshot() {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
-        let parent = active_for_regime(&conn, "range").unwrap();
+        let parent = active_for_regime(&conn, "range").unwrap().unwrap();
         let snapshot = validate_candidate(
             &parent.params,
             &[param_update("entry_threshold", json!(0.40))],
@@ -877,7 +911,7 @@ mod tests {
         assert_eq!(set.version, 1);
         assert!(set.activated_at.is_none(), "候选不应被激活");
 
-        let active = active_for_regime(&conn, "range").unwrap();
+        let active = active_for_regime(&conn, "range").unwrap().unwrap();
         assert_eq!(active.id, parent.id, "插入候选不得改变 active");
     }
 
@@ -887,13 +921,109 @@ mod tests {
         seed_bootstrap(&conn).unwrap();
 
         assert_eq!(
-            active_for_regime(&conn, "range").unwrap().name,
+            active_for_regime(&conn, "range").unwrap().unwrap().name,
             "range-bootstrap"
         );
         assert_eq!(
-            active_for_regime(&conn, "chaos").unwrap().name,
+            active_for_regime(&conn, "chaos").unwrap().unwrap().name,
             "chaos-bootstrap"
         );
-        assert!(active_for_regime(&conn, "trend").is_none());
+        assert!(active_for_regime(&conn, "trend").unwrap().is_none());
+
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(
+            active_for_regime(&bare, "range").is_err(),
+            "缺表必须传播 DB 错误，不能当作无 active"
+        );
+    }
+
+    #[test]
+    fn candidate_validation_requires_numeric_baseline_but_allows_zero() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+
+        let missing = [param_update("exit_threshold", json!(0.5))];
+        assert!(
+            validate_candidate(&active, &missing).is_err(),
+            "active 缺少目标键时必须拒绝，不能跳过步长检查"
+        );
+
+        let mut zero = active;
+        zero["trailing_pct"] = json!(0.0);
+        let at_zero = [param_update("trailing_pct", json!(2.0))];
+        let snapshot = validate_candidate(&zero, &at_zero).unwrap();
+        assert_eq!(snapshot["trailing_pct"], 2.0, "old=0 时跳过比例检查");
+    }
+
+    #[test]
+    fn duplicate_candidate_keys_still_use_immutable_active_baseline() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let mut active = seeded_snapshot(&conn, "range");
+        active["sl_atr_mult"] = json!(2.0);
+
+        let patch = [
+            param_update("sl_atr_mult", json!(2.4)),
+            param_update("sl_atr_mult", json!(2.9)),
+        ];
+        assert!(
+            validate_candidate(&active, &patch).is_err(),
+            "第二次必须相对 active 2.0 计算 45%，不能相对中间值 2.4 只算 20%"
+        );
+    }
+
+    #[test]
+    fn candidate_rejects_array_strategy_key() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+        let patch = [param_update("roi_table", json!([[1, 2]]))];
+        assert!(
+            validate_candidate(&active, &patch).is_err(),
+            "roi_table 是数组，不允许 AI 候选"
+        );
+    }
+
+    #[test]
+    fn insert_candidate_rejects_timeframe_and_parent_mismatch() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let parent = active_for_regime(&conn, "range").unwrap().unwrap();
+        let snapshot = validate_candidate(
+            &parent.params,
+            &[param_update("entry_threshold", json!(0.40))],
+        )
+        .unwrap();
+
+        assert!(
+            insert_candidate(&conn, "bad-tf", "range", "4h", &snapshot, Some(parent.id)).is_err(),
+            "timeframe 列与快照不一致必须拒绝"
+        );
+        assert!(
+            insert_candidate(&conn, "no-parent", "range", "1h", &snapshot, Some(999_999)).is_err(),
+            "父集不存在必须拒绝"
+        );
+        assert!(
+            insert_candidate(
+                &conn,
+                "bad-regime",
+                "chaos",
+                "1h",
+                &snapshot,
+                Some(parent.id)
+            )
+            .is_err(),
+            "父集 regime 与候选不一致必须拒绝"
+        );
+        assert!(
+            insert_candidate(&conn, "not-object", "range", "1h", &json!([]), None).is_err(),
+            "非对象快照必须拒绝"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "失败的候选不应写入");
     }
 }
