@@ -55,6 +55,7 @@ mod oi_regime;
 mod ops_tools;
 mod param_registry;
 mod parameter_sets;
+mod parameter_sets_api;
 mod protection_api;
 mod providers;
 mod public;
@@ -462,6 +463,7 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         );
         api = api.merge(public::routes().with_state(database.clone()));
         api = api.merge(engine::routes().with_state(database.clone()));
+        api = api.merge(parameter_sets_api::routes().with_state(database.clone()));
         api = api.merge(engine_actions::routes().with_state(state.clone()));
         api = api.merge(protection_api::routes().with_state(state.clone()));
         api = api.merge(evolution_api::routes().with_state(database.clone()));
