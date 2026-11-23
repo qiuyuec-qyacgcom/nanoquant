@@ -30,6 +30,9 @@ pub(crate) fn spawn_tuning_task(
     async move {
         // 首次检查延迟 5 分钟：服务刚启动时行情、regime 与信号审计都还没稳定。
         // 期间也监听停止信号，服务退出时不必等满 5 分钟。
+        if *stop.borrow() {
+            return;
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SEC)) => {}
             changed = stop.changed() => {
@@ -64,6 +67,10 @@ pub(crate) async fn run_once(state: &AiState) -> Result<(), String> {
         return Ok(());
     };
     let (cfg, chain) = provider_chain(state);
+    // ai.enabled=false 是总开关：不调用模型、不生成候选，也不推进调参时间戳。
+    if !cfg.enabled {
+        return Ok(());
+    }
     if chain.is_empty() {
         return Err("未配置可用的 AI 模型, 请先在「AI 模型」中接入并启用".to_string());
     }
@@ -154,6 +161,10 @@ fn prepare(state: &AiState) -> Result<Option<Prepared>, String> {
         .lock()
         .map_err(|_| "数据库连接锁不可用".to_string())?;
     let ai = group_json(&conn, "ai");
+    // AI 总开关关闭时连父集检查与告警都不做，任务完全静默。
+    if !flag(&ai, "enabled", true) {
+        return Ok(None);
+    }
     if !flag(&ai, "allow_param_tuning", true) {
         return Ok(None);
     }
@@ -270,6 +281,15 @@ fn tuning_context(
     }))
 }
 
+/// 整数语义键：模型容易写成 9.5 之类的小数并绕过校验，调参目录不提供。
+const INTEGER_STRATEGY_KEYS: &[&str] = &[
+    "ema_fast",
+    "ema_slow",
+    "rsi_period",
+    "atr_period",
+    "max_data_gaps",
+];
+
 /// 只暴露 strategy 组里 AI 可写的数字字段，并附带当前值与人工范围/专用边界。
 /// 不注入 risk/engine/parameter_set/ai，也不暴露 timeframe、字符串、数组字段。
 fn writable_strategy_parameters(active: &Value) -> Value {
@@ -287,17 +307,25 @@ fn writable_strategy_parameters(active: &Value) -> Value {
         if key == "timeframe" {
             continue;
         }
+        if INTEGER_STRATEGY_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         if field.get("kind").and_then(Value::as_str) != Some("number") {
             continue;
         }
         if field.get("ai_writable").and_then(Value::as_bool) != Some(true) {
             continue;
         }
+        // 缺少当前值的键不展示：展示 null 会让整轮候选因缺基线而被 reject。
+        let Some(current) = active
+            .get(key.as_str())
+            .filter(|value| !value.is_null())
+            .cloned()
+        else {
+            continue;
+        };
         let mut entry = Map::new();
-        entry.insert(
-            "current".into(),
-            active.get(key.as_str()).cloned().unwrap_or(Value::Null),
-        );
+        entry.insert("current".into(), current);
         entry.insert(
             "min".into(),
             field.get("min").cloned().unwrap_or(Value::Null),
@@ -319,7 +347,8 @@ fn writable_strategy_parameters(active: &Value) -> Value {
 }
 
 fn record_failure(state: &AiState, error: &str) {
-    tracing::warn!(%error, "参数集调参任务失败");
+    let detail = sanitize_error(error);
+    tracing::warn!(error = %detail, "参数集调参任务失败");
     let Ok(conn) = state.db.conn.lock() else {
         return;
     };
@@ -327,8 +356,39 @@ fn record_failure(state: &AiState, error: &str) {
         &conn,
         "warn",
         "参数集调参失败",
-        json!({ "event": "parameter_set.tuning_failed", "error": error }),
+        json!({ "event": "parameter_set.tuning_failed", "error": detail }),
     );
+}
+
+/// 失败文本可能带上游 URL/响应体：截断并去掉 URL 查询串与常见 key 参数。
+fn sanitize_error(error: &str) -> String {
+    let mut text: String = error.chars().take(400).collect();
+    if let Some(scheme) = text.find("://") {
+        if let Some(offset) = text[scheme..].find('?') {
+            let start = scheme + offset;
+            let end = text[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '}' | ']'))
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            text.replace_range(start..end, "");
+        }
+    }
+    for marker in ["api_key=", "apikey=", "token=", "key=", "signature="] {
+        let mut search_from = 0;
+        while let Some(relative) = text[search_from..].find(marker) {
+            let index = search_from + relative;
+            let start = index + marker.len();
+            let end = text[start..]
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ')' | '}' | ',')
+                })
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            text.replace_range(start..end, "***");
+            search_from = start + 3;
+        }
+    }
+    text
 }
 
 fn record_event(
@@ -492,9 +552,9 @@ mod tests {
         })
     }
 
-    fn ai_config(allow: bool) -> Value {
+    fn ai_config(allow: bool, enabled: bool) -> Value {
         json!({
-            "enabled": true,
+            "enabled": enabled,
             "mode": "single",
             "provider_id": 1,
             "fallback_provider_ids": [],
@@ -509,11 +569,11 @@ mod tests {
         })
     }
 
-    fn seed_settings(db: &Db, allow: bool) {
+    fn seed_settings(db: &Db, allow: bool, ai_enabled: bool) {
         let conn = db.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO app_settings VALUES('ai',?1,0)",
-            [ai_config(allow).to_string()],
+            [ai_config(allow, ai_enabled).to_string()],
         )
         .unwrap();
         conn.execute(
@@ -621,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn allow_param_tuning_false_skips_generation() {
         let db = memory_db();
-        seed_settings(&db, false);
+        seed_settings(&db, false, true);
         seed_regime(&db, "range");
         let state = state(
             db.clone(),
@@ -635,9 +695,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_disabled_skips_without_calling_model_or_advancing_timestamp() {
+        let db = memory_db();
+        seed_settings(&db, true, false);
+        seed_provider(&db);
+        seed_regime(&db, "range");
+        {
+            let conn = db.conn.lock().unwrap();
+            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+        }
+        // 空 replies：若误调用模型，chat 会因 500 失败并让 run_once 返回 Err。
+        let state = state(db.clone(), Vec::new());
+
+        run_once(&state).await.unwrap();
+
+        assert_eq!(candidate_count(&db), 0, "AI 总开关关闭不应生成候选");
+        assert!(
+            event_payloads(&db).is_empty(),
+            "AI 总开关关闭不应写参数集事件"
+        );
+        let last_ts: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.last_tuning_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(last_ts.is_none(), "AI 总开关关闭不应推进调参时间戳");
+    }
+
+    #[tokio::test]
     async fn missing_active_parent_records_event_and_keeps_task_alive() {
         let db = memory_db();
-        seed_settings(&db, true);
+        seed_settings(&db, true, true);
         seed_regime(&db, "range");
         let state = state(db.clone(), Vec::new());
 
@@ -653,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn run_once_creates_candidate_without_touching_strategy() {
         let db = memory_db();
-        seed_settings(&db, true);
+        seed_settings(&db, true, true);
         seed_provider(&db);
         seed_regime(&db, "range");
         {
@@ -728,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn interval_not_elapsed_skips_generation() {
         let db = memory_db();
-        seed_settings(&db, true);
+        seed_settings(&db, true, true);
         seed_provider(&db);
         seed_regime(&db, "range");
         {
@@ -756,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn empty_params_records_no_candidate_without_touching_strategy() {
         let db = memory_db();
-        seed_settings(&db, true);
+        seed_settings(&db, true, true);
         seed_provider(&db);
         seed_regime(&db, "range");
         {
@@ -796,7 +889,13 @@ mod tests {
 
     #[test]
     fn tuning_context_only_exposes_strategy_numeric_fields() {
-        let active = json!(strategy_snapshot());
+        let mut active = strategy_snapshot();
+        active["sl_atr_mult"] = json!(1.2);
+        active["ema_fast"] = json!(9);
+        active["ema_slow"] = json!(21);
+        active["rsi_period"] = json!(14);
+        active["atr_period"] = json!(14);
+        active["max_data_gaps"] = json!(1);
         let writable = writable_strategy_parameters(&active);
         let fields = writable.as_object().unwrap();
         for key in [
@@ -808,9 +907,25 @@ mod tests {
         ] {
             assert!(fields.contains_key(key), "strategy.{key} 应出现在可调目录");
         }
+        for key in [
+            "ema_fast",
+            "ema_slow",
+            "rsi_period",
+            "atr_period",
+            "max_data_gaps",
+        ] {
+            assert!(
+                !fields.contains_key(key),
+                "strategy.{key} 是整数语义，不应出现在调参目录"
+            );
+        }
         assert!(!fields.contains_key("timeframe"), "timeframe 不可由 AI 调");
         assert!(!fields.contains_key("mode"), "非数值字段不应出现");
         assert!(!fields.contains_key("roi_table"), "数组字段不应出现");
+        assert!(
+            !fields.contains_key("trailing_arm_r"),
+            "active 缺少当前值的键不应出现，否则整轮候选会被缺基线拒绝"
+        );
         for forbidden in ["risk", "engine", "parameter_set", "ai"] {
             assert!(writable.get(forbidden).is_none(), "{forbidden} 组不应出现");
         }
