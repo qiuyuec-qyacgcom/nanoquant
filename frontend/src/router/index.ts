@@ -30,6 +30,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'news', name: 'news', component: () => import('../views/NewsView.vue'), meta: { title: '资讯情绪' } },
       { path: 'ai', name: 'ai', component: () => import('../views/AiView.vue'), meta: { title: 'AI 模型' } },
       { path: 'strategy', name: 'strategy', component: () => import('../views/StrategyView.vue'), meta: { title: '参数配置' } },
+      { path: 'parameter-sets', name: 'parameter-sets', component: () => import('../views/ParameterSetsView.vue'), meta: { title: '参数集' } },
       { path: 'evolution', name: 'evolution', component: () => import('../views/EvolutionView.vue'), meta: { title: '自进化心法' } },
       { path: 'journal', name: 'journal', component: () => import('../views/JournalView.vue'), meta: { title: '决策经验' } },
       { path: 'backup', name: 'backup', component: () => import('../views/BackupView.vue'), meta: { title: '备份还原' } },

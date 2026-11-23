@@ -43,6 +43,13 @@ pub fn initialize(
         .map_err(|e| format!("写入默认配置 {key} 失败: {e}"))?;
     }
 
+    // 必须在默认配置逐组写入之后：空库此时才有 strategy 行可供快照。
+    crate::parameter_sets::seed_bootstrap(&conn)?;
+    // C 期启用失败只告警，不能阻断服务启动。
+    if let Err(error) = crate::parameter_sets::enable_c_phase(&conn) {
+        tracing::warn!(%error, "C 期参数集启用失败，等待人工处理");
+    }
+
     if created_database {
         // 新库没有标的池 = 引擎没有可扫的标的 = 每轮信号审计都是空的。
         // 先给一份默认池（合约规格取自币安在线表），用户可在「标的池」页增删。
@@ -249,11 +256,11 @@ mod tests {
         let report = initialize(&db, &key, Some("test-password")).unwrap();
         assert!(report.created_database);
         assert!(report.created_master_key);
-        assert_eq!(report.tables, 24);
+        assert_eq!(report.tables, 26);
         assert_eq!(report.generated_password, None);
 
         let conn = Connection::open(&db).unwrap();
-        assert_eq!(table_count(&conn), 24);
+        assert_eq!(table_count(&conn), 26);
         let schema_version: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='schema_version'",
@@ -322,13 +329,66 @@ mod tests {
         let report = initialize(&db, &key, Some("second-password")).unwrap();
         assert!(!report.created_database);
         assert!(!report.created_master_key);
-        assert_eq!(report.tables, 24);
+        assert_eq!(report.tables, 26);
         assert_eq!(std::fs::read(&key).unwrap(), first_key);
         let conn = Connection::open(&db).unwrap();
         assert_eq!(
             security(&conn)["password_hash"].as_str().unwrap(),
             first_hash
         );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn initialize_seeds_parameter_sets_after_defaults_without_touching_strategy() {
+        let dir = workspace("param-sets");
+        let db = dir.join("nanoquant.db");
+        let key = dir.join(".master_key");
+        initialize(&db, &key, Some("test-password")).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT name,status FROM parameter_sets")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        // 默认 strategy 是 4h：只留审计快照，不种子化 1h bootstrap 集。
+        assert_eq!(
+            rows,
+            vec![("current-snapshot".to_string(), "retired".to_string())]
+        );
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let strategy: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(strategy["timeframe"], "4h");
+        let config_raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap();
+        assert_eq!(
+            config["auto_apply"], false,
+            "非 1h 默认策略不得开启自动启用"
+        );
+        let since = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.auto_apply_since'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        assert!(since.is_none(), "非 1h 默认策略不得写自动启用起点");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

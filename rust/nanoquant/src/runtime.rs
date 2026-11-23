@@ -1187,6 +1187,8 @@ impl EngineRuntime {
         crate::trade_policy::TradePolicy {
             base_threshold: num(strategy, "entry_threshold", 0.3),
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
+            atr_pct_min: num(strategy, "atr_pct_min", 0.05),
+            atr_pct_max: num(strategy, "atr_pct_max", 4.0),
             sl_atr_mult: num(strategy, "sl_atr_mult", 1.2),
             tp_atr_mult: num(strategy, "tp_atr_mult", 2.0),
             min_risk_reward: num(strategy, "min_risk_reward", 2.0),
@@ -1421,6 +1423,7 @@ impl EngineRuntime {
             &format!("candle_metrics.{mode}"),
             &serde_json::to_string(&metrics).map_err(|error| error.to_string())?,
         )?;
+        record_regimes(&tx, mode, &snapshot.markets, &metrics)?;
         upsert_state(
             &tx,
             &format!("snapshot_ts.{mode}"),
@@ -1569,6 +1572,26 @@ impl EngineRuntime {
         preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
         preview_value["executed"] = serde_json::json!(executed);
         preview_value["venue_closed"] = serde_json::json!(venue_closed);
+        // 周期尾推进 regime 状态机并切换参数集；失败只告警，不阻断本轮。
+        if let Err(error) = apply_regime_transition(&tx, mode) {
+            tracing::warn!(%error, %mode, "regime 切换处理失败，不影响本轮周期");
+        }
+        // 自动启用 approved 候选并推进无候选守卫；失败只告警，不阻断本轮。
+        let live_timeframe = strategy
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Err(error) = apply_parameter_set_governance(
+            &tx,
+            mode,
+            &live_timeframe,
+            !report.ai_symbols.is_empty(),
+            !report.skipped.is_empty(),
+            crate::now(),
+        ) {
+            tracing::warn!(%error, %mode, "参数集自动启用/无候选守卫失败，不影响本轮周期");
+        }
         upsert_state(
             &tx,
             &format!("cycle_preview.{mode}"),
@@ -4159,11 +4182,267 @@ fn truncate_body(body: &str) -> String {
     }
 }
 
+/// 只读记录每个标的与整体市场的 regime，键按交易环境隔离（`symbol_regime.{mode}` / `market_regime.{mode}`）。
+fn record_regimes(
+    conn: &rusqlite::Connection,
+    mode: &str,
+    markets: &[crate::providers::MarketSnapshot],
+    metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+) -> Result<(), String> {
+    let mut regimes = Vec::new();
+    let mut symbol_regimes = serde_json::Map::new();
+    for market in markets {
+        if let Some(metric) = metrics.get(market.symbol.as_str()) {
+            if let Some(regime) = crate::trade_policy::regime_for(
+                &market.candles,
+                market.mark_price,
+                metric.atr,
+                crate::trade_policy::MarketFeatures::default(),
+            ) {
+                regimes.push(regime);
+                symbol_regimes.insert(market.symbol.clone(), json!(regime.as_str()));
+            }
+        }
+    }
+    if !symbol_regimes.is_empty() {
+        upsert_state(
+            conn,
+            &format!("symbol_regime.{mode}"),
+            &Value::Object(symbol_regimes).to_string(),
+        )?;
+    }
+    match crate::regime::market_regime(&regimes) {
+        Some(regime) => upsert_state(conn, &format!("market_regime.{mode}"), regime.as_str())?,
+        None => tracing::warn!(
+            valid = regimes.len(),
+            "market_regime 有效标的不足 quorum，保留上一值"
+        ),
+    }
+    Ok(())
+}
+
 fn upsert_state(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(), String> {
     conn.execute(
         "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         (key, value, crate::now()),
     ).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 读取某 mode 的 regime 状态机并推进一轮；切换时按新 regime 激活参数集。
+///
+/// C 期只做 regime 切换触发激活，不实现 C3 的自动启用与无候选回滚。
+fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<(), String> {
+    apply_regime_transition_at(conn, mode, crate::now())
+}
+
+const REGIME_ACTIVATION_FAILURE_LOG_SEC: i64 = 3_600;
+
+fn apply_regime_transition_at(
+    conn: &rusqlite::Connection,
+    mode: &str,
+    now: i64,
+) -> Result<(), String> {
+    let read_state = |key: String| -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let Some(next) = read_state(format!("market_regime.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw))
+    else {
+        // 本轮有效标的不足 quorum：保持当前 regime，不重置 pending。
+        return Ok(());
+    };
+    let config = crate::settings_api::group_value_public(conn, "parameter_set");
+    let confirm_sec = config
+        .get("regime_confirm_sec")
+        .and_then(Value::as_i64)
+        .unwrap_or(1_800)
+        .max(0);
+    let cooldown_sec = config
+        .get("regime_cooldown_sec")
+        .and_then(Value::as_i64)
+        .unwrap_or(1_800)
+        .max(0);
+    let current = read_state(format!("regime.current.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw));
+    let pending = read_state(format!("regime.pending.{mode}"))
+        .and_then(|raw| crate::regime::Regime::from_str(&raw));
+    let pending_since =
+        read_state(format!("regime.pending_since.{mode}")).and_then(|raw| raw.parse::<i64>().ok());
+    let changed_at = read_state(format!("regime.changed_at.{mode}"))
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0);
+    let mut tracker = crate::regime::RegimeTracker::restore(
+        current,
+        pending,
+        pending_since,
+        changed_at,
+        confirm_sec,
+        cooldown_sec,
+    );
+    let switched = tracker.observe(next, now);
+    upsert_state(
+        conn,
+        &format!("regime.current.{mode}"),
+        tracker.current().map(|r| r.as_str()).unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.pending.{mode}"),
+        tracker.pending().map(|r| r.as_str()).unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.pending_since.{mode}"),
+        &tracker
+            .pending_since()
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )?;
+    upsert_state(
+        conn,
+        &format!("regime.changed_at.{mode}"),
+        &tracker.changed_at().to_string(),
+    )?;
+    if let Some(regime) = switched {
+        if let Err(error) =
+            crate::parameter_sets::activate_for_regime(conn, regime.as_str(), "regime", mode)
+        {
+            // 激活失败不能把 regime 留在“已切换”状态：否则下轮不再触发激活，
+            // 策略与 regime 永久错位。恢复旧 current/changed_at，并清空 pending，
+            // 让下一轮按 market_regime 重新累计确认后重试。
+            let previous = current.map(|r| r.as_str()).unwrap_or_default();
+            let _ = upsert_state(conn, &format!("regime.current.{mode}"), previous);
+            let _ = upsert_state(conn, &format!("regime.pending.{mode}"), "");
+            let _ = upsert_state(conn, &format!("regime.pending_since.{mode}"), "");
+            let _ = upsert_state(
+                conn,
+                &format!("regime.changed_at.{mode}"),
+                &changed_at.to_string(),
+            );
+            // 首次失败后 current 为空，下轮会立即重试；事件与日志按小时限流，
+            // 避免每 15 秒刷一条。
+            let failed_key = format!("parameter_set.regime_activation_failed_ts.{mode}");
+            let last_failed =
+                read_state(failed_key.clone()).and_then(|raw| raw.parse::<i64>().ok());
+            let should_log =
+                !last_failed.is_some_and(|last| now - last < REGIME_ACTIVATION_FAILURE_LOG_SEC);
+            if should_log {
+                tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
+                let _ = upsert_state(conn, &failed_key, &now.to_string());
+                let _ = conn.execute(
+                    "INSERT INTO engine_events(ts,level,category,message,payload) \
+                     VALUES(?1,'warn','parameter_set',?2,?3)",
+                    (
+                        now,
+                        format!("parameter_set.regime_activation_failed: {error}"),
+                        json!({
+                            "mode": mode,
+                            "regime": regime.as_str(),
+                            "previous": previous,
+                            "error": error,
+                        })
+                        .to_string(),
+                    ),
+                );
+            }
+        } else {
+            // 激活成功即初始化守卫，计时从切换时刻开始。
+            match crate::parameter_sets::active_set_for_regime(conn, regime.as_str()) {
+                Ok(Some(set)) => {
+                    if let Err(error) = crate::parameter_sets::set_guard(
+                        conn,
+                        regime.as_str(),
+                        set.id,
+                        now,
+                    ) {
+                        tracing::warn!(%error, regime = regime.as_str(), %mode, "参数集守卫初始化失败");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, regime = regime.as_str(), %mode, "读取激活参数集失败");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 周期尾参数集治理：自动启用 approved 候选，再推进无候选守卫。
+///
+/// 调用方在 regime 切换处理后、同一事务内调用；错误由调用方告警，不阻断周期。
+fn apply_parameter_set_governance(
+    conn: &rusqlite::Connection,
+    mode: &str,
+    live_timeframe: &str,
+    has_candidate: bool,
+    skipped: bool,
+    now: i64,
+) -> Result<(), String> {
+    let current_regime = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [format!("regime.current.{mode}")],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    if current_regime.is_empty() {
+        return Ok(());
+    }
+    let auto_apply_error = match crate::parameter_sets::auto_apply_approved(
+        conn,
+        &current_regime,
+        mode,
+        live_timeframe,
+        now,
+    ) {
+        Ok(Some(applied)) => {
+            let applied_set = crate::parameter_sets::load_set(conn, applied)?;
+            crate::parameter_sets::set_guard(conn, &applied_set.regime, applied, now)?;
+            None
+        }
+        Ok(None) => None,
+        Err(error) => {
+            // 自动启用失败要留事件，不能只靠日志；guard 仍继续推进。
+            if let Err(record_error) = conn.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) \
+                 VALUES(?1,'warn','parameter_set',?2,?3)",
+                (
+                    now,
+                    format!("parameter_set.auto_apply_failed: {error}"),
+                    json!({
+                        "mode": mode,
+                        "regime": current_regime,
+                        "error": &error,
+                    })
+                    .to_string(),
+                ),
+            ) {
+                tracing::warn!(%record_error, "写入参数集自动启用失败事件失败");
+            }
+            Some(error)
+        }
+    };
+    let Some(active) = crate::parameter_sets::active_set_for_regime(conn, &current_regime)? else {
+        return auto_apply_error.map_or(Ok(()), Err);
+    };
+    // 守卫已把 active 集回滚标记写进自己的状态，这里不能再 set_guard 覆盖。
+    crate::parameter_sets::update_guard(
+        conn,
+        &current_regime,
+        active.id,
+        has_candidate,
+        skipped,
+        now,
+    )?;
+    auto_apply_error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn acquire_lock(data_dir: &Path) -> io::Result<File> {
@@ -4377,6 +4656,179 @@ mod tests {
             )
             .unwrap();
         assert!(audited > 0, "行情闸门挡下的标的也要进信号审计");
+    }
+
+    #[tokio::test]
+    async fn snapshot_records_symbol_regime_without_market_regime_below_quorum() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        let mut snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        for candle in &mut snapshot.markets[0].candles {
+            candle.high = 100.5;
+            candle.low = 99.5;
+        }
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'symbol_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let symbol_regimes: Value = serde_json::from_str(&raw).unwrap();
+        let symbol_regime = symbol_regimes
+            .get("BTCUSDT")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            matches!(symbol_regime, "trend" | "range" | "chaos"),
+            "单标的 regime 必须是合法枚举值: {raw}"
+        );
+        let market_regime: Option<String> = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'market_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            market_regime.is_none(),
+            "有效标的不足 6 个时不应写出 market_regime"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_regimes_writes_market_regime_with_full_quorum() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        let template = snapshot.markets[0].clone();
+        let symbols = [
+            "AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT", "FFFUSDT",
+        ];
+        let markets: Vec<_> = symbols
+            .iter()
+            .map(|symbol| {
+                let mut market = template.clone();
+                market.symbol = (*symbol).into();
+                for candle in &mut market.candles {
+                    candle.high = 100.5;
+                    candle.low = 99.5;
+                }
+                market
+            })
+            .collect();
+        let metrics: std::collections::BTreeMap<_, _> = markets
+            .iter()
+            .map(|market| {
+                (
+                    market.symbol.as_str(),
+                    crate::providers::candle_metrics(&market.candles, 14).unwrap(),
+                )
+            })
+            .collect();
+        let mut conn = db.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        record_regimes(&tx, "demo", &markets, &metrics).unwrap();
+        let market_regime: String = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'market_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(market_regime.as_str(), "trend" | "range" | "chaos"),
+            "6 个有效标的应写出合法 market_regime: {market_regime}"
+        );
+        let raw: String = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'symbol_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let symbol_regimes: Value = serde_json::from_str(&raw).unwrap();
+        for symbol in symbols {
+            let value = symbol_regimes
+                .get(symbol)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                matches!(value, "trend" | "range" | "chaos"),
+                "{symbol} 的 regime 必须是合法枚举值: {raw}"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_symbol_persist_keeps_existing_market_regime() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        let mut snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        for candle in &mut snapshot.markets[0].candles {
+            candle.high = 100.5;
+            candle.low = 99.5;
+        }
+        upsert_state(&db.conn.lock().unwrap(), "market_regime.demo", "chaos").unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let value: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'market_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "chaos", "不足 quorum 不能覆盖上一轮 market_regime");
+    }
+
+    #[tokio::test]
+    async fn empty_symbol_regimes_keep_previous_values() {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        let snapshot = DemoProvider::with_mark_price(100.0)
+            .snapshot()
+            .await
+            .unwrap();
+        upsert_state(
+            &db.conn.lock().unwrap(),
+            "symbol_regime.demo",
+            r#"{"BTCUSDT":"range"}"#,
+        )
+        .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let value: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'symbol_regime.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            value, r#"{"BTCUSDT":"range"}"#,
+            "空 regime 映射不能清空历史记录"
+        );
     }
 
     #[tokio::test]
@@ -5878,6 +6330,342 @@ mod tests {
             seen,
             "平仓提交后必须触发复盘并留下事件（样本不足时记录跳过原因）"
         );
+    }
+
+    #[test]
+    fn apply_regime_transition_restores_previous_regime_when_activation_fails() {
+        let conn = regime_transition_fixture(Some("range"), 100);
+
+        apply_regime_transition_at(&conn, "demo", 10_000).expect("激活失败不能阻断周期");
+
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "range",
+            "激活失败必须恢复旧 regime，下轮才能重新触发"
+        );
+        assert_eq!(regime_state(&conn, "regime.pending.demo"), "");
+        assert_eq!(regime_state(&conn, "regime.pending_since.demo"), "");
+        assert_eq!(
+            regime_state(&conn, "regime.changed_at.demo"),
+            "100",
+            "changed_at 必须恢复激活前的值"
+        );
+        let failures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='warn' AND category='parameter_set' \
+                 AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn apply_regime_transition_throttles_activation_failure_events() {
+        let conn = regime_transition_fixture(Some("range"), 100);
+        let base = 10_000;
+        let failure_count = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        apply_regime_transition_at(&conn, "demo", base).unwrap();
+        apply_regime_transition_at(&conn, "demo", base + 3_599).unwrap();
+        assert_eq!(failure_count(&conn), 1, "3600 秒内失败事件必须限流");
+        assert_eq!(
+            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            base.to_string()
+        );
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "range",
+            "限流不影响失败回退"
+        );
+
+        apply_regime_transition_at(&conn, "demo", base + 3_600).unwrap();
+        assert_eq!(failure_count(&conn), 2, "满 3600 秒后可再写一条");
+        assert_eq!(
+            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            (base + 3_600).to_string()
+        );
+    }
+
+    #[test]
+    fn apply_regime_transition_clears_current_when_first_activation_fails() {
+        let conn = regime_transition_fixture(None, 0);
+
+        apply_regime_transition_at(&conn, "demo", 10_000).expect("首次激活失败不能阻断周期");
+
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "",
+            "首次激活失败必须清空 current，下轮按首次初始化重试"
+        );
+        assert_eq!(regime_state(&conn, "regime.pending.demo"), "");
+        assert_eq!(regime_state(&conn, "regime.pending_since.demo"), "");
+        let failures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    fn regime_transition_fixture(current: Option<&str>, changed_at: i64) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); \
+             CREATE TABLE trades(id INTEGER PRIMARY KEY, parameter_set_id INTEGER); \
+             INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\"}',0); \
+             INSERT INTO app_settings VALUES('parameter_set','{\"regime_confirm_sec\":0,\"regime_cooldown_sec\":0}',0); \
+             INSERT INTO engine_state VALUES('market_regime.demo','chaos',0);",
+        )
+        .unwrap();
+        if let Some(current) = current {
+            conn.execute(
+                "INSERT INTO engine_state VALUES('regime.current.demo',?1,0)",
+                [current],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO engine_state VALUES('regime.changed_at.demo',?1,0)",
+                [changed_at.to_string()],
+            )
+            .unwrap();
+        }
+        crate::schema::ensure_parameter_changes(&conn).unwrap();
+        crate::schema::ensure_parameter_sets(&conn).unwrap();
+        conn
+    }
+
+    fn regime_state(conn: &rusqlite::Connection, key: &str) -> String {
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn parameter_set_governance_fixture() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings VALUES('strategy',?1,0)",
+            [serde_json::json!({
+                "timeframe": "1h",
+                "atr_pct_min": 1.5,
+                "atr_pct_max": 8,
+                "volume_ratio_min": 1.1,
+                "entry_threshold": 0.55
+            })
+            .to_string()],
+        )
+        .unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) VALUES('regime.current.demo','range',0) \
+             ON CONFLICT(key) DO UPDATE SET value='range'",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn governance_approved_candidate(conn: &rusqlite::Connection) -> i64 {
+        let parent = crate::parameter_sets::active_for_regime(conn, "range")
+            .unwrap()
+            .unwrap();
+        let snapshot = crate::parameter_sets::validate_candidate(
+            &parent.params,
+            &[crate::ai_client::ParamUpdate {
+                group: "strategy".to_string(),
+                key: "entry_threshold".to_string(),
+                value: serde_json::json!(0.40),
+                reason: String::new(),
+            }],
+        )
+        .unwrap();
+        let id = crate::parameter_sets::insert_candidate(
+            conn,
+            "range-ai-governance",
+            "range",
+            "1h",
+            &snapshot,
+            Some(parent.id),
+        )
+        .unwrap();
+        crate::parameter_sets::mark_evidence(conn, id, true, &serde_json::json!({"gate":{"pass":true}}))
+            .unwrap();
+        id
+    }
+
+    fn enable_auto_apply(conn: &rusqlite::Connection, since: &str) {
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('parameter_set',?1,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::json!({
+                "enabled": true,
+                "auto_apply": true,
+                "auto_apply_timeframes": "1h",
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) \
+             VALUES('parameter_set.auto_apply_since',?1,0) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [since],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_materializes_approved_candidate() {
+        let conn = parameter_set_governance_fixture();
+        let candidate_id = governance_approved_candidate(&conn);
+        enable_auto_apply(&conn, "0");
+        let now = crate::now();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", true, false, now)
+            .expect("自动启用不能阻断周期");
+
+        let active = crate::parameter_sets::active_for_regime(&conn, "range")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, candidate_id, "当前 regime 必须直接启用候选");
+        let strategy_raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let strategy: serde_json::Value = serde_json::from_str(&strategy_raw).unwrap();
+        assert_eq!(
+            strategy["entry_threshold"],
+            serde_json::json!(0.40),
+            "当前 regime 必须物化 strategy"
+        );
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM parameter_set_activations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "auto_apply");
+        let guard_raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.guard.range'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let guard: serde_json::Value = serde_json::from_str(&guard_raw).unwrap();
+        assert_eq!(guard["set_id"], serde_json::json!(candidate_id));
+        assert_eq!(guard["rollback_done"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_rolls_back_after_no_candidate_window() {
+        let conn = parameter_set_governance_fixture();
+        let bootstrap_id: i64 = conn
+            .query_row(
+                "SELECT id FROM parameter_sets WHERE name='range-bootstrap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_id = governance_approved_candidate(&conn);
+        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        let now = crate::now();
+        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_799)
+            .expect("守卫推进不能阻断周期");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            candidate_id,
+            "未满窗口不得回滚"
+        );
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_800)
+            .expect("守卫回滚不能阻断周期");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            bootstrap_id,
+            "无候选满窗口必须回滚到上一套"
+        );
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM parameter_set_activations WHERE set_id=?1 \
+                 ORDER BY id DESC LIMIT 1",
+                [bootstrap_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "no_candidate");
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
+                 AND message LIKE 'parameter_set.no_candidate_rollback%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn apply_parameter_set_governance_pauses_on_skipped_cycle() {
+        let conn = parameter_set_governance_fixture();
+        let candidate_id = governance_approved_candidate(&conn);
+        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        let now = crate::now();
+        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+
+        apply_parameter_set_governance(&conn, "demo", "1h", false, true, now + 10_000)
+            .expect("熔断轮不得报错");
+        assert_eq!(
+            crate::parameter_sets::active_for_regime(&conn, "range")
+                .unwrap()
+                .unwrap()
+                .id,
+            candidate_id,
+            "skipped 轮次必须暂停计时，不得累计零候选"
+        );
+        let paused: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE message LIKE 'parameter_set.guard_paused%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, 1);
     }
 
     fn test_db() -> Db {

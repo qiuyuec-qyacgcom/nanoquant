@@ -31,6 +31,7 @@ const nav = [
     { path: '/admin/news', label: '资讯情绪', ico: '✦' },
     { path: '/admin/ai', label: 'AI 模型', ico: '◉' },
     { path: '/admin/strategy', label: '参数配置', ico: '⚙' },
+    { path: '/admin/parameter-sets', label: '参数集', ico: '▤' },
   ]},
   { group: '运维', items: [
     { path: '/admin/backup', label: '备份还原', ico: '⛁' },

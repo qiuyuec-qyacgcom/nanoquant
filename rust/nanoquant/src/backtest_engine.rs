@@ -4,7 +4,7 @@
 //! 点差按成本计入；资金费按假设费率在每个 8h 结算点扣减；历史缺口只标注不插值；
 //! 同一根 K 线内止损与部分止盈冲突时按止损优先。结果仅用于参数粗筛与逻辑回归。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::prelude::IndexedRandom;
@@ -60,6 +60,7 @@ pub struct BacktestTrade {
     pub entry_fee: f64,
     pub funding: f64,
     pub partial_tp: bool,
+    pub market_regime: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +201,7 @@ impl<'a> Sim<'a> {
             entry_fee: round(position.initial_fee, 6),
             funding: round(position.funding, 6),
             partial_tp: position.partial,
+            market_regime: String::new(),
         });
         self.curve.push(round(self.equity, 6));
     }
@@ -1022,6 +1024,293 @@ pub fn run_walkforward(
     }))
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BasketMetrics {
+    /// 已评估的 symbol×fold 单元数；B3 以 positive_folds/folds 比例判定稳健性。
+    pub folds: usize,
+    pub oos_trades: usize,
+    pub positive_folds: usize,
+    pub oos_avg_return_pct: f64,
+    pub overfit_gap_pp: f64,
+    pub stressed_avg_return_pct: f64,
+    pub max_drawdown_pct: f64,
+    pub bootstrap_ci_low: f64,
+    pub bootstrap_p_positive: f64,
+    pub symbols_used: Vec<String>,
+    pub symbols_skipped: Vec<String>,
+    pub target_regime: String,
+    pub timeframe: String,
+}
+
+#[allow(dead_code)]
+fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
+    let value = timeframe.trim();
+    if value.is_empty() {
+        return Err("timeframe 不能为空".to_string());
+    }
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    if number.is_empty() {
+        return Err(format!("timeframe {timeframe} 缺少数值"));
+    }
+    let count = number
+        .parse::<i64>()
+        .map_err(|_| format!("timeframe {timeframe} 数值非法"))?;
+    if count <= 0 {
+        return Err(format!("timeframe {timeframe} 必须为正数"));
+    }
+    let unit_ms = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return Err(format!("timeframe {timeframe} 单位非法")),
+    };
+    count
+        .checked_mul(unit_ms)
+        .ok_or_else(|| format!("timeframe {timeframe} 超出范围"))
+}
+
+#[allow(dead_code)]
+fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnapshot> {
+    let step = interval_ms.max(1);
+    bars.iter()
+        .map(|bar| CandleSnapshot {
+            close_time: bar.close_time.max(bar.open_time + step - 1),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn build_market_regime_map(
+    basket: &[(String, Vec<HistoryBar>)],
+    frame_ms: i64,
+) -> BTreeMap<i64, crate::regime::Regime> {
+    let per_symbol: Vec<BTreeMap<i64, crate::regime::Regime>> = basket
+        .iter()
+        .map(|(_, bars)| {
+            let candles = candles_from_history(bars, frame_ms);
+            let series = crate::regime::regime_series(&candles, 14);
+            let mut map = BTreeMap::new();
+            for (candle, regime) in candles.iter().zip(series) {
+                if let Some(regime) = regime {
+                    map.insert(candle.close_time, regime);
+                }
+            }
+            map
+        })
+        .collect();
+    let mut buckets: BTreeSet<i64> = BTreeSet::new();
+    for map in &per_symbol {
+        buckets.extend(map.keys().copied());
+    }
+    let mut regimes = BTreeMap::new();
+    for ts in buckets {
+        let mut votes = Vec::new();
+        for map in &per_symbol {
+            if let Some((&stamp, &regime)) = map.range(..=ts).next_back() {
+                if ts - stamp <= frame_ms {
+                    votes.push(regime);
+                }
+            }
+        }
+        if let Some(regime) = crate::regime::market_regime(&votes) {
+            regimes.insert(ts, regime);
+        }
+    }
+    regimes
+}
+
+#[allow(dead_code)]
+fn market_regime_at(
+    regimes: &BTreeMap<i64, crate::regime::Regime>,
+    ts: i64,
+    frame_ms: i64,
+) -> Option<crate::regime::Regime> {
+    let (&stamp, &regime) = regimes.range(..=ts).next_back()?;
+    (ts - stamp <= frame_ms).then_some(regime)
+}
+
+#[allow(dead_code)]
+fn tag_trades(
+    result: &mut BacktestResult,
+    regimes: &BTreeMap<i64, crate::regime::Regime>,
+    frame_ms: i64,
+) {
+    for trade in &mut result.trades {
+        if let Some(regime) = market_regime_at(regimes, trade.entry_ts, frame_ms) {
+            trade.market_regime = regime.as_str().to_string();
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn target_returns(trades: &[BacktestTrade], target: &str) -> Vec<f64> {
+    trades
+        .iter()
+        .filter(|trade| trade.market_regime == target)
+        .map(|trade| trade.pnl_pct)
+        .collect()
+}
+
+#[allow(dead_code)]
+fn compounded_max_drawdown(returns: &[(i64, f64)]) -> f64 {
+    let mut ordered = returns.to_vec();
+    ordered.sort_by_key(|(exit_ts, _)| *exit_ts);
+    let mut equity = 1.0_f64;
+    let mut peak = 1.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for (_, value) in ordered {
+        equity *= 1.0 + value / 100.0;
+        peak = peak.max(equity);
+        max_drawdown = max_drawdown.max((peak - equity) / peak * 100.0);
+    }
+    max_drawdown
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn run_walkforward_basket_fixed(
+    basket: &[(String, Vec<HistoryBar>)],
+    base: &EngineConfig,
+    folds: i64,
+    train_bars: i64,
+    target_regime: crate::regime::Regime,
+    timeframe: &str,
+    cancel: &AtomicBool,
+) -> Result<BasketMetrics, String> {
+    if basket.len() < 6 {
+        return Err("有效标的少于 6 个".to_string());
+    }
+    let frame_ms = timeframe_ms(timeframe)?;
+    if frame_ms != base.interval_ms {
+        return Err(format!(
+            "timeframe {timeframe} 与 EngineConfig.interval_ms {} 不一致",
+            base.interval_ms
+        ));
+    }
+    let regimes = build_market_regime_map(basket, frame_ms);
+    let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
+    let target = target_regime.as_str();
+    let mut fold_results = Vec::new();
+    let mut oos_fold_avgs = Vec::new();
+    let mut stressed_fold_avgs = Vec::new();
+    let mut is_fold_avgs = Vec::new();
+    let mut seen_oos: BTreeSet<(String, i64)> = BTreeSet::new();
+    let mut all_oos = Vec::new();
+    let mut oos_ordered: Vec<(i64, f64)> = Vec::new();
+    let mut used = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (symbol, bars) in basket {
+        if bars.len() < WARMUP * 4 {
+            skipped.push(symbol.clone());
+            continue;
+        }
+        let train_bars = (train_bars as usize).clamp(WARMUP * 2, bars.len() - WARMUP * 2);
+        let mut local_folds = requested_folds;
+        let mut step = (bars.len() - WARMUP - train_bars) / local_folds;
+        while local_folds > MIN_FOLDS && step <= WARMUP {
+            local_folds -= 1;
+            step = (bars.len() - WARMUP - train_bars) / local_folds;
+        }
+        if step <= WARMUP {
+            skipped.push(symbol.clone());
+            continue;
+        }
+        let mut evaluated = false;
+        for index in 0..local_folds {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.to_string());
+            }
+            let train_end = WARMUP + train_bars + index * step;
+            let test_end = (train_end + step).min(bars.len());
+            let train = &bars[train_end.saturating_sub(train_bars)..train_end];
+            let test = &bars[train_end.saturating_sub(WARMUP)..test_end];
+            if train.len() <= WARMUP || test.len() <= WARMUP {
+                continue;
+            }
+            let mut train_result = run(train, base)?;
+            let mut test_result = run(test, base)?;
+            let mut stressed_config = base.clone();
+            stressed_config.fee_bps *= 2.0;
+            stressed_config.slippage_bps *= 2.0;
+            let mut stressed_result = run(test, &stressed_config)?;
+            for result in [&mut train_result, &mut test_result, &mut stressed_result] {
+                tag_trades(result, &regimes, frame_ms);
+            }
+            let is_returns = target_returns(&train_result.trades, target);
+            let oos_returns = target_returns(&test_result.trades, target);
+            if oos_returns.is_empty() {
+                continue;
+            }
+            let stressed_returns = target_returns(&stressed_result.trades, target);
+            fold_results.push(oos_returns.iter().sum::<f64>());
+            oos_fold_avgs.push(average(&oos_returns));
+            stressed_fold_avgs.push(average(&stressed_returns));
+            is_fold_avgs.push(if is_returns.is_empty() {
+                average(&oos_returns)
+            } else {
+                average(&is_returns)
+            });
+            evaluated = true;
+            for trade in test_result
+                .trades
+                .iter()
+                .filter(|trade| trade.market_regime == target)
+            {
+                if seen_oos.insert((symbol.clone(), trade.entry_ts)) {
+                    all_oos.push(trade.pnl_pct);
+                    oos_ordered.push((trade.exit_ts, trade.pnl_pct));
+                }
+            }
+        }
+        if evaluated {
+            used.push(symbol.clone());
+        } else {
+            skipped.push(symbol.clone());
+        }
+    }
+
+    if fold_results.len() < MIN_FOLDS {
+        return Err(format!("评估到的 symbol×fold 单元少于 {MIN_FOLDS} 个"));
+    }
+    if used.len() < 6 {
+        return Err("有效标的少于 6 个".to_string());
+    }
+    if all_oos.is_empty() {
+        return Err(format!("目标 regime {target} 的 OOS 成交为 0"));
+    }
+
+    let oos_avg = average(&oos_fold_avgs);
+    let is_avg = average(&is_fold_avgs);
+    let positive_folds = fold_results.iter().filter(|value| **value > 0.0).count();
+    let bootstrap = bootstrap_ci(&all_oos);
+    Ok(BasketMetrics {
+        folds: fold_results.len(),
+        oos_trades: all_oos.len(),
+        positive_folds,
+        oos_avg_return_pct: round(oos_avg, 4),
+        overfit_gap_pp: round(is_avg - oos_avg, 4),
+        stressed_avg_return_pct: round(average(&stressed_fold_avgs), 4),
+        max_drawdown_pct: round(compounded_max_drawdown(&oos_ordered), 4),
+        bootstrap_ci_low: bootstrap["ci_low"].as_f64().unwrap_or_default(),
+        bootstrap_p_positive: bootstrap["p_positive"].as_f64().unwrap_or_default(),
+        symbols_used: used,
+        symbols_skipped: skipped,
+        target_regime: target.to_string(),
+        timeframe: timeframe.to_string(),
+    })
+}
+
 fn items_len(values: &[f64]) -> f64 {
     values.len().max(1) as f64
 }
@@ -1035,6 +1324,7 @@ fn average(values: &[f64]) -> f64 {
 }
 
 fn bootstrap_ci(returns: &[f64]) -> Value {
+    // 少于 10 笔不构建置信区间；B3 证据门的 30 笔门槛由调用方另行保证。
     if returns.len() < 10 {
         return json!({"ci_low":0.0,"ci_high":0.0,"p_positive":0.0,"n_trades":returns.len()});
     }
@@ -1090,6 +1380,8 @@ mod tests {
             policy: TradePolicy {
                 base_threshold: 0.05,
                 volume_ratio_min: 0.0,
+                atr_pct_min: 0.05,
+                atr_pct_max: 4.0,
                 sl_atr_mult: 1.0,
                 tp_atr_mult: 10.0,
                 min_risk_reward: 0.5,
@@ -1315,5 +1607,195 @@ mod tests {
         )
         .expect_err("窗口不足时必须返回错误，不能 panic");
         assert!(error.contains("K 线不足"), "实际错误: {error}");
+    }
+
+    fn basket_config() -> EngineConfig {
+        let mut cfg = config();
+        cfg.interval_ms = 3_600_000;
+        cfg
+    }
+
+    fn synthetic_basket(symbols: usize, count: usize) -> Vec<(String, Vec<HistoryBar>)> {
+        (0..symbols)
+            .map(|symbol| {
+                let anchor = 100.0 + symbol as f64 * 0.4;
+                let mut price = anchor;
+                let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ (symbol as u64 + 1);
+                let bars = (0..count)
+                    .map(|index| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        let noise = ((state >> 11) % 2001) as f64 / 1_000.0 - 1.0;
+                        price += (anchor - price) * 0.08 + noise * 0.8;
+                        let open = price - noise * 0.2;
+                        let open_time = index as i64 * 3_600_000;
+                        HistoryBar {
+                            open_time,
+                            close_time: open_time + 3_599_999,
+                            open,
+                            high: open.max(price) + 0.5,
+                            low: open.min(price) - 0.5,
+                            close: price,
+                            volume: 10_000.0,
+                        }
+                    })
+                    .collect();
+                (format!("SYM{}USDT", symbol + 1), bars)
+            })
+            .collect()
+    }
+
+    fn tagged_regimes_cover_target(basket: &[(String, Vec<HistoryBar>)], target: &str) -> usize {
+        let frame_ms = timeframe_ms("1h").unwrap();
+        let regimes = build_market_regime_map(basket, frame_ms);
+        assert!(!regimes.is_empty(), "市场 regime map 不应为空");
+        let config = basket_config();
+        let mut tagged = 0;
+        for (_, bars) in basket {
+            let mut result = run(bars, &config).unwrap();
+            tag_trades(&mut result, &regimes, frame_ms);
+            assert!(
+                result
+                    .trades
+                    .iter()
+                    .all(|trade| !trade.market_regime.is_empty()),
+                "每笔成交都应回填 market_regime"
+            );
+            tagged += result
+                .trades
+                .iter()
+                .filter(|trade| trade.market_regime == target)
+                .count();
+        }
+        tagged
+    }
+
+    #[test]
+    fn basket_fixed_filters_target_market_regime_and_aggregates() {
+        let basket = synthetic_basket(6, 700);
+        let metrics = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(metrics.target_regime, "range");
+        assert_eq!(metrics.timeframe, "1h");
+        assert!(metrics.symbols_used.len() >= 6);
+        assert!(metrics.folds >= 2);
+        assert!(metrics.oos_trades > 0);
+        assert!(metrics.max_drawdown_pct >= 0.0);
+        assert!((0.0..=1.0).contains(&metrics.bootstrap_p_positive));
+        assert!(
+            tagged_regimes_cover_target(&basket, "range") > 0,
+            "至少一笔成交的 market_regime 应为 range"
+        );
+    }
+
+    #[test]
+    fn basket_fixed_rejects_insufficient_coverage() {
+        let basket = synthetic_basket(5, 700);
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("少于 6 个"));
+    }
+
+    #[test]
+    fn basket_fixed_rejects_when_target_regime_has_no_oos_trades() {
+        let basket = synthetic_basket(6, 700);
+        let frame_ms = timeframe_ms("1h").unwrap();
+        let regimes = build_market_regime_map(&basket, frame_ms);
+        assert!(!regimes.is_empty(), "chaos 用例仍应产生非空 regime map");
+        assert!(
+            regimes
+                .values()
+                .all(|regime| *regime != crate::regime::Regime::Chaos),
+            "合成数据不应出现 chaos，才能覆盖无目标 regime 分支"
+        );
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Chaos,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("symbol×fold") || error.contains("OOS"),
+            "实际错误: {error}"
+        );
+    }
+
+    #[test]
+    fn basket_fixed_counts_symbol_fold_units_for_mixed_coverage() {
+        let mut basket = synthetic_basket(6, 700);
+        basket[0].1.truncate(400);
+        let metrics = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            4,
+            150,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            metrics.folds >= 6,
+            "6 个标的应至少评估 6 个 symbol×fold 单元"
+        );
+        assert!(metrics.positive_folds <= metrics.folds);
+        assert!(metrics.oos_trades > 0);
+    }
+
+    #[test]
+    fn compounded_max_drawdown_follows_compound_returns() {
+        assert!(compounded_max_drawdown(&[]).abs() < 1e-9);
+        assert!(compounded_max_drawdown(&[(1, 5.0), (2, 10.0)]).abs() < 1e-9);
+        assert!((compounded_max_drawdown(&[(2, -20.0), (1, 10.0)]) - 20.0).abs() < 1e-6);
+        assert!((compounded_max_drawdown(&[(1, -50.0), (2, 100.0)]) - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn basket_fixed_rejects_timeframe_mismatch() {
+        let basket = synthetic_basket(6, 700);
+        let mut cfg = basket_config();
+        cfg.interval_ms = 900_000;
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &cfg,
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("不一致"), "实际错误: {error}");
+    }
+
+    #[test]
+    fn timeframe_parser_rejects_invalid_input_and_parses_units() {
+        assert_eq!(timeframe_ms("1h").unwrap(), 3_600_000);
+        assert_eq!(timeframe_ms("15m").unwrap(), 900_000);
+        assert!(timeframe_ms("").is_err());
+        assert!(timeframe_ms("h").is_err());
+        assert!(timeframe_ms("1x").is_err());
+        assert!(timeframe_ms("0h").is_err());
     }
 }

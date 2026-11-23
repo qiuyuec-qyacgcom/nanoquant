@@ -35,6 +35,8 @@ mod db;
 mod engine;
 mod engine_actions;
 mod events;
+mod evidence;
+mod evidence_task;
 mod evolution;
 mod evolution_api;
 mod evolution_review;
@@ -52,11 +54,14 @@ mod news;
 mod oi_regime;
 mod ops_tools;
 mod param_registry;
+mod parameter_sets;
+mod parameter_sets_api;
 mod protection_api;
 mod providers;
 mod public;
 mod reasoning;
 mod reconcile;
+mod regime;
 mod review;
 mod risk;
 mod runtime;
@@ -73,6 +78,7 @@ mod submit;
 mod symbols;
 mod system;
 mod trade_policy;
+mod tuning;
 mod ws;
 mod wsauth;
 
@@ -306,6 +312,10 @@ async fn main() {
             ai_market::BinanceMarketSource::new(db.clone()),
         ))
     });
+    // 独立调参任务：只在有数据库时启动，只生成候选参数集，与交易引擎完全解耦。
+    if let Some(ai) = ai_state.clone() {
+        tokio::spawn(crate::tuning::spawn_tuning_task(ai, stop_tx.subscribe()));
+    }
     // 执行内核端点：EXEC_TCP 优先，其次 EXEC_SOCKET（与旧 exec_endpoint 同口径）。
     let exec_endpoint = std::env::var("EXEC_TCP")
         .ok()
@@ -453,6 +463,7 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         );
         api = api.merge(public::routes().with_state(database.clone()));
         api = api.merge(engine::routes().with_state(database.clone()));
+        api = api.merge(parameter_sets_api::routes().with_state(database.clone()));
         api = api.merge(engine_actions::routes().with_state(state.clone()));
         api = api.merge(protection_api::routes().with_state(state.clone()));
         api = api.merge(evolution_api::routes().with_state(database.clone()));

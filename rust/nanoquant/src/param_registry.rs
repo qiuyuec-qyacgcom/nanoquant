@@ -15,7 +15,10 @@ pub(crate) struct ParamMeta {
 }
 
 /// 这些组的全部非敏感字段可写（含页面可见字段）。
-pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["risk", "strategy"];
+pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
+
+/// 组级黑名单：即使整组对 AI 不可见也不得写入，避免新组默认变成可写。
+const AI_BLOCKED_GROUPS: &[&str] = &["parameter_set", "risk"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
 const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
@@ -74,7 +77,19 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
+    ("parameter_set", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
+    (
+        "parameter_set",
+        "no_candidate_rollback_sec",
+        60.0,
+        86400.0,
+        60.0,
+    ),
+    ("parameter_set", "regime_confirm_sec", 60.0, 86400.0, 60.0),
+    ("parameter_set", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
+    ("parameter_set", "min_oos_trades", 1.0, 1000.0, 1.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
+    ("ai", "param_tuning_min_interval_sec", 60.0, 604800.0, 60.0),
     ("ai", "max_calls_per_hour", 1.0, 10000.0, 1.0),
     ("ai", "monthly_budget_usd", 0.0, 1.0e6, 0.1),
     ("ai", "timeout_sec", 1.0, 300.0, 1.0),
@@ -152,6 +167,19 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "partial_tp_ratio",
             "max_spread_bps",
             "roi_table",
+        ],
+    ),
+    (
+        "parameter_set",
+        &[
+            "enabled",
+            "auto_apply",
+            "max_auto_apply_per_24h",
+            "no_candidate_rollback_sec",
+            "regime_confirm_sec",
+            "regime_cooldown_sec",
+            "min_oos_trades",
+            "auto_apply_timeframes",
         ],
     ),
     (
@@ -261,7 +289,10 @@ fn is_visible(group: &str, key: &str) -> bool {
 }
 
 fn is_ai_writable(group: &str, key: &str) -> bool {
-    if group == "ai" || AI_BLOCKED_KEYS.contains(&(group, key)) {
+    if group == "ai"
+        || AI_BLOCKED_GROUPS.contains(&group)
+        || AI_BLOCKED_KEYS.contains(&(group, key))
+    {
         return false;
     }
     if is_sensitive(group, key) {
@@ -273,7 +304,18 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     !is_visible(group, key)
 }
 
-fn kind_of(value: &Value) -> &'static str {
+/// AI 调参专用边界：prompt 展示与候选校验共用同一区间。
+pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
+    match (group, key) {
+        ("strategy", "atr_pct_min") => Some((0.0, 1.0)),
+        ("strategy", "atr_pct_max") => Some((6.0, 20.0)),
+        ("strategy", "volume_ratio_min") => Some((0.0, 1.0)),
+        ("strategy", "entry_threshold") => Some((0.01, 0.5)),
+        _ => None,
+    }
+}
+
+pub(crate) fn kind_of(value: &Value) -> &'static str {
     match value {
         Value::Bool(_) => "bool",
         Value::Number(_) => "number",
@@ -333,36 +375,6 @@ pub(crate) fn catalog() -> Value {
             group.clone(),
             json!({ "hidden": hidden, "writable": writable, "meta": meta }),
         );
-    }
-    json!({ "groups": groups })
-}
-
-/// 只给 AI 看可写字段的边界：不带 visible/hidden 标志，避免模型猜测可见性。
-pub(crate) fn writable_catalog() -> Value {
-    let mut groups = Map::new();
-    for (group, object) in defaults().as_object().unwrap() {
-        let Some(object) = object.as_object() else {
-            continue;
-        };
-        let mut fields = Map::new();
-        for (key, default) in object {
-            if !is_ai_writable(group, key) {
-                continue;
-            }
-            let (min, max, step) = range_of(group, key);
-            fields.insert(
-                key.clone(),
-                json!({
-                    "kind": kind_of(default),
-                    "min": min,
-                    "max": max,
-                    "step": step,
-                }),
-            );
-        }
-        if !fields.is_empty() {
-            groups.insert(group.clone(), Value::Object(fields));
-        }
     }
     json!({ "groups": groups })
 }
@@ -470,7 +482,7 @@ mod tests {
         assert!(!find("engine", "enabled").unwrap().ai_writable);
         assert!(!find("signal_follow", "enabled").unwrap().ai_writable);
         assert!(!find("backup", "encrypt").unwrap().ai_writable);
-        assert!(find("risk", "max_leverage").unwrap().ai_writable);
+        assert!(!find("risk", "max_leverage").unwrap().ai_writable);
     }
 
     #[test]
@@ -507,8 +519,8 @@ mod tests {
             "入场核心可写"
         );
         assert!(
-            find("risk", "max_leverage").unwrap().ai_writable,
-            "风控核心可写"
+            !find("risk", "max_leverage").unwrap().ai_writable,
+            "风控核心不可写"
         );
         assert!(
             !find("engine", "cycle_interval_sec").unwrap().ai_writable,
@@ -525,19 +537,84 @@ mod tests {
     }
 
     #[test]
-    fn writable_catalog_only_lists_writable_fields() {
-        let catalog = writable_catalog();
-        let groups = catalog["groups"].as_object().unwrap();
-        let field = &groups["strategy"]["entry_threshold"];
-        assert_eq!(field["kind"], "number");
-        assert!(field.get("min").is_some());
-        assert!(field.get("hidden").is_none(), "不暴露可见性标志");
-        assert!(field.get("ai_writable").is_none(), "不暴露可写标志");
-        let engine = groups.get("engine").and_then(Value::as_object);
+    fn parameter_set_group_is_visible_but_ai_blocked() {
+        let value = crate::param_registry::catalog();
+        let group = &value["groups"]["parameter_set"];
+        assert_eq!(group["writable"], serde_json::json!([]));
+        for key in [
+            "enabled",
+            "auto_apply",
+            "max_auto_apply_per_24h",
+            "no_candidate_rollback_sec",
+            "regime_confirm_sec",
+            "regime_cooldown_sec",
+            "min_oos_trades",
+            "auto_apply_timeframes",
+        ] {
+            assert_eq!(
+                group["meta"][key]["visible"],
+                serde_json::json!(true),
+                "{key} 应可见"
+            );
+            assert_eq!(
+                group["meta"][key]["ai_writable"],
+                serde_json::json!(false),
+                "{key} 不可被 AI 写"
+            );
+        }
+    }
+
+    #[test]
+    fn risk_is_not_ai_writable_after_a_phase() {
         assert!(
-            engine.is_none_or(|fields| !fields.contains_key("cycle_interval_sec")),
-            "可见运行参数不该出现在写目录里"
+            !crate::param_registry::find("risk", "max_leverage")
+                .unwrap()
+                .ai_writable
         );
-        assert!(groups.get("ai").is_none(), "ai 组不可写，不应出现");
+        assert!(
+            !crate::param_registry::find("risk", "risk_per_trade_pct")
+                .unwrap()
+                .ai_writable
+        );
+        assert!(!is_ai_writable("risk", "future_hidden_field"));
+        assert!(
+            crate::param_registry::find("strategy", "entry_threshold")
+                .unwrap()
+                .ai_writable
+        );
+    }
+
+    #[test]
+    fn ai_bounds_are_stricter_than_manual_ranges() {
+        for (group, key) in [
+            ("strategy", "atr_pct_min"),
+            ("strategy", "atr_pct_max"),
+            ("strategy", "volume_ratio_min"),
+            ("strategy", "entry_threshold"),
+        ] {
+            let (low, high) = ai_bounds(group, key).unwrap();
+            let (min, max, _) = range_of(group, key);
+            assert!(low >= min.unwrap(), "{group}.{key} 下界应落在 RANGES 内");
+            assert!(high <= max.unwrap(), "{group}.{key} 上界应落在 RANGES 内");
+        }
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "atr_pct_min"),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "atr_pct_max"),
+            Some((6.0, 20.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "volume_ratio_min"),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "entry_threshold"),
+            Some((0.01, 0.5))
+        );
+        assert_eq!(ai_bounds("risk", "max_leverage"), None);
+        assert_eq!(ai_bounds("strategy", "ema_fast"), None);
+        assert_eq!(ai_bounds("parameter_set", "min_oos_trades"), None);
     }
 }

@@ -132,6 +132,8 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         }
         backfill_sort_order(conn)?;
         ensure_parameter_changes(conn)?;
+        ensure_parameter_sets(conn)?;
+        normalize_ai_tuning_interval(conn)?;
         drop_legacy_default_leverage(conn)?;
         Ok(())
     })();
@@ -149,6 +151,58 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
          CREATE INDEX IF NOT EXISTS ix_parameter_changes_ts ON parameter_changes(ts);",
     )
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
+}
+
+pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parameter_sets(\
+         id INTEGER PRIMARY KEY, name TEXT NOT NULL, regime TEXT NOT NULL, timeframe TEXT NOT NULL, \
+         version INTEGER NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, \
+         evidence TEXT NOT NULL DEFAULT '{}', parent_id INTEGER, created_at INTEGER NOT NULL, activated_at INTEGER); \
+         CREATE UNIQUE INDEX IF NOT EXISTS ix_parameter_sets_active_regime ON parameter_sets(regime) WHERE status='active'; \
+         CREATE INDEX IF NOT EXISTS ix_parameter_sets_regime_status ON parameter_sets(regime,status); \
+         CREATE TABLE IF NOT EXISTS parameter_set_activations(\
+         id INTEGER PRIMARY KEY, set_id INTEGER NOT NULL, regime TEXT NOT NULL, previous_set_id INTEGER, \
+         ts INTEGER NOT NULL, trigger TEXT NOT NULL); \
+         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_ts ON parameter_set_activations(ts); \
+         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_set_id ON parameter_set_activations(set_id);",
+    )
+    .map_err(|e| format!("建表 parameter_sets 失败: {e}"))?;
+    if !column_exists(conn, "parameter_changes", "set_id")? {
+        conn.execute_batch("ALTER TABLE parameter_changes ADD COLUMN set_id INTEGER;")
+            .map_err(|e| format!("补列 parameter_changes.set_id 失败: {e}"))?;
+    }
+    if !column_exists(conn, "parameter_changes", "regime")? {
+        conn.execute_batch("ALTER TABLE parameter_changes ADD COLUMN regime TEXT;")
+            .map_err(|e| format!("补列 parameter_changes.regime 失败: {e}"))?;
+    }
+    if !column_exists(conn, "trades", "parameter_set_id")? {
+        conn.execute_batch("ALTER TABLE trades ADD COLUMN parameter_set_id INTEGER;")
+            .map_err(|e| format!("补列 trades.parameter_set_id 失败: {e}"))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ix_parameter_changes_set_id ON parameter_changes(set_id); \
+         CREATE INDEX IF NOT EXISTS ix_trades_parameter_set_id ON trades(parameter_set_id);",
+    )
+    .map_err(|e| format!("建索引 parameter_set 关联列失败: {e}"))?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    Ok(column_names(conn, table)?.contains(column))
+}
+
+/// 存量库的调参间隔 0 表示「每轮复核都可调参」，A 期解耦后语义变为独立任务间隔，
+/// 必须归一为 86400；显式配置过的非 0 值保持不动。
+pub(crate) fn normalize_ai_tuning_interval(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE app_settings SET value = json_set(value, '$.param_tuning_min_interval_sec', 86400) \
+         WHERE key='ai' AND json_valid(value) \
+         AND COALESCE(json_extract(value, '$.param_tuning_min_interval_sec'), 0) = 0",
+        [],
+    )
+    .map_err(|e| format!("迁移 ai.param_tuning_min_interval_sec 失败: {e}"))?;
+    Ok(())
 }
 
 /// 杠杆改由「AI 在全局上下限内给值」，老库里的 default_leverage 必须清掉：
@@ -250,7 +304,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let report = migrate(&conn).unwrap();
         assert_eq!(report.created_tables.len(), 23);
-        assert_eq!(table_count(&conn), 24);
+        assert_eq!(table_count(&conn), 26);
     }
 
     #[test]
@@ -261,7 +315,65 @@ mod tests {
         assert!(second.created_tables.is_empty());
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
-        assert_eq!(table_count(&conn), 24);
+        assert_eq!(table_count(&conn), 26);
+    }
+
+    #[test]
+    fn normalize_ai_tuning_interval_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings(key,value,updated_at) \
+             VALUES('ai','{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":0}',0)",
+            [],
+        )
+        .unwrap();
+        normalize_ai_tuning_interval(&conn).unwrap();
+        normalize_ai_tuning_interval(&conn).unwrap();
+        let raw: String = conn
+            .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let ai: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ai["param_tuning_min_interval_sec"], 86400);
+    }
+
+    #[test]
+    fn migrate_normalize_ai_tuning_interval_keeps_nonzero_and_fills_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let write_ai = |value: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key,value,updated_at) VALUES('ai',?1,0)",
+                [value],
+            )
+            .unwrap();
+        };
+        let read_ai = || -> serde_json::Value {
+            let raw: String = conn
+                .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        write_ai("{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":0}");
+        migrate(&conn).unwrap();
+        let zero = read_ai();
+        assert_eq!(zero["param_tuning_min_interval_sec"], 86400);
+        assert_eq!(zero["allow_param_tuning"], true);
+
+        write_ai("{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":3600}");
+        migrate(&conn).unwrap();
+        assert_eq!(read_ai()["param_tuning_min_interval_sec"], 3600);
+
+        write_ai("{\"allow_param_tuning\":false}");
+        migrate(&conn).unwrap();
+        let missing = read_ai();
+        assert_eq!(missing["param_tuning_min_interval_sec"], 86400);
+        assert_eq!(missing["allow_param_tuning"], false);
     }
 
     #[test]

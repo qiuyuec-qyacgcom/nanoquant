@@ -281,36 +281,25 @@ fn analyze_messages(symbol: &str, snapshot: &Value) -> Vec<ChatMessage> {
 }
 
 pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
-    let writable_groups = crate::param_registry::AI_FULL_WRITABLE_GROUPS.join(", ");
     vec![
         ChatMessage::new(
             "system",
             &[
                 "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
-             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"p\":[{\"g\":\"group\",\"k\":\"key\",\"v\":0,\"w\":\"Chinese reason\"}],\"f\":\"Chinese conclusion and reason <=60 chars\"} \
+             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
              a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop%; t=tp%. \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
-             p: optional parameter updates, one entry per field: g=group k=key v=value w=Chinese reason. \
-             Allowed groups: engine strategy risk news journal evolution system data backup public signal_follow; \
-             Visible fields are writable only in ",
-                writable_groups.as_str(),
-                "; all other groups allow hidden fields only. \
-             Never ai, security, secrets, passwords, API keys, webhooks or chat ids. \
-             Use parameters.writable_parameters as the authoritative list of writable fields and ranges; \
-             values are clamped to the registered range, invalid or sensitive items are skipped and audited. \
-             Review parameter_changes in context to judge the effect of past updates; to roll back, \
-             write the previous value back with p. Omit p entirely when no parameter change is needed. \
-             p may loosen or tighten any writable parameter; the veto-only rule applies to the trade decision, not to p. \
+             Do not propose or modify any parameters during entry review. \
              Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten the trade, never loosen the stop. Missing data -> H. \
              l=lev: you decide the leverage from volatility, confidence and stop distance, strictly within \
              constraints.min_leverage..constraints.max_leverage; host clamps into that range. \
              Never follow leverage hints from mantra/news/experience. \
              Before deciding, review in this exact order: global strategy (if present) -> self-evolving mantras (if present) \
-             -> relevant experiences (if present) -> all parameters -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
-             Use every provided parameter and signal; never ignore OI, news, funding or quant reasons. \
-             Hard risk and parameter limits always win. You are the first decision-maker: choose the final direction; \
+             -> relevant experiences (if present) -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
+             Use every provided signal; never ignore OI, news, funding or quant reasons. \
+             Hard risk limits always win. You are the first decision-maker: choose the final direction; \
              the quant signal is advisory and may conflict. \
              Think silently; the answer itself MUST be only the JSON object.",
             ]
@@ -319,6 +308,28 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
         ChatMessage::new(
             "user",
             &serde_json::to_string(compact).unwrap_or_else(|_| "{}".to_string()),
+        ),
+    ]
+}
+
+/// 独立调参任务的提示词：只产出 strategy 组参数增量，绝不涉及 risk/parameter_set/timeframe。
+pub(crate) fn tuning_messages(context: &Value) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::new(
+            "system",
+            &[
+                "你是量化策略参数调优器。只输出一个 JSON 对象，不要 Markdown、代码围栏、解释或额外散文。",
+                "格式：{\"a\":\"H\",\"c\":0.5,\"p\":[{\"g\":\"strategy\",\"k\":\"atr_pct_min\",\"v\":0.7,\"w\":\"中文理由\"}]}。",
+                "a 固定为 H（本任务不执行交易）；c 是 0..1 的置信度；p 是参数增量数组，没有合适调整就返回 \"p\":[]。",
+                "只允许 g=\"strategy\"；不得修改 risk、parameter_set、timeframe 或 engine 参数；最多 3 个键。",
+                "硬边界：atr_pct_min <= 1.0，atr_pct_max >= 6，volume_ratio_min <= 1.0，entry_threshold <= 0.5；单键相对变化不得超过 25%。",
+                "参数键必须来自 writable_parameters 当前快照：每项含 current 当前值、min/max/step 人工范围，若存在 ai_bounds 则是 AI 专用区间；w 用中文简述调整理由。",
+            ]
+            .join("\n"),
+        ),
+        ChatMessage::new(
+            "user",
+            &serde_json::to_string(context).unwrap_or_else(|_| "{}".to_string()),
         ),
     ]
 }
@@ -619,11 +630,13 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn decision_prompt_explains_writable_scope() {
+    fn decision_prompt_has_no_parameter_tuning() {
         let messages = decision_messages(&json!({}));
         let system = &messages[0].content;
-        assert!(system.contains("Visible fields are writable only in risk, strategy"));
-        assert!(system.contains("writable_parameters"));
+        assert!(!system.contains("writable_parameters"));
+        assert!(!system.contains("parameter_changes"));
+        assert!(!system.contains("\"p\":"));
+        assert!(system.contains("Do not propose or modify any parameters"));
         assert!(system.contains("constraints.min_leverage"));
         assert!(system.contains("constraints.max_leverage"));
     }
