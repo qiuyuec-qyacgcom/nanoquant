@@ -36,6 +36,7 @@ mod engine;
 mod engine_actions;
 mod events;
 mod evidence;
+mod evidence_task;
 mod evolution;
 mod evolution_api;
 mod evolution_review;

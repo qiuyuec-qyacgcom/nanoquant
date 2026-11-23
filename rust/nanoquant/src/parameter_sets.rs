@@ -323,6 +323,28 @@ pub(crate) fn insert_candidate(
     )
 }
 
+/// 证据门结果落库：只允许改写待评估的 AI 候选。
+/// `active`/`strategy` 与人工参数集一律不动；没有匹配行时返回 Err，避免静默丢结果。
+pub(crate) fn mark_evidence(
+    conn: &Connection,
+    id: i64,
+    pass: bool,
+    evidence: &Value,
+) -> Result<(), String> {
+    let status = if pass { "approved" } else { "rejected" };
+    let updated = conn
+        .execute(
+            "UPDATE parameter_sets SET status=?1, evidence=?2 \
+             WHERE id=?3 AND source='ai' AND status='candidate'",
+            params![status, evidence.to_string(), id],
+        )
+        .map_err(|error| format!("写入参数集 {id} 证据失败: {error}"))?;
+    if updated == 0 {
+        return Err(format!("参数集 {id} 不是待评估的 AI 候选，未写入证据"));
+    }
+    Ok(())
+}
+
 /// 把 AI 参数增量合并到 active 快照上并校验，返回完整 strategy 快照。
 /// 任何一条不合规都整体拒绝，避免部分写入。
 pub(crate) fn validate_candidate(
@@ -1018,5 +1040,70 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM parameter_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3, "失败的候选不应写入");
+    }
+
+    fn pending_candidate(conn: &Connection, name: &str) -> (i64, i64) {
+        let parent = active_for_regime(conn, "range").unwrap().unwrap();
+        let snapshot = validate_candidate(
+            &parent.params,
+            &[param_update("entry_threshold", json!(0.40))],
+        )
+        .unwrap();
+        let id = insert_candidate(conn, name, "range", "1h", &snapshot, Some(parent.id)).unwrap();
+        (id, parent.id)
+    }
+
+    #[test]
+    fn mark_evidence_approves_pending_candidate_without_touching_active() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let (candidate_id, parent_id) = pending_candidate(&conn, "range-ai-approved");
+        let evidence = json!({"gate":{"pass":true,"reasons":[]}});
+
+        mark_evidence(&conn, candidate_id, true, &evidence).unwrap();
+
+        let set = load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "approved");
+        assert_eq!(set.source, "ai");
+        assert_eq!(set.evidence, evidence);
+        assert!(set.activated_at.is_none(), "B 期证据门不得激活参数集");
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().id,
+            parent_id,
+            "落证据不得改变 active"
+        );
+
+        assert!(
+            mark_evidence(&conn, candidate_id, false, &json!({"gate":{"pass":false}})).is_err(),
+            "已评审候选不能再写一次证据"
+        );
+        let set = load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "approved", "重复写入失败不得改状态");
+        assert_eq!(set.evidence, evidence, "重复写入失败不得改证据");
+
+        assert!(
+            mark_evidence(&conn, parent_id, true, &json!({})).is_err(),
+            "active 不是待评估 AI 候选，必须拒绝"
+        );
+        assert_eq!(
+            load_set(&conn, parent_id).unwrap().status,
+            "active",
+            "拒绝写入不得改动其他状态"
+        );
+    }
+
+    #[test]
+    fn mark_evidence_rejects_failed_candidate() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let (candidate_id, _) = pending_candidate(&conn, "range-ai-rejected");
+        let evidence = json!({"gate":{"pass":false,"reasons":["insufficient_oos_trades: 0 < 30"]}});
+
+        mark_evidence(&conn, candidate_id, false, &evidence).unwrap();
+
+        let set = load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "rejected");
+        assert_eq!(set.source, "ai");
+        assert_eq!(set.evidence, evidence);
     }
 }

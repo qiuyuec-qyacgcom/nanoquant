@@ -45,8 +45,21 @@ pub(crate) fn spawn_tuning_task(
             if *stop.borrow() {
                 break;
             }
-            if let Err(error) = run_once(&state).await {
-                record_failure(&state, &error);
+            match run_once(&state).await {
+                Ok(Some(set_id)) => {
+                    // 候选先提交，再串行跑证据门：证伪/失败都不影响下一轮调参。
+                    if let Err(error) =
+                        crate::evidence_task::evaluate_candidate(state.clone(), set_id).await
+                    {
+                        tracing::warn!(
+                            set_id,
+                            error = %sanitize_error(&error),
+                            "候选参数集证据门失败, 保留 candidate 待重试"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => record_failure(&state, &error),
             }
             let wait = interval_seconds(&state).max(MIN_INTERVAL_SEC) as u64;
             tokio::select! {
@@ -61,15 +74,16 @@ pub(crate) fn spawn_tuning_task(
     }
 }
 
-/// 单轮任务：读取配置与父集，调 AI，校验并落候选。跳过条件返回 `Ok(())`。
-pub(crate) async fn run_once(state: &AiState) -> Result<(), String> {
+/// 单轮任务：读取配置与父集，调 AI，校验并落候选。
+/// 生成候选返回 `Some(set_id)`；跳过或无候选返回 `None`。
+pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
     let Some(prepared) = prepare(state)? else {
-        return Ok(());
+        return Ok(None);
     };
     let (cfg, chain) = provider_chain(state);
     // ai.enabled=false 是总开关：不调用模型、不生成候选，也不推进调参时间戳。
     if !cfg.enabled {
-        return Ok(());
+        return Ok(None);
     }
     if chain.is_empty() {
         return Err("未配置可用的 AI 模型, 请先在「AI 模型」中接入并启用".to_string());
@@ -140,11 +154,14 @@ pub(crate) async fn run_once(state: &AiState) -> Result<(), String> {
                     "timeframe": prepared.active.timeframe,
                 }),
             )?;
+            tx.commit()
+                .map_err(|error| format!("提交调参事务失败: {error}"))?;
+            return Ok(Some(set_id));
         }
     }
     tx.commit()
         .map_err(|error| format!("提交调参事务失败: {error}"))?;
-    Ok(())
+    Ok(None)
 }
 
 struct Prepared {
@@ -361,7 +378,7 @@ fn record_failure(state: &AiState, error: &str) {
 }
 
 /// 失败文本可能带上游 URL/响应体：截断并去掉 URL 查询串与常见 key 参数。
-fn sanitize_error(error: &str) -> String {
+pub(crate) fn sanitize_error(error: &str) -> String {
     let mut text: String = error.chars().take(400).collect();
     if let Some(scheme) = text.find("://") {
         if let Some(offset) = text[scheme..].find('?') {
@@ -688,7 +705,11 @@ mod tests {
             vec![chat_reply("{\"a\":\"H\",\"c\":0.5,\"p\":[]}")],
         );
 
-        run_once(&state).await.unwrap();
+        assert_eq!(
+            run_once(&state).await.unwrap(),
+            None,
+            "关闭总开关不应生成候选"
+        );
 
         assert_eq!(candidate_count(&db), 0, "关闭总开关不应生成候选");
         assert!(event_payloads(&db).is_empty(), "关闭总开关不应写参数集事件");
@@ -707,7 +728,7 @@ mod tests {
         // 空 replies：若误调用模型，chat 会因 500 失败并让 run_once 返回 Err。
         let state = state(db.clone(), Vec::new());
 
-        run_once(&state).await.unwrap();
+        assert_eq!(run_once(&state).await.unwrap(), None);
 
         assert_eq!(candidate_count(&db), 0, "AI 总开关关闭不应生成候选");
         assert!(
@@ -734,7 +755,7 @@ mod tests {
         seed_regime(&db, "range");
         let state = state(db.clone(), Vec::new());
 
-        run_once(&state).await.unwrap();
+        assert_eq!(run_once(&state).await.unwrap(), None);
 
         assert_eq!(candidate_count(&db), 0);
         let payloads = event_payloads(&db);
@@ -761,7 +782,11 @@ mod tests {
             )],
         );
 
-        run_once(&state).await.unwrap();
+        let set_id = run_once(&state)
+            .await
+            .unwrap()
+            .expect("决策含参数增量时应生成候选");
+        assert!(set_id > 0);
 
         let conn = db.conn.lock().unwrap();
         let parent_id: i64 = conn
@@ -805,7 +830,7 @@ mod tests {
             .unwrap();
         assert_eq!(message, "生成参数集候选");
         let payload: Value = serde_json::from_str(&payload).unwrap();
-        assert!(payload["set_id"].as_i64().unwrap() > 0);
+        assert_eq!(payload["set_id"].as_i64(), Some(set_id));
         assert_eq!(payload["event"], "parameter_set.candidate");
         assert_eq!(payload["regime"], "range");
         assert_eq!(payload["timeframe"], "1h");
@@ -836,7 +861,7 @@ mod tests {
         }
         let state = state(db.clone(), Vec::new());
 
-        run_once(&state).await.unwrap();
+        assert_eq!(run_once(&state).await.unwrap(), None);
 
         assert_eq!(
             candidate_count(&db),
@@ -862,7 +887,7 @@ mod tests {
             vec![chat_reply("{\"a\":\"H\",\"c\":0.5,\"p\":[]}")],
         );
 
-        run_once(&state).await.unwrap();
+        assert_eq!(run_once(&state).await.unwrap(), None);
 
         assert_eq!(candidate_count(&db), 0, "p:[] 不应生成候选");
         let payloads = event_payloads(&db);
