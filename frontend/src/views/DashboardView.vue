@@ -7,6 +7,7 @@ import EventFeed from '../components/EventFeed.vue'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
+import { displayDirection, displayScore } from '../utils/signalAudit'
 
 interface EquityPoint { ts: number; wallet: number; unrealized: number; available: number; margin_used: number; positions: number }
 
@@ -605,10 +606,10 @@ useSilentRefresh(load, 30000)
               <td>{{ s.symbol }}</td>
               <td>
                 <span class="tag" :class="s.direction === 'long' ? 'tag-long' : s.direction === 'short' ? 'tag-short' : 'tag-dim'">
-                  {{ s.direction }}
+                  {{ displayDirection(s).text }}
                 </span>
               </td>
-              <td class="mono">{{ s.score?.toFixed(3) }}</td>
+              <td class="mono">{{ displayScore(s).text }}</td>
               <td>
                 <span v-if="s.ai_action" class="tag tag-ai">{{ s.ai_action }} · {{ ((s.ai_confidence || 0) * 100).toFixed(0) }}%</span>
                 <span v-else class="muted">-</span>

@@ -88,6 +88,9 @@ struct EntryDraft {
     side: String,
     quant_side: Option<String>,
     quant_score: Option<f64>,
+    preview_side: Option<String>,
+    preview_score: Option<f64>,
+    quant_passed: bool,
     /// 全局杠杆下限（AI 未给杠杆时的回退值）。
     leverage: f64,
     /// 全局杠杆上限，已并入交易所与单标的限制。
@@ -104,6 +107,18 @@ struct EntryDraft {
 }
 
 impl EntryDraft {
+    fn signal_side(&self) -> Option<&str> {
+        self.quant_side
+            .as_deref()
+            .or(self.preview_side.as_deref())
+    }
+
+    fn signal_score(&self) -> f64 {
+        self.quant_score
+            .or(self.preview_score)
+            .unwrap_or(self.score)
+    }
+
     fn proposal(&self) -> crate::review::EntryProposal {
         crate::review::EntryProposal {
             symbol: self.symbol.clone(),
@@ -145,13 +160,21 @@ impl EntryDraft {
             );
             object.insert("mark_price".to_string(), json!(self.mark_price));
         }
-        crate::signal_audit::AuditSignal::new(&self.symbol)
+        let row = crate::signal_audit::AuditSignal::new(&self.symbol)
             .with_direction(direction)
-            .with_score(self.quant_score.unwrap_or(self.score))
+            .with_score(self.signal_score())
             .with_features(features)
             .with_ai(ai_action, ai_confidence, ai_reason)
             .with_decision(decision)
-            .with_reject_reason(reject_reason)
+            .with_reject_reason(reject_reason);
+        if !self.quant_passed
+            && self.preview_side.as_deref() == Some(direction)
+            && decision == "rejected"
+        {
+            row.with_stage("evaluate")
+        } else {
+            row
+        }
     }
 }
 
@@ -2328,19 +2351,30 @@ impl EngineRuntime {
                 continue;
             };
             let price = market.mark_price;
+            let features = crate::trade_policy::MarketFeatures {
+                funding_rate: market.funding_rate,
+                open_interest_change_pct: market.open_interest_change_pct,
+                relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
+                relative_strength_available: relative_strength.contains_key(symbol),
+            };
             let signal = crate::trade_policy::evaluate(
                 &market.candles,
                 price,
                 metric.atr,
                 policy,
-                crate::trade_policy::MarketFeatures {
-                    funding_rate: market.funding_rate,
-                    open_interest_change_pct: market.open_interest_change_pct,
-                    relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
-                    relative_strength_available: relative_strength.contains_key(symbol),
-                },
+                features,
             );
-            let (side, stop_price, take_profit, score, quant_side, quant_score) = match signal {
+            let (
+                side,
+                stop_price,
+                take_profit,
+                score,
+                quant_side,
+                quant_score,
+                preview_side,
+                preview_score,
+                quant_passed,
+            ) = match signal {
                 Some(signal) => (
                     signal.side.to_string(),
                     signal.stop_price,
@@ -2348,11 +2382,34 @@ impl EngineRuntime {
                     signal.score,
                     Some(signal.side.to_string()),
                     Some(signal.score),
+                    Some(signal.side.to_string()),
+                    Some(signal.score),
+                    true,
                 ),
                 None => {
+                    let preview = crate::trade_policy::preview(
+                        &market.candles,
+                        price,
+                        metric.atr,
+                        features,
+                    );
+                    let preview_side = preview
+                        .filter(|item| item.side != "flat")
+                        .map(|item| item.side.to_string());
+                    let preview_score = preview.map(|item| item.score);
                     let sl = metric.atr * policy.sl_atr_mult;
                     let tp = metric.atr * policy.tp_atr_mult;
-                    ("long".to_string(), price - sl, price + tp, 0.0, None, None)
+                    (
+                        "long".to_string(),
+                        price - sl,
+                        price + tp,
+                        0.0,
+                        None,
+                        None,
+                        preview_side,
+                        preview_score,
+                        false,
+                    )
                 }
             };
             if stop_price <= 0.0 || take_profit <= 0.0 {
@@ -2399,6 +2456,9 @@ impl EngineRuntime {
                 "journal_snapshot": journal_snapshot,
                 "quant_side": quant_side,
                 "quant_score": quant_score,
+                "preview_side": preview_side,
+                "preview_score": preview_score,
+                "quant_passed": quant_passed,
             }))
             .unwrap_or_else(|_| "{}".to_string());
             let client_id = format!(
@@ -2410,6 +2470,9 @@ impl EngineRuntime {
                 side,
                 quant_side,
                 quant_score,
+                preview_side,
+                preview_score,
+                quant_passed,
                 leverage,
                 max_leverage: upper as f64,
                 stop_price,
@@ -2472,7 +2535,7 @@ impl EngineRuntime {
                     );
                     audit.push(draft.audit_row(
                         "rejected",
-                        draft.quant_side.as_deref().unwrap_or("flat"),
+                        draft.signal_side().unwrap_or("flat"),
                         &error.reason,
                         &error.action,
                         error.confidence,
@@ -4372,6 +4435,72 @@ mod tests {
         assert_eq!(value["stage"], "gate");
     }
 
+    struct HoldReviewer;
+
+    impl crate::review::AiReviewer for HoldReviewer {
+        fn review(
+            &self,
+            _proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            Ok(crate::review::ReviewDecision {
+                action: crate::review::ReviewAction::Hold,
+                side: None,
+                leverage: None,
+                stop_price: None,
+                take_profit: None,
+                reason: "测试观望".to_string(),
+                confidence: 0.62,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_hold_keeps_preview_direction_score_and_stage() {
+        let (db, mut snapshot) = entry_fixture().await;
+        let market = &mut snapshot.markets[0];
+        market.funding_rate = 0.0;
+        market.open_interest_change_pct = 0.0;
+        let runtime = test_runtime(&db).with_reviewer(Arc::new(HoldReviewer));
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (direction, score, features, ai_action, ai_confidence, decision): (
+            String,
+            f64,
+            String,
+            String,
+            f64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT direction, score, features, ai_action, ai_confidence, decision \
+                 FROM signals WHERE mode='demo' AND ai_action='hold' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(direction, "long", "AI 观望行要保留量化预评分方向");
+        assert!(score > 0.0, "AI 观望行要保留量化预评分: {score}");
+        let value: serde_json::Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["stage"], "evaluate");
+        assert_eq!(value["preview_side"], "long");
+        assert!(value["quant_side"].is_null());
+        assert_eq!(value["quant_passed"], false);
+        let preview_score = value["preview_score"].as_f64().unwrap();
+        assert!((preview_score - score).abs() < 1e-9);
+        assert_eq!(ai_action, "hold");
+        assert!((ai_confidence - 0.62).abs() < 1e-9, "AI 置信度不能被清零");
+        assert_eq!(decision, "rejected");
+    }
+
     #[tokio::test]
     async fn demo_signal_opens_once_with_sized_quantity_and_protection() {
         let (db, snapshot) = entry_fixture().await;
@@ -4578,6 +4707,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orders, 0, "AI 拒绝后不能产生订单");
+        let (score, features): (f64, String) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT score, features FROM signals WHERE mode='demo' AND decision='rejected' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(score > 0.0, "量化已过门槛时仍要保留真实评分: {score}");
+        let value: serde_json::Value = serde_json::from_str(&features).unwrap();
+        assert!(
+            value["stage"].is_null(),
+            "量化已过门槛的行不能标成预评分: {value}"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReviewAction {
     Agree,
+    Hold,
     Reject,
     Tighten,
 }
@@ -149,6 +150,15 @@ fn apply_decision(
             take_profit,
             reason: decision.reason,
             action: action_for(&side),
+            confidence,
+        }),
+        ReviewAction::Hold => Err(ReviewError {
+            reason: if decision.reason.is_empty() {
+                "AI 观望".to_string()
+            } else {
+                decision.reason
+            },
+            action: "hold".to_string(),
             confidence,
         }),
         ReviewAction::Reject => Err(ReviewError {
@@ -304,6 +314,23 @@ mod tests {
         assert!(apply_review(&proposal(), Some(&timeout), false).is_err());
         assert!(apply_review(&proposal(), None, true).is_err());
         assert!(apply_review(&proposal(), None, false).is_ok());
+    }
+
+    #[test]
+    fn hold_returns_ai_confidence_without_an_entry() {
+        let hold = FakeReviewer(Ok(ReviewDecision {
+            action: ReviewAction::Hold,
+            side: None,
+            leverage: None,
+            stop_price: None,
+            take_profit: None,
+            reason: "观望".to_string(),
+            confidence: 0.62,
+        }));
+        let error = apply_review(&proposal(), Some(&hold), true).unwrap_err();
+        assert_eq!(error.action, "hold");
+        assert!((error.confidence - 0.62).abs() < 1e-9);
+        assert_eq!(error.reason, "观望");
     }
 
     #[test]

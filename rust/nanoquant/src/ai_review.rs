@@ -478,11 +478,19 @@ fn decision_to_review(
         "open_long" => "long",
         "open_short" => "short",
         _ => {
-            return Ok(reject(if decision.reason.is_empty() {
-                "AI 未批准开仓".to_string()
-            } else {
-                decision.reason.clone()
-            }))
+            return Ok(ReviewDecision {
+                action: ReviewAction::Hold,
+                side: None,
+                leverage: None,
+                stop_price: None,
+                take_profit: None,
+                reason: if decision.reason.is_empty() {
+                    "AI 未批准开仓".to_string()
+                } else {
+                    decision.reason.clone()
+                },
+                confidence: decision.confidence,
+            })
         }
     };
     if side_lock == "long" && side == "short" {
@@ -625,13 +633,17 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_and_hold_are_rejected() {
+    fn low_confidence_is_rejected_and_hold_keeps_ai_confidence() {
         let low = decision_to_review(&proposal("long"), "any", &decision("open_long", 0.2), 0.45)
             .unwrap();
         assert_eq!(low.action, ReviewAction::Reject);
+        assert!((low.confidence - 0.2).abs() < 1e-9);
+
         let hold =
             decision_to_review(&proposal("long"), "any", &decision("hold", 0.9), 0.45).unwrap();
-        assert_eq!(hold.action, ReviewAction::Reject);
+        assert_eq!(hold.action, ReviewAction::Hold);
+        assert!((hold.confidence - 0.9).abs() < 1e-9);
+        assert_eq!(hold.reason, "test");
     }
 
     const MASTER_KEY: &str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";

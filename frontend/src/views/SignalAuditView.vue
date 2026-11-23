@@ -7,7 +7,8 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
-import { numClass, pct, timeStr } from '../utils/format'
+import { pct, timeStr } from '../utils/format'
+import { displayDirection, displayScore, isGate } from '../utils/signalAudit'
 
 interface SignalRow {
   id: number
@@ -38,42 +39,9 @@ const DECISION_LABELS: Record<string, { text: string; cls: string }> = {
   pending: { text: '挂单中', cls: 'tag-blue' },
 }
 
-const DIRECTION_LABELS: Record<string, string> = { long: '多', short: '空', flat: '—' }
-
-/** 行情闸门初筛拒绝：只有量化预评分，未进入 AI 复核。 */
-function isGate(row: SignalRow): boolean {
-  return row.features?.stage === 'gate'
-}
-
 function decisionLabel(row: SignalRow): { text: string; cls: string } {
   if (isGate(row)) return { text: '初筛拒', cls: 'tag-warn' }
   return DECISION_LABELS[row.decision] || { text: row.decision, cls: 'tag-dim' }
-}
-
-function displayDirection(row: SignalRow): { text: string; cls: string } {
-  if (row.direction && row.direction !== 'flat') {
-    return {
-      text: (DIRECTION_LABELS[row.direction] || row.direction) + (isGate(row) ? '(预)' : ''),
-      cls: row.direction === 'long' ? 'up' : 'down',
-    }
-  }
-  if (row.ai_action === 'open_long') return { text: '多(AI)', cls: 'up' }
-  if (row.ai_action === 'open_short') return { text: '空(AI)', cls: 'down' }
-  if (row.ai_action === 'hold') return { text: '观望', cls: 'flat' }
-  return { text: '—', cls: 'flat' }
-}
-
-function displayScore(row: SignalRow): { text: string; cls: string } {
-  if (row.score) {
-    return { text: row.score.toFixed(2), cls: numClass(row.score) }
-  }
-  if (isGate(row)) {
-    return { text: '—', cls: 'flat' }
-  }
-  if (row.ai_confidence > 0) {
-    return { text: `${(row.ai_confidence * 100).toFixed(0)}%`, cls: 'up' }
-  }
-  return { text: '0.00', cls: 'flat' }
 }
 
 function feat(row: SignalRow, key: string): string {
@@ -137,7 +105,7 @@ onMounted(load)
         <div class="hint" style="margin-top: 8px">
           引擎每一轮对标的池逐标的计算五因子得分，过闸门、过 AI 复核后才可能开仓。
           任何一步不通过都会写入「拒绝原因」，本页按时间倒序摊开。
-          初筛行只保留量化预评分方向，评分是预评分，AI 列显示「未进入」。
+          初筛行只保留量化预评分方向，评分是预评分，AI 列显示「未进入」；量化未达入场门槛但仍进入 AI 复核的行同样保留预评分，方向标「(预)」。
         </div>
       </div>
     </div>
