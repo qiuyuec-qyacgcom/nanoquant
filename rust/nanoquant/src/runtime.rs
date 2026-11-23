@@ -4216,6 +4216,16 @@ fn upsert_state(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(
 ///
 /// C 期只做 regime 切换触发激活，不实现 C3 的自动启用与无候选回滚。
 fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<(), String> {
+    apply_regime_transition_at(conn, mode, crate::now())
+}
+
+const REGIME_ACTIVATION_FAILURE_LOG_SEC: i64 = 3_600;
+
+fn apply_regime_transition_at(
+    conn: &rusqlite::Connection,
+    mode: &str,
+    now: i64,
+) -> Result<(), String> {
     let read_state = |key: String| -> Option<String> {
         conn.query_row(
             "SELECT value FROM engine_state WHERE key=?1",
@@ -4258,7 +4268,7 @@ fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<()
         confirm_sec,
         cooldown_sec,
     );
-    let switched = tracker.observe(next, crate::now());
+    let switched = tracker.observe(next, now);
     upsert_state(
         conn,
         &format!("regime.current.{mode}"),
@@ -4286,7 +4296,6 @@ fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<()
         if let Err(error) =
             crate::parameter_sets::activate_for_regime(conn, regime.as_str(), "regime", mode)
         {
-            tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
             // 激活失败不能把 regime 留在“已切换”状态：否则下轮不再触发激活，
             // 策略与 regime 永久错位。恢复旧 current/changed_at，并清空 pending，
             // 让下一轮按 market_regime 重新累计确认后重试。
@@ -4299,21 +4308,32 @@ fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<()
                 &format!("regime.changed_at.{mode}"),
                 &changed_at.to_string(),
             );
-            let _ = conn.execute(
-                "INSERT INTO engine_events(ts,level,category,message,payload) \
-                 VALUES(?1,'warn','parameter_set',?2,?3)",
-                (
-                    crate::now(),
-                    format!("parameter_set.regime_activation_failed: {error}"),
-                    json!({
-                        "mode": mode,
-                        "regime": regime.as_str(),
-                        "previous": previous,
-                        "error": error,
-                    })
-                    .to_string(),
-                ),
-            );
+            // 首次失败后 current 为空，下轮会立即重试；事件与日志按小时限流，
+            // 避免每 15 秒刷一条。
+            let failed_key = format!("parameter_set.regime_activation_failed_ts.{mode}");
+            let last_failed =
+                read_state(failed_key.clone()).and_then(|raw| raw.parse::<i64>().ok());
+            let should_log =
+                !last_failed.is_some_and(|last| now - last < REGIME_ACTIVATION_FAILURE_LOG_SEC);
+            if should_log {
+                tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
+                let _ = upsert_state(conn, &failed_key, &now.to_string());
+                let _ = conn.execute(
+                    "INSERT INTO engine_events(ts,level,category,message,payload) \
+                     VALUES(?1,'warn','parameter_set',?2,?3)",
+                    (
+                        now,
+                        format!("parameter_set.regime_activation_failed: {error}"),
+                        json!({
+                            "mode": mode,
+                            "regime": regime.as_str(),
+                            "previous": previous,
+                            "error": error,
+                        })
+                        .to_string(),
+                    ),
+                );
+            }
         }
     }
     Ok(())
@@ -6210,7 +6230,7 @@ mod tests {
     fn apply_regime_transition_restores_previous_regime_when_activation_fails() {
         let conn = regime_transition_fixture(Some("range"), 100);
 
-        apply_regime_transition(&conn, "demo").expect("激活失败不能阻断周期");
+        apply_regime_transition_at(&conn, "demo", 10_000).expect("激活失败不能阻断周期");
 
         assert_eq!(
             regime_state(&conn, "regime.current.demo"),
@@ -6237,10 +6257,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_regime_transition_throttles_activation_failure_events() {
+        let conn = regime_transition_fixture(Some("range"), 100);
+        let base = 10_000;
+        let failure_count = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        apply_regime_transition_at(&conn, "demo", base).unwrap();
+        apply_regime_transition_at(&conn, "demo", base + 3_599).unwrap();
+        assert_eq!(failure_count(&conn), 1, "3600 秒内失败事件必须限流");
+        assert_eq!(
+            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            base.to_string()
+        );
+        assert_eq!(
+            regime_state(&conn, "regime.current.demo"),
+            "range",
+            "限流不影响失败回退"
+        );
+
+        apply_regime_transition_at(&conn, "demo", base + 3_600).unwrap();
+        assert_eq!(failure_count(&conn), 2, "满 3600 秒后可再写一条");
+        assert_eq!(
+            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            (base + 3_600).to_string()
+        );
+    }
+
+    #[test]
     fn apply_regime_transition_clears_current_when_first_activation_fails() {
         let conn = regime_transition_fixture(None, 0);
 
-        apply_regime_transition(&conn, "demo").expect("首次激活失败不能阻断周期");
+        apply_regime_transition_at(&conn, "demo", 10_000).expect("首次激活失败不能阻断周期");
 
         assert_eq!(
             regime_state(&conn, "regime.current.demo"),

@@ -321,11 +321,6 @@ fn activate_in_savepoint(
     if !ACTIVATABLE_STATUSES.contains(&set.status.as_str()) {
         return Err(format!("参数集 {} 状态 {} 不允许激活", set.id, set.status));
     }
-    if set.status == "active" {
-        // 同 regime 唯一 active 由唯一索引保证：再次激活同一 id 是 no-op，
-        // 不重复写 activated_at/strategy/变更/激活记录/事件。
-        return Ok(());
-    }
     let before = crate::settings_api::group_value_public(conn, "strategy");
     let current_timeframe = before
         .get("timeframe")
@@ -340,6 +335,16 @@ fn activate_in_savepoint(
     let after = merged_strategy(&before, &set.params)?;
     crate::settings_api::validate_group("strategy", &after)?;
 
+    if set.status == "active" {
+        if after == before {
+            // 已 active 且 strategy 与该集 params 一致：真 no-op，不写任何审计。
+            return Ok(());
+        }
+        // 已 active 但尚未物化（如 bootstrap 首次启用）：只物化，不退役自身、
+        // 不改 status，避免违反每 regime 唯一 active 约束。
+        return materialize(conn, set, &before, &after, None, trigger, mode);
+    }
+
     let previous_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM parameter_sets \
@@ -350,32 +355,45 @@ fn activate_in_savepoint(
         .optional()
         .map_err(|e| format!("读取 {} active 参数集失败: {e}", set.regime))?;
 
-    let now = crate::now();
     conn.execute(
         "UPDATE parameter_sets SET status='retired' \
          WHERE regime=?1 AND status='active' AND id<>?2",
         params![set.regime, set.id],
     )
     .map_err(|e| format!("退役旧参数集失败: {e}"))?;
+
+    materialize(conn, set, &before, &after, previous_id, trigger, mode)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize(
+    conn: &Connection,
+    set: &ParameterSet,
+    before: &Value,
+    after: &Value,
+    previous_id: Option<i64>,
+    trigger: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let now = crate::now();
     conn.execute(
         "UPDATE parameter_sets SET status='active', activated_at=?1 WHERE id=?2",
         params![now, set.id],
     )
     .map_err(|e| format!("激活参数集 {} 失败: {e}", set.id))?;
-
     conn.execute(
         "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,?2) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         params![
-            serde_json::to_string(&after).map_err(|e| e.to_string())?,
+            serde_json::to_string(after).map_err(|e| e.to_string())?,
             now
         ],
     )
     .map_err(|e| format!("物化 strategy 失败: {e}"))?;
     crate::settings_api::record_set_changes(
         conn,
-        &before,
-        &after,
+        before,
+        after,
         &set.regime,
         set.id,
         mode,
@@ -1618,6 +1636,9 @@ mod tests {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
         let range_id = set_id_by_name(&conn, "range-bootstrap");
+        // 先完成首次物化；之后同参数 active 再次激活才是 no-op。
+        activate(&conn, range_id, "regime", "demo").unwrap();
+
         let before_strategy = strategy_value(&conn);
         let before_activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
@@ -1640,7 +1661,7 @@ mod tests {
         assert_eq!(
             strategy_value(&conn),
             before_strategy,
-            "重复激活 active 集不得改写 strategy"
+            "同参数 active 不得改写 strategy"
         );
         let after_activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
@@ -1661,6 +1682,75 @@ mod tests {
             .unwrap();
         assert_eq!(after_events, before_events, "不得新增激活事件");
         assert_eq!(load_set(&conn, range_id).unwrap().status, "active");
+    }
+
+    #[test]
+    fn activate_active_set_with_stale_strategy_materializes() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range_id = set_id_by_name(&conn, "range-bootstrap");
+        assert_eq!(
+            strategy_value(&conn)["entry_threshold"],
+            0.55,
+            "种子化不物化，策略仍是原快照"
+        );
+        let before_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        activate(&conn, range_id, "regime", "demo").unwrap();
+
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy["entry_threshold"], 0.45, "active 但未同步必须物化");
+        assert_eq!(strategy["atr_pct_min"], 0.6);
+        assert_eq!(strategy["atr_pct_max"], 10.0);
+        assert_eq!(strategy["volume_ratio_min"], 0.8);
+        assert_eq!(strategy["timeframe"], "1h");
+        let set = load_set(&conn, range_id).unwrap();
+        assert_eq!(set.status, "active", "物化不得改变自身 active 状态");
+        assert!(set.activated_at.is_some(), "物化必须更新 activated_at");
+
+        let changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameter_changes \
+                 WHERE source='parameter_set' AND set_id=?1 AND regime='range' AND mode='demo' \
+                 AND decision_id=0",
+                [range_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(changes > 0, "物化必须逐键记录变更");
+
+        let (set_id, previous_id, trigger): (i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT set_id, previous_set_id, trigger FROM parameter_set_activations \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(set_id, range_id);
+        assert_eq!(previous_id, None, "物化自身不应产生上一套");
+        assert_eq!(trigger, "regime");
+
+        let after_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_activations, before_activations + 1);
+
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='info' AND category='parameter_set' AND message LIKE '%已激活%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
     }
 
     #[test]
