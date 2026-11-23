@@ -45,6 +45,10 @@ pub fn initialize(
 
     // 必须在默认配置逐组写入之后：空库此时才有 strategy 行可供快照。
     crate::parameter_sets::seed_bootstrap(&conn)?;
+    // C 期启用失败只告警，不能阻断服务启动。
+    if let Err(error) = crate::parameter_sets::enable_c_phase(&conn) {
+        tracing::warn!(%error, "C 期参数集启用失败，等待人工处理");
+    }
 
     if created_database {
         // 新库没有标的池 = 引擎没有可扫的标的 = 每轮信号审计都是空的。
@@ -365,6 +369,26 @@ mod tests {
             .unwrap();
         let strategy: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(strategy["timeframe"], "4h");
+        let config_raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap();
+        assert_eq!(
+            config["auto_apply"], false,
+            "非 1h 默认策略不得开启自动启用"
+        );
+        let since = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='parameter_set.auto_apply_since'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        assert!(since.is_none(), "非 1h 默认策略不得写自动启用起点");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

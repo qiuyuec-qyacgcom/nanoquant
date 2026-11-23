@@ -76,6 +76,16 @@ export function canManuallyActivate(
   return regime === (currentRegime || 'range')
 }
 
+/** 手动回滚只允许当前 regime 的 active 集；缺失 regime 时与后端一致回退 range。 */
+export function canRollback(
+  status: string,
+  regime: string,
+  currentRegime: string | null | undefined
+): boolean {
+  if (status !== 'active') return false
+  return regime === (currentRegime || 'range')
+}
+
 export function gateTag(evidence: EvidenceLike): { text: string; cls: string } {
   const gate = evidence.gate
   if (!gate) return { text: '无证据', cls: 'tag-dim' }

@@ -232,11 +232,20 @@ async fn activate_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<
     Ok(json!({ "ok": true, "id": id }).into())
 }
 
-/// 手动回滚当前集到上一套，审计来源由 `rollback` 固定为 `parameter_set_rollback`。
+/// 手动回滚当前 regime 的 active 集，审计来源由 `rollback` 固定为 `parameter_set_rollback`。
+/// 跨 regime 回滚会绕过 regime 状态机，因此在写入任何状态前直接拒绝。
 async fn rollback_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
     ensure_set_exists(&conn, id)?;
     let mode = current_mode(&conn);
+    let regime = current_regime(&conn, &mode);
+    let set = load_set(&conn, id).map_err(server_error)?;
+    if set.regime != regime {
+        return Err(bad_request(format!(
+            "只能回滚当前 regime 的参数集；跨 regime 回滚由自动切换处理（参数集 {} 属于 {}，当前为 {}）",
+            id, set.regime, regime
+        )));
+    }
     rollback(&conn, id, &mode).map_err(bad_request)?;
     Ok(json!({ "ok": true, "id": id }).into())
 }
@@ -566,6 +575,7 @@ mod tests {
         let db = memory_db();
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
+        set_engine_state(&db, "market_regime.demo", "range");
         let first = insert_set_with_params(&db, "range-first", "range", "manual", params_with_threshold(0.50));
         let second = insert_set_with_params(&db, "range-second", "range", "manual", params_with_threshold(0.52));
 
@@ -682,5 +692,50 @@ mod tests {
             assert_eq!(count_activations(&db, "rollback", id), 0);
         }
         assert_eq!(strategy_value(&db), before, "拒绝时不得改动 strategy");
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_non_current_regime_active_without_writes() {
+        let db = memory_db();
+        seed_strategy(&db, params_with_threshold(0.55));
+        set_engine_state(&db, "mode", "demo");
+        set_engine_state(&db, "market_regime.demo", "range");
+        let chaos_active = insert_set_with_params(
+            &db,
+            "chaos-active",
+            "chaos",
+            "active",
+            params_with_threshold(0.50),
+        );
+        let before = strategy_value(&db);
+
+        let (status, body) = post(
+            app(db.clone()),
+            &format!("/api/v1/parameter-sets/{chaos_active}/rollback"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "跨 regime 回滚应拒绝: {body}"
+        );
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("只能回滚当前 regime 的参数集"),
+            "文案应说明仅当前 regime 可回滚: {body}"
+        );
+        assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");
+        assert_eq!(
+            count_changes(&db, "parameter_set_rollback", chaos_active),
+            0,
+            "不得写回滚审计"
+        );
+        assert_eq!(
+            count_activations(&db, "rollback", chaos_active),
+            0,
+            "不得写激活记录"
+        );
     }
 }

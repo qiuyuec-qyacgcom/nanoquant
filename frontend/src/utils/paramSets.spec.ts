@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   canManuallyActivate,
+  canRollback,
   evidenceSummary,
   formatPercent,
   gateTag,
@@ -59,6 +60,17 @@ describe('paramSets formatting', () => {
     expect(canManuallyActivate('active', 'range', 'range')).toBe(false)
     expect(canManuallyActivate('approved', 'range', null)).toBe(true)
     expect(canManuallyActivate('approved', 'range', '')).toBe(true)
+  })
+
+  it('only allows rollback for active sets in the current regime', () => {
+    expect(canRollback('active', 'range', 'range')).toBe(true)
+    expect(canRollback('active', 'range', null)).toBe(true)
+    expect(canRollback('active', 'range', '')).toBe(true)
+    expect(canRollback('active', 'chaos', 'range')).toBe(false)
+    expect(canRollback('active', 'trend', 'range')).toBe(false)
+    expect(canRollback('manual', 'range', 'range')).toBe(false)
+    expect(canRollback('approved', 'range', 'range')).toBe(false)
+    expect(canRollback('retired', 'range', 'range')).toBe(false)
   })
 
   it('maps regime labels', () => {

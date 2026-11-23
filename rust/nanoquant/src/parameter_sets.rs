@@ -6,6 +6,8 @@ const CURRENT_SNAPSHOT_EVIDENCE: &str = "{\"kind\":\"manual\",\"reason\":\"timef
 const INCIDENT_EVIDENCE: &str = "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\",\"incident_date\":\"2026-11-23\",\"known_keys\":[\"atr_pct_min\",\"atr_pct_max\",\"volume_ratio_min\",\"entry_threshold\"]}";
 const AUTO_SWITCH_DISABLED: &str = "strategy.timeframe 不在自动切换白名单，已禁用自动切换";
 const AUTO_SWITCH_SKIPPED: &str = "parameter_set 配置缺失或无效，未能清空自动切换白名单";
+const C_PHASE_DISABLED: &str = "strategy.timeframe 不在 C 期自动切换白名单，已禁用参数集自动启用";
+const C_PHASE_DISABLED_UNBOUND: &str = "parameter_set 配置缺失或无效，未能禁用参数集自动启用";
 
 /// A 期迁移种子化：只建参数集记录，绝不改写 `app_settings.strategy`（C 期才物化）。
 /// 幂等：`parameter_sets` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
@@ -128,6 +130,85 @@ fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(
         None,
         now,
     )?;
+    Ok(())
+}
+
+/// C 期启动启用：仅 1h 策略打开自动启用并立即物化当前 regime 的 bootstrap 集。
+///
+/// 幂等：`parameter_set.auto_apply_since` 已存在时直接返回，不重复物化或新增激活记录。
+/// 非 1h 只关闭自动启用并写 warn，不写 `auto_apply_since`，也不阻断启动。
+/// 写入失败整体回滚；启动层只告警，保证服务可起。
+pub(crate) fn enable_c_phase(conn: &Connection) -> Result<(), String> {
+    let strategy = crate::settings_api::group_value_public(conn, "strategy");
+    let timeframe = strategy
+        .get("timeframe")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if timeframe != BOOTSTRAP_TIMEFRAME {
+        return disable_c_phase_auto_apply(conn, timeframe);
+    }
+    if engine_state(conn, "parameter_set.auto_apply_since").is_some() {
+        return Ok(());
+    }
+    let mode = engine_mode(conn);
+    let regime = engine_state(conn, &format!("market_regime.{mode}"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "range".to_string());
+    let now = crate::now();
+    conn.execute_batch("SAVEPOINT parameter_set_enable_c_phase")
+        .map_err(|error| format!("开启 C 期参数集启用事务失败: {error}"))?;
+    let result = (|| {
+        let updated = conn
+            .execute(
+                "UPDATE app_settings \
+                 SET value=json_patch(value,'{\"auto_apply\":true}'), updated_at=?1 \
+                 WHERE key='parameter_set' AND json_valid(value)",
+                [now],
+            )
+            .map_err(|error| format!("启用参数集自动切换失败: {error}"))?;
+        if updated == 0 {
+            return Err("parameter_set 配置缺失或无效，无法启用自动切换".to_string());
+        }
+        upsert_engine_state(conn, "parameter_set.auto_apply_since", &now.to_string())?;
+        activate_for_regime(conn, &regime, "bootstrap", &mode)
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE parameter_set_enable_c_phase")
+            .map_err(|error| format!("提交 C 期参数集启用事务失败: {error}")),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO parameter_set_enable_c_phase; RELEASE parameter_set_enable_c_phase",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn disable_c_phase_auto_apply(conn: &Connection, timeframe: &str) -> Result<(), String> {
+    let updated = conn
+        .execute(
+            "UPDATE app_settings \
+             SET value=json_patch(value,'{\"auto_apply\":false}') \
+             WHERE key='parameter_set' AND json_valid(value)",
+            [],
+        )
+        .map_err(|error| format!("禁用 C 期参数集自动启用失败: {error}"))?;
+    let message = if updated > 0 {
+        C_PHASE_DISABLED
+    } else {
+        C_PHASE_DISABLED_UNBOUND
+    };
+    conn.execute(
+        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','parameter_set',?2,?3)",
+        params![
+            crate::now(),
+            message,
+            json!({ "timeframe": timeframe, "auto_apply_disabled": updated > 0 }).to_string()
+        ],
+    )
+    .map_err(|error| format!("写入 C 期参数集告警失败: {error}"))?;
     Ok(())
 }
 
@@ -1413,6 +1494,149 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, "not-json", "脏配置保持原样，不做半更新");
+    }
+
+    fn parameter_set_config(conn: &Connection) -> Value {
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn activation_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn enable_c_phase_materializes_bootstrap_and_is_idempotent() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        set_state(&conn, "market_regime.demo", "range");
+        let before_activations = activation_count(&conn);
+
+        enable_c_phase(&conn).unwrap();
+
+        let config = parameter_set_config(&conn);
+        assert_eq!(config["auto_apply"], true, "1h 应打开自动启用");
+        assert_eq!(config["auto_apply_timeframes"], "1h", "应保留其它键");
+        assert!(
+            state_value(&conn, "parameter_set.auto_apply_since").is_some(),
+            "应写入自动启用起点"
+        );
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy["atr_pct_min"], json!(0.6));
+        assert_eq!(strategy["atr_pct_max"], json!(10.0));
+        assert_eq!(strategy["volume_ratio_min"], json!(0.8));
+        assert_eq!(strategy["entry_threshold"], json!(0.45));
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().status,
+            "active",
+            "当前 regime 的 bootstrap 集应保持 active"
+        );
+        let after_first = activation_count(&conn);
+        assert_eq!(
+            after_first,
+            before_activations + 1,
+            "当前 regime bootstrap 应新增一条激活记录"
+        );
+
+        enable_c_phase(&conn).unwrap();
+        assert_eq!(
+            activation_count(&conn),
+            after_first,
+            "重复启用不得新增激活记录"
+        );
+        assert_eq!(strategy_value(&conn), strategy, "重复启用不得再次物化");
+    }
+
+    #[test]
+    fn enable_c_phase_disables_auto_apply_for_non_1h_without_since() {
+        let conn = conn_with_strategy("4h");
+        seed_bootstrap(&conn).unwrap();
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
+        );
+        let before = strategy_value(&conn);
+
+        enable_c_phase(&conn).unwrap();
+
+        let config = parameter_set_config(&conn);
+        assert_eq!(config["auto_apply"], false, "非 1h 必须关闭自动启用");
+        assert_eq!(
+            config["auto_apply_timeframes"], "1h",
+            "只改 auto_apply，保留其它键"
+        );
+        assert!(
+            state_value(&conn, "parameter_set.auto_apply_since").is_none(),
+            "非 1h 不得写自动启用起点"
+        );
+        assert_eq!(strategy_value(&conn), before, "非 1h 不得物化 strategy");
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events \
+                 WHERE level='warn' AND category='parameter_set' AND message=?1",
+                [C_PHASE_DISABLED],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1, "应留下可观测的 C 期禁用告警");
+    }
+
+    #[test]
+    fn enable_c_phase_missing_market_regime_falls_back_to_range() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+
+        enable_c_phase(&conn).unwrap();
+
+        let strategy = strategy_value(&conn);
+        assert_eq!(
+            strategy["atr_pct_min"],
+            json!(0.6),
+            "缺失 regime 应回退 range"
+        );
+        assert_eq!(strategy["entry_threshold"], json!(0.45));
+        assert_eq!(
+            active_for_regime(&conn, "range").unwrap().unwrap().name,
+            "range-bootstrap"
+        );
+    }
+
+    #[test]
+    fn enable_c_phase_rolls_back_all_writes_when_activation_fails() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        set_parameter_set_config(
+            &conn,
+            json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
+        );
+        conn.execute_batch(
+            "CREATE TRIGGER c_phase_boom BEFORE INSERT ON parameter_set_activations \
+             WHEN NEW.trigger='bootstrap' BEGIN SELECT RAISE(ABORT,'boom'); END;",
+        )
+        .unwrap();
+        let before = strategy_value(&conn);
+
+        assert!(enable_c_phase(&conn).is_err(), "激活失败必须传播错误");
+
+        assert_eq!(
+            parameter_set_config(&conn)["auto_apply"],
+            false,
+            "事务失败不得留下 auto_apply=true"
+        );
+        assert!(
+            state_value(&conn, "parameter_set.auto_apply_since").is_none(),
+            "事务失败不得留下 auto_apply_since"
+        );
+        assert_eq!(strategy_value(&conn), before, "事务失败不得物化 strategy");
     }
 
     #[test]

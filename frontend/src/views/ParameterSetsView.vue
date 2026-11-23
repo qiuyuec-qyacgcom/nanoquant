@@ -10,6 +10,7 @@ import { useSilentRefresh } from '../composables/silentRefresh'
 import { ago, timeStr } from '../utils/format'
 import {
   canManuallyActivate,
+  canRollback as canRollbackSet,
   evidenceSummary,
   formatPercent,
   gateTag,
@@ -99,7 +100,7 @@ function isActivatableStatus(item: SetItem): boolean {
 }
 
 function canRollback(item: SetItem): boolean {
-  return item.status === 'active'
+  return canRollbackSet(item.status, item.regime, current.value?.market_regime)
 }
 
 function guardAge(entry: GuardEntry): string {
@@ -169,8 +170,8 @@ useSilentRefresh(() => load(true), 30000)
         </div>
         <div class="hint" style="margin-top: 8px">
           参数集按 regime 保存 strategy 数值快照。approve 后的候选通常由引擎自动启用；
-          这里提供人工兜底：approved/manual 集可立即启用，active 集可回滚到该 regime 的上一套。
-          所有变更写入参数集激活记录与逐键审计。
+                  这里提供人工兜底：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
+                  跨 regime 的启用与回滚由自动切换处理。
         </div>
         <div v-if="notice" class="hint" style="margin-top: 6px; color: var(--long)">{{ notice }}</div>
         <div v-if="error" class="hint" style="margin-top: 6px; color: var(--warn)">{{ error }}</div>
@@ -267,9 +268,10 @@ useSilentRefresh(() => load(true), 30000)
                     {{ busyId === item.id ? '处理中…' : '启用' }}
                   </button>
                   <button
-                    v-else-if="canRollback(item)"
+                    v-else-if="item.status === 'active'"
                     class="btn btn-sm"
-                    :disabled="busyId === item.id"
+                    :disabled="busyId === item.id || !canRollback(item)"
+                    :title="canRollback(item) ? '' : `仅当前 regime（${marketRegimeText}）的 active 集可回滚；其他 regime 由自动切换处理`"
                     @click="act(item, 'rollback')"
                   >
                     {{ busyId === item.id ? '处理中…' : '回滚' }}
