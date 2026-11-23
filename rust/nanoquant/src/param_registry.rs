@@ -89,6 +89,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("parameter_set", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
     ("parameter_set", "min_oos_trades", 1.0, 1000.0, 1.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
+    ("ai", "param_tuning_min_interval_sec", 60.0, 604800.0, 60.0),
     ("ai", "max_calls_per_hour", 1.0, 10000.0, 1.0),
     ("ai", "monthly_budget_usd", 0.0, 1.0e6, 0.1),
     ("ai", "timeout_sec", 1.0, 300.0, 1.0),

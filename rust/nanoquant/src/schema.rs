@@ -300,6 +300,43 @@ mod tests {
     }
 
     #[test]
+    fn migrate_normalize_ai_tuning_interval_keeps_nonzero_and_fills_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let write_ai = |value: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings(key,value,updated_at) VALUES('ai',?1,0)",
+                [value],
+            )
+            .unwrap();
+        };
+        let read_ai = || -> serde_json::Value {
+            let raw: String = conn
+                .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        write_ai("{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":0}");
+        migrate(&conn).unwrap();
+        let zero = read_ai();
+        assert_eq!(zero["param_tuning_min_interval_sec"], 86400);
+        assert_eq!(zero["allow_param_tuning"], true);
+
+        write_ai("{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":3600}");
+        migrate(&conn).unwrap();
+        assert_eq!(read_ai()["param_tuning_min_interval_sec"], 3600);
+
+        write_ai("{\"allow_param_tuning\":false}");
+        migrate(&conn).unwrap();
+        let missing = read_ai();
+        assert_eq!(missing["param_tuning_min_interval_sec"], 86400);
+        assert_eq!(missing["allow_param_tuning"], false);
+    }
+
+    #[test]
     fn migrate_drops_legacy_default_leverage_but_keeps_the_bounds() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();

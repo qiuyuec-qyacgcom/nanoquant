@@ -290,6 +290,10 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
+    param_tuning_min_interval_sec: {
+      label: '调参最小间隔', unit: '秒', min: 60, max: 604800,
+      hint: '独立调参任务的最小间隔；0 已废弃，最低 60 秒，86400=每天一次',
+    },
   },
   evolution: {
     min_confidence: { label: '心法最低置信度', hint: '低于该值的复盘结论不进入心法库' },

@@ -236,6 +236,13 @@ async fn write_group(
     deep_merge(&mut candidate, &stored(&conn, &group));
     deep_merge(&mut candidate, &Value::Object(body.patch.clone()));
     drop_removed_keys(&group, &mut candidate);
+    if group == "parameter_set" {
+        if let Some(timeframes) = candidate.get_mut("auto_apply_timeframes") {
+            if let Some(text) = timeframes.as_str() {
+                *timeframes = json!(text.trim().to_ascii_lowercase());
+            }
+        }
+    }
     if let Err(detail) = validate(&group, &candidate) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
     }
@@ -547,6 +554,9 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
             continue;
         };
         if candidate.is_null() {
+            if group == "parameter_set" {
+                return Err(format!("{key}: 不允许为 null"));
+            }
             continue;
         }
         let actual = crate::param_registry::kind_of(candidate);
@@ -776,6 +786,28 @@ mod tests {
         Db::open(path.to_str().unwrap()).unwrap()
     }
 
+    async fn put_settings(app: Router, group: &str, patch: &str) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/settings/{group}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!("{{\"patch\":{patch}}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
     fn test_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::schema::migrate(&conn).unwrap();
@@ -810,13 +842,67 @@ mod tests {
         assert!(validate("parameter_set", &defaults_of("parameter_set")).is_ok());
         for (key, bad) in [
             ("enabled", json!("yes")),
+            ("enabled", Value::Null),
             ("min_oos_trades", json!(-5)),
             ("auto_apply_timeframes", json!("4h")),
+            ("auto_apply_timeframes", Value::Null),
         ] {
             let mut value = defaults_of("parameter_set");
             value[key] = bad;
             assert!(validate("parameter_set", &value).is_err(), "{key} 应被拒绝");
         }
+    }
+
+    #[tokio::test]
+    async fn parameter_set_validation_normalizes_and_rejects_null() {
+        let path = std::env::temp_dir().join("nq-settings-parameter-set.db");
+        let db = fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+
+        let (status, body) = put_settings(
+            app.clone(),
+            "parameter_set",
+            r#"{"auto_apply_timeframes":"1H"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["auto_apply_timeframes"], "1h");
+        let stored: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored).unwrap()["auto_apply_timeframes"],
+            "1h"
+        );
+
+        let (status, body) = put_settings(
+            app.clone(),
+            "parameter_set",
+            r#"{"auto_apply_timeframes":" 1h "}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["auto_apply_timeframes"], "1h");
+
+        for patch in [
+            r#"{"auto_apply_timeframes":"1h, 4h"}"#,
+            r#"{"auto_apply_timeframes":""}"#,
+            r#"{"auto_apply_timeframes":null}"#,
+            r#"{"enabled":null}"#,
+        ] {
+            let (status, body) = put_settings(app.clone(), "parameter_set", patch).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}: {body}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
