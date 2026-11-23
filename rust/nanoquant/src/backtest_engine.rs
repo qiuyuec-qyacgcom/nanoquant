@@ -4,7 +4,7 @@
 //! 点差按成本计入；资金费按假设费率在每个 8h 结算点扣减；历史缺口只标注不插值；
 //! 同一根 K 线内止损与部分止盈冲突时按止损优先。结果仅用于参数粗筛与逻辑回归。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::prelude::IndexedRandom;
@@ -60,6 +60,7 @@ pub struct BacktestTrade {
     pub entry_fee: f64,
     pub funding: f64,
     pub partial_tp: bool,
+    pub market_regime: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +201,7 @@ impl<'a> Sim<'a> {
             entry_fee: round(position.initial_fee, 6),
             funding: round(position.funding, 6),
             partial_tp: position.partial,
+            market_regime: String::new(),
         });
         self.curve.push(round(self.equity, 6));
     }
@@ -1022,6 +1024,257 @@ pub fn run_walkforward(
     }))
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BasketMetrics {
+    pub folds: usize,
+    pub oos_trades: usize,
+    pub positive_folds: usize,
+    pub oos_avg_return_pct: f64,
+    pub overfit_gap_pp: f64,
+    pub stressed_avg_return_pct: f64,
+    pub max_drawdown_pct: f64,
+    pub bootstrap_ci_low: f64,
+    pub bootstrap_p_positive: f64,
+    pub symbols_used: Vec<String>,
+    pub symbols_skipped: Vec<String>,
+    pub target_regime: String,
+    pub timeframe: String,
+}
+
+#[allow(dead_code)]
+fn timeframe_ms(timeframe: &str) -> i64 {
+    let value = timeframe.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let count = number.parse::<i64>().unwrap_or(1).max(1);
+    let unit_ms = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => 3_600_000,
+    };
+    count * unit_ms
+}
+
+#[allow(dead_code)]
+fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnapshot> {
+    let step = interval_ms.max(1);
+    bars.iter()
+        .map(|bar| CandleSnapshot {
+            close_time: bar.close_time.max(bar.open_time + step - 1),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn build_market_regime_map(
+    basket: &[(String, Vec<HistoryBar>)],
+    interval_ms: i64,
+    frame_ms: i64,
+) -> BTreeMap<i64, crate::regime::Regime> {
+    let per_symbol: Vec<BTreeMap<i64, crate::regime::Regime>> = basket
+        .iter()
+        .map(|(_, bars)| {
+            let candles = candles_from_history(bars, interval_ms);
+            let series = crate::regime::regime_series(&candles, 14);
+            let mut map = BTreeMap::new();
+            for (candle, regime) in candles.iter().zip(series) {
+                if let Some(regime) = regime {
+                    map.insert(candle.close_time, regime);
+                }
+            }
+            map
+        })
+        .collect();
+    let mut buckets: BTreeSet<i64> = BTreeSet::new();
+    for map in &per_symbol {
+        buckets.extend(map.keys().copied());
+    }
+    let mut regimes = BTreeMap::new();
+    for ts in buckets {
+        let mut votes = Vec::new();
+        for map in &per_symbol {
+            if let Some((&stamp, &regime)) = map.range(..=ts).next_back() {
+                if ts - stamp <= frame_ms {
+                    votes.push(regime);
+                }
+            }
+        }
+        if let Some(regime) = crate::regime::market_regime(&votes) {
+            regimes.insert(ts, regime);
+        }
+    }
+    regimes
+}
+
+#[allow(dead_code)]
+fn market_regime_at(
+    regimes: &BTreeMap<i64, crate::regime::Regime>,
+    ts: i64,
+    frame_ms: i64,
+) -> Option<crate::regime::Regime> {
+    let (&stamp, &regime) = regimes.range(..=ts).next_back()?;
+    (ts - stamp <= frame_ms).then_some(regime)
+}
+
+#[allow(dead_code)]
+fn tag_trades(
+    result: &mut BacktestResult,
+    regimes: &BTreeMap<i64, crate::regime::Regime>,
+    frame_ms: i64,
+) {
+    for trade in &mut result.trades {
+        if let Some(regime) = market_regime_at(regimes, trade.entry_ts, frame_ms) {
+            trade.market_regime = regime.as_str().to_string();
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn target_returns(trades: &[BacktestTrade], target: &str) -> Vec<f64> {
+    trades
+        .iter()
+        .filter(|trade| trade.market_regime == target)
+        .map(|trade| trade.pnl_pct)
+        .collect()
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn run_walkforward_basket_fixed(
+    basket: &[(String, Vec<HistoryBar>)],
+    base: &EngineConfig,
+    folds: i64,
+    train_bars: i64,
+    target_regime: crate::regime::Regime,
+    timeframe: &str,
+    cancel: &AtomicBool,
+) -> Result<BasketMetrics, String> {
+    if basket.len() < 6 {
+        return Err("有效标的少于 6 个".to_string());
+    }
+    let frame_ms = timeframe_ms(timeframe);
+    let regimes = build_market_regime_map(basket, base.interval_ms, frame_ms);
+    let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
+    let target = target_regime.as_str();
+    let mut all_is = Vec::new();
+    let mut all_oos = Vec::new();
+    let mut oos_ordered: Vec<(i64, f64)> = Vec::new();
+    let mut all_stressed = Vec::new();
+    let mut fold_pnl = vec![0.0_f64; requested_folds];
+    let mut used = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (symbol, bars) in basket {
+        if bars.len() < WARMUP * 4 {
+            skipped.push(symbol.clone());
+            continue;
+        }
+        let train_bars = (train_bars as usize).clamp(WARMUP * 2, bars.len() - WARMUP * 2);
+        let mut local_folds = requested_folds;
+        let mut step = (bars.len() - WARMUP - train_bars) / local_folds;
+        while local_folds > MIN_FOLDS && step <= WARMUP {
+            local_folds -= 1;
+            step = (bars.len() - WARMUP - train_bars) / local_folds;
+        }
+        if step <= WARMUP {
+            skipped.push(symbol.clone());
+            continue;
+        }
+        used.push(symbol.clone());
+        for (index, fold_total) in fold_pnl.iter_mut().enumerate().take(local_folds) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.to_string());
+            }
+            let train_end = WARMUP + train_bars + index * step;
+            let test_end = (train_end + step).min(bars.len());
+            let train = &bars[train_end.saturating_sub(train_bars)..train_end];
+            let test = &bars[train_end.saturating_sub(WARMUP)..test_end];
+            if train.len() <= WARMUP || test.len() <= WARMUP {
+                continue;
+            }
+            let mut train_result = run(train, base)?;
+            let mut test_result = run(test, base)?;
+            let mut stressed_config = base.clone();
+            stressed_config.fee_bps *= 2.0;
+            stressed_config.slippage_bps *= 2.0;
+            let mut stressed_result = run(test, &stressed_config)?;
+            for result in [&mut train_result, &mut test_result, &mut stressed_result] {
+                tag_trades(result, &regimes, frame_ms);
+            }
+            let is_returns = target_returns(&train_result.trades, target);
+            let oos_returns = target_returns(&test_result.trades, target);
+            let stressed_returns = target_returns(&stressed_result.trades, target);
+            *fold_total += oos_returns.iter().sum::<f64>();
+            all_is.extend(is_returns);
+            for trade in test_result
+                .trades
+                .iter()
+                .filter(|trade| trade.market_regime == target)
+            {
+                oos_ordered.push((trade.exit_ts, trade.pnl_pct));
+            }
+            all_oos.extend(oos_returns);
+            all_stressed.extend(stressed_returns);
+        }
+    }
+
+    if used.len() < 6 {
+        return Err("有效标的少于 6 个".to_string());
+    }
+    if all_oos.is_empty() {
+        return Err(format!("目标 regime {target} 的 OOS 成交为 0"));
+    }
+
+    oos_ordered.sort_by_key(|(exit_ts, _)| *exit_ts);
+    let mut equity = 0.0_f64;
+    let mut peak = 0.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for (_, value) in &oos_ordered {
+        equity += value;
+        peak = peak.max(equity);
+        let drawdown = if peak > 0.0 {
+            (peak - equity) / peak * 100.0
+        } else {
+            -equity
+        };
+        max_drawdown = max_drawdown.max(drawdown);
+    }
+
+    let oos_avg = average(&all_oos);
+    let is_avg = if all_is.is_empty() {
+        oos_avg
+    } else {
+        average(&all_is)
+    };
+    let positive_folds = fold_pnl.iter().filter(|value| **value > 0.0).count();
+    let bootstrap = bootstrap_ci(&all_oos);
+    Ok(BasketMetrics {
+        folds: requested_folds,
+        oos_trades: all_oos.len(),
+        positive_folds,
+        oos_avg_return_pct: round(oos_avg, 4),
+        overfit_gap_pp: round(is_avg - oos_avg, 4),
+        stressed_avg_return_pct: round(average(&all_stressed), 4),
+        max_drawdown_pct: round(max_drawdown, 4),
+        bootstrap_ci_low: bootstrap["ci_low"].as_f64().unwrap_or_default(),
+        bootstrap_p_positive: bootstrap["p_positive"].as_f64().unwrap_or_default(),
+        symbols_used: used,
+        symbols_skipped: skipped,
+        target_regime: target.to_string(),
+        timeframe: timeframe.to_string(),
+    })
+}
+
 fn items_len(values: &[f64]) -> f64 {
     values.len().max(1) as f64
 }
@@ -1317,5 +1570,96 @@ mod tests {
         )
         .expect_err("窗口不足时必须返回错误，不能 panic");
         assert!(error.contains("K 线不足"), "实际错误: {error}");
+    }
+
+    fn basket_config() -> EngineConfig {
+        let mut cfg = config();
+        cfg.interval_ms = 3_600_000;
+        cfg
+    }
+
+    fn synthetic_basket(symbols: usize, count: usize) -> Vec<(String, Vec<HistoryBar>)> {
+        (0..symbols)
+            .map(|symbol| {
+                let anchor = 100.0 + symbol as f64 * 0.4;
+                let mut price = anchor;
+                let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ (symbol as u64 + 1);
+                let bars = (0..count)
+                    .map(|index| {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        let noise = ((state >> 11) % 2001) as f64 / 1_000.0 - 1.0;
+                        price += (anchor - price) * 0.08 + noise * 0.8;
+                        let open = price - noise * 0.2;
+                        let open_time = index as i64 * 3_600_000;
+                        HistoryBar {
+                            open_time,
+                            close_time: open_time + 3_599_999,
+                            open,
+                            high: open.max(price) + 0.5,
+                            low: open.min(price) - 0.5,
+                            close: price,
+                            volume: 10_000.0,
+                        }
+                    })
+                    .collect();
+                (format!("SYM{}USDT", symbol + 1), bars)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn basket_fixed_filters_target_market_regime_and_aggregates() {
+        let basket = synthetic_basket(6, 700);
+        let metrics = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(metrics.target_regime, "range");
+        assert_eq!(metrics.timeframe, "1h");
+        assert!(metrics.symbols_used.len() >= 6);
+        assert!(metrics.folds >= 2);
+        assert!(metrics.oos_trades > 0);
+        assert!(metrics.max_drawdown_pct >= 0.0);
+        assert!((0.0..=1.0).contains(&metrics.bootstrap_p_positive));
+    }
+
+    #[test]
+    fn basket_fixed_rejects_insufficient_coverage() {
+        let basket = synthetic_basket(5, 700);
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Range,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("少于 6 个"));
+    }
+
+    #[test]
+    fn basket_fixed_rejects_when_target_regime_has_no_oos_trades() {
+        let basket = synthetic_basket(6, 700);
+        let error = run_walkforward_basket_fixed(
+            &basket,
+            &basket_config(),
+            2,
+            300,
+            crate::regime::Regime::Chaos,
+            "1h",
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("OOS"));
     }
 }
