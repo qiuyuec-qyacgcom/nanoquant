@@ -321,6 +321,9 @@ fn activate_in_savepoint(
     if !ACTIVATABLE_STATUSES.contains(&set.status.as_str()) {
         return Err(format!("参数集 {} 状态 {} 不允许激活", set.id, set.status));
     }
+    if !set.params.is_object() {
+        return Err(format!("参数集 {} params 必须是对象快照", set.id));
+    }
     let before = crate::settings_api::group_value_public(conn, "strategy");
     let current_timeframe = before
         .get("timeframe")
@@ -332,7 +335,7 @@ fn activate_in_savepoint(
             set.id, set.timeframe
         ));
     }
-    let after = merged_strategy(&before, &set.params)?;
+    let after = crate::settings_api::normalized_group_value("strategy", &set.params);
     crate::settings_api::validate_group("strategy", &after)?;
 
     if set.status == "active" {
@@ -477,8 +480,11 @@ fn rollback_in_savepoint(
     previous: &ParameterSet,
     mode: &str,
 ) -> Result<(), String> {
+    if !previous.params.is_object() {
+        return Err(format!("参数集 {} params 必须是对象快照", previous.id));
+    }
     let before = crate::settings_api::group_value_public(conn, "strategy");
-    let after = merged_strategy(&before, &previous.params)?;
+    let after = crate::settings_api::normalized_group_value("strategy", &previous.params);
     crate::settings_api::validate_group("strategy", &after)?;
 
     let now = crate::now();
@@ -533,21 +539,6 @@ fn rollback_in_savepoint(
         }),
         now,
     )
-}
-
-/// 把参数集快照覆盖到当前 strategy 上，缺失键沿用当前/默认值，保证物化后仍是完整配置。
-fn merged_strategy(before: &Value, params: &Value) -> Result<Value, String> {
-    let params = params
-        .as_object()
-        .ok_or_else(|| "参数集 params 必须是对象快照".to_string())?;
-    let mut merged = before.clone();
-    let Some(object) = merged.as_object_mut() else {
-        return Err("当前 strategy 配置不是对象".to_string());
-    };
-    for (key, value) in params {
-        object.insert(key.clone(), value.clone());
-    }
-    Ok(merged)
 }
 
 fn record_event(
@@ -1751,6 +1742,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1);
+    }
+
+    fn active_range_set_with_legacy_key(conn: &Connection, name: &str) -> i64 {
+        let range = active_for_regime(conn, "range").unwrap().unwrap();
+        conn.execute(
+            "UPDATE parameter_sets SET status='retired' WHERE regime='range'",
+            [],
+        )
+        .unwrap();
+        let mut params = range.params.clone();
+        params["weight_trend"] = json!(0.123);
+        insert_set(
+            conn,
+            name,
+            "range",
+            "1h",
+            &params,
+            "active",
+            "manual",
+            "{}",
+            None,
+            crate::now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn activate_active_set_with_legacy_key_is_noop_when_strategy_matches() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let set_id = active_range_set_with_legacy_key(&conn, "range-legacy");
+        let params = load_set(&conn, set_id).unwrap().params;
+        // strategy 已经是该集归一化后的值：legacy 键被 migrate 剔除，不应触发物化。
+        let normalized = crate::settings_api::normalized_group_value("strategy", &params);
+        conn.execute(
+            "UPDATE app_settings SET value=?1 WHERE key='strategy'",
+            [normalized.to_string()],
+        )
+        .unwrap();
+        let before_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let before_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        let before_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        activate(&conn, set_id, "regime", "demo").unwrap();
+
+        assert_eq!(strategy_value(&conn), normalized, "strategy 不应变化");
+        assert!(
+            strategy_value(&conn).get("weight_trend").is_none(),
+            "历史键不得进入 strategy"
+        );
+        let after_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_activations, before_activations, "不得新增激活记录");
+        let after_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_changes, before_changes, "不得新增参数变更");
+        let after_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_events, before_events, "不得新增激活事件");
+    }
+
+    #[test]
+    fn activate_active_set_strips_legacy_key_and_materializes_once() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let set_id = active_range_set_with_legacy_key(&conn, "range-legacy-stale");
+        let params = load_set(&conn, set_id).unwrap().params;
+        let normalized = crate::settings_api::normalized_group_value("strategy", &params);
+        assert_ne!(
+            strategy_value(&conn),
+            normalized,
+            "前置条件：strategy 尚未物化"
+        );
+
+        activate(&conn, set_id, "regime", "demo").unwrap();
+
+        let strategy = strategy_value(&conn);
+        assert_eq!(strategy, normalized, "应写入归一化后的完整策略");
+        assert_eq!(strategy["entry_threshold"], 0.45);
+        assert!(
+            strategy.get("weight_trend").is_none(),
+            "历史键不得进入 strategy"
+        );
+
+        let legacy_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameter_changes WHERE key='weight_trend'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_changes, 0, "历史键不应产生参数变更");
+        let effective_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameter_changes \
+                 WHERE source='parameter_set' AND set_id=?1 AND key<>'weight_trend'",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(effective_changes > 0, "有效差异键必须记录");
+
+        let first_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let first_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        let first_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        activate(&conn, set_id, "regime", "demo").unwrap();
+
+        assert_eq!(strategy_value(&conn), strategy, "归一化后再次激活应 no-op");
+        let after_activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_set_activations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after_activations, first_activations);
+        let after_changes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_changes, first_changes);
+        let after_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE category='parameter_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_events, first_events);
     }
 
     #[test]

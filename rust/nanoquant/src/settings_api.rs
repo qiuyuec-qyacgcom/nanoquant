@@ -600,6 +600,17 @@ pub(crate) fn group_value_public(conn: &rusqlite::Connection, name: &str) -> Val
     group_value(conn, name)
 }
 
+/// 把原始配置归一化为完整值：补默认、剔除历史键并执行迁移。
+///
+/// 参数集激活比较与物化都走这里，避免历史快照里的隐藏键（如 `weight_trend`）
+/// 在每次切换时被重新写回 strategy。
+pub(crate) fn normalized_group_value(group: &str, raw: &Value) -> Value {
+    let mut merged = defaults_of(group);
+    let migrated = migrate(group, raw);
+    deep_merge(&mut merged, &migrated);
+    merged
+}
+
 /// 参数集激活/回滚时逐键记录到 `parameter_changes`，与人工/AI 调参共用审计表。
 pub(crate) fn record_set_changes(
     conn: &rusqlite::Connection,
