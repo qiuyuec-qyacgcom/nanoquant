@@ -11,6 +11,7 @@ describe('参数配置目录', () => {
     expect(groupIds).toEqual([
       'engine',
       'strategy',
+      'parameter_set',
       'risk',
       'data',
       'news',
@@ -122,7 +123,10 @@ describe('参数配置目录', () => {
   })
 
   it('分组字段不重复', () => {
-    expect(new Set(sectionKeys).size).toBe(sectionKeys.length)
+    for (const [group, sections] of Object.entries(SETTINGS_SECTIONS)) {
+      const keys = sections.flatMap((section) => section.fields)
+      expect(new Set(keys).size, group).toBe(keys.length)
+    }
   })
 
   it('风控不再提供默认杠杆，只保留上下限', () => {

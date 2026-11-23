@@ -293,10 +293,10 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
              p: optional parameter updates, one entry per field: g=group k=key v=value w=Chinese reason. \
-             Allowed groups: engine strategy risk news journal evolution system data backup public signal_follow; \
+             Allowed groups: engine strategy news journal evolution system data backup public signal_follow; \
              Visible fields are writable only in ",
                 writable_groups.as_str(),
-                "; all other groups allow hidden fields only. \
+                "; all other groups allow hidden fields only. Never write risk or parameter_set. \
              Never ai, security, secrets, passwords, API keys, webhooks or chat ids. \
              Use parameters.writable_parameters as the authoritative list of writable fields and ranges; \
              values are clamped to the registered range, invalid or sensitive items are skipped and audited. \
@@ -622,7 +622,8 @@ mod tests {
     fn decision_prompt_explains_writable_scope() {
         let messages = decision_messages(&json!({}));
         let system = &messages[0].content;
-        assert!(system.contains("Visible fields are writable only in risk, strategy"));
+        assert!(system.contains("Visible fields are writable only in strategy"));
+        assert!(system.contains("Never write risk or parameter_set"));
         assert!(system.contains("writable_parameters"));
         assert!(system.contains("constraints.min_leverage"));
         assert!(system.contains("constraints.max_leverage"));

@@ -18,7 +18,7 @@ pub(crate) struct ParamMeta {
 pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
 
 /// 组级黑名单：即使整组对 AI 不可见也不得写入，避免新组默认变成可写。
-const AI_BLOCKED_GROUPS: &[&str] = &["parameter_set"];
+const AI_BLOCKED_GROUPS: &[&str] = &["parameter_set", "risk"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
 const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
@@ -568,25 +568,61 @@ mod tests {
             "min_oos_trades",
             "auto_apply_timeframes",
         ] {
-            assert_eq!(group["meta"][key]["visible"], serde_json::json!(true), "{key} 应可见");
-            assert_eq!(group["meta"][key]["ai_writable"], serde_json::json!(false), "{key} 不可被 AI 写");
+            assert_eq!(
+                group["meta"][key]["visible"],
+                serde_json::json!(true),
+                "{key} 应可见"
+            );
+            assert_eq!(
+                group["meta"][key]["ai_writable"],
+                serde_json::json!(false),
+                "{key} 不可被 AI 写"
+            );
         }
     }
 
     #[test]
     fn risk_is_not_ai_writable_after_a_phase() {
-        assert!(!crate::param_registry::find("risk", "max_leverage").unwrap().ai_writable);
-        assert!(!crate::param_registry::find("risk", "risk_per_trade_pct").unwrap().ai_writable);
-        assert!(crate::param_registry::find("strategy", "entry_threshold").unwrap().ai_writable);
+        assert!(
+            !crate::param_registry::find("risk", "max_leverage")
+                .unwrap()
+                .ai_writable
+        );
+        assert!(
+            !crate::param_registry::find("risk", "risk_per_trade_pct")
+                .unwrap()
+                .ai_writable
+        );
+        assert!(!is_ai_writable("risk", "future_hidden_field"));
+        assert!(
+            crate::param_registry::find("strategy", "entry_threshold")
+                .unwrap()
+                .ai_writable
+        );
     }
 
     #[test]
     fn ai_bounds_are_stricter_than_manual_ranges() {
-        assert_eq!(crate::param_registry::ai_bounds("strategy", "atr_pct_min"), Some((0.0, 1.0)));
-        assert_eq!(crate::param_registry::ai_bounds("strategy", "atr_pct_max"), Some((6.0, 20.0)));
-        assert_eq!(crate::param_registry::ai_bounds("strategy", "volume_ratio_min"), Some((0.0, 1.0)));
-        assert_eq!(crate::param_registry::ai_bounds("strategy", "entry_threshold"), Some((0.01, 0.5)));
-        assert_eq!(crate::param_registry::ai_bounds("risk", "max_leverage"), None);
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "atr_pct_min"),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "atr_pct_max"),
+            Some((6.0, 20.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "volume_ratio_min"),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("strategy", "entry_threshold"),
+            Some((0.01, 0.5))
+        );
+        assert_eq!(
+            crate::param_registry::ai_bounds("risk", "max_leverage"),
+            None
+        );
     }
 
     #[test]
