@@ -1,8 +1,7 @@
 use crate::providers::{candle_metrics, CandleSnapshot};
 
-#[cfg_attr(not(test), allow(dead_code))]
 const MIN_BARS_FOR_REGIME: usize = 30;
-pub(crate) const MARKET_QUORUM: usize = 6;
+const MARKET_QUORUM: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Regime {

@@ -161,8 +161,7 @@ pub(crate) fn regime_for(
     atr: f64,
     features: MarketFeatures,
 ) -> Option<crate::regime::Regime> {
-    core(candles, mark, atr, features)
-        .and_then(|core| crate::regime::Regime::from_str(core.regime))
+    core(candles, mark, atr, features).and_then(|core| crate::regime::Regime::from_str(core.regime))
 }
 
 pub(crate) fn preview(
