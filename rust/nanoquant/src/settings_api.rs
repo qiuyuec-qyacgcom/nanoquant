@@ -1,4 +1,4 @@
-//! 配置组读写。14 个组的默认值与取值范围对齐 `services/settings.py`。
+//! 配置组读写。14 个组的默认值与取值范围对齐 `default_settings.json` 与 `param_registry`。
 //!
 //! 未知组返回 404，不静默建组：前端拼错组名时若返回空对象，
 //! 用户会以为配置丢了再存一次，把别的组覆盖掉。
@@ -546,11 +546,28 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         let Some(meta) = crate::param_registry::find(group, key) else {
             continue;
         };
+        if candidate.is_null() {
+            continue;
+        }
+        let actual = crate::param_registry::kind_of(candidate);
+        if actual != meta.kind {
+            return Err(format!("{key}: 类型应为 {}", meta.kind));
+        }
+        if group == "parameter_set" && key == "auto_apply_timeframes" {
+            let allowed = candidate.as_str().is_some_and(|text| {
+                !text.trim().is_empty()
+                    && text
+                        .split(',')
+                        .all(|part| part.trim().eq_ignore_ascii_case("1h"))
+            });
+            if !allowed {
+                return Err(format!("{key}: v1 仅允许 1h"));
+            }
+        }
         let (Some(low), Some(high)) = (meta.min, meta.max) else {
             continue;
         };
         match candidate {
-            Value::Null => {}
             Value::Number(number) => match number.as_f64() {
                 Some(number) if number.is_finite() && (low..=high).contains(&number) => {}
                 _ => return Err(format!("{key}: 超出取值范围")),
@@ -785,6 +802,20 @@ mod tests {
                 validate(group, &Value::Object(hi)).is_ok(),
                 "{group}.{key} 上界"
             );
+        }
+    }
+
+    #[test]
+    fn parameter_set_validation_rejects_invalid_values() {
+        assert!(validate("parameter_set", &defaults_of("parameter_set")).is_ok());
+        for (key, bad) in [
+            ("enabled", json!("yes")),
+            ("min_oos_trades", json!(-5)),
+            ("auto_apply_timeframes", json!("4h")),
+        ] {
+            let mut value = defaults_of("parameter_set");
+            value[key] = bad;
+            assert!(validate("parameter_set", &value).is_err(), "{key} 应被拒绝");
         }
     }
 
@@ -1199,6 +1230,7 @@ mod tests {
 
     #[test]
     fn defaults_cover_every_group_and_risk_leverage_is_present() {
+        assert_eq!(GROUPS.len(), 14);
         for group in GROUPS {
             let value = defaults_of(group);
             assert!(

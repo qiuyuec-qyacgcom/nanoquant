@@ -132,6 +132,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         }
         backfill_sort_order(conn)?;
         ensure_parameter_changes(conn)?;
+        normalize_ai_tuning_interval(conn)?;
         drop_legacy_default_leverage(conn)?;
         Ok(())
     })();
@@ -149,6 +150,19 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
          CREATE INDEX IF NOT EXISTS ix_parameter_changes_ts ON parameter_changes(ts);",
     )
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
+}
+
+/// 存量库的调参间隔 0 表示「每轮复核都可调参」，A 期解耦后语义变为独立任务间隔，
+/// 必须归一为 86400；显式配置过的非 0 值保持不动。
+pub(crate) fn normalize_ai_tuning_interval(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE app_settings SET value = json_set(value, '$.param_tuning_min_interval_sec', 86400) \
+         WHERE key='ai' AND json_valid(value) \
+         AND COALESCE(json_extract(value, '$.param_tuning_min_interval_sec'), 0) = 0",
+        [],
+    )
+    .map_err(|e| format!("迁移 ai.param_tuning_min_interval_sec 失败: {e}"))?;
+    Ok(())
 }
 
 /// 杠杆改由「AI 在全局上下限内给值」，老库里的 default_leverage 必须清掉：
@@ -262,6 +276,27 @@ mod tests {
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
         assert_eq!(table_count(&conn), 24);
+    }
+
+    #[test]
+    fn normalize_ai_tuning_interval_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings(key,value,updated_at) \
+             VALUES('ai','{\"allow_param_tuning\":true,\"param_tuning_min_interval_sec\":0}',0)",
+            [],
+        )
+        .unwrap();
+        normalize_ai_tuning_interval(&conn).unwrap();
+        normalize_ai_tuning_interval(&conn).unwrap();
+        let raw: String = conn
+            .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let ai: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ai["param_tuning_min_interval_sec"], 86400);
     }
 
     #[test]

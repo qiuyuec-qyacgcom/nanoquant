@@ -304,6 +304,16 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   data: {
     request_timeout_sec: { label: '行情请求超时', unit: '秒', hint: '只作用于交易所行情接口' },
   },
+  parameter_set: {
+    enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择、自动启用与无候选回滚；手动启用/回滚保留' },
+    auto_apply: { label: '自动启用', hint: '证据门通过后自动启用 approved 候选；关闭则只允许手动启用' },
+    max_auto_apply_per_24h: { label: '24h 自动启用上限', unit: '次', min: 1, max: 100, hint: '滚动 24 小时只统计 auto_apply' },
+    no_candidate_rollback_sec: { label: '无候选回滚时长', unit: '秒', min: 60, max: 86400, hint: '生效后连续无 gate 候选的实跑时长，到期回滚上一套' },
+    regime_confirm_sec: { label: 'regime 确认时长', unit: '秒', min: 60, max: 86400, hint: 'market_regime 连续一致达到该时长才切换' },
+    regime_cooldown_sec: { label: 'regime 冷却', unit: '秒', min: 0, max: 86400, hint: '两次 regime 切换的最小间隔' },
+    min_oos_trades: { label: '样本外成交下限', unit: '笔', min: 1, max: 1000, hint: '证据门中目标 regime 的样本外成交数下限' },
+    auto_apply_timeframes: { label: '自动启用周期', hint: 'v1 仅 1h；逗号分隔的白名单，其它周期需人工校准' },
+  },
 }
 
 const SECTIONS = SETTINGS_SECTIONS

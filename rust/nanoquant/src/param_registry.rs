@@ -77,6 +77,17 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
+    ("parameter_set", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
+    (
+        "parameter_set",
+        "no_candidate_rollback_sec",
+        60.0,
+        86400.0,
+        60.0,
+    ),
+    ("parameter_set", "regime_confirm_sec", 60.0, 86400.0, 60.0),
+    ("parameter_set", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
+    ("parameter_set", "min_oos_trades", 1.0, 1000.0, 1.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
     ("ai", "max_calls_per_hour", 1.0, 10000.0, 1.0),
     ("ai", "monthly_budget_usd", 0.0, 1.0e6, 0.1),
@@ -292,6 +303,8 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     !is_visible(group, key)
 }
 
+/// A 期先定义边界，A3 接入候选校验后移除 allow。
+#[allow(dead_code)]
 pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
     match (group, key) {
         ("strategy", "atr_pct_min") => Some((0.0, 1.0)),
@@ -302,7 +315,7 @@ pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
     }
 }
 
-fn kind_of(value: &Value) -> &'static str {
+pub(crate) fn kind_of(value: &Value) -> &'static str {
     match value {
         Value::Bool(_) => "bool",
         Value::Number(_) => "number",
@@ -603,6 +616,17 @@ mod tests {
 
     #[test]
     fn ai_bounds_are_stricter_than_manual_ranges() {
+        for (group, key) in [
+            ("strategy", "atr_pct_min"),
+            ("strategy", "atr_pct_max"),
+            ("strategy", "volume_ratio_min"),
+            ("strategy", "entry_threshold"),
+        ] {
+            let (low, high) = ai_bounds(group, key).unwrap();
+            let (min, max, _) = range_of(group, key);
+            assert!(low >= min.unwrap(), "{group}.{key} 下界应落在 RANGES 内");
+            assert!(high <= max.unwrap(), "{group}.{key} 上界应落在 RANGES 内");
+        }
         assert_eq!(
             crate::param_registry::ai_bounds("strategy", "atr_pct_min"),
             Some((0.0, 1.0))
@@ -619,10 +643,9 @@ mod tests {
             crate::param_registry::ai_bounds("strategy", "entry_threshold"),
             Some((0.01, 0.5))
         );
-        assert_eq!(
-            crate::param_registry::ai_bounds("risk", "max_leverage"),
-            None
-        );
+        assert_eq!(ai_bounds("risk", "max_leverage"), None);
+        assert_eq!(ai_bounds("strategy", "ema_fast"), None);
+        assert_eq!(ai_bounds("parameter_set", "min_oos_trades"), None);
     }
 
     #[test]
