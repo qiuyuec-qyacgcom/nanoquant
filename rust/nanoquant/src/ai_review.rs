@@ -67,7 +67,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     if market.candles.len() < 30 {
         return Err("K 线不足，无法复核".to_string());
     }
-    let features = crate::ai_analysis::feature_snapshot(market, &interval);
+    let features = crate::ai_analysis::feature_snapshot(
+        market,
+        &interval,
+        crate::ai_analysis::rsi_period_of(&strategy_cfg),
+    );
     let risk = state
         .db
         .setting("risk")

@@ -154,6 +154,12 @@ pub(crate) struct OrderSpec {
     pub dual_side: bool,
     pub purpose: String,
     pub client_order_id: String,
+    /// "MARKET" 或 "LIMIT"。
+    pub order_type: String,
+    /// 限价单价格；市价单为 None。
+    pub price: Option<f64>,
+    /// 只做 Maker：LIMIT + GTX，无法立即成交就被交易所拒掉。
+    pub post_only: bool,
 }
 
 impl OrderSpec {
@@ -162,7 +168,8 @@ impl OrderSpec {
         filter: &SymbolFilter,
         recv_window_ms: i64,
     ) -> Vec<(String, String)> {
-        let mut params = crate::sign::order_params(
+        let price = self.price.map(|price| filter.format_price(price));
+        let mut params = crate::sign::order_params_typed(
             &self.symbol,
             &self.side,
             &self.position_side,
@@ -170,6 +177,9 @@ impl OrderSpec {
             &self.client_order_id,
             self.dual_side,
             self.reduce_only,
+            &self.order_type,
+            price.as_deref(),
+            self.post_only,
         );
         params.push(("recvWindow".into(), recv_window_ms.to_string()));
         params
@@ -809,6 +819,9 @@ mod tests {
             dual_side: false,
             purpose: "stop_loss".into(),
             client_order_id: "nq42".into(),
+            order_type: "MARKET".into(),
+            price: None,
+            post_only: false,
         }
     }
 

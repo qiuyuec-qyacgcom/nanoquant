@@ -107,6 +107,7 @@ pub fn signed_query(
 /// 平多仓时两者相反：卖出（SELL）去减多头仓（LONG）。
 /// 双向持仓用 `positionSide` 标明仓位，且不能再带 `reduceOnly`（币安会拒单）；
 /// 单向持仓只在平仓时带 `reduceOnly=true`。
+#[cfg(test)]
 pub fn order_params(
     symbol: &str,
     order_side: &str,
@@ -116,13 +117,57 @@ pub fn order_params(
     dual: bool,
     closing: bool,
 ) -> Vec<(String, String)> {
+    order_params_typed(
+        symbol,
+        order_side,
+        position_side,
+        qty,
+        client_id,
+        dual,
+        closing,
+        "MARKET",
+        None,
+        false,
+    )
+}
+
+/// 同 `order_params`，但支持只做 Maker 的限价单。
+///
+/// `price` 只在 `LIMIT` 时使用；`post_only` 为真时追加 `timeInForce=GTX`，
+/// 交易所会把无法立即成交的挂单拒掉而不是转为 taker。
+#[allow(clippy::too_many_arguments)]
+pub fn order_params_typed(
+    symbol: &str,
+    order_side: &str,
+    position_side: &str,
+    qty: &str,
+    client_id: &str,
+    dual: bool,
+    closing: bool,
+    order_type: &str,
+    price: Option<&str>,
+    post_only: bool,
+) -> Vec<(String, String)> {
+    let kind = if order_type.trim().eq_ignore_ascii_case("LIMIT") {
+        "LIMIT"
+    } else {
+        "MARKET"
+    };
     let mut params = vec![
         ("symbol".to_string(), symbol.to_string()),
         ("side".to_string(), order_side.to_string()),
-        ("type".to_string(), "MARKET".to_string()),
+        ("type".to_string(), kind.to_string()),
         ("quantity".to_string(), qty.to_string()),
-        ("newClientOrderId".to_string(), client_id.to_string()),
     ];
+    if kind == "LIMIT" {
+        if let Some(price) = price.filter(|value| !value.is_empty()) {
+            params.push(("price".to_string(), price.to_string()));
+        }
+        if post_only {
+            params.push(("timeInForce".to_string(), "GTX".to_string()));
+        }
+    }
+    params.push(("newClientOrderId".to_string(), client_id.to_string()));
     if dual {
         params.push((
             "positionSide".to_string(),
@@ -273,6 +318,40 @@ mod tests {
             a.signature, reversed.signature,
             "参数顺序不同必须得到不同签名"
         );
+    }
+
+    #[test]
+    fn order_type_market_keeps_market_and_limit_post_only_sends_gtx_price() {
+        let market = order_params("BTCUSDT", "BUY", "long", "0.25", "nq-mkt", false, false);
+        assert_eq!(
+            market.iter().find(|(k, _)| k == "type").map(|(_, v)| v.as_str()),
+            Some("MARKET"),
+            "market 模式必须继续用市价单"
+        );
+        assert!(!market.iter().any(|(k, _)| k == "timeInForce" || k == "price"));
+
+        let limit = order_params_typed(
+            "BTCUSDT",
+            "BUY",
+            "long",
+            "0.25",
+            "nq-lmt",
+            false,
+            false,
+            "LIMIT",
+            Some("99999.9"),
+            true,
+        );
+        let value = |key: &str| {
+            limit
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("type"), Some("LIMIT"));
+        assert_eq!(value("timeInForce"), Some("GTX"), "只做 Maker 必须用 GTX");
+        assert_eq!(value("price"), Some("99999.9"));
+        assert!(!limit.iter().any(|(k, _)| k == "reduceOnly"));
     }
 
     #[test]

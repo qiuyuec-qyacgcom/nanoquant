@@ -60,6 +60,33 @@ pub(crate) struct RuntimeConfig {
     pub(crate) interval_sec: u64,
 }
 
+/// 实盘开仓的下单方式。平仓与保护单始终是市价，避免挂不出去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveOrderType {
+    Market,
+    LimitPostOnly,
+}
+
+impl LiveOrderType {
+    fn from_setting(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("limit_post_only") => Self::LimitPostOnly,
+            _ => Self::Market,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Market => "MARKET",
+            Self::LimitPostOnly => "LIMIT",
+        }
+    }
+
+    fn is_post_only(self) -> bool {
+        self == Self::LimitPostOnly
+    }
+}
+
 /// 实盘准备发送的一笔管仓单。网络请求必须在数据库事务之外发。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LivePlan {
@@ -70,6 +97,10 @@ pub(crate) struct LivePlan {
     pub(crate) qty: f64,
     pub(crate) purpose: String,
     pub(crate) mark_price: f64,
+    /// 开仓下单方式；平仓计划固定为市价。
+    pub(crate) order_type: LiveOrderType,
+    /// 限价开仓的委托价（未按 tick 格式化，发单前统一格式化）。
+    pub(crate) price: Option<f64>,
     entry: Option<EntryTerms>,
     /// 开仓决策时的注入 ID，随成交回执写入持仓 features。
     features: Option<String>,
@@ -1536,9 +1567,10 @@ impl EngineRuntime {
             let inflight: std::collections::BTreeSet<String> = {
                 let mut stmt = tx
                     .prepare(
-                        // 只拦市价管仓单：条件单是保护腿，不该阻止平仓。
+                        // 只拦市价/限价管仓单：条件单是保护腿，不该阻止平仓。
                         "SELECT DISTINCT symbol FROM orders WHERE mode='live' \
-                         AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') AND order_type='MARKET'",
+                         AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') \
+                         AND order_type IN ('MARKET','LIMIT')",
                     )
                     .map_err(|error| error.to_string())?;
                 let rows = stmt
@@ -1667,8 +1699,44 @@ impl EngineRuntime {
         );
     }
 
-    /// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
-    fn live_plans(
+/// 限价开仓优先挂对手盘最优价：买单挂买一，卖单挂卖一。
+/// 没有可信盘口（<=0 或非有限）时退回标记价，宁可挂不上也不追价。
+fn limit_entry_price(side: &str, bid: f64, ask: f64, mark: f64) -> f64 {
+    let book = if side == "BUY" { bid } else { ask };
+    if book.is_finite() && book > 0.0 {
+        book
+    } else {
+        mark
+    }
+}
+
+/// 开仓成交费率：只做 Maker 的限价开仓用 maker 费率，其余（市价开仓、
+/// 平仓、保护单）一律 taker，保证 positions/trades 的手续费口径一致。
+fn plan_fee_rate(plan: &LivePlan, taker_rate: f64, maker_rate: f64) -> f64 {
+    if plan.purpose == "entry" && plan.order_type.is_post_only() {
+        maker_rate
+    } else {
+        taker_rate
+    }
+}
+
+/// 实盘开仓单是否还挂着。未成交的限价单不会写 positions，
+/// 只看仓位会重复挂单，所以必须回查订单表。
+fn live_entry_inflight(
+    tx: &rusqlite::Transaction<'_>,
+    symbol: &str,
+) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='live' AND purpose='entry' AND symbol=?1 \
+         AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED'))",
+        [symbol],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
+fn live_plans(
         symbols: &[String],
         positions: &[crate::manage::ManagedPosition],
         report: &crate::cycle::CycleReport,
@@ -1702,6 +1770,8 @@ impl EngineRuntime {
                     qty,
                     purpose,
                     mark_price: position.mark_price,
+                    order_type: LiveOrderType::Market,
+                    price: None,
                     entry: None,
                     features: None,
                 })
@@ -1709,7 +1779,26 @@ impl EngineRuntime {
             .collect()
     }
 
-    fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
+    /// 扫描闸门配置。点差上限优先读界面字段 `max_spread_bps`，
+/// 兼容历史键 `spread_bps_max`，都为缺时按 8bp 兜底。
+fn scan_gates_of(strategy: &Value) -> crate::scan::ScanGates {
+    let spread_bps_max = strategy["max_spread_bps"]
+        .as_f64()
+        .or_else(|| strategy["spread_bps_max"].as_f64())
+        .unwrap_or(8.0);
+    crate::scan::ScanGates {
+        atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
+        atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
+        volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
+        min_24h_quote_volume: strategy["min_24h_quote_volume"]
+            .as_f64()
+            .unwrap_or(3_000_000.0),
+        spread_bps_max,
+        entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
+    }
+}
+
+fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         let minutes: i64 = match strategy["timeframe"].as_str().unwrap_or("4h") {
             "1m" => 1,
             "3m" => 3,
@@ -2036,16 +2125,7 @@ impl EngineRuntime {
             now,
             halted: state("halted")?.unwrap_or_default(),
         };
-        let gates = crate::scan::ScanGates {
-            atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
-            atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
-            volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
-            min_24h_quote_volume: strategy["min_24h_quote_volume"]
-                .as_f64()
-                .unwrap_or(3_000_000.0),
-            spread_bps_max: strategy["spread_bps_max"].as_f64().unwrap_or(8.0),
-            entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
-        };
+        let gates = Self::scan_gates_of(strategy);
         let interval_ms = Self::timeframe_ms(strategy)?;
         let max_age_ms = interval_ms as f64
             * strategy["data_stale_mult"]
@@ -2544,6 +2624,7 @@ impl EngineRuntime {
         executed: &mut Vec<Value>,
     ) -> Result<Vec<LivePlan>, String> {
         let cfg = Self::risk_settings(tx)?;
+        let entry_order_type = LiveOrderType::from_setting(engine["order_type"].as_str());
         let mut plans = Vec::new();
         let mut available = snapshot.account.available_balance;
         let now = crate::now();
@@ -2646,6 +2727,37 @@ impl EngineRuntime {
                 score: draft.score,
             };
             if mode == "live" {
+                // 上一轮挂出去的开仓单还没结论时，绝不能再发第二张；
+                // 本地没有持仓不代表交易所没有挂单。
+                if Self::live_entry_inflight(tx, &draft.symbol)? {
+                    audit.push(draft.audit_row(
+                        "rejected",
+                        draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                        "已有未完成的实盘开仓挂单，等待成交或对账",
+                        &reviewed.action,
+                        reviewed.confidence,
+                        &reviewed.reason,
+                    ));
+                    break;
+                }
+                let price = match entry_order_type {
+                    LiveOrderType::Market => None,
+                    LiveOrderType::LimitPostOnly => {
+                        let book = snapshot
+                            .markets
+                            .iter()
+                            .find(|market| market.symbol == draft.symbol);
+                        let (bid, ask) = book
+                            .map(|market| (market.bid, market.ask))
+                            .unwrap_or((draft.mark_price, draft.mark_price));
+                        Some(Self::limit_entry_price(
+                            side,
+                            bid,
+                            ask,
+                            draft.mark_price,
+                        ))
+                    }
+                };
                 plans.push(LivePlan {
                     symbol: draft.symbol.clone(),
                     position_side: final_side.clone(),
@@ -2653,6 +2765,8 @@ impl EngineRuntime {
                     qty,
                     purpose: "entry".into(),
                     mark_price: draft.mark_price,
+                    order_type: entry_order_type,
+                    price,
                     entry: Some(entry),
                     features: Some(features_text.clone()),
                 });
@@ -3070,12 +3184,14 @@ impl EngineRuntime {
         tx.execute(
             "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
              client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
-             VALUES(?1,?2,?3,'MARKET',?4,0,'SUBMITTING',?5,?6,'',?7,'live',0)",
+             VALUES(?1,?2,?3,?4,?5,?6,'SUBMITTING',?7,?8,'',?9,'live',0)",
             (
                 crate::now(),
                 &plan.symbol,
                 &plan.side,
+                plan.order_type.as_str(),
                 qty,
+                plan.price.unwrap_or(0.0),
                 &plan.purpose,
                 client_order_id,
                 plan.entry.is_none(),
@@ -3258,11 +3374,17 @@ impl EngineRuntime {
                     (if status.is_empty() { "NEW" } else { status.as_str() }, order_id, client_order_id),
                 )
                 .map_err(|error| error.to_string())?;
-                Some(format!(
-                    "{} 下单已受理但未成交（{}）",
-                    plan.symbol,
-                    reply.status_text()
-                ))
+                // 只做 Maker 的开仓单挂上之后就进入等待状态：不是失败，也不建仓，
+                // 由下一轮对账确认成交或超时撤销。
+                if plan.purpose == "entry" && plan.order_type.is_post_only() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} 下单已受理但未成交（{}）",
+                        plan.symbol,
+                        reply.status_text()
+                    ))
+                }
             }
             Reply::Rejected { code, message } => {
                 tx.execute(
@@ -3357,7 +3479,8 @@ impl EngineRuntime {
             .setting("risk")
             .map_err(|error| error.to_string())?
             .unwrap_or_else(|| crate::settings_api::defaults_of("risk"));
-        let fee_rate = risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+        let taker_rate = risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+        let maker_rate = risk["fee_rate_maker"].as_f64().unwrap_or(0.0002);
         let buffer = risk["min_notional_buffer"].as_f64().unwrap_or(1.05);
         let symbols: Vec<String> = plans.iter().map(|plan| plan.symbol.clone()).collect();
         let filters = {
@@ -3440,6 +3563,9 @@ impl EngineRuntime {
                 dual_side,
                 purpose: plan.purpose.clone(),
                 client_order_id: client_order_id.clone(),
+                order_type: plan.order_type.as_str().to_string(),
+                price: plan.price,
+                post_only: plan.order_type.is_post_only(),
             };
             let request = match self
                 .build_live(
@@ -3486,6 +3612,7 @@ impl EngineRuntime {
             }
             let wait_ms = elapsed_ms(t_wait);
             let t_settle = Instant::now();
+            let fee_rate = Self::plan_fee_rate(&plan, taker_rate, maker_rate);
             match self.settle_live(&plan, &client_order_id, qty, fee_rate, &reply) {
                 Ok(Some(failure)) => failures.push(failure),
                 Ok(None) => {}
@@ -3512,7 +3639,7 @@ impl EngineRuntime {
             ]);
         }
         failures.extend(
-            self.reconcile_pending(creds, gateway, fee_rate)
+            self.reconcile_pending(creds, gateway, taker_rate, maker_rate)
                 .await?
                 .into_iter()
                 .map(|failure| format!("对账: {failure}")),
@@ -3536,7 +3663,8 @@ impl EngineRuntime {
         &self,
         creds: &LiveCreds,
         gateway: &dyn crate::live::Gateway,
-        fee_rate: f64,
+        taker_rate: f64,
+        maker_rate: f64,
     ) -> Result<Vec<String>, String> {
         let pending = {
             let conn = self
@@ -3546,11 +3674,11 @@ impl EngineRuntime {
                 .map_err(|_| "数据库锁不可用".to_string())?;
             let mut stmt = conn
                 .prepare(
-                    // 只查市价单：条件单是保护腿，按 clientAlgoId 挂在 Algo 接口上，
+                    // 只查市价/限价单：条件单是保护腿，按 clientAlgoId 挂在 Algo 接口上，
                     // 用订单接口查只会拿到 -2013。
-                    "SELECT client_order_id,symbol,side,purpose FROM orders \
+                    "SELECT client_order_id,symbol,side,purpose,order_type FROM orders \
                      WHERE mode='live' AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') \
-                     AND order_type='MARKET' ORDER BY id LIMIT 20",
+                     AND order_type IN ('MARKET','LIMIT') ORDER BY id LIMIT 20",
                 )
                 .map_err(|error| error.to_string())?;
             let rows = stmt
@@ -3560,6 +3688,7 @@ impl EngineRuntime {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|error| error.to_string())?;
@@ -3567,7 +3696,7 @@ impl EngineRuntime {
                 .map_err(|error| error.to_string())?
         };
         let mut failures = Vec::new();
-        for (client_order_id, symbol, side, purpose) in pending {
+        for (client_order_id, symbol, side, purpose, order_type) in pending {
             let reply = self
                 .resolve_live(creds, gateway, &symbol, &client_order_id)
                 .await;
@@ -3583,9 +3712,12 @@ impl EngineRuntime {
                 qty: 0.0,
                 purpose,
                 mark_price: 0.0,
+                order_type: LiveOrderType::from_setting(Some(&order_type)),
+                price: None,
                 entry: None,
                 features: None,
             };
+            let fee_rate = Self::plan_fee_rate(&plan, taker_rate, maker_rate);
             match reply {
                 crate::live::Reply::Filled {
                     avg_price,
@@ -4510,6 +4642,76 @@ mod tests {
         assert_eq!(liveness_threshold_sec(60), 180);
     }
 
+    #[test]
+    fn order_type_limit_price_uses_top_of_book_and_falls_back_to_mark() {
+        assert_eq!(
+            EngineRuntime::limit_entry_price("BUY", 99.5, 100.5, 100.0),
+            99.5,
+            "买单挂买一"
+        );
+        assert_eq!(
+            EngineRuntime::limit_entry_price("SELL", 99.5, 100.5, 100.0),
+            100.5,
+            "卖单挂卖一"
+        );
+        assert_eq!(
+            EngineRuntime::limit_entry_price("BUY", 0.0, 0.0, 100.0),
+            100.0,
+            "没有盘口时退回标记价"
+        );
+        assert_eq!(
+            EngineRuntime::limit_entry_price("SELL", f64::NAN, 0.0, 101.0),
+            101.0,
+            "盘口非有限值同样退回标记价"
+        );
+
+        assert_eq!(LiveOrderType::from_setting(None), LiveOrderType::Market);
+        assert_eq!(
+            LiveOrderType::from_setting(Some("market")),
+            LiveOrderType::Market
+        );
+        assert_eq!(
+            LiveOrderType::from_setting(Some("limit_post_only")),
+            LiveOrderType::LimitPostOnly
+        );
+        assert_eq!(
+            LiveOrderType::from_setting(Some("unknown")),
+            LiveOrderType::Market,
+            "未知配置按市价处理，不能发出不合法的订单类型"
+        );
+        assert_eq!(LiveOrderType::Market.as_str(), "MARKET");
+        assert_eq!(LiveOrderType::LimitPostOnly.as_str(), "LIMIT");
+    }
+
+    #[test]
+    fn max_spread_bps_setting_rejects_a_wide_book() {
+        let gates = EngineRuntime::scan_gates_of(&serde_json::json!({"max_spread_bps": 2.0}));
+        assert_eq!(gates.spread_bps_max, 2.0, "界面字段 max_spread_bps 必须生效");
+        let candidate = crate::scan::Candidate {
+            symbol: "BTCUSDT".into(),
+            data_ok: true,
+            atr_pct: gates.atr_pct_min + 0.1,
+            vol_ratio: gates.volume_ratio_min + 0.1,
+            quote_volume: gates.min_24h_quote_volume + 1.0,
+            spread_bps: 3.0,
+            strength: 0.5,
+            preview_side: None,
+        };
+        assert!(
+            crate::scan::risk_gate(&candidate, &gates).contains("盘口点差过大"),
+            "点差 3bp 超过上限 2bp 必须被闸门拒绝"
+        );
+
+        let legacy = EngineRuntime::scan_gates_of(&serde_json::json!({"spread_bps_max": 4.0}));
+        assert_eq!(legacy.spread_bps_max, 4.0, "旧键仍要兼容");
+        let fallback = EngineRuntime::scan_gates_of(&serde_json::json!({}));
+        assert_eq!(fallback.spread_bps_max, 8.0, "两者都缺时缺省 8bp");
+        let both = EngineRuntime::scan_gates_of(
+            &serde_json::json!({"max_spread_bps": 2.0, "spread_bps_max": 9.0}),
+        );
+        assert_eq!(both.spread_bps_max, 2.0, "新键优先于旧键");
+    }
+
     fn test_runtime(db: &Db) -> EngineRuntime {
         let lock = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
         EngineRuntime::new(
@@ -5057,6 +5259,260 @@ mod tests {
         assert_eq!(position, ("long".into(), 2.0, 100.1, 5.0));
     }
 
+    #[test]
+    fn live_order_type_fee_rate_uses_maker_only_for_post_only_entries() {
+        let plan = |order_type: LiveOrderType, purpose: &str| LivePlan {
+            symbol: "BTCUSDT".into(),
+            position_side: "long".into(),
+            side: "BUY".into(),
+            qty: 1.0,
+            purpose: purpose.into(),
+            mark_price: 100.0,
+            order_type,
+            price: None,
+            entry: None,
+            features: None,
+        };
+        assert_eq!(
+            EngineRuntime::plan_fee_rate(&plan(LiveOrderType::LimitPostOnly, "entry"), 0.0005, 0.0002),
+            0.0002,
+            "maker 开仓成交用 maker 费率"
+        );
+        assert_eq!(
+            EngineRuntime::plan_fee_rate(&plan(LiveOrderType::Market, "entry"), 0.0005, 0.0002),
+            0.0005,
+            "市价开仓仍用 taker 费率"
+        );
+        assert_eq!(
+            EngineRuntime::plan_fee_rate(&plan(LiveOrderType::LimitPostOnly, "stop_loss"), 0.0005, 0.0002),
+            0.0005,
+            "平仓始终是 taker，即使订单类型写着 LIMIT"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_order_type_limit_post_only_entry_waits_without_position_or_replan() {
+        let (db, snapshot) = entry_fixture().await;
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = plans[0].clone();
+        assert_eq!(plan.order_type, LiveOrderType::LimitPostOnly);
+        assert_eq!(plan.side, "BUY");
+        let bid = snapshot.markets[0].bid;
+        assert!(
+            (plan.price.unwrap() - bid).abs() < 1e-9,
+            "买单要挂在买一，拿到 {:?} 而非 {bid}",
+            plan.price
+        );
+
+        let leverage = plan.entry.as_ref().unwrap().leverage.round() as i64;
+        let leverage_body = Box::leak(
+            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
+        );
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, leverage_body),
+            (
+                200,
+                r#"{"orderId":55,"status":"NEW","executedQty":"0","avgPrice":"0"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, vec![plan])
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "挂单不是失败：{failures:?}");
+        let urls = gateway.sent_urls();
+        assert_eq!(urls.len(), 4, "挂单后同轮还会对账查询一次");
+        assert_eq!(
+            urls.iter().filter(|url| url.contains("type=LIMIT")).count(),
+            1,
+            "限价开仓只发一次，后续只是查询"
+        );
+        assert!(urls[2].contains("type=LIMIT"), "{}", urls[2]);
+        assert!(urls[2].contains("timeInForce=GTX"), "{}", urls[2]);
+        assert!(urls[2].contains("price=99.99"), "{}", urls[2]);
+        assert!(urls[3].contains("origClientOrderId="), "{}", urls[3]);
+        {
+            let conn = db.conn.lock().unwrap();
+            let (order_type, status): (String, String) = conn
+                .query_row(
+                    "SELECT order_type,status FROM orders WHERE mode='live'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(order_type, "LIMIT", "reserve_order 不能继续写 MARKET");
+            assert_eq!(status, "NEW");
+            let positions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM positions WHERE mode='live'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(positions, 0, "未成交的限价单不能当成已开仓");
+        }
+        let replanned = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert!(replanned.is_empty(), "挂单未完成时不能重复发单");
+    }
+
+    #[tokio::test]
+    async fn live_order_type_limit_entry_rejection_is_not_resent() {
+        let (db, snapshot) = entry_fixture().await;
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
+        let leverage_body = Box::leak(
+            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
+        );
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, leverage_body),
+            (
+                400,
+                r#"{"code":-2021,"msg":"Order would immediately match and take."}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| failure.contains("-2021")),
+            "拒单原因必须上报：{failures:?}"
+        );
+        assert_eq!(gateway.sent_count(), 3, "挂单被拒必须放弃，不能追价改市价");
+        let conn = db.conn.lock().unwrap();
+        let (order_type, status): (String, String) = conn
+            .query_row(
+                "SELECT order_type,status FROM orders WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(order_type, "LIMIT");
+        assert_eq!(status, "REJECTED");
+        let positions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE mode='live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(positions, 0);
+    }
+
+    #[tokio::test]
+    async fn live_order_type_unknown_entry_is_not_resent() {
+        let (db, snapshot) = entry_fixture().await;
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
+        let leverage_body = Box::leak(
+            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
+        );
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, leverage_body),
+            (0, ""),
+            (0, ""),
+        ]);
+        runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway.sent_count(),
+            5,
+            "未知结果只查询，绝不重发第二笔挂单"
+        );
+        let urls = gateway.sent_urls();
+        assert_eq!(
+            urls.iter().filter(|url| url.contains("type=LIMIT")).count(),
+            1,
+            "只有一笔真实的限价发单"
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM orders WHERE mode='live'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "UNKNOWN");
+            let positions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM positions WHERE mode='live'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(positions, 0);
+        }
+        let replanned = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert!(replanned.is_empty(), "结果未知的挂单不能重复发单");
+    }
+
+    #[tokio::test]
+    async fn live_order_type_limit_fill_charges_the_maker_fee() {
+        let (db, snapshot) = entry_fixture().await;
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        let runtime = test_runtime(&db);
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
+        let leverage_body = Box::leak(
+            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
+        );
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, leverage_body),
+            (
+                200,
+                r#"{"orderId":66,"status":"FILLED","executedQty":"2","avgPrice":"99.5"}"#,
+            ),
+            (200, r#"{"algoId":101}"#),
+            (200, r#"{"algoId":102}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, plans)
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let conn = db.conn.lock().unwrap();
+        let (qty, entry_price, fees): (f64, f64, f64) = conn
+            .query_row(
+                "SELECT qty,entry_price,fees FROM positions WHERE mode='live' AND status='open'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((qty, entry_price), (2.0, 99.5));
+        let expected = 2.0 * 99.5 * 0.0002;
+        assert!(
+            (fees - expected).abs() < 1e-12,
+            "maker 成交手续费应为 {expected}，实际 {fees}"
+        );
+    }
+
     #[tokio::test]
     async fn live_entry_requires_confirmed_leverage_before_sending_order() {
         let (db, snapshot) = entry_fixture().await;
@@ -5204,6 +5660,17 @@ mod tests {
             )
             .unwrap();
         assert!(expiry > crate::now());
+    }
+
+    fn set_engine_settings(db: &Db, value: &str) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [value],
+            )
+            .unwrap();
     }
 
     async fn entry_fixture() -> (Db, crate::providers::TradingSnapshot) {
@@ -5453,6 +5920,12 @@ mod tests {
 
     fn seed_live_position(db: &Db) {
         let conn = db.conn.lock().unwrap();
+        // test_db 的持仓夹具早于 trades 生产 schema 字段，补齐 record_trade 读取的列。
+        conn.execute_batch(
+            "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
+             ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';",
+        )
+        .unwrap();
         conn.execute(
             "UPDATE app_settings SET value=?1 WHERE key='engine'",
             [r#"{"enabled":true,"mode":"live"}"#],

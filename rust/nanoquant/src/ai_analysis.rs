@@ -133,7 +133,17 @@ fn interval_of(body_interval: &str) -> String {
     }
 }
 
-pub(crate) fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value {
+/// 从 strategy 配置读 RSI 周期；缺省 14，非整数或越界时同样回退 14。
+pub(crate) fn rsi_period_of(strategy: &Value) -> usize {
+    strategy
+        .get("rsi_period")
+        .and_then(Value::as_f64)
+        .map(|period| period.round() as i64)
+        .filter(|period| (2..=200).contains(period))
+        .map_or(14, |period| period as usize)
+}
+
+pub(crate) fn feature_snapshot(market: &MarketSnapshot, interval: &str, rsi_period: usize) -> Value {
     let candles = &market.candles;
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
     let metrics = candle_metrics(candles, 14);
@@ -156,7 +166,8 @@ pub(crate) fn feature_snapshot(market: &MarketSnapshot, interval: &str) -> Value
         "close": round4(last),
         "ema_fast": ema(&closes, 9).map(round4),
         "ema_slow": ema(&closes, 21).map(round4),
-        "rsi": rsi(&closes, 14).map(round4),
+        "rsi_period": rsi_period,
+        "rsi": rsi(&closes, rsi_period).map(round4),
         "atr": metrics.map(|item| round4(item.atr)),
         "atr_pct": metrics.map(|item| item.atr_pct),
         "vol_ratio": metrics.map(|item| item.vol_ratio),
@@ -354,7 +365,8 @@ async fn analyze(
     if market.candles.len() < 30 {
         return Err(bad_request("K 线数据不足, 无法分析"));
     }
-    let features = feature_snapshot(&market, &interval);
+    let strategy = strategy_config(&state);
+    let features = feature_snapshot(&market, &interval, rsi_period_of(&strategy));
     let snapshot_view = json!({
         "price": market.mark_price,
         "change_24h": features["change_24h"],
@@ -461,7 +473,7 @@ async fn decision_preview(
     if market.candles.len() < 30 {
         return Err(bad_request("K 线数据不足"));
     }
-    let features = feature_snapshot(&market, &interval);
+    let features = feature_snapshot(&market, &interval, rsi_period_of(&strategy));
     let ema_gap = features["ema_gap_pct"].as_f64().unwrap_or(0.0);
     let fast = features["ema_fast"].as_f64().unwrap_or(0.0);
     let slow = features["ema_slow"].as_f64().unwrap_or(0.0);
@@ -628,6 +640,58 @@ mod tests {
     use axum::http::Request;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    #[test]
+    fn rsi_period_setting_drives_the_feature_snapshot() {
+        assert_eq!(rsi_period_of(&json!({})), 14, "缺省 RSI 周期是 14");
+        assert_eq!(rsi_period_of(&json!({"rsi_period": 7})), 7);
+        assert_eq!(rsi_period_of(&json!({"rsi_period": 0})), 14, "非法周期回退 14");
+        assert_eq!(rsi_period_of(&json!({"rsi_period": 999})), 14);
+
+        let mut closes = vec![100.0; 20];
+        for index in 0..7 {
+            let last = *closes.last().unwrap();
+            closes.push(if index % 2 == 0 { last + 1.0 } else { last - 1.0 });
+        }
+        for _ in 0..7 {
+            let last = *closes.last().unwrap();
+            closes.push(last + 1.0);
+        }
+        let candles: Vec<CandleSnapshot> = closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| CandleSnapshot {
+                close_time: 1_700_000_000 + index as i64 * 60,
+                open: *close,
+                high: close + 0.5,
+                low: close - 0.5,
+                close: *close,
+                volume: 10.0,
+            })
+            .collect();
+        let market = MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            mark_price: *closes.last().unwrap(),
+            timestamp: 1_700_000_000,
+            quote_volume: 5_000_000.0,
+            funding_rate: 0.0001,
+            open_interest: 1000.0,
+            open_interest_change_pct: 1.5,
+            bid: 100.0,
+            ask: 100.01,
+            spread_bps: 1.0,
+            candles,
+        };
+        let short = feature_snapshot(&market, "15m", 7);
+        let long = feature_snapshot(&market, "15m", 14);
+        assert_eq!(short["rsi_period"], json!(7));
+        assert_eq!(long["rsi_period"], json!(14));
+        assert_ne!(
+            short["rsi"], long["rsi"],
+            "不同 RSI 周期必须产出不同的 rsi 读数: {short} vs {long}"
+        );
+        assert_eq!(short["rsi"], json!(100.0), "最后 7 根全涨，7 周期应是 100");
+    }
 
     #[test]
     fn decision_prompt_has_no_parameter_tuning() {
