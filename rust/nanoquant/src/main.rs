@@ -306,6 +306,10 @@ async fn main() {
     // 签名时间戳依赖交易所时钟：先用 /fapi/v1/time 对时，之后每分钟刷新
     exchange_time::spawn_sync_task();
     let (stop_tx, stop_rx) = runtime::stop_channel();
+    // 自动换池独立任务：与交易引擎解耦，进程退出时随 stop_tx 一起收敛。
+    if let Some(db) = database.clone() {
+        tokio::spawn(crate::symbol_scan::spawn_loop(db, stop_tx.subscribe()));
+    }
     // AI 复核器必须注入引擎：漏了这一步，每个候选都会以「AI 复核不可用」被拒，
     // 信号审计里全是同一句话，真正的复核原因根本落不了库。
     let ai_state = database.as_ref().map(|db| {

@@ -3,8 +3,6 @@
 //! `plan` 根据当前池、持仓、扫描特征与闸门，输出「保留 / 删除 / 新增 / 持仓 / 候选」，
 //! 不访问外部资源；`run` 负责拉取合约表与行情，并在单事务内落库。
 
-#![cfg_attr(not(test), allow(dead_code))]
-// TODO(任务6): 接入后台循环后移除上面的 dead_code 豁免。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -395,6 +393,71 @@ fn set_last_run_ts(db: &crate::db::Db, ts: i64) -> Result<(), String> {
     upsert_state(&conn, "symbol_scan.last_run_ts", &ts.to_string())
 }
 
+/// 是否到期换池。`last_run_ts == 0` 表示尚未建立基线，不能算到期。
+pub fn due(last_run_ts: i64, now: i64, interval_hours: i64) -> bool {
+    last_run_ts > 0
+        && now.saturating_sub(last_run_ts) >= interval_hours.max(1) * 3600
+}
+
+fn record_event(db: &crate::db::Db, level: &str, message: &str, payload: Value) {
+    let Ok(conn) = db.conn.lock() else {
+        return;
+    };
+    let _ = conn.execute(
+        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,?2,'symbol_scan',?3,?4)",
+        (crate::now(), level, message, payload.to_string()),
+    );
+}
+
+/// 独立后台换池循环：与交易引擎解耦，仅共享 SQLite 锁。
+///
+/// 首次启用不立即扫描，只落基线时间；满一个间隔后才自动换池。
+pub fn spawn_loop(
+    db: crate::db::Db,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            match load_config(&db) {
+                Ok(cfg) if cfg.enabled => {
+                    let last = last_run_ts(&db).unwrap_or(0);
+                    let now = crate::now();
+                    if last == 0 {
+                        if let Err(error) = set_last_run_ts(&db, now) {
+                            record_event(
+                                &db,
+                                "warn",
+                                "自动换池失败",
+                                json!({ "error": error }),
+                            );
+                        }
+                    } else if due(last, now, cfg.interval_hours) {
+                        if let Err(error) = run(&db, true).await {
+                            record_event(
+                                &db,
+                                "warn",
+                                "自动换池失败",
+                                json!({ "error": error }),
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    record_event(&db, "warn", "自动换池失败", json!({ "error": error }));
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}
+                _ = stop.changed() => break,
+            }
+        }
+    })
+}
+
 fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     conn.execute(
         "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) \
@@ -700,6 +763,47 @@ mod tests {
             path: ":memory:".to_string(),
             conn: Arc::new(Mutex::new(conn)),
         }
+    }
+
+    #[test]
+    fn first_run_is_delayed_until_interval_elapsed() {
+        let now = 1_000_000;
+        assert!(!due(0, now, 3));
+        assert!(due(now - 3 * 3600, now, 3));
+        assert!(!due(now - 2 * 3600, now, 3));
+        assert!(due(now - 3600, now, 1));
+        assert!(!due(now - 3600, now, 2));
+    }
+
+    #[test]
+    fn record_event_writes_symbol_scan_warning() {
+        let db = memory_db(&[]);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE engine_events(ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT);",
+            )
+            .unwrap();
+        }
+        record_event(
+            &db,
+            "warn",
+            "自动换池失败",
+            json!({"error": "network down"}),
+        );
+        let conn = db.conn.lock().unwrap();
+        let row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT level, category, message, payload FROM engine_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "warn");
+        assert_eq!(row.1, "symbol_scan");
+        assert_eq!(row.2, "自动换池失败");
+        let payload: Value = serde_json::from_str(&row.3).unwrap();
+        assert_eq!(payload["error"], "network down");
     }
 
     fn contract_with(symbol: &str, contract_type: &str, status: &str, quote: &str) -> Value {
