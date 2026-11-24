@@ -329,6 +329,11 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     min_oos_trades: { label: '样本外成交下限', unit: '笔', min: 1, max: 1000, hint: '证据门中目标 regime 的样本外成交数下限' },
     auto_apply_timeframes: { label: '自动启用周期', hint: 'v1 仅 1h；逗号分隔的白名单，其它周期需人工校准' },
   },
+  symbol_scan: {
+    enabled: { label: '自动换池', widget: 'switch', hint: '开启后按间隔自动扫描并替换标的' },
+    interval_hours: { label: '扫描间隔', unit: '小时', hint: '1–24 小时；默认 3 小时' },
+    market_limit: { label: '扫描数量', unit: '个', hint: '按 24h 成交额取前 N 个 USDT 永续' },
+  },
 }
 
 const SECTIONS = SETTINGS_SECTIONS

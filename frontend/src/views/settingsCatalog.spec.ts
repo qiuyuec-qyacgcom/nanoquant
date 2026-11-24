@@ -12,6 +12,7 @@ describe('参数配置目录', () => {
       'engine',
       'strategy',
       'ai_tuning',
+      'symbol_scan',
       'risk',
       'data',
       'news',

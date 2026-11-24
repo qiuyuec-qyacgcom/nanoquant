@@ -94,6 +94,11 @@
     "min_oos_trades": 30,
     "auto_apply_timeframes": "1h"
   },
+  "symbol_scan": {
+    "enabled": true,
+    "interval_hours": 3,
+    "market_limit": 300
+  },
   "ai": {
     "enabled": true,
     "mode": "single",

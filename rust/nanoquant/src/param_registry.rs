@@ -18,7 +18,7 @@ pub(crate) struct ParamMeta {
 pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
 
 /// 组级黑名单：即使整组对 AI 不可见也不得写入，避免新组默认变成可写。
-const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk"];
+const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk", "symbol_scan"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
 const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
@@ -86,6 +86,8 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai_tuning", "regime_confirm_sec", 60.0, 86400.0, 60.0),
     ("ai_tuning", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
     ("ai_tuning", "min_oos_trades", 1.0, 1000.0, 1.0),
+    ("symbol_scan", "interval_hours", 1.0, 24.0, 1.0),
+    ("symbol_scan", "market_limit", 50.0, 500.0, 10.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
     ("ai", "param_tuning_min_interval_sec", 60.0, 604800.0, 60.0),
     ("ai", "max_calls_per_hour", 1.0, 10000.0, 1.0),
@@ -177,6 +179,10 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "min_oos_trades",
             "auto_apply_timeframes",
         ],
+    ),
+    (
+        "symbol_scan",
+        &["enabled", "interval_hours", "market_limit"],
     ),
     (
         "risk",
@@ -578,6 +584,43 @@ mod tests {
                 .unwrap()
                 .ai_writable
         );
+    }
+
+    #[test]
+    fn symbol_scan_group_is_visible_and_ai_blocked() {
+        let value = crate::param_registry::catalog();
+        let group = &value["groups"]["symbol_scan"];
+        assert_eq!(
+            group["meta"]["enabled"]["visible"],
+            serde_json::json!(true),
+            "enabled 应可见"
+        );
+        for key in ["interval_hours", "market_limit"] {
+            assert_eq!(
+                group["meta"][key]["visible"],
+                serde_json::json!(true),
+                "{key} 应可见"
+            );
+        }
+        assert_eq!(group["writable"], serde_json::json!([]));
+        assert_eq!(
+            find("symbol_scan", "interval_hours").unwrap().min,
+            Some(1.0)
+        );
+        assert_eq!(
+            find("symbol_scan", "interval_hours").unwrap().max,
+            Some(24.0)
+        );
+        assert_eq!(
+            find("symbol_scan", "market_limit").unwrap().min,
+            Some(50.0)
+        );
+        assert_eq!(
+            find("symbol_scan", "market_limit").unwrap().max,
+            Some(500.0)
+        );
+        assert!(!is_ai_writable("symbol_scan", "enabled"));
+        assert!(!is_ai_writable("symbol_scan", "future_hidden_field"));
     }
 
     #[test]
