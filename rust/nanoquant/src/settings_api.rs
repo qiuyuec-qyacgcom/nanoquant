@@ -1,4 +1,4 @@
-//! 配置组读写。14 个组的默认值与取值范围对齐 `default_settings.json` 与 `param_registry`。
+//! 配置组读写。15 个组的默认值与取值范围对齐 `default_settings.json` 与 `param_registry`。
 //!
 //! 未知组返回 404，不静默建组：前端拼错组名时若返回空对象，
 //! 用户会以为配置丢了再存一次，把别的组覆盖掉。
@@ -31,11 +31,12 @@ pub fn routes() -> Router<Db> {
         .route("/system/system-settings", get(system_settings))
 }
 
-const GROUPS: [&str; 14] = [
+const GROUPS: [&str; 15] = [
     "engine",
     "risk",
     "strategy",
     "ai_tuning",
+    "symbol_scan",
     "ai",
     "data",
     "news",
@@ -1213,8 +1214,19 @@ mod tests {
     }
 
     #[test]
+    fn every_default_group_is_exposed_by_the_settings_api() {
+        let defaults = all_defaults().as_object().unwrap();
+        for group in defaults.keys() {
+            assert!(
+                GROUPS.contains(&group.as_str()),
+                "{group} 在 default_settings.json 中但未加入 GROUPS，接口会 404"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_cover_every_group_and_risk_leverage_is_present() {
-        assert_eq!(GROUPS.len(), 14);
+        assert_eq!(GROUPS.len(), 15);
         for group in GROUPS {
             let value = defaults_of(group);
             assert!(

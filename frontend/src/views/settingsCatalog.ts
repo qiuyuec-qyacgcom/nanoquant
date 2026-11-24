@@ -14,7 +14,7 @@ export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
   { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 每周期自动调整隐藏参数' },
-  { id: 'symbol_scan', label: '自动换池', hint: '每 3 小时按成交额扫描前 300 个合约，自动替换不达标且无持仓的标的' },
+  { id: 'symbol_scan', label: '自动换池', hint: '按配置的间隔与数量扫描 USDT 永续，自动替换不达标且无持仓的标的' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
   { id: 'data', label: '交易所', hint: '网络、代理与 API 凭证' },
   { id: 'news', label: '资讯', hint: '新闻抓取与情绪' },

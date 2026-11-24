@@ -619,6 +619,18 @@ mod tests {
             find("symbol_scan", "market_limit").unwrap().max,
             Some(500.0)
         );
+        assert_eq!(
+            find("symbol_scan", "interval_hours").unwrap().step,
+            Some(1.0)
+        );
+        assert_eq!(
+            find("symbol_scan", "market_limit").unwrap().step,
+            Some(10.0)
+        );
+        let defaults = defaults();
+        assert_eq!(defaults["symbol_scan"]["enabled"], json!(true));
+        assert_eq!(defaults["symbol_scan"]["interval_hours"], json!(3));
+        assert_eq!(defaults["symbol_scan"]["market_limit"], json!(300));
         assert!(!is_ai_writable("symbol_scan", "enabled"));
         assert!(!is_ai_writable("symbol_scan", "future_hidden_field"));
     }

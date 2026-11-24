@@ -30,10 +30,12 @@ const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_LISTED_FILES: usize = 200;
 
-const SETTINGS_GROUPS: [&str; 13] = [
+const SETTINGS_GROUPS: [&str; 15] = [
     "engine",
     "risk",
     "strategy",
+    "ai_tuning",
+    "symbol_scan",
     "ai",
     "data",
     "news",
@@ -1562,6 +1564,16 @@ mod tests {
         assert!(safe_join(Path::new("/home/nq"), "../secret").is_none());
         assert!(safe_join(Path::new("/home/nq"), "/etc/passwd").is_none());
         assert!(safe_join(Path::new("/home/nq"), "logs/app.log").is_some());
+    }
+
+    #[test]
+    fn backup_whitelist_covers_every_settings_group() {
+        for group in ["symbol_scan", "ai_tuning"] {
+            assert!(
+                SETTINGS_GROUPS.contains(&group),
+                "{group} 必须在备份白名单中，否则备份/还原会静默丢配置"
+            );
+        }
     }
 
     #[test]

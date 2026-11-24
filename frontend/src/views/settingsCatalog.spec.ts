@@ -117,6 +117,11 @@ describe('参数配置目录', () => {
     ])
   })
 
+  it('自动换池分组覆盖三个字段', () => {
+    const keys = [...explicitKeys('symbol_scan')].sort()
+    expect(keys).toEqual(['enabled', 'interval_hours', 'market_limit'])
+  })
+
   it('风控不再提供默认杠杆，只保留上下限', () => {
     const risk = explicitKeys('risk')
     expect(risk.has('default_leverage')).toBe(false)

@@ -330,9 +330,9 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     auto_apply_timeframes: { label: '自动启用周期', hint: 'v1 仅 1h；逗号分隔的白名单，其它周期需人工校准' },
   },
   symbol_scan: {
-    enabled: { label: '自动换池', widget: 'switch', hint: '开启后按间隔自动扫描并替换标的' },
-    interval_hours: { label: '扫描间隔', unit: '小时', hint: '1–24 小时；默认 3 小时' },
-    market_limit: { label: '扫描数量', unit: '个', hint: '按 24h 成交额取前 N 个 USDT 永续' },
+    enabled: { label: '启用自动换池', widget: 'switch', hint: '开启后按间隔自动扫描并替换标的' },
+    interval_hours: { label: '扫描间隔', unit: '小时', min: 1, max: 24, hint: '1–24 小时，步长 1；默认 3 小时' },
+    market_limit: { label: '扫描数量', unit: '个', min: 50, max: 500, hint: '50–500 个，步长 10；按 24h 成交额取前 N 个 USDT 永续' },
   },
 }
 
