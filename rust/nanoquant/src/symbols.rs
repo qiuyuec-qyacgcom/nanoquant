@@ -278,7 +278,7 @@ fn bulk_with_contracts(db: &Db, contracts: &[Value], symbols: Vec<String>) -> Va
     json!({"added":added,"skipped":skipped,"invalid":invalid,"ok":true,"count":count})
 }
 
-async fn exchange_contracts(db: &Db) -> Result<Vec<Value>, (StatusCode, Json<Value>)> {
+pub(crate) async fn exchange_contracts(db: &Db) -> Result<Vec<Value>, (StatusCode, Json<Value>)> {
     static CLIENT: std::sync::LazyLock<Result<reqwest::Client, reqwest::Error>> =
         std::sync::LazyLock::new(|| {
             reqwest::Client::builder()
@@ -563,7 +563,7 @@ fn normalize_symbol(raw: &str) -> String {
         .to_uppercase()
 }
 
-fn current_mode(db: &Db) -> String {
+pub(crate) fn current_mode(db: &Db) -> String {
     let conn = db.conn.lock().expect("db");
     mode_from_conn(&conn)
 }

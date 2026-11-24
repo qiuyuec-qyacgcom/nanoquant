@@ -8,6 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use axum::Json;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::{json, Value};
+
 use crate::scan::{risk_gate, Candidate, ScanGates};
 
 /// 一个标的的本轮扫描特征，只保留换池要看的字段。
@@ -134,9 +138,533 @@ pub fn plan(
     plan
 }
 
+/// 扫描配置。每轮从 app_settings 现读，缺项按内置默认值补齐。
+struct Config {
+    enabled: bool,
+    interval_hours: i64,
+    market_limit: usize,
+    target: usize,
+    concurrency: usize,
+    kline_limit: usize,
+    atr_period: usize,
+    gates: ScanGates,
+    base_url: String,
+}
+
+// `ScanGates` 位于 scan 模块且未实现 Clone/Debug，本任务不改动它，这里按字段复制。
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            interval_hours: self.interval_hours,
+            market_limit: self.market_limit,
+            target: self.target,
+            concurrency: self.concurrency,
+            kline_limit: self.kline_limit,
+            atr_period: self.atr_period,
+            gates: ScanGates {
+                atr_pct_min: self.gates.atr_pct_min,
+                atr_pct_max: self.gates.atr_pct_max,
+                volume_ratio_min: self.gates.volume_ratio_min,
+                min_24h_quote_volume: self.gates.min_24h_quote_volume,
+                spread_bps_max: self.gates.spread_bps_max,
+                entry_threshold: self.gates.entry_threshold,
+            },
+            base_url: self.base_url.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("enabled", &self.enabled)
+            .field("interval_hours", &self.interval_hours)
+            .field("market_limit", &self.market_limit)
+            .field("target", &self.target)
+            .field("concurrency", &self.concurrency)
+            .field("kline_limit", &self.kline_limit)
+            .field("atr_period", &self.atr_period)
+            .field("gates.atr_pct_min", &self.gates.atr_pct_min)
+            .field("gates.atr_pct_max", &self.gates.atr_pct_max)
+            .field("gates.volume_ratio_min", &self.gates.volume_ratio_min)
+            .field(
+                "gates.min_24h_quote_volume",
+                &self.gates.min_24h_quote_volume,
+            )
+            .field("gates.spread_bps_max", &self.gates.spread_bps_max)
+            .field("gates.entry_threshold", &self.gates.entry_threshold)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+/// 读取一个配置组；组缺失或不是对象时按空对象处理，让默认值接管。
+fn setting_group(db: &crate::db::Db, name: &str) -> Result<Value, String> {
+    let value = db
+        .setting(name)
+        .map_err(|error| format!("读取配置 {name} 失败: {error}"))?;
+    Ok(match value {
+        Some(value) if value.is_object() => value,
+        _ => json!({}),
+    })
+}
+
+fn load_config(db: &crate::db::Db) -> Result<Config, String> {
+    let scan = setting_group(db, "symbol_scan")?;
+    let engine = setting_group(db, "engine")?;
+    let strategy = setting_group(db, "strategy")?;
+    let data = setting_group(db, "data")?;
+    let mode = crate::symbols::current_mode(db);
+
+    // 点差上限以 `max_spread_bps` 为准，兼容历史上使用的 `spread_bps_max`。
+    let spread_bps_max = strategy["max_spread_bps"]
+        .as_f64()
+        .or_else(|| strategy["spread_bps_max"].as_f64())
+        .unwrap_or(8.0);
+    let gates = ScanGates {
+        atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
+        atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
+        volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
+        min_24h_quote_volume: strategy["min_24h_quote_volume"]
+            .as_f64()
+            .unwrap_or(3_000_000.0),
+        spread_bps_max,
+        entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
+    };
+    let (endpoint, fallback) = if mode == "live" {
+        ("live_base_url", "https://fapi.binance.com")
+    } else {
+        ("demo_base_url", "https://testnet.binancefuture.com")
+    };
+
+    Ok(Config {
+        enabled: scan["enabled"].as_bool().unwrap_or(true),
+        interval_hours: scan["interval_hours"].as_i64().unwrap_or(3).clamp(1, 24),
+        market_limit: scan["market_limit"].as_i64().unwrap_or(300).clamp(50, 500) as usize,
+        target: engine["max_symbols_per_cycle"]
+            .as_i64()
+            .unwrap_or(12)
+            .clamp(1, 100) as usize,
+        concurrency: engine["scan_concurrency"]
+            .as_i64()
+            .unwrap_or(3)
+            .clamp(1, 20) as usize,
+        kline_limit: data["kline_limit"]
+            .as_i64()
+            .unwrap_or(200)
+            .clamp(20, 500) as usize,
+        atr_period: strategy["atr_period"].as_i64().unwrap_or(14).max(1) as usize,
+        gates,
+        base_url: data[endpoint]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| fallback.to_string()),
+    })
+}
+
+fn current_pool(db: &crate::db::Db) -> Result<Vec<String>, String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT symbol FROM trading_symbols WHERE enabled=1 ORDER BY sort_order, symbol")
+        .map_err(|error| format!("读取标的池失败: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取标的池失败: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取标的池失败: {error}"))
+}
+
+fn held_symbols(db: &crate::db::Db, mode: &str) -> Result<HashSet<String>, String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT symbol FROM positions WHERE mode=?1 AND status='open'")
+        .map_err(|error| format!("读取持仓失败: {error}"))?;
+    let rows = stmt
+        .query_map([mode], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取持仓失败: {error}"))?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| format!("读取持仓失败: {error}"))
+}
+
+fn last_run_ts(db: &crate::db::Db) -> Result<i64, String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            ["symbol_scan.last_run_ts"],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取上次换池时间失败: {error}"))?;
+    Ok(raw
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0))
+}
+
+fn set_last_run_ts(db: &crate::db::Db, ts: i64) -> Result<(), String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    upsert_state(&conn, "symbol_scan.last_run_ts", &ts.to_string())
+}
+
+fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?3) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, value, crate::now()),
+    )
+    .map(|_| ())
+    .map_err(|error| format!("写入 engine_state.{key} 失败: {error}"))
+}
+
+fn plan_result(plan: &ScanPlan, scanned: usize, applied: bool) -> Value {
+    json!({
+        "scanned": scanned,
+        "candidates": plan.candidates.clone(),
+        "keep": plan.keep.clone(),
+        "held": plan.held.clone(),
+        "delete": plan.delete.clone(),
+        "add": plan.add.clone(),
+        "delete_reasons": plan
+            .delete_reasons
+            .iter()
+            .map(|(symbol, reason)| json!({"symbol": symbol, "reason": reason}))
+            .collect::<Vec<_>>(),
+        "applied": applied,
+    })
+}
+
+/// 把计划落到库里。删除前再查一次持仓，持仓标的跳过；写入新增标的。
+/// 状态与事件由调用方在同一事务内负责，本函数不写。
+fn apply_plan(
+    conn: &Connection,
+    mode: &str,
+    plan: &ScanPlan,
+    contracts: &[Value],
+) -> Result<(), String> {
+    for symbol in &plan.delete {
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE symbol=?1 AND mode=?2 AND status='open'",
+                (symbol.as_str(), mode),
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("检查 {symbol} 持仓失败: {error}"))?;
+        if open > 0 {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM trading_symbols WHERE symbol=?1",
+            [symbol.as_str()],
+        )
+        .map_err(|error| format!("删除标的 {symbol} 失败: {error}"))?;
+    }
+    for symbol in &plan.add {
+        crate::symbols::upsert_contract_row_conn(conn, contracts, symbol)?;
+    }
+    Ok(())
+}
+
+/// 执行一轮换池扫描。`apply=false` 只返回计划，不写库、不更新上次运行时间。
+/// 行情或合约表读取失败直接返回错误，不修改标的池。
+pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
+    let cfg = load_config(db)?;
+    let mode = crate::symbols::current_mode(db);
+
+    let contracts = crate::symbols::exchange_contracts(db)
+        .await
+        .map_err(|(_, Json(body))| {
+            body.get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("无法读取币安合约表")
+                .to_string()
+        })?;
+
+    let provider = crate::providers::BinanceProvider::public(cfg.base_url.clone())
+        .map_err(|error| format!("初始化行情客户端失败: {error:?}"))?;
+
+    let current = current_pool(db)?;
+
+
+    let tickers = provider
+        .tickers_24h()
+        .await
+        .map_err(|error| format!("读取 24h 成交额失败: {error:?}"))?;
+    let books = provider
+        .book_tops()
+        .await
+        .map_err(|error| format!("读取盘口失败: {error:?}"))?;
+
+    let tradable: HashSet<String> = contracts
+        .iter()
+        .filter(|row| {
+            row["contractType"].as_str() == Some("PERPETUAL")
+                && row["status"].as_str() == Some("TRADING")
+                && row["quoteAsset"].as_str() == Some("USDT")
+        })
+        .filter_map(|row| row["symbol"].as_str().map(str::to_string))
+        .collect();
+
+    let mut ranked: Vec<&crate::providers::ExchangeTicker> = tickers
+        .iter()
+        .filter(|ticker| tradable.contains(&ticker.symbol) && ticker.quote_volume > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| b.quote_volume.total_cmp(&a.quote_volume));
+    ranked.truncate(cfg.market_limit);
+
+    // 原池标的即使跌出 Top N 也要扫描，否则会被当作缺行情误删。
+    let mut scan_symbols: Vec<String> = Vec::with_capacity(ranked.len() + current.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for ticker in &ranked {
+        if seen.insert(ticker.symbol.clone()) {
+            scan_symbols.push(ticker.symbol.clone());
+        }
+    }
+    for symbol in &current {
+        if seen.insert(symbol.clone()) {
+            scan_symbols.push(symbol.clone());
+        }
+    }
+
+    let ticker_map: HashMap<String, f64> = tickers
+        .iter()
+        .map(|ticker| (ticker.symbol.clone(), ticker.quote_volume))
+        .collect();
+    let book_map: HashMap<String, f64> = books
+        .iter()
+        .map(|book| (book.symbol.clone(), book.spread_bps))
+        .collect();
+
+    let mut scanned: Vec<ScannedSymbol> = Vec::with_capacity(scan_symbols.len());
+    let mut queue = scan_symbols.into_iter();
+    let mut set = tokio::task::JoinSet::new();
+    loop {
+        while set.len() < cfg.concurrency {
+            let Some(symbol) = queue.next() else { break };
+            let provider = provider.clone();
+            let kline_limit = cfg.kline_limit;
+            let atr_period = cfg.atr_period;
+            let quote_volume = ticker_map.get(&symbol).copied().unwrap_or(0.0);
+            let spread_bps = book_map.get(&symbol).copied().unwrap_or(f64::INFINITY);
+            set.spawn(async move {
+                let klines = provider.klines(&symbol, kline_limit).await;
+                (symbol, klines, quote_volume, spread_bps, atr_period)
+            });
+        }
+        let Some(joined) = set.join_next().await else {
+            break;
+        };
+        let (symbol, klines, quote_volume, spread_bps, atr_period) = match joined {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "扫描任务异常退出");
+                continue;
+            }
+        };
+        // 单只标的失败不中断整轮，按缺数据处理后交给闸门。
+        let metrics = klines
+            .ok()
+            .and_then(|rows| crate::providers::candle_metrics(&rows, atr_period));
+        scanned.push(match metrics {
+            Some(metrics) => ScannedSymbol {
+                symbol,
+                data_ok: true,
+                vol_ratio: metrics.vol_ratio,
+                atr_pct: metrics.atr_pct,
+                quote_volume,
+                spread_bps,
+            },
+            None => ScannedSymbol {
+                symbol,
+                data_ok: false,
+                vol_ratio: 0.0,
+                atr_pct: 0.0,
+                quote_volume,
+                spread_bps,
+            },
+        });
+    }
+
+    let held = held_symbols(db, &mode)?;
+    let plan = plan(&current, &held, &scanned, &cfg.gates, cfg.target);
+
+    if !apply {
+        return Ok(plan_result(&plan, scanned.len(), false));
+    }
+
+    let result = plan_result(&plan, scanned.len(), true);
+    let payload = result.to_string();
+    let message = format!(
+        "自动换池：替换 {} 个，新增 {} 个",
+        plan.delete.len(),
+        plan.add.len()
+    );
+    let now = crate::now();
+    {
+        // 锁只覆盖同步落库段，不跨 await，避免 future 失去 Send。
+        let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| format!("开启换池事务失败: {error}"))?;
+        apply_plan(&tx, &mode, &plan, &contracts)?;
+        upsert_state(&tx, "symbol_scan.last_run_ts", &now.to_string())?;
+        upsert_state(&tx, "symbol_scan.last_result", &payload)?;
+        tx.execute(
+            "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'info','symbol_scan',?2,?3)",
+            (now, message, payload),
+        )
+        .map_err(|error| format!("写入换池事件失败: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交换池事务失败: {error}"))?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    fn memory_db(settings: &[(&str, serde_json::Value)]) -> crate::db::Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+             CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
+        )
+        .unwrap();
+        for (key, value) in settings {
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES(?1,?2,0)",
+                (key, value.to_string()),
+            )
+            .unwrap();
+        }
+        crate::db::Db {
+            path: ":memory:".to_string(),
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    #[test]
+    fn apply_plan_keeps_held_symbols_and_replaces_the_rest() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+             CREATE TABLE positions(symbol TEXT, status TEXT, mode TEXT);
+             INSERT INTO trading_symbols VALUES('AAAUSDT',1);
+             INSERT INTO trading_symbols VALUES('BBBUSDT',1);
+             INSERT INTO positions VALUES('BBBUSDT','open','live');",
+        )
+        .unwrap();
+        let plan = ScanPlan {
+            keep: vec!["BBBUSDT".into()],
+            delete: vec!["AAAUSDT".into()],
+            add: vec![],
+            held: vec!["BBBUSDT".into()],
+            candidates: vec![],
+            delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
+        };
+        apply_plan(&conn, "live", &plan, &[]).unwrap();
+        let symbols: Vec<String> = conn
+            .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(symbols, vec!["BBBUSDT"]);
+    }
+
+    #[test]
+    fn apply_plan_skips_delete_when_position_is_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+             CREATE TABLE positions(symbol TEXT, status TEXT, mode TEXT);
+             INSERT INTO trading_symbols VALUES('AAAUSDT',1);
+             INSERT INTO trading_symbols VALUES('BBBUSDT',1);
+             INSERT INTO positions VALUES('AAAUSDT','open','live');",
+        )
+        .unwrap();
+        let plan = ScanPlan {
+            keep: vec![],
+            delete: vec!["AAAUSDT".into()],
+            add: vec![],
+            held: vec!["AAAUSDT".into()],
+            candidates: vec![],
+            delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
+        };
+        apply_plan(&conn, "live", &plan, &[]).unwrap();
+        let symbols: Vec<String> = conn
+            .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            symbols,
+            vec!["AAAUSDT", "BBBUSDT"],
+            "有持仓的标的不能被二次检查删除"
+        );
+    }
+
+    #[test]
+    fn load_config_uses_defaults_when_groups_are_missing() {
+        let db = memory_db(&[]);
+        let cfg = load_config(&db).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval_hours, 3);
+        assert_eq!(cfg.market_limit, 300);
+        assert_eq!(cfg.target, 12);
+        assert_eq!(cfg.concurrency, 3);
+        assert_eq!(cfg.kline_limit, 200);
+        assert_eq!(cfg.atr_period, 14);
+        assert_eq!(cfg.gates.spread_bps_max, 8.0);
+        assert_eq!(cfg.base_url, "https://testnet.binancefuture.com");
+    }
+
+    #[test]
+    fn load_config_clamps_and_follows_mode() {
+        let db = memory_db(&[
+            (
+                "symbol_scan",
+                json!({"enabled": false, "interval_hours": 99, "market_limit": 10}),
+            ),
+            (
+                "engine",
+                json!({"mode": "live", "max_symbols_per_cycle": 200, "scan_concurrency": 0}),
+            ),
+            (
+                "strategy",
+                json!({"atr_period": 20, "max_spread_bps": 5.0, "entry_threshold": 0.5}),
+            ),
+            (
+                "data",
+                json!({"kline_limit": 1000, "live_base_url": "https://example.test"}),
+            ),
+        ]);
+        let cfg = load_config(&db).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.interval_hours, 24);
+        assert_eq!(cfg.market_limit, 50);
+        assert_eq!(cfg.target, 100);
+        assert_eq!(cfg.concurrency, 1);
+        assert_eq!(cfg.kline_limit, 500);
+        assert_eq!(cfg.atr_period, 20);
+        assert_eq!(cfg.gates.spread_bps_max, 5.0);
+        assert_eq!(cfg.gates.entry_threshold, 0.5);
+        assert_eq!(cfg.base_url, "https://example.test");
+    }
+
+    #[test]
+    fn load_config_accepts_legacy_spread_key() {
+        let db = memory_db(&[("strategy", json!({"spread_bps_max": 6.0}))]);
+        assert_eq!(load_config(&db).unwrap().gates.spread_bps_max, 6.0);
+    }
 
     fn gates() -> ScanGates {
         ScanGates {
