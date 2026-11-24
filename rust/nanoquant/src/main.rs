@@ -75,6 +75,7 @@ mod signal_follow;
 
 mod strategies;
 mod submit;
+mod symbol_scan;
 mod symbols;
 mod system;
 mod trade_policy;
