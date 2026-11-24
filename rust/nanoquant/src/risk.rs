@@ -10,6 +10,9 @@ pub struct Gate {
     pub ok: bool,
     pub reason: String,
     pub halt: String,
+    /// 是否由风控熔断（日亏/回撤/连亏）触发。手动熔断为 false，
+    /// `engine.close_on_halt` 只在风控熔断时平仓，手动暂停不能动仓位。
+    pub risk_halt: bool,
 }
 
 impl Gate {
@@ -18,6 +21,7 @@ impl Gate {
             ok: true,
             reason: String::new(),
             halt: String::new(),
+            risk_halt: false,
         }
     }
     fn closed(reason: impl Into<String>) -> Self {
@@ -25,6 +29,7 @@ impl Gate {
             ok: false,
             reason: reason.into(),
             halt: String::new(),
+            risk_halt: false,
         }
     }
     fn halt(reason: impl Into<String>, halt: impl Into<String>) -> Self {
@@ -32,6 +37,28 @@ impl Gate {
             ok: false,
             reason: reason.into(),
             halt: halt.into(),
+            risk_halt: true,
+        }
+    }
+    /// 连亏冷静期：只拦本轮，不持久化，但属于风控熔断。
+    fn risk_blocked(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            reason: reason.into(),
+            halt: String::new(),
+            risk_halt: true,
+        }
+    }
+    /// 持久化的 halted：可能是手动暂停，不能当作风控熔断去平仓。
+    /// 只有文本明确来自日亏/回撤时才视作风控熔断。
+    fn persisted_halt(reason: impl Into<String>, halt: impl Into<String>) -> Self {
+        let halt = halt.into();
+        let risk_halt = halt.contains("日内亏损") || halt.contains("回撤");
+        Self {
+            ok: false,
+            reason: reason.into(),
+            halt,
+            risk_halt,
         }
     }
 }
@@ -81,13 +108,13 @@ pub fn global_gates(input: &RiskInput) -> Gate {
     if input.consecutive_losses >= input.consecutive_loss_limit && input.now < input.cooldown_until
     {
         let remain = input.cooldown_until - input.now;
-        return Gate::closed(format!(
+        return Gate::risk_blocked(format!(
             "连亏 {} 笔, 冷静期剩余 {remain}s",
             input.consecutive_losses
         ));
     }
     if !input.halted.is_empty() {
-        return Gate::halt(
+        return Gate::persisted_halt(
             format!("引擎已熔断: {}", input.halted),
             input.halted.clone(),
         );
@@ -320,6 +347,27 @@ mod tests {
             gate.halt.is_empty(),
             "冷静期到点自愈，持久化会把引擎永久锁死"
         );
+        assert!(gate.risk_halt, "连亏冷静期属于风控熔断");
+    }
+
+    #[test]
+    fn only_risk_halts_are_marked_for_close_on_halt() {
+        let mut manual = healthy();
+        manual.halted = "手动暂停".into();
+        let gate = global_gates(&manual);
+        assert!(!gate.ok);
+        assert!(!gate.risk_halt, "手动暂停不能触发 close_on_halt");
+
+        let mut drawdown = healthy();
+        drawdown.halted = "最大回撤触发熔断".into();
+        let gate = global_gates(&drawdown);
+        assert!(!gate.ok);
+        assert!(gate.risk_halt, "持久化的回撤熔断仍属风控熔断");
+
+        let mut daily = healthy();
+        daily.equity = 940.0;
+        let gate = global_gates(&daily);
+        assert!(!gate.ok && gate.risk_halt, "日内亏损必须标记为风控熔断");
     }
 
     #[test]

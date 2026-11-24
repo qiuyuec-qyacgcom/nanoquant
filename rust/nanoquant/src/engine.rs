@@ -985,8 +985,22 @@ fn evaluate_admission(db: &Db) -> Value {
     let loss_limit = risk["consecutive_loss_limit"].as_i64().unwrap_or(4);
     let halted = state("halted");
     let halted_on = !halted.is_empty() && halted != "0" && halted != "false";
-    let engine_ok =
-        enabled_flag && engine_alive && window_ok && consecutive < loss_limit && !halted_on;
+    // 全局冷却：任何标的亏损平仓后写一条 kind='global' 的 cooldown，冷却内禁止新开仓。
+    let global_cooldown_until = conn
+        .query_row(
+            "SELECT until_ts FROM cooldowns WHERE kind='global' AND until_ts>?1 \
+             ORDER BY until_ts DESC LIMIT 1",
+            [crate::now()],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+    let global_cooldown = global_cooldown_until.is_some();
+    let engine_ok = enabled_flag
+        && engine_alive
+        && window_ok
+        && consecutive < loss_limit
+        && !halted_on
+        && !global_cooldown;
     let mut details = Vec::new();
     if !enabled_flag {
         details.push("引擎未启动 (总览页点「启动引擎」)".to_string());
@@ -1010,6 +1024,9 @@ fn evaluate_admission(db: &Db) -> Value {
     }
     if halted_on {
         details.push(format!("已熔断: {}", &halted[..halted.len().min(60)]));
+    }
+    if let Some(until) = global_cooldown_until {
+        details.push(format!("全局冷却中，剩余 {}s", (until - crate::now()).max(0)));
     }
     steps.push(step(
         "engine",
@@ -1121,7 +1138,7 @@ fn evaluate_admission(db: &Db) -> Value {
         .unwrap_or(0);
     json!({
         "ok": blocking.is_empty(),
-        "can_open": tradeable > 0 && blocking.is_empty() && enabled_flag,
+        "can_open": tradeable > 0 && blocking.is_empty() && enabled_flag && !global_cooldown,
         "score": (passed as f64 / steps.len() as f64 * 1000.0).round() / 1000.0,
         "mode": mode,
         "steps": steps,

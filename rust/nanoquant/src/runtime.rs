@@ -14,6 +14,13 @@ use tokio::time::{sleep, Duration};
 const MIN_INTERVAL_SEC: i64 = 15;
 const MAX_INTERVAL_SEC: i64 = 3600;
 
+/// 全局冷却在 `cooldowns` 里的哨兵 symbol。
+/// 真实标的不会叫这个名字，用同一张表避免额外的 schema 迁移。
+const GLOBAL_COOLDOWN_SYMBOL: &str = "__global__";
+
+/// LIMIT 开仓挂单的最短超时。周期更长时按 `cycle_interval_sec * 2` 放宽。
+const LIMIT_ORDER_TIMEOUT_SEC: i64 = 120;
+
 /// 引擎判活阈值（秒）。
 ///
 /// 必须跟着扫描周期走：周期 10 分钟时，两轮之间天然有近 10 分钟没有新的扫描心跳，
@@ -41,6 +48,12 @@ pub(crate) fn cycle_interval_sec(conn: &rusqlite::Connection) -> u64 {
     .and_then(|value| value.get("cycle_interval_sec").and_then(Value::as_i64))
     .unwrap_or(MIN_INTERVAL_SEC)
     .clamp(MIN_INTERVAL_SEC, MAX_INTERVAL_SEC) as u64
+}
+
+/// LIMIT 开仓挂单的超时秒数。
+/// 最短 120 秒；周期拉长到 1 分钟以上时按两轮周期放宽，避免刚挂上就被撤掉。
+fn limit_order_timeout_sec(conn: &rusqlite::Connection) -> i64 {
+    LIMIT_ORDER_TIMEOUT_SEC.max(cycle_interval_sec(conn) as i64 * 2)
 }
 
 /// panic 载荷里能取到字符串就取，取不到给个兜底文案。
@@ -1480,8 +1493,20 @@ impl EngineRuntime {
             .unwrap_or(5)
             .clamp(0, 1440)
             * 60;
+        let global_cooldown_seconds = entry_cfg["cooldown_minutes"]
+            .as_i64()
+            .unwrap_or(10)
+            .clamp(0, 1440)
+            * 60;
         let _ = tx.execute("DELETE FROM cooldowns WHERE until_ts<=?1", [crate::now()]);
-        let (mut preview_value, report, symbols, positions, rejected_rows) = Self::run_cycle_state(
+        let (
+            mut preview_value,
+            report,
+            symbols,
+            positions,
+            rejected_rows,
+            risk_halt,
+        ) = Self::run_cycle_state(
             &tx,
             mode,
             &strategy,
@@ -1498,7 +1523,7 @@ impl EngineRuntime {
                 tracing::warn!(%error, "信号审计写入失败，不影响本轮周期");
             }
         }
-        let executed = Self::execute_demo_cycle(
+        let mut executed = Self::execute_demo_cycle(
             &tx,
             mode,
             &symbols,
@@ -1507,6 +1532,31 @@ impl EngineRuntime {
             snapshot,
             engine_is_enabled,
         )?;
+        // 风控熔断且开了 close_on_halt：本轮只平一次，熔断解除前不重复全平。
+        // 手动熔断与普通 skipped 不在此列（risk_halt 只由风控闸门置位）。
+        let halt_key = format!("close_on_halt.{mode}");
+        let halt_seen: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key=?1)",
+                [&halt_key],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let close_on_halt = config["close_on_halt"].as_bool().unwrap_or(false);
+        let halt_flatten = risk_halt && close_on_halt && !halt_seen;
+        if halt_flatten {
+            upsert_state(&tx, &halt_key, &crate::now().to_string())?;
+            if mode == "demo" {
+                let fee_rate = entry_cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005);
+                Self::flatten_demo_positions(&tx, mode, snapshot, fee_rate, &mut executed)?;
+            } else {
+                // 实盘平仓要撤单 + 发单，不能在事务里做；tick 提交后按这个标记执行。
+                upsert_state(&tx, &format!("close_on_halt.pending.{mode}"), "1")?;
+            }
+        } else if !risk_halt && halt_seen {
+            tx.execute("DELETE FROM engine_state WHERE key=?1", [&halt_key])
+                .map_err(|error| error.to_string())?;
+        }
         let closed_symbols: Vec<(i64, String, f64, i64)> = {
             let mut stmt = tx.prepare("SELECT id,symbol,realized_pnl,trade_id FROM positions WHERE mode=?1 AND closed_at>=?2 AND status='closed'").map_err(|e| e.to_string())?;
             let rows = stmt
@@ -1538,6 +1588,21 @@ impl EngineRuntime {
                 tx.execute(
                     "DELETE FROM cooldowns WHERE symbol=?1 AND kind='symbol'",
                     [&symbol],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            // 全局冷却：亏损平仓后除标的自身冷却外，再对全部新开仓关门一段时间。
+            // 盈利不写全局行，也不清掉既有的全局冷却（那段时间本来就该空仓）。
+            if pnl < 0.0 && global_cooldown_seconds > 0 {
+                tx.execute(
+                    "INSERT INTO cooldowns(symbol,until_ts,reason,kind) VALUES(?1,?2,?3,'global') \
+                     ON CONFLICT(symbol) DO UPDATE SET until_ts=excluded.until_ts,reason=excluded.reason,kind=excluded.kind \
+                     WHERE cooldowns.until_ts<excluded.until_ts",
+                    (
+                        GLOBAL_COOLDOWN_SYMBOL,
+                        crate::now() + global_cooldown_seconds,
+                        format!("全局冷却: 本笔亏损 {pnl:.4} USDT"),
+                    ),
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -1586,7 +1651,7 @@ impl EngineRuntime {
         tx.commit().map_err(|error| error.to_string())?;
         drop(conn);
         let reviewed = Self::review_drafts(self.reviewer.as_deref(), drafts, true);
-        let mut executed = executed;
+
         let mut conn = self
             .db
             .conn
@@ -1604,6 +1669,7 @@ impl EngineRuntime {
         preview_value["engine_enabled"] = serde_json::json!(engine_is_enabled);
         preview_value["executed"] = serde_json::json!(executed);
         preview_value["venue_closed"] = serde_json::json!(venue_closed);
+        preview_value["halt_flatten"] = serde_json::json!(halt_flatten);
         // 周期尾推进 regime 状态机并切换参数集；失败只告警，不阻断本轮。
         if let Err(error) = apply_regime_transition(&tx, mode) {
             tracing::warn!(%error, %mode, "regime 切换处理失败，不影响本轮周期");
@@ -1633,6 +1699,18 @@ impl EngineRuntime {
         drop(conn);
         // 事务提交后再推事件：没落库的账不能出现在前端。
         self.publish_cycle_events(mode, snapshot, &executed, &order_differences);
+        if halt_flatten {
+            self.events.record(
+                "warn",
+                "risk",
+                if mode == "demo" {
+                    "风控熔断，已按 close_on_halt 平掉全部仓位"
+                } else {
+                    "风控熔断，已按 close_on_halt 请求平掉全部仓位"
+                },
+                json!({"mode": mode, "reason": preview_value["skipped"].clone()}),
+            );
+        }
         self.spawn_reviews(&review_ids);
         self.maybe_label_journal(mode, snapshot);
         Ok(plans)
@@ -1698,6 +1776,35 @@ impl EngineRuntime {
             serde_json::json!({"mode": mode, "orders": snapshot.open_orders}),
         );
     }
+
+/// 有界并发映射，结果顺序与输入严格一致。
+///
+/// 只用本地线程池：扫描阶段已经拿到快照，指标计算是纯 CPU，
+/// 不能在这里额外打交易所接口。并发度上限 20，避免池子被扫描线程占满。
+fn map_bounded<T, R, F>(items: &[T], concurrency: usize, map: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let workers = concurrency.clamp(1, 20).min(items.len());
+    if workers <= 1 {
+        return items.iter().map(&map).collect();
+    }
+    let chunk = items.len().div_ceil(workers);
+    let mut slots: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        for (chunk_items, chunk_slots) in items.chunks(chunk).zip(slots.chunks_mut(chunk)) {
+            let map = &map;
+            scope.spawn(move || {
+                for (item, slot) in chunk_items.iter().zip(chunk_slots.iter_mut()) {
+                    *slot = Some(map(item));
+                }
+            });
+        }
+    });
+    slots.into_iter().flatten().collect()
+}
 
 /// 限价开仓优先挂对手盘最优价：买单挂买一，卖单挂卖一。
 /// 没有可信盘口（<=0 或非有限）时退回标记价，宁可挂不上也不追价。
@@ -1779,8 +1886,19 @@ fn live_plans(
             .collect()
     }
 
+/// 扫描并发度：界面配置 1..20，0 或非法值回退 1。
+    /// 并发只作用于本地指标/候选计算，不放大交易所请求。
+    fn scan_concurrency_of(engine: &Value) -> usize {
+        let parsed = engine
+            .get("scan_concurrency")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .map(|value| value.floor() as usize);
+        parsed.unwrap_or(1).clamp(1, 20)
+    }
+
     /// 扫描闸门配置。点差上限优先读界面字段 `max_spread_bps`，
-/// 兼容历史键 `spread_bps_max`，都为缺时按 8bp 兜底。
+    /// 兼容历史键 `spread_bps_max`，都为缺时按 8bp 兜底。
 fn scan_gates_of(strategy: &Value) -> crate::scan::ScanGates {
     let spread_bps_max = strategy["max_spread_bps"]
         .as_f64()
@@ -2067,6 +2185,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             Vec<String>,
             Vec<crate::manage::ManagedPosition>,
             Vec<crate::signal_audit::AuditSignal>,
+            bool,
         ),
         String,
     > {
@@ -2174,52 +2293,49 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 })
                 .collect()
         };
-        let candidates: Vec<_> = snapshot
-            .markets
-            .iter()
-            .map(|market| {
-                let metric = &metrics[market.symbol.as_str()];
-                let recent = &market.candles[market.candles.len() - 20..];
-                let fresh = recent.last().is_some_and(|candle| {
-                    let age = now_ms.saturating_sub(candle.close_time);
-                    age > 0 && age as f64 <= max_age_ms
-                });
-                let gaps = recent
-                    .windows(2)
-                    .filter(|pair| {
-                        pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms
-                    })
-                    .count();
-                let preview = crate::trade_policy::preview(
-                    &market.candles,
-                    market.mark_price,
-                    metric.atr,
-                    crate::trade_policy::MarketFeatures {
-                        funding_rate: market.funding_rate,
-                        open_interest_change_pct: market.open_interest_change_pct,
-                        relative_strength: relative_strength
-                            .get(&market.symbol)
-                            .copied()
-                            .unwrap_or(0.0),
-                        relative_strength_available: relative_strength.contains_key(&market.symbol),
-                    },
-                );
-                let (strength, preview_side) = match preview {
-                    Some(preview) => (preview.score.abs(), Some(preview.side)),
-                    None => (0.0, None),
-                };
-                crate::scan::Candidate {
-                    symbol: market.symbol.clone(),
-                    data_ok: fresh && gaps <= max_gaps,
-                    atr_pct: metric.atr_pct,
-                    vol_ratio: metric.vol_ratio,
-                    quote_volume: market.quote_volume,
-                    spread_bps: market.spread_bps,
-                    strength,
-                    preview_side,
-                }
-            })
-            .collect();
+        let concurrency = Self::scan_concurrency_of(&engine);
+        let candidates: Vec<_> = Self::map_bounded(&snapshot.markets, concurrency, |market| {
+            let metric = &metrics[market.symbol.as_str()];
+            let recent = &market.candles[market.candles.len() - 20..];
+            let fresh = recent.last().is_some_and(|candle| {
+                let age = now_ms.saturating_sub(candle.close_time);
+                age > 0 && age as f64 <= max_age_ms
+            });
+            let gaps = recent
+                .windows(2)
+                .filter(|pair| {
+                    pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms
+                })
+                .count();
+            let preview = crate::trade_policy::preview(
+                &market.candles,
+                market.mark_price,
+                metric.atr,
+                crate::trade_policy::MarketFeatures {
+                    funding_rate: market.funding_rate,
+                    open_interest_change_pct: market.open_interest_change_pct,
+                    relative_strength: relative_strength
+                        .get(&market.symbol)
+                        .copied()
+                        .unwrap_or(0.0),
+                    relative_strength_available: relative_strength.contains_key(&market.symbol),
+                },
+            );
+            let (strength, preview_side) = match preview {
+                Some(preview) => (preview.score.abs(), Some(preview.side)),
+                None => (0.0, None),
+            };
+            crate::scan::Candidate {
+                symbol: market.symbol.clone(),
+                data_ok: fresh && gaps <= max_gaps,
+                atr_pct: metric.atr_pct,
+                vol_ratio: metric.vol_ratio,
+                quote_volume: market.quote_volume,
+                spread_bps: market.spread_bps,
+                strength,
+                preview_side,
+            }
+        });
         let windows: Vec<String> = match engine.get("trading_windows") {
             None => vec!["00:00-24:00".into()],
             Some(value) => {
@@ -2297,11 +2413,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         });
         // 止损保护是独立状态，不属于 risk 输入；熔断期间的亏损仓位仍要管，
         // 所以只拦扫描，不拦管仓。
-        if report.skipped.is_empty() && int_state("sl_guard_until")? > now {
+        let risk_gate = crate::risk::global_gates(&risk);
+        let sl_guard_active = int_state("sl_guard_until")? > now;
+        if report.skipped.is_empty() && sl_guard_active {
             report.skipped = "止损熔断中".into();
             report.scanned.clear();
             report.ai_symbols.clear();
         }
+        // close_on_halt 只认风控熔断（日亏/回撤/连亏/止损），手动熔断与普通 skipped 不算。
+        let risk_halt =
+            engine_enabled && (sl_guard_active || (risk_gate.risk_halt && !risk_gate.ok));
         let rejected: std::collections::BTreeMap<_, _> = candidates
             .iter()
             .filter_map(|candidate| {
@@ -2340,7 +2461,14 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             "rejected": rejected,
             "reconcile": &report.reconcile,
         });
-        Ok((preview, report, symbols, positions, rejected_rows))
+        Ok((
+            preview,
+            report,
+            symbols,
+            positions,
+            rejected_rows,
+            risk_halt,
+        ))
     }
 
     fn collect_entries(
@@ -2893,6 +3021,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         notional: f64,
         now: i64,
     ) -> Result<Option<String>, String> {
+        let global_cooldown: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cooldowns WHERE kind='global' AND until_ts>?1)",
+                [now],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if global_cooldown {
+            return Ok(Some("全局冷却中，本轮不新开仓".to_string()));
+        }
         let cooldown: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM cooldowns WHERE symbol=?1 AND until_ts>?2)",
@@ -2980,6 +3118,76 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             )));
         }
         Ok(None)
+    }
+
+    /// close_on_halt 触发的 demo 全平：复用管仓平仓的成交结算路径，
+/// 只处理本地账本，不发网络请求。标记价缺失时用当前行情快照兜底。
+    fn flatten_demo_positions(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        snapshot: &crate::providers::TradingSnapshot,
+        fee_rate: f64,
+        executed: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        if mode != "demo" {
+            return Ok(());
+        }
+        let cycle_id = format!("halt-{}", crate::now());
+        let rows: Vec<(String, String, f64, f64)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT symbol,side,qty,mark_price FROM positions \
+                     WHERE mode=?1 AND status='open' AND qty>0 ORDER BY id",
+                )
+                .map_err(|error| error.to_string())?;
+            let mapped = stmt
+                .query_map([mode], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (symbol, side, qty, mark_price) in rows {
+            let mark = if mark_price.is_finite() && mark_price > 0.0 {
+                mark_price
+            } else {
+                snapshot
+                    .markets
+                    .iter()
+                    .find(|market| market.symbol == symbol)
+                    .map(|market| market.mark_price)
+                    .unwrap_or(0.0)
+            };
+            let action = crate::manage::ManageAction::Close {
+                reason: "halt_flatten".to_string(),
+            };
+            let Some(fill) = crate::execution::demo_fill_for_manage(
+                &cycle_id, &symbol, &side, qty, mark, &action,
+            ) else {
+                continue;
+            };
+            let (applied, trade_id) =
+                crate::execution::apply_demo_fill_tx(tx, mode, crate::now(), fee_rate, &fill)?;
+            if applied {
+                executed.push(json!({
+                    "symbol": fill.symbol,
+                    "side": fill.side,
+                    "qty": fill.qty,
+                    "price": fill.price,
+                    "reason": fill.reason,
+                    "client_order_id": fill.client_order_id,
+                    "trade_id": trade_id,
+                }));
+            }
+        }
+        Ok(())
     }
 
     fn execute_demo_cycle(
@@ -3639,7 +3847,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             ]);
         }
         failures.extend(
-            self.reconcile_pending(creds, gateway, taker_rate, maker_rate)
+            self.reconcile_pending(creds, gateway, &mut gate, taker_rate, maker_rate)
                 .await?
                 .into_iter()
                 .map(|failure| format!("对账: {failure}")),
@@ -3659,24 +3867,28 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
     }
 
     /// 上一轮没拿到明确结论的订单：按 clientOrderId 查，确认后再结算。
+    /// LIMIT 开仓单长时间未成交会一直占用标的，超过超时后主动撤单；
+    /// 撤单失败/未知时不重发，保持 UNKNOWN 并告警。
     async fn reconcile_pending(
         &self,
         creds: &LiveCreds,
         gateway: &dyn crate::live::Gateway,
+        gate: &mut crate::submit::BanGate,
         taker_rate: f64,
         maker_rate: f64,
     ) -> Result<Vec<String>, String> {
-        let pending = {
+        let (pending, timeout_sec) = {
             let conn = self
                 .db
                 .conn
                 .lock()
                 .map_err(|_| "数据库锁不可用".to_string())?;
+            let timeout_sec = limit_order_timeout_sec(&conn);
             let mut stmt = conn
                 .prepare(
                     // 只查市价/限价单：条件单是保护腿，按 clientAlgoId 挂在 Algo 接口上，
                     // 用订单接口查只会拿到 -2013。
-                    "SELECT client_order_id,symbol,side,purpose,order_type FROM orders \
+                    "SELECT client_order_id,symbol,side,purpose,order_type,ts FROM orders \
                      WHERE mode='live' AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') \
                      AND order_type IN ('MARKET','LIMIT') ORDER BY id LIMIT 20",
                 )
@@ -3689,17 +3901,23 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 })
                 .map_err(|error| error.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?
+            let rows = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            (rows, timeout_sec)
         };
+        let now = crate::now();
         let mut failures = Vec::new();
-        for (client_order_id, symbol, side, purpose, order_type) in pending {
+        for (client_order_id, symbol, side, purpose, order_type, ts) in pending {
             let reply = self
                 .resolve_live(creds, gateway, &symbol, &client_order_id)
                 .await;
+            let limit_entry = order_type == "LIMIT" && purpose == "entry";
+            let timed_out = limit_entry && now.saturating_sub(ts) >= timeout_sec;
             let plan = LivePlan {
                 symbol: symbol.clone(),
                 position_side: if (side == "BUY") == (purpose == "entry") {
@@ -3718,23 +3936,24 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 features: None,
             };
             let fee_rate = Self::plan_fee_rate(&plan, taker_rate, maker_rate);
-            match reply {
+            match &reply {
                 crate::live::Reply::Filled {
                     avg_price,
                     executed_qty,
                     ..
                 } => {
                     if !(avg_price.is_finite()
-                        && avg_price > 0.0
+                        && *avg_price > 0.0
                         && executed_qty.is_finite()
-                        && executed_qty > 0.0)
+                        && *executed_qty > 0.0)
                     {
                         // 没有成交价就算不出盈亏，保持未知，等下一轮再查。
                         failures.push(format!("{symbol} 已成交但缺成交价，暂不结算"));
                         continue;
                     }
+                    let filled = *executed_qty;
                     if let Some(failure) =
-                        self.settle_live(&plan, &client_order_id, executed_qty, fee_rate, &reply)?
+                        self.settle_live(&plan, &client_order_id, filled, fee_rate, &reply)?
                     {
                         failures.push(failure);
                     }
@@ -3743,17 +3962,106 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     self.update_order_status(&client_order_id, "REJECTED", "")?;
                     failures.push(format!("{symbol} 补查为拒单 {code} {message}"));
                 }
-                crate::live::Reply::NotFound | crate::live::Reply::Unknown => {}
+                crate::live::Reply::NotFound | crate::live::Reply::Unknown => {
+                    if timed_out {
+                        if matches!(&reply, crate::live::Reply::NotFound) {
+                            // 交易所查不到这笔挂单：没有可撤的单，直接标记取消，解除 inflight。
+                            self.update_order_status(&client_order_id, "CANCELED", "")?;
+                            self.events.record(
+                                "warn",
+                                "trade",
+                                &format!("{symbol} 限价开仓超时且交易所无此单，已标记取消"),
+                                json!({"symbol": symbol, "client_order_id": client_order_id}),
+                            );
+                        } else {
+                            // 结果未知时不能撤单也不能重发：保持 UNKNOWN，人工确认前不放开。
+                            self.update_order_status(&client_order_id, "UNKNOWN", "")?;
+                            failures.push(format!("{symbol} 限价开仓超时但结果未知，未撤单未重发"));
+                            self.events.record(
+                                "warn",
+                                "trade",
+                                &format!("{symbol} 限价开仓超时但结果未知，保持 UNKNOWN 不重发"),
+                                json!({"symbol": symbol, "client_order_id": client_order_id}),
+                            );
+                        }
+                    }
+                }
                 crate::live::Reply::Accepted { status, .. } => {
+                    let partial = status.eq_ignore_ascii_case("PARTIALLY_FILLED");
+                    if timed_out && !partial {
+                        match self
+                            .cancel_limit_order(creds, gateway, gate, &symbol, &client_order_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                self.update_order_status(&client_order_id, "CANCELED", "")?;
+                                self.events.record(
+                                    "warn",
+                                    "trade",
+                                    &format!("{symbol} 限价开仓超时，已撤单"),
+                                    json!({"symbol": symbol, "client_order_id": client_order_id}),
+                                );
+                            }
+                            Err(error) => {
+                                self.update_order_status(&client_order_id, "UNKNOWN", "")?;
+                                failures.push(format!("{symbol} 限价开仓撤单失败: {error}"));
+                                self.events.record(
+                                    "warn",
+                                    "trade",
+                                    &format!("{symbol} 限价开仓撤单失败，保持 UNKNOWN 不重发"),
+                                    json!({
+                                        "symbol": symbol,
+                                        "client_order_id": client_order_id,
+                                        "error": error,
+                                    }),
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     self.update_order_status(
                         &client_order_id,
-                        if status.is_empty() { "NEW" } else { &status },
+                        if status.is_empty() { "NEW" } else { status },
                         "",
                     )?;
                 }
             }
         }
         Ok(failures)
+    }
+
+    /// 撤掉未成交的 LIMIT 开仓单。任何超时/网络不确定都返回 Err，调用方保持 UNKNOWN。
+    async fn cancel_limit_order(
+        &self,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        gate: &mut crate::submit::BanGate,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<(), String> {
+        let params = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            (
+                "origClientOrderId".to_string(),
+                client_order_id.to_string(),
+            ),
+            ("recvWindow".to_string(), creds.recv_window_ms.to_string()),
+        ];
+        let request = self
+            .build_live(gate, creds, "DELETE", crate::live::ORDER_PATH, &params)
+            .await?;
+        let reply = gateway.send(&request).await;
+        if reply.transport_failed {
+            return Err("撤单结果未知: 传输失败".into());
+        }
+        if !(200..300).contains(&reply.status) {
+            return Err(format!(
+                "撤单失败 HTTP {}: {}",
+                reply.status,
+                truncate_body(&reply.body)
+            ));
+        }
+        Ok(())
     }
 
     /// 需要补挂保护单的仓位。
@@ -4163,14 +4471,57 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         let mut failures: Vec<String> = Vec::new();
         let result = if config.enabled {
             match self.sync_exchange().await {
-                Ok((mode, plans)) if mode == "live" => match self.run_live(plans).await {
-                    Ok(items) => {
-                        failures = items;
+                Ok((mode, plans)) => {
+                    let mut outcome = if mode == "live" {
+                        match self.run_live(plans).await {
+                            Ok(items) => {
+                                failures = items;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
                         Ok(())
+                    };
+                    // close_on_halt 的实盘平仓在快照事务里只落标记：撤单和发单必须走网络，
+                    // 提交后在这里执行一次；标记读取即删除，后续轮次不重复全平。
+                    if outcome.is_ok() {
+                        match self.take_halt_flatten_pending(&mode) {
+                            Ok(true) => {
+                                // flatten 属于 EngineControl：复用撤单 + 市价平仓 + 本地结算的现有路径。
+                                let control = EngineControl::new(
+                                    self.db.clone(),
+                                    self.master_key.clone(),
+                                );
+                                match control.flatten(false).await {
+                                    Ok(value) => {
+                                        self.events.record(
+                                            "warn",
+                                            "risk",
+                                            "风控熔断平仓完成",
+                                            json!({"mode": mode, "result": value}),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        failures.push(format!("风控熔断平仓失败: {error}"));
+                                        self.events.record(
+                                            "error",
+                                            "risk",
+                                            "风控熔断平仓失败",
+                                            json!({"mode": mode, "error": error}),
+                                        );
+                                        outcome = Err(format!("风控熔断平仓失败: {error}"));
+                                    }
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                failures.push(format!("读取熔断平仓标记失败: {error}"));
+                            }
+                        }
                     }
-                    Err(error) => Err(error),
-                },
-                Ok(_) => Ok(()),
+                    outcome
+                }
                 Err(error) => Err(error),
             }
         } else {
@@ -4221,6 +4572,29 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
 
     /// 心跳文件：守护脚本靠它判断「进程还在、引擎却不动了」。
     /// 引擎停用时后台同样在跑，所以这个文件只表示后台任务活着。
+    /// 读取并清掉 close_on_halt 的实盘平仓标记。读取即删除，
+/// 即使平仓失败也不会在后续轮次重复全平（失败只告警，交给人工处理）。
+    fn take_halt_flatten_pending(&self, mode: &str) -> Result<bool, String> {
+        let key = format!("close_on_halt.pending.{mode}");
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key=?1)",
+                [&key],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if present {
+            conn.execute("DELETE FROM engine_state WHERE key=?1", [&key])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(present)
+    }
+
     fn write_heartbeat(db_path: &str) {
         let Some(parent) = std::path::Path::new(db_path).parent() else {
             return;
@@ -4631,6 +5005,65 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn scan_concurrency_falls_back_to_one_for_zero_or_invalid_values() {
+        assert_eq!(
+            EngineRuntime::scan_concurrency_of(&json!({"scan_concurrency": 0})),
+            1,
+            "0 不能当并发度，回退串行"
+        );
+        assert_eq!(
+            EngineRuntime::scan_concurrency_of(&json!({"scan_concurrency": -3})),
+            1
+        );
+        assert_eq!(
+            EngineRuntime::scan_concurrency_of(&json!({"scan_concurrency": "fast"})),
+            1
+        );
+        assert_eq!(EngineRuntime::scan_concurrency_of(&json!({})), 1);
+        assert_eq!(
+            EngineRuntime::scan_concurrency_of(&json!({"scan_concurrency": 3})),
+            3
+        );
+        assert_eq!(
+            EngineRuntime::scan_concurrency_of(&json!({"scan_concurrency": 99})),
+            20,
+            "并发度上限 20"
+        );
+    }
+
+    #[test]
+    fn scan_concurrency_matches_serial_candidates_without_duplicates() {
+        let candidates: Vec<crate::scan::Candidate> = (0..40)
+            .map(|index| crate::scan::Candidate {
+                symbol: format!("SYM{index:03}USDT"),
+                data_ok: true,
+                atr_pct: 1.0 + index as f64 * 0.01,
+                vol_ratio: 1.0,
+                quote_volume: 1e8,
+                spread_bps: 2.0,
+                strength: index as f64 / 40.0,
+                preview_side: None,
+            })
+            .collect();
+        let serial = EngineRuntime::map_bounded(&candidates, 1, |candidate| candidate.symbol.clone());
+        let parallel = EngineRuntime::map_bounded(&candidates, 4, |candidate| candidate.symbol.clone());
+        assert_eq!(parallel, serial, "并发结果必须与串行完全一致且顺序不变");
+        assert_eq!(
+            serial,
+            candidates
+                .iter()
+                .map(|candidate| candidate.symbol.clone())
+                .collect::<Vec<_>>()
+        );
+        let unique: std::collections::BTreeSet<&String> = parallel.iter().collect();
+        assert_eq!(
+            unique.len(),
+            parallel.len(),
+            "并发扫描不能产生重复标的"
+        );
+    }
 
     #[test]
     fn the_liveness_threshold_follows_the_scan_interval() {
@@ -5540,6 +5973,163 @@ mod tests {
         assert_eq!(orders, 0);
     }
 
+    fn seed_limit_entry_order(db: &Db, ts: i64, status: &str) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
+                 client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+                 VALUES(?1,'BTCUSDT','BUY','LIMIT',1,99,?2,'entry','nq-entry-old','',0,'live',0)",
+                (ts, status),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn limit_order_entry_is_canceled_after_timeout() {
+        let db = test_db();
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        seed_limit_entry_order(&db, crate::now() - 300, "NEW");
+        let runtime = test_runtime_with_events(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":9,"status":"NEW","executedQty":"0","avgPrice":"0"}"#,
+            ),
+            (
+                200,
+                r#"{"orderId":9,"status":"CANCELED","executedQty":"0","avgPrice":"0"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, vec![])
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(
+            gateway.sent_count(),
+            3,
+            "超时后只查一次、撤一次，不能重发新单"
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "CANCELED", "超时未成交的 LIMIT 开仓必须标记撤销");
+            let events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM engine_events WHERE message LIKE '%已撤单%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(events > 0, "撤单必须写事件");
+        }
+        let inflight = {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            EngineRuntime::live_entry_inflight(&tx, "BTCUSDT").unwrap()
+        };
+        assert!(!inflight, "撤单成功后同标的 inflight 必须解除");
+    }
+
+    #[tokio::test]
+    async fn limit_order_entry_is_not_canceled_before_timeout() {
+        let db = test_db();
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        seed_limit_entry_order(&db, crate::now(), "NEW");
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":9,"status":"NEW","executedQty":"0","avgPrice":"0"}"#,
+            ),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, vec![])
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(gateway.sent_count(), 2, "未超时不能发撤单请求");
+        let status: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "NEW");
+    }
+
+    #[tokio::test]
+    async fn limit_order_cancel_unknown_keeps_unknown_and_is_not_resent() {
+        let db = test_db();
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        seed_limit_entry_order(&db, crate::now() - 300, "NEW");
+        let runtime = test_runtime_with_events(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (
+                200,
+                r#"{"orderId":9,"status":"NEW","executedQty":"0","avgPrice":"0"}"#,
+            ),
+            (0, ""),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, vec![])
+            .await
+            .unwrap();
+        assert!(
+            failures.iter().any(|failure| failure.contains("撤单")),
+            "撤单未知必须告警：{failures:?}"
+        );
+        assert_eq!(gateway.sent_count(), 3);
+        assert!(
+            gateway
+                .sent_urls()
+                .iter()
+                .all(|url| !url.contains("type=LIMIT")),
+            "撤单未知时绝不能重发开仓单"
+        );
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "UNKNOWN", "撤单未知时保持 UNKNOWN 等人工确认");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE message LIKE '%保持 UNKNOWN%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "撤单未知必须写告警事件");
+    }
+
     #[tokio::test]
     async fn demo_entry_rejects_active_cooldown_and_projected_category_limit() {
         let (db, snapshot) = entry_fixture().await;
@@ -5662,6 +6252,315 @@ mod tests {
         assert!(expiry > crate::now());
     }
 
+    fn test_runtime_with_events(db: &Db) -> EngineRuntime {
+        let lock = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        EngineRuntime::new(
+            db.clone(),
+            lock,
+            b"MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=".to_vec(),
+            crate::events::EventBus::new(Some(db.clone())),
+        )
+        .with_reviewer(Arc::new(TestApproveReviewer))
+    }
+
+    /// 一笔已开仓的 demo 夹具：由标记价决定触发止损（亏损）还是止盈（盈利）。
+    /// 策略关掉部分止盈并把 ROI 门槛抬高，确保一轮里是一次整仓平仓。
+    async fn cooldown_position_fixture(mark: f64) -> (Db, crate::providers::TradingSnapshot) {
+        use crate::providers::{DemoProvider, SnapshotProvider};
+        let db = test_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
+                ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
+                UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
+                INSERT INTO app_settings VALUES('risk','{"cooldown_minutes":7,"symbol_cooldown_minutes":5}',0);
+                INSERT INTO app_settings VALUES('strategy','{"partial_tp_at_r":0,"entry_threshold":2.0,"roi_table":[[0,1000]]}',0);
+                INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,status,mode)
+                VALUES('BTCUSDT','long',0.5,100,100,95,105,100,95,0,1,'open','demo');"#,
+            )
+            .unwrap();
+        let snapshot = DemoProvider::with_mark_price(mark).snapshot().await.unwrap();
+        (db, snapshot)
+    }
+
+    #[tokio::test]
+    async fn losing_close_writes_global_cooldown_minutes() {
+        let (db, snapshot) = cooldown_position_fixture(95.0).await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let now = crate::now();
+        let conn = db.conn.lock().unwrap();
+        let (until, kind): (i64, String) = conn
+            .query_row(
+                "SELECT until_ts, kind FROM cooldowns WHERE symbol='__global__'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "global");
+        let remain = until - now;
+        assert!(
+            (7 * 60 - 10..=7 * 60).contains(&remain),
+            "全局冷却应等于 risk.cooldown_minutes=7，实际剩余 {remain}s"
+        );
+        let (symbol_until, symbol_kind): (i64, String) = conn
+            .query_row(
+                "SELECT until_ts, kind FROM cooldowns WHERE symbol='BTCUSDT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(symbol_kind, "symbol");
+        assert!(symbol_until > now, "symbol 冷却不能被全局冷却取代");
+    }
+
+    #[tokio::test]
+    async fn profitable_close_does_not_write_global_cooldown_minutes() {
+        let (db, snapshot) = cooldown_position_fixture(110.0).await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (status, reason): (String, String) = conn
+            .query_row(
+                "SELECT status, exit_reason FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed");
+        assert_eq!(reason, "take_profit", "本用例必须是一笔盈利的整仓平仓");
+        let global: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cooldowns WHERE kind='global'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(global, 0, "盈利平仓不能触发全局冷却");
+    }
+
+    #[tokio::test]
+    async fn global_cooldown_minutes_blocks_entries_until_it_expires() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cooldowns VALUES('__global__',?1,'test','global')",
+                [crate::now() + 600],
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(entry_orders(&db), 0, "全局冷却内不能新开仓");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cooldowns SET until_ts=?1 WHERE kind='global'",
+                [crate::now() - 1],
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(entry_orders(&db), 1, "全局冷却到期后必须恢复开仓");
+    }
+
+    #[tokio::test]
+    async fn global_cooldown_minutes_keeps_symbol_cooldown_independent() {
+        let (db, snapshot) = cooldown_position_fixture(95.0).await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE cooldowns SET until_ts=0 WHERE kind='global'",
+                [],
+            )
+            .unwrap();
+        }
+        // 下一轮会清掉过期的全局冷却；symbol 冷却仍在有效期内，不能被一起删掉。
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let global: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cooldowns WHERE kind='global'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(global, 0, "过期的全局冷却应被清理");
+        let symbol: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cooldowns WHERE symbol='BTCUSDT' AND kind='symbol' \
+                 AND until_ts>?1",
+                [crate::now()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(symbol, 1, "symbol 冷却必须独立于全局冷却");
+    }
+
+    async fn halt_flatten_fixture(close_on_halt: bool) -> (Db, crate::providers::TradingSnapshot) {
+        let (db, snapshot) = cooldown_position_fixture(100.0).await;
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [format!(
+                    r#"{{"enabled":true,"mode":"demo","close_on_halt":{close_on_halt}}}"#
+                )],
+            )
+            .unwrap();
+            // 回撤 66% 超过 50% 上限，稳定触发风控熔断。
+            upsert_state(
+                &conn,
+                "equity_peak",
+                &(snapshot.account.equity * 3.0).to_string(),
+            )
+            .unwrap();
+        }
+        (db, snapshot)
+    }
+
+    #[tokio::test]
+    async fn close_on_halt_flattens_positions_on_a_risk_halt() {
+        let (db, snapshot) = halt_flatten_fixture(true).await;
+        let runtime = test_runtime_with_events(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (status, reason): (String, String) = conn
+            .query_row(
+                "SELECT status, exit_reason FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "closed", "close_on_halt=true 必须平掉仓位");
+        assert_eq!(reason, "halt_flatten");
+        let purpose: String = conn
+            .query_row(
+                "SELECT purpose FROM orders WHERE mode='demo' AND reduce_only=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(purpose, "halt_flatten");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_events WHERE message LIKE '%close_on_halt%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events > 0, "熔断平仓必须写事件");
+    }
+
+    #[tokio::test]
+    async fn close_on_halt_false_leaves_positions_alone() {
+        let (db, snapshot) = halt_flatten_fixture(false).await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open", "close_on_halt 默认 false 时不能动仓位");
+        let closes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE purpose='halt_flatten'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closes, 0);
+    }
+
+    #[tokio::test]
+    async fn close_on_halt_ignores_a_manual_halt() {
+        let (db, snapshot) = halt_flatten_fixture(true).await;
+        {
+            let conn = db.conn.lock().unwrap();
+            upsert_state(&conn, "equity_peak", "0").unwrap();
+            upsert_state(&conn, "halted", "手动暂停").unwrap();
+        }
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open", "手动熔断不能触发 close_on_halt");
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='cycle_preview.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preview: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(preview["halt_flatten"], false);
+        assert!(
+            preview["skipped"].as_str().unwrap().contains("熔断"),
+            "手动熔断仍要拦扫描，只是不平仓"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_on_halt_dedupes_repeated_halts() {
+        let (db, snapshot) = halt_flatten_fixture(true).await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,100,100,95,105,100,95,0,1,'open','demo');",
+            )
+            .unwrap();
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let closes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE purpose='halt_flatten'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closes, 1, "同一段熔断期间只允许全平一次");
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE mode='demo' AND status='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1, "去重后新仓不应被再次全平");
+    }
+
+    fn entry_orders(db: &Db) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE mode='demo' AND purpose='entry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn set_engine_settings(db: &Db, value: &str) {
         db.conn
             .lock()
@@ -5677,12 +6576,11 @@ mod tests {
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
         db.conn.lock().unwrap().execute_batch(
-            r#"UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
-            UPDATE engine_state SET value='true' WHERE key='enabled';
-            ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
+            r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
             ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
-
+            UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
+            UPDATE engine_state SET value='true' WHERE key='enabled';
             INSERT INTO app_settings VALUES('risk','{"min_leverage":10,"max_leverage":20,"margin_pct":10,"risk_per_trade_pct":10,"rsi_long_max":100.1}',0);
             CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY,enabled INTEGER,max_leverage INTEGER,tick_sz TEXT,min_sz TEXT,min_notional REAL);
             INSERT INTO trading_symbols VALUES('BTCUSDT',1,5,'0.01','0.001',5);
@@ -5714,6 +6612,11 @@ mod tests {
         let db = test_db();
         {
             let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
+                 ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';",
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"demo"}"#],
@@ -6742,6 +7645,11 @@ mod tests {
         let db = test_db();
         {
             let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
+                 ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';",
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"demo"}"#],
