@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_set_group_is_visible_but_ai_blocked() {
+    fn ai_tuning_group_is_visible_but_ai_blocked() {
         let value = crate::param_registry::catalog();
         let group = &value["groups"]["ai_tuning"];
         assert_eq!(group["writable"], serde_json::json!([]));

@@ -1679,7 +1679,7 @@ impl EngineRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if let Err(error) = apply_parameter_set_governance(
+        if let Err(error) = apply_ai_tuning_governance(
             &tx,
             mode,
             &live_timeframe,
@@ -4978,7 +4978,7 @@ fn apply_regime_transition_at(
     )?;
     if let Some(regime) = switched {
         if let Err(error) =
-            crate::parameter_sets::activate_for_regime(conn, regime.as_str(), "regime", mode)
+            crate::ai_tuning::activate_for_regime(conn, regime.as_str(), "regime", mode)
         {
             // 激活失败不能把 regime 留在“已切换”状态：否则下轮不再触发激活，
             // 策略与 regime 永久错位。恢复旧 current/changed_at，并清空 pending，
@@ -5020,9 +5020,9 @@ fn apply_regime_transition_at(
             }
         } else {
             // 激活成功即初始化守卫，计时从切换时刻开始。
-            match crate::parameter_sets::active_set_for_regime(conn, regime.as_str()) {
+            match crate::ai_tuning::active_set_for_regime(conn, regime.as_str()) {
                 Ok(Some(set)) => {
-                    if let Err(error) = crate::parameter_sets::set_guard(
+                    if let Err(error) = crate::ai_tuning::set_guard(
                         conn,
                         regime.as_str(),
                         set.id,
@@ -5044,7 +5044,7 @@ fn apply_regime_transition_at(
 /// 周期尾AI 调参治理：自动启用 approved 候选，再推进无候选守卫。
 ///
 /// 调用方在 regime 切换处理后、同一事务内调用；错误由调用方告警，不阻断周期。
-fn apply_parameter_set_governance(
+fn apply_ai_tuning_governance(
     conn: &rusqlite::Connection,
     mode: &str,
     live_timeframe: &str,
@@ -5064,7 +5064,7 @@ fn apply_parameter_set_governance(
     if current_regime.is_empty() {
         return Ok(());
     }
-    let auto_apply_error = match crate::parameter_sets::auto_apply_approved(
+    let auto_apply_error = match crate::ai_tuning::auto_apply_approved(
         conn,
         &current_regime,
         mode,
@@ -5072,8 +5072,8 @@ fn apply_parameter_set_governance(
         now,
     ) {
         Ok(Some(applied)) => {
-            let applied_set = crate::parameter_sets::load_set(conn, applied)?;
-            crate::parameter_sets::set_guard(conn, &applied_set.regime, applied, now)?;
+            let applied_set = crate::ai_tuning::load_set(conn, applied)?;
+            crate::ai_tuning::set_guard(conn, &applied_set.regime, applied, now)?;
             None
         }
         Ok(None) => None,
@@ -5098,11 +5098,11 @@ fn apply_parameter_set_governance(
             Some(error)
         }
     };
-    let Some(active) = crate::parameter_sets::active_set_for_regime(conn, &current_regime)? else {
+    let Some(active) = crate::ai_tuning::active_set_for_regime(conn, &current_regime)? else {
         return auto_apply_error.map_or(Ok(()), Err);
     };
     // 守卫已把 active 集回滚标记写进自己的状态，这里不能再 set_guard 覆盖。
-    crate::parameter_sets::update_guard(
+    crate::ai_tuning::update_guard(
         conn,
         &current_regime,
         active.id,
@@ -8008,7 +8008,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         }
         crate::schema::ensure_parameter_changes(&conn).unwrap();
-        crate::schema::ensure_parameter_sets(&conn).unwrap();
+        crate::schema::ensure_ai_tuning(&conn).unwrap();
         conn
     }
 
@@ -8021,7 +8021,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         .unwrap()
     }
 
-    fn parameter_set_governance_fixture() -> rusqlite::Connection {
+    fn ai_tuning_governance_fixture() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
@@ -8040,7 +8040,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         )
         .unwrap();
         crate::schema::migrate(&conn).unwrap();
-        crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+        crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         conn.execute(
             "INSERT INTO engine_state(key,value,updated_at) VALUES('regime.current.demo','range',0) \
              ON CONFLICT(key) DO UPDATE SET value='range'",
@@ -8051,10 +8051,10 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     fn governance_approved_candidate(conn: &rusqlite::Connection) -> i64 {
-        let parent = crate::parameter_sets::active_for_regime(conn, "range")
+        let parent = crate::ai_tuning::active_for_regime(conn, "range")
             .unwrap()
             .unwrap();
-        let snapshot = crate::parameter_sets::validate_candidate(
+        let snapshot = crate::ai_tuning::validate_candidate(
             &parent.params,
             &[crate::ai_client::ParamUpdate {
                 group: "strategy".to_string(),
@@ -8064,7 +8064,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             }],
         )
         .unwrap();
-        let id = crate::parameter_sets::insert_candidate(
+        let id = crate::ai_tuning::insert_candidate(
             conn,
             "range-ai-governance",
             "range",
@@ -8073,7 +8073,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             Some(parent.id),
         )
         .unwrap();
-        crate::parameter_sets::mark_evidence(conn, id, true, &serde_json::json!({"gate":{"pass":true}}))
+        crate::ai_tuning::mark_evidence(conn, id, true, &serde_json::json!({"gate":{"pass":true}}))
             .unwrap();
         id
     }
@@ -8100,16 +8100,16 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[test]
-    fn apply_parameter_set_governance_materializes_approved_candidate() {
-        let conn = parameter_set_governance_fixture();
+    fn apply_ai_tuning_governance_materializes_approved_candidate() {
+        let conn = ai_tuning_governance_fixture();
         let candidate_id = governance_approved_candidate(&conn);
         enable_auto_apply(&conn, "0");
         let now = crate::now();
 
-        apply_parameter_set_governance(&conn, "demo", "1h", true, false, now)
+        apply_ai_tuning_governance(&conn, "demo", "1h", true, false, now)
             .expect("自动启用不能阻断周期");
 
-        let active = crate::parameter_sets::active_for_regime(&conn, "range")
+        let active = crate::ai_tuning::active_for_regime(&conn, "range")
             .unwrap()
             .unwrap();
         assert_eq!(active.id, candidate_id, "当前 regime 必须直接启用候选");
@@ -8147,8 +8147,8 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[test]
-    fn apply_parameter_set_governance_rolls_back_after_no_candidate_window() {
-        let conn = parameter_set_governance_fixture();
+    fn apply_ai_tuning_governance_rolls_back_after_no_candidate_window() {
+        let conn = ai_tuning_governance_fixture();
         let bootstrap_id: i64 = conn
             .query_row(
                 "SELECT id FROM ai_tuning_sets WHERE name='range-bootstrap'",
@@ -8157,14 +8157,14 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             )
             .unwrap();
         let candidate_id = governance_approved_candidate(&conn);
-        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        crate::ai_tuning::activate(&conn, candidate_id, "regime", "demo").unwrap();
         let now = crate::now();
-        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+        crate::ai_tuning::set_guard(&conn, "range", candidate_id, now).unwrap();
 
-        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_799)
+        apply_ai_tuning_governance(&conn, "demo", "1h", false, false, now + 1_799)
             .expect("守卫推进不能阻断周期");
         assert_eq!(
-            crate::parameter_sets::active_for_regime(&conn, "range")
+            crate::ai_tuning::active_for_regime(&conn, "range")
                 .unwrap()
                 .unwrap()
                 .id,
@@ -8172,10 +8172,10 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             "未满窗口不得回滚"
         );
 
-        apply_parameter_set_governance(&conn, "demo", "1h", false, false, now + 1_800)
+        apply_ai_tuning_governance(&conn, "demo", "1h", false, false, now + 1_800)
             .expect("守卫回滚不能阻断周期");
         assert_eq!(
-            crate::parameter_sets::active_for_regime(&conn, "range")
+            crate::ai_tuning::active_for_regime(&conn, "range")
                 .unwrap()
                 .unwrap()
                 .id,
@@ -8203,17 +8203,17 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[test]
-    fn apply_parameter_set_governance_pauses_on_skipped_cycle() {
-        let conn = parameter_set_governance_fixture();
+    fn apply_ai_tuning_governance_pauses_on_skipped_cycle() {
+        let conn = ai_tuning_governance_fixture();
         let candidate_id = governance_approved_candidate(&conn);
-        crate::parameter_sets::activate(&conn, candidate_id, "regime", "demo").unwrap();
+        crate::ai_tuning::activate(&conn, candidate_id, "regime", "demo").unwrap();
         let now = crate::now();
-        crate::parameter_sets::set_guard(&conn, "range", candidate_id, now).unwrap();
+        crate::ai_tuning::set_guard(&conn, "range", candidate_id, now).unwrap();
 
-        apply_parameter_set_governance(&conn, "demo", "1h", false, true, now + 10_000)
+        apply_ai_tuning_governance(&conn, "demo", "1h", false, true, now + 10_000)
             .expect("熔断轮不得报错");
         assert_eq!(
-            crate::parameter_sets::active_for_regime(&conn, "range")
+            crate::ai_tuning::active_for_regime(&conn, "range")
                 .unwrap()
                 .unwrap()
                 .id,

@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_set_validation_rejects_invalid_values() {
+    fn ai_tuning_validation_rejects_invalid_values() {
         assert!(validate("ai_tuning", &defaults_of("ai_tuning")).is_ok());
         for (key, bad) in [
             ("enabled", json!("yes")),
@@ -799,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parameter_set_validation_normalizes_and_rejects_null() {
+    async fn ai_tuning_validation_normalizes_and_rejects_null() {
         let path = std::env::temp_dir().join("nq-settings-parameter-set.db");
         let db = fixture(&path);
         let app = Router::new()

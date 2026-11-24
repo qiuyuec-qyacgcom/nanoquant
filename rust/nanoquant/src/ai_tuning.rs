@@ -10,7 +10,7 @@ const C_PHASE_DISABLED: &str = "strategy.timeframe 不在 C 期自动切换白�
 const C_PHASE_DISABLED_UNBOUND: &str = "ai_tuning 配置缺失或无效，未能禁用AI 调参自动启用";
 
 /// A 期迁移种子化：只建AI 调参记录，绝不改写 `app_settings.strategy`（C 期才物化）。
-/// 幂等：`parameter_sets` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
+/// 幂等：`ai_tuning` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
 /// 全部写入放在一个事务里：中途失败整体回滚，避免留下半套数据导致下次跳过。
 pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
     let exists: i64 = conn
@@ -156,7 +156,7 @@ pub(crate) fn enable_c_phase(conn: &Connection) -> Result<(), String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "range".to_string());
     let now = crate::now();
-    conn.execute_batch("SAVEPOINT parameter_set_enable_c_phase")
+    conn.execute_batch("SAVEPOINT ai_tuning_enable_c_phase")
         .map_err(|error| format!("开启 C 期AI 调参启用事务失败: {error}"))?;
     let result = (|| {
         let updated = conn
@@ -175,11 +175,11 @@ pub(crate) fn enable_c_phase(conn: &Connection) -> Result<(), String> {
     })();
     match result {
         Ok(()) => conn
-            .execute_batch("RELEASE parameter_set_enable_c_phase")
+            .execute_batch("RELEASE ai_tuning_enable_c_phase")
             .map_err(|error| format!("提交 C 期AI 调参启用事务失败: {error}")),
         Err(error) => {
             let _ = conn.execute_batch(
-                "ROLLBACK TO parameter_set_enable_c_phase; RELEASE parameter_set_enable_c_phase",
+                "ROLLBACK TO ai_tuning_enable_c_phase; RELEASE ai_tuning_enable_c_phase",
             );
             Err(error)
         }
@@ -305,7 +305,7 @@ const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ParameterSet {
+pub(crate) struct AiTuningSet {
     pub id: i64,
     pub name: String,
     pub regime: String,
@@ -321,10 +321,10 @@ pub(crate) struct ParameterSet {
 }
 
 /// `params` / `evidence` 是历史 JSON 快照；解析失败时降级为 Null，读取不中断。
-pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterSet> {
+pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiTuningSet> {
     let params_raw: String = row.get(5)?;
     let evidence_raw: String = row.get(8)?;
-    Ok(ParameterSet {
+    Ok(AiTuningSet {
         id: row.get(0)?,
         name: row.get(1)?,
         regime: row.get(2)?,
@@ -344,7 +344,7 @@ pub(crate) fn row_to_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ParameterS
 pub(crate) fn active_for_regime(
     conn: &Connection,
     regime: &str,
-) -> Result<Option<ParameterSet>, String> {
+) -> Result<Option<AiTuningSet>, String> {
     let query = format!(
         "SELECT {SET_COLUMNS} FROM ai_tuning_sets \
          WHERE regime=?1 AND status='active' ORDER BY id DESC LIMIT 1"
@@ -357,7 +357,7 @@ pub(crate) fn active_for_regime(
 }
 
 /// 按 id 读取AI 调参，候选父集校验也复用它。
-pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<ParameterSet, String> {
+pub(crate) fn load_set(conn: &Connection, id: i64) -> Result<AiTuningSet, String> {
     conn.query_row(
         &format!("SELECT {SET_COLUMNS} FROM ai_tuning_sets WHERE id=?1"),
         [id],
@@ -378,15 +378,15 @@ pub(crate) fn activate(
     mode: &str,
 ) -> Result<(), String> {
     let set = load_set(conn, set_id)?;
-    conn.execute_batch("SAVEPOINT parameter_set_activate")
+    conn.execute_batch("SAVEPOINT ai_tuning_activate")
         .map_err(|e| format!("开启AI 调参激活事务失败: {e}"))?;
     match activate_in_savepoint(conn, &set, trigger, mode) {
         Ok(()) => conn
-            .execute_batch("RELEASE parameter_set_activate")
+            .execute_batch("RELEASE ai_tuning_activate")
             .map_err(|e| format!("提交AI 调参激活事务失败: {e}")),
         Err(error) => {
             let _ = conn.execute_batch(
-                "ROLLBACK TO parameter_set_activate; RELEASE parameter_set_activate",
+                "ROLLBACK TO ai_tuning_activate; RELEASE ai_tuning_activate",
             );
             Err(error)
         }
@@ -395,7 +395,7 @@ pub(crate) fn activate(
 
 fn activate_in_savepoint(
     conn: &Connection,
-    set: &ParameterSet,
+    set: &AiTuningSet,
     trigger: &str,
     mode: &str,
 ) -> Result<(), String> {
@@ -452,7 +452,7 @@ fn activate_in_savepoint(
 #[allow(clippy::too_many_arguments)]
 fn materialize(
     conn: &Connection,
-    set: &ParameterSet,
+    set: &AiTuningSet,
     before: &Value,
     after: &Value,
     previous_id: Option<i64>,
@@ -503,7 +503,7 @@ fn materialize(
 pub(crate) fn active_set_for_regime(
     conn: &Connection,
     regime: &str,
-) -> Result<Option<ParameterSet>, String> {
+) -> Result<Option<AiTuningSet>, String> {
     match active_for_regime(conn, regime)? {
         Some(set) => Ok(Some(set)),
         None if regime == "trend" => active_for_regime(conn, "range"),
@@ -610,7 +610,7 @@ fn configured_auto_apply_timeframes(config: &Value) -> Vec<String> {
 
 fn activate_without_materializing(
     conn: &Connection,
-    set: &ParameterSet,
+    set: &AiTuningSet,
     mode: &str,
     now: i64,
 ) -> Result<(), String> {
@@ -621,7 +621,7 @@ fn activate_without_materializing(
         "strategy",
         &crate::settings_api::normalized_group_value("strategy", &set.params),
     )?;
-    conn.execute_batch("SAVEPOINT parameter_set_auto_apply")
+    conn.execute_batch("SAVEPOINT ai_tuning_auto_apply")
         .map_err(|error| format!("开启自动启用事务失败: {error}"))?;
     let result = (|| {
         let previous_id: Option<i64> = conn
@@ -669,11 +669,11 @@ fn activate_without_materializing(
     })();
     match result {
         Ok(()) => conn
-            .execute_batch("RELEASE parameter_set_auto_apply")
+            .execute_batch("RELEASE ai_tuning_auto_apply")
             .map_err(|error| format!("提交自动启用事务失败: {error}")),
         Err(error) => {
             let _ = conn.execute_batch(
-                "ROLLBACK TO parameter_set_auto_apply; RELEASE parameter_set_auto_apply",
+                "ROLLBACK TO ai_tuning_auto_apply; RELEASE ai_tuning_auto_apply",
             );
             Err(error)
         }
@@ -914,15 +914,15 @@ pub(crate) fn rollback_with_trigger(
             previous.regime, current.regime
         ));
     }
-    conn.execute_batch("SAVEPOINT parameter_set_rollback")
+    conn.execute_batch("SAVEPOINT ai_tuning_rollback")
         .map_err(|e| format!("开启AI 调参回滚事务失败: {e}"))?;
     match rollback_in_savepoint(conn, &current, &previous, mode, trigger) {
         Ok(()) => conn
-            .execute_batch("RELEASE parameter_set_rollback")
+            .execute_batch("RELEASE ai_tuning_rollback")
             .map_err(|e| format!("提交AI 调参回滚事务失败: {e}")),
         Err(error) => {
             let _ = conn.execute_batch(
-                "ROLLBACK TO parameter_set_rollback; RELEASE parameter_set_rollback",
+                "ROLLBACK TO ai_tuning_rollback; RELEASE ai_tuning_rollback",
             );
             Err(error)
         }
@@ -931,8 +931,8 @@ pub(crate) fn rollback_with_trigger(
 
 fn rollback_in_savepoint(
     conn: &Connection,
-    current: &ParameterSet,
-    previous: &ParameterSet,
+    current: &AiTuningSet,
+    previous: &AiTuningSet,
     mode: &str,
     trigger: &str,
 ) -> Result<(), String> {
@@ -1198,7 +1198,7 @@ mod tests {
             .to_string()],
         )
         .unwrap();
-        // 非 1h 分支需要既有 parameter_set 配置来验证白名单被清空。
+        // 非 1h 分支需要既有 ai_tuning 配置来验证白名单被清空。
         conn.execute(
             "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
             [serde_json::json!({
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn non_1h_with_corrupt_parameter_set_config_keeps_going() {
+    fn non_1h_with_corrupt_ai_tuning_config_keeps_going() {
         let conn = conn_with_strategy("4h");
         conn.execute(
             "UPDATE app_settings SET value='not-json' WHERE key='ai_tuning'",
@@ -1496,7 +1496,7 @@ mod tests {
         assert_eq!(value, "not-json", "脏配置保持原样，不做半更新");
     }
 
-    fn parameter_set_config(conn: &Connection) -> Value {
+    fn ai_tuning_config(conn: &Connection) -> Value {
         let raw: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
@@ -1523,7 +1523,7 @@ mod tests {
 
         enable_c_phase(&conn).unwrap();
 
-        let config = parameter_set_config(&conn);
+        let config = ai_tuning_config(&conn);
         assert_eq!(config["auto_apply"], true, "1h 应打开自动启用");
         assert_eq!(config["auto_apply_timeframes"], "1h", "应保留其它键");
         assert!(
@@ -1560,7 +1560,7 @@ mod tests {
     fn enable_c_phase_disables_auto_apply_for_non_1h_without_since() {
         let conn = conn_with_strategy("4h");
         seed_bootstrap(&conn).unwrap();
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
         );
@@ -1568,7 +1568,7 @@ mod tests {
 
         enable_c_phase(&conn).unwrap();
 
-        let config = parameter_set_config(&conn);
+        let config = ai_tuning_config(&conn);
         assert_eq!(config["auto_apply"], false, "非 1h 必须关闭自动启用");
         assert_eq!(
             config["auto_apply_timeframes"], "1h",
@@ -1614,7 +1614,7 @@ mod tests {
     fn enable_c_phase_rolls_back_all_writes_when_activation_fails() {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
         );
@@ -1628,7 +1628,7 @@ mod tests {
         assert!(enable_c_phase(&conn).is_err(), "激活失败必须传播错误");
 
         assert_eq!(
-            parameter_set_config(&conn)["auto_apply"],
+            ai_tuning_config(&conn)["auto_apply"],
             false,
             "事务失败不得留下 auto_apply=true"
         );
@@ -2640,7 +2640,7 @@ mod tests {
         .unwrap()
     }
 
-    fn set_parameter_set_config(conn: &Connection, value: Value) {
+    fn set_ai_tuning_config(conn: &Connection, value: Value) {
         conn.execute(
             "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
             [value.to_string()],
@@ -2725,7 +2725,7 @@ mod tests {
         );
 
         set_state(&conn, "ai_tuning.auto_apply_since", "0");
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
         );
@@ -2735,7 +2735,7 @@ mod tests {
             "auto_apply=false 不得启用"
         );
 
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": false, "auto_apply": true, "auto_apply_timeframes": "1h"}),
         );
@@ -2745,7 +2745,7 @@ mod tests {
             "enabled=false 不得启用"
         );
 
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": ""}),
         );
@@ -2755,7 +2755,7 @@ mod tests {
             "空白名单表示不自动启用"
         );
 
-        set_parameter_set_config(
+        set_ai_tuning_config(
             &conn,
             json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
         );

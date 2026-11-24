@@ -381,7 +381,7 @@ pub(crate) fn gate_injected_context(
     }
 }
 
-/// 独立调参任务的提示词：只产出 strategy 组参数增量，绝不涉及 risk/parameter_set/timeframe。
+/// 独立调参任务的提示词：只产出 strategy 组参数增量，绝不涉及 risk/ai_tuning/timeframe。
 pub(crate) fn tuning_messages(context: &Value) -> Vec<ChatMessage> {
     vec![
         ChatMessage::new(
@@ -390,7 +390,7 @@ pub(crate) fn tuning_messages(context: &Value) -> Vec<ChatMessage> {
                 "你是量化策略参数调优器。只输出一个 JSON 对象，不要 Markdown、代码围栏、解释或额外散文。",
                 "格式：{\"a\":\"H\",\"c\":0.5,\"p\":[{\"g\":\"strategy\",\"k\":\"atr_pct_min\",\"v\":0.7,\"w\":\"中文理由\"}]}。",
                 "a 固定为 H（本任务不执行交易）；c 是 0..1 的置信度；p 是参数增量数组，没有合适调整就返回 \"p\":[]。",
-                "只允许 g=\"strategy\"；不得修改 risk、parameter_set、timeframe 或 engine 参数；最多 3 个键。",
+                "只允许 g=\"strategy\"；不得修改 risk、ai_tuning、timeframe 或 engine 参数；最多 3 个键。",
                 "硬边界：atr_pct_min <= 1.0，atr_pct_max >= 6，volume_ratio_min <= 1.0，entry_threshold <= 0.5；单键相对变化不得超过 25%。",
                 "参数键必须来自 writable_parameters 当前快照：每项含 current 当前值、min/max/step 人工范围，若存在 ai_bounds 则是 AI 专用区间；w 用中文简述调整理由。",
             ]

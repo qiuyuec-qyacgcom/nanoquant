@@ -133,7 +133,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         backfill_sort_order(conn)?;
         migrate_ai_tuning_names(conn)?;
         ensure_parameter_changes(conn)?;
-        ensure_parameter_sets(conn)?;
+        ensure_ai_tuning(conn)?;
         normalize_ai_tuning_interval(conn)?;
         drop_legacy_default_leverage(conn)?;
         Ok(())
@@ -211,7 +211,7 @@ fn migrate_ai_tuning_names(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
+pub(crate) fn ensure_ai_tuning(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ai_tuning_sets(\
          id INTEGER PRIMARY KEY, name TEXT NOT NULL, regime TEXT NOT NULL, timeframe TEXT NOT NULL, \

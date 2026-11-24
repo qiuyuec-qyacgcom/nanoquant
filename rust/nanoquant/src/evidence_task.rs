@@ -1,7 +1,7 @@
 //! 候选AI 调参证据门：按 B 期规则拉真实历史、跑固定 walk-forward 并落 approved/rejected。
 //!
 //! 只写AI 调参状态与审计事件：不激活AI 调参、不写 `app_settings.strategy`。
-//! 历史数据不可用或回测本身出错时返回 Err 并记 `parameter_set.evidence_failed`，
+//! 历史数据不可用或回测本身出错时返回 Err 并记 `ai_tuning.evidence_failed`，
 //! 候选保持 `candidate`，绝不把「没数据」误判成「策略不达标」。
 
 use std::sync::atomic::AtomicBool;
@@ -13,7 +13,7 @@ use crate::ai_providers::AiState;
 use crate::backtest_engine::{self, BasketMetrics, EngineConfig};
 use crate::evidence::{self, EvidenceReport};
 use crate::history::{self, BinanceHistory, HistoryBar, HistorySource};
-use crate::parameter_sets::{self, ParameterSet};
+use crate::ai_tuning::{self, AiTuningSet};
 use crate::regime::Regime;
 use crate::runtime::EngineRuntime;
 
@@ -60,8 +60,8 @@ async fn evaluate_with_history(
 }
 
 struct Prepared {
-    candidate: ParameterSet,
-    baseline: Option<ParameterSet>,
+    candidate: AiTuningSet,
+    baseline: Option<AiTuningSet>,
     symbols: Vec<String>,
     risk: Value,
     live_timeframe: String,
@@ -170,29 +170,29 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         .conn
         .lock()
         .map_err(|_| "数据库连接锁不可用".to_string())?;
-    let candidate = parameter_sets::load_set(&conn, candidate_id)?;
+    let candidate = ai_tuning::load_set(&conn, candidate_id)?;
     if candidate.source != "ai" || candidate.status != "candidate" {
         return Ok(None);
     }
     let strategy = group_json(&conn, "strategy")?;
     let risk = group_json(&conn, "risk")?;
-    let parameter_set = group_json(&conn, "ai_tuning")?;
+    let ai_tuning = group_json(&conn, "ai_tuning")?;
     let live_timeframe = strategy
         .get("timeframe")
         .and_then(Value::as_str)
         .ok_or_else(|| "strategy.timeframe 缺失或非法".to_string())?
         .to_string();
-    let min_oos_trades = parameter_set
+    let min_oos_trades = ai_tuning
         .get("min_oos_trades")
         .and_then(Value::as_f64)
         .filter(|value| *value >= 1.0)
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MIN_OOS_TRADES as usize);
-    let auto_apply_timeframes = parse_timeframes(&parameter_set)?;
+    let auto_apply_timeframes = parse_timeframes(&ai_tuning)?;
     // 同 regime 的 active 作为基线；该 regime 没有 active 时回退 range-bootstrap。
-    let mut baseline = parameter_sets::active_for_regime(&conn, &candidate.regime)?;
+    let mut baseline = ai_tuning::active_for_regime(&conn, &candidate.regime)?;
     if baseline.is_none() {
-        baseline = parameter_sets::active_for_regime(&conn, "range")?;
+        baseline = ai_tuning::active_for_regime(&conn, "range")?;
     }
     let symbols = pool_symbols(&conn)?;
     Ok(Some(Prepared {
@@ -206,8 +206,8 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
     }))
 }
 
-fn parse_timeframes(parameter_set: &Value) -> Result<Vec<String>, String> {
-    let Some(value) = parameter_set.get("auto_apply_timeframes") else {
+fn parse_timeframes(ai_tuning: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = ai_tuning.get("auto_apply_timeframes") else {
         return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
     };
     if value.is_null() {
@@ -385,7 +385,7 @@ fn write_outcome(
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("开启证据门事务失败: {error}"))?;
-    parameter_sets::mark_evidence(&tx, set_id, report.pass, evidence)?;
+    ai_tuning::mark_evidence(&tx, set_id, report.pass, evidence)?;
     let (level, message, event) = if report.pass {
         ("info", "AI 调参证据门通过", "ai_tuning.evidence_pass")
     } else {
@@ -511,7 +511,7 @@ fn current_mode(conn: &Connection) -> Result<String, String> {
         .to_string())
 }
 
-/// 证据门扫描节流：`parameter_set.evidence_sweep_ts` 每 6h 最多一次。
+/// 证据门扫描节流：`ai_tuning.evidence_sweep_ts` 每 6h 最多一次。
 pub(crate) fn sweep_due(state: &AiState) -> bool {
     let Ok(conn) = state.db.conn.lock() else {
         return false;
@@ -724,14 +724,14 @@ mod tests {
         let state = memory_state();
         let candidate_id = {
             let conn = state.db.conn.lock().unwrap();
-            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
-            let parent = crate::parameter_sets::active_for_regime(&conn, "range")
+            crate::ai_tuning::seed_bootstrap(&conn).unwrap();
+            let parent = crate::ai_tuning::active_for_regime(&conn, "range")
                 .unwrap()
                 .unwrap();
             let mut snapshot = parent.params.clone();
             snapshot["atr_pct_min"] = json!(0.7);
             snapshot["timeframe"] = json!(timeframe);
-            crate::parameter_sets::insert_candidate(
+            crate::ai_tuning::insert_candidate(
                 &conn,
                 "range-ai-evidence",
                 "range",
@@ -809,7 +809,7 @@ mod tests {
 
         assert_eq!(history.calls(), 0, "注定失败的门不应触网");
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "rejected");
         assert_eq!(set.evidence["gate"]["pass"], false);
         let reasons = set.evidence["gate"]["reasons"].as_array().unwrap();
@@ -838,7 +838,7 @@ mod tests {
         assert!(result.is_err(), "历史不可用必须报错，不能判 rejected");
         assert!(history.calls() > 0);
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "数据失败时候选必须保持待评估");
         assert_eq!(set.evidence, json!({}), "数据失败不得写证据");
         drop(conn);
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_parameter_set_row_falls_back_to_defaults() {
+    fn missing_ai_tuning_row_falls_back_to_defaults() {
         let (state, candidate_id) = setup("1h");
         {
             let conn = state.db.conn.lock().unwrap();
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_parameter_set_returns_error_and_keeps_candidate() {
+    async fn corrupt_ai_tuning_returns_error_and_keeps_candidate() {
         let (state, candidate_id) = setup("1h");
         {
             let conn = state.db.conn.lock().unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
         );
         assert_eq!(history.calls(), 0);
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "配置错误不得把候选永久拒绝");
         assert_eq!(set.evidence, json!({}));
     }
@@ -1062,7 +1062,7 @@ mod tests {
         {
             let conn = state.db.conn.lock().unwrap();
             conn.execute_batch(
-                "CREATE TRIGGER block_parameter_set_events BEFORE INSERT ON engine_events \
+                "CREATE TRIGGER block_ai_tuning_events BEFORE INSERT ON engine_events \
                  BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
             )
             .unwrap();
@@ -1074,7 +1074,7 @@ mod tests {
         assert!(result.is_err(), "事件写失败必须整体失败");
         assert_eq!(history.calls(), 0);
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "事务回滚后候选必须保持待评估");
         assert_eq!(set.evidence, json!({}), "回滚不得留下证据");
         drop(conn);
@@ -1155,7 +1155,7 @@ mod tests {
 
         assert_eq!(history.calls(), 0, "空白名单应直接失败，不触网");
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "rejected");
         assert_eq!(set.evidence["gate"]["pass"], false);
         let reasons = set.evidence["gate"]["reasons"].as_array().unwrap();
@@ -1192,7 +1192,7 @@ mod tests {
         assert!(result.is_err(), "非法白名单必须走 evidence_failed");
         assert_eq!(history.calls(), 0);
         let conn = state.db.conn.lock().unwrap();
-        let set = crate::parameter_sets::load_set(&conn, candidate_id).unwrap();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "配置错误不得永久拒绝候选");
         assert_eq!(set.evidence, json!({}));
     }

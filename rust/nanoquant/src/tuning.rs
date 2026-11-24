@@ -10,8 +10,8 @@ use tokio::sync::watch;
 
 use crate::ai_client::{self, ChatCall};
 use crate::ai_providers::{provider_chain, AiState};
-use crate::parameter_sets::{
-    active_for_regime, insert_candidate, validate_candidate, ParameterSet,
+use crate::ai_tuning::{
+    active_for_regime, insert_candidate, validate_candidate, AiTuningSet,
 };
 
 const STARTUP_DELAY_SEC: u64 = 300;
@@ -189,7 +189,7 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
 
 struct Prepared {
     regime: String,
-    active: ParameterSet,
+    active: AiTuningSet,
     context: Value,
 }
 
@@ -253,7 +253,7 @@ fn tuning_context(
     conn: &Connection,
     mode: &str,
     requested_regime: &str,
-    active: &ParameterSet,
+    active: &AiTuningSet,
     now: i64,
 ) -> Result<Value, String> {
     let (closed, wins, total_pnl): (i64, i64, f64) = conn
@@ -746,7 +746,7 @@ mod tests {
         seed_regime(&db, "range");
         {
             let conn = db.conn.lock().unwrap();
-            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+            crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         // 空 replies：若误调用模型，chat 会因 500 失败并让 run_once 返回 Err。
         let state = state(db.clone(), Vec::new());
@@ -795,7 +795,7 @@ mod tests {
         seed_regime(&db, "range");
         {
             let conn = db.conn.lock().unwrap();
-            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+            crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         let before = strategy_value(&db);
         let state = state(
@@ -874,7 +874,7 @@ mod tests {
         seed_regime(&db, "range");
         {
             let conn = db.conn.lock().unwrap();
-            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+            crate::ai_tuning::seed_bootstrap(&conn).unwrap();
             conn.execute(
                 "INSERT INTO engine_state(key,value,updated_at) \
                  VALUES('ai_tuning.last_tuning_ts',?1,0)",
@@ -902,7 +902,7 @@ mod tests {
         seed_regime(&db, "range");
         {
             let conn = db.conn.lock().unwrap();
-            crate::parameter_sets::seed_bootstrap(&conn).unwrap();
+            crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         let before = strategy_value(&db);
         let state = state(

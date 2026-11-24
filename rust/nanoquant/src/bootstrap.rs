@@ -44,9 +44,9 @@ pub fn initialize(
     }
 
     // 必须在默认配置逐组写入之后：空库此时才有 strategy 行可供快照。
-    crate::parameter_sets::seed_bootstrap(&conn)?;
+    crate::ai_tuning::seed_bootstrap(&conn)?;
     // C 期启用失败只告警，不能阻断服务启动。
-    if let Err(error) = crate::parameter_sets::enable_c_phase(&conn) {
+    if let Err(error) = crate::ai_tuning::enable_c_phase(&conn) {
         tracing::warn!(%error, "C 期AI 调参启用失败，等待人工处理");
     }
 
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_seeds_parameter_sets_after_defaults_without_touching_strategy() {
+    fn initialize_seeds_ai_tuning_sets_after_defaults_without_touching_strategy() {
         let dir = workspace("param-sets");
         let db = dir.join("nanoquant.db");
         let key = dir.join(".master_key");

@@ -1,5 +1,5 @@
 //! AI 调参接口。B 期只读列表、当前视图与完整证据；C 期追加手动启用/回滚，
-//! 复用 `parameter_sets` 的 SAVEPOINT 事务与审计，不在 API 层另写 `strategy`。
+//! 复用 `ai_tuning` 的 SAVEPOINT 事务与审计，不在 API 层另写 `strategy`。
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -10,8 +10,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::Db;
-use crate::parameter_sets::{
-    activate, active_for_regime, load_set, rollback, row_to_set, ParameterSet,
+use crate::ai_tuning::{
+    activate, active_for_regime, load_set, rollback, row_to_set, AiTuningSet,
 };
 
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
@@ -98,7 +98,7 @@ struct ListQuery {
 }
 
 /// 列表只返回摘要字段，完整证据走单独的 evidence 接口。
-fn summary(set: &ParameterSet) -> Value {
+fn summary(set: &AiTuningSet) -> Value {
     json!({
         "id": set.id,
         "name": set.name,
@@ -130,7 +130,7 @@ async fn list_sets(
     let rows = stmt
         .query_map(params![regime.as_deref(), status.as_deref()], row_to_set)
         .map_err(server_error)?;
-    let sets: rusqlite::Result<Vec<ParameterSet>> = rows.collect();
+    let sets: rusqlite::Result<Vec<AiTuningSet>> = rows.collect();
     let items: Vec<Value> = sets.map_err(server_error)?.iter().map(summary).collect();
     Ok(json!({ "items": items }).into())
 }
@@ -147,7 +147,7 @@ fn read_engine_state(conn: &Connection, key: &str) -> Result<Option<String>, Str
     }
 }
 
-fn active_entry(regime: &str, set: Option<ParameterSet>) -> Value {
+fn active_entry(regime: &str, set: Option<AiTuningSet>) -> Value {
     match set {
         Some(set) => json!({
             "regime": regime,
