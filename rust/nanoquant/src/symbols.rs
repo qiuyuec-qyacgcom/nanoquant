@@ -131,7 +131,14 @@ pub(crate) fn upsert_contract_row_conn(
         "INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12)",
         rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()],
     )
-    .map_err(|_| "标的写入失败".to_string())?;
+    .map_err(|error| match error {
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            "该币种已在交易池中".to_string()
+        }
+        _ => format!("标的写入失败: {error}"),
+    })?;
     row["enabled"] = json!(true);
     row["custom"] = json!(false);
     Ok(row)
@@ -215,8 +222,15 @@ fn add_with_contracts(
         return Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":true}));
     }
     drop(conn);
-    let added = upsert_contract_row(db, contracts, symbol)
-        .map_err(|_| pool_error(StatusCode::INTERNAL_SERVER_ERROR, "标的写入失败"))?;
+    let added = match upsert_contract_row(db, contracts, symbol) {
+        Ok(added) => added,
+        Err(message) if message.contains("已在交易池中") => {
+            return Err(pool_error(StatusCode::CONFLICT, &message))
+        }
+        Err(message) => {
+            return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message))
+        }
+    };
     Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":false}))
 }
 
@@ -686,11 +700,6 @@ mod tests {
     fn upsert_contract_row_inserts_known_contract() {
         let path = std::env::temp_dir().join("nq-symbol-scan-upsert.db");
         let db = seed(&path);
-        db.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM trading_symbols", [])
-            .unwrap();
         let contracts = vec![contract("ETHUSDT", "PERPETUAL", "TRADING", "USDT")];
         let row = upsert_contract_row(&db, &contracts, "ETHUSDT").unwrap();
         assert_eq!(row["symbol"], "ETHUSDT");
@@ -702,7 +711,19 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM trading_symbols", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2, "seed 的 BTCUSDT 应保留，新插入 ETHUSDT 后共 2 条");
+        let (enabled, min_score): (i64, f64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT enabled, min_score FROM trading_symbols WHERE symbol='BTCUSDT'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1, "纯插入不应改动既有标的的启用状态");
+        assert_eq!(min_score, 0.0, "纯插入不应改动既有标的的评分门槛");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -720,7 +741,10 @@ mod tests {
             .unwrap();
         let contracts = vec![contract("BTCUSDT", "PERPETUAL", "TRADING", "USDT")];
         let err = upsert_contract_row(&db, &contracts, "BTCUSDT").unwrap_err();
-        assert!(err.contains("写入失败"), "主键冲突必须报错，实际错误：{err}");
+        assert!(
+            err.contains("已在交易池中"),
+            "主键冲突必须说明重复，实际错误：{err}"
+        );
         let (enabled, min_score): (i64, f64) = db
             .conn
             .lock()
@@ -733,6 +757,23 @@ mod tests {
             .unwrap();
         assert_eq!(enabled, 0, "冲突不能把用户手动禁用的标的重新启用");
         assert_eq!(min_score, 9.0, "冲突不能覆盖既有评分门槛");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_with_contracts_conflicts_when_symbol_already_in_pool() {
+        let path = std::env::temp_dir().join("nq-symbol-scan-add-conflict.db");
+        let db = seed(&path);
+        let contracts = vec![contract("BTCUSDT", "PERPETUAL", "TRADING", "USDT")];
+        let err = add_with_contracts(&db, &contracts, "BTCUSDT").unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            err.1["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("已在交易池中"),
+            "重复添加必须返回 409 并说明原因"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
