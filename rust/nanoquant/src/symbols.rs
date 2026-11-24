@@ -85,6 +85,69 @@ async fn add_symbol(
     add_with_contracts(&db, &contracts, &symbol).map(Json)
 }
 
+/// 把一只已知的币安合约写入标的池。`symbol` 必须存在于 `contracts` 且当前可交易；
+/// 调用方负责池上限与重复检查（`upsert` 供事务内自动扫描复用，冲突时刷新合约规格）。
+pub(crate) fn upsert_contract_row_conn(
+    conn: &rusqlite::Connection,
+    contracts: &[Value],
+    symbol: &str,
+) -> Result<Value, String> {
+    if !plausible_symbol(symbol) {
+        return Err("标的名称无效".into());
+    }
+    let raw = contracts
+        .iter()
+        .find(|row| row["symbol"].as_str() == Some(symbol))
+        .ok_or_else(|| format!("{symbol} 不在币安合约表中"))?;
+    if !valid_contract(raw, symbol) {
+        return Err("仅允许当前可交易的 USDT 永续合约".into());
+    }
+    let cap = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='risk'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|risk| risk["max_leverage"].as_i64())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let mut row = build_pool_row(raw, cap).ok_or_else(|| "币安合约规格无效".to_string())?;
+    let underlying = raw["underlyingType"].as_str().unwrap_or("").to_uppercase();
+    let note = if underlying == "EQUITY" || underlying == "COMMODITY" {
+        "股票/商品类永续".to_string()
+    } else {
+        String::new()
+    };
+    let order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order),0)+1 FROM trading_symbols",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12) \
+         ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,tier=excluded.tier,sl_atr_mult=excluded.sl_atr_mult,enabled=excluded.enabled,max_leverage=excluded.max_leverage,precision=excluded.precision,tick_sz=excluded.tick_sz,min_sz=excluded.min_sz,min_notional=excluded.min_notional,ct_val=excluded.ct_val,min_score=excluded.min_score,note=excluded.note,updated_at=excluded.updated_at",
+        rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()],
+    )
+    .map_err(|_| "标的写入失败".to_string())?;
+    row["enabled"] = json!(true);
+    row["custom"] = json!(false);
+    Ok(row)
+}
+
+/// 同 [`upsert_contract_row_conn`]，自行加锁。
+pub(crate) fn upsert_contract_row(
+    db: &Db,
+    contracts: &[Value],
+    symbol: &str,
+) -> Result<Value, String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    upsert_contract_row_conn(&conn, contracts, symbol)
+}
+
 /// 添加一只标的的全部校验与落库。合约表由调用方注入，便于离线回归。
 fn add_with_contracts(
     db: &Db,
@@ -101,25 +164,20 @@ fn add_with_contracts(
         .iter()
         .find(|row| row["symbol"].as_str() == Some(symbol));
     let is_custom = raw.is_none() && !symbol.is_ascii();
-    let row = match raw {
-        Some(raw) => {
-            if !valid_contract(raw, symbol) {
-                return Err(pool_error(
-                    StatusCode::BAD_REQUEST,
-                    "仅允许添加当前可交易的 USDT 永续合约",
-                ));
-            }
-            build_pool_row(raw, leverage_cap(db))
-                .ok_or_else(|| pool_error(StatusCode::BAD_REQUEST, "币安合约规格无效"))?
-        }
-        None if is_custom => custom_pool_row(symbol, leverage_cap(db)),
-        None => {
+    if let Some(raw) = raw {
+        if !valid_contract(raw, symbol) {
             return Err(pool_error(
                 StatusCode::BAD_REQUEST,
-                &format!("{symbol} 不在当前环境的币安合约表中"),
-            ))
+                "仅允许添加当前可交易的 USDT 永续合约",
+            ));
         }
-    };
+    } else if !is_custom {
+        return Err(pool_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{symbol} 不在当前环境的币安合约表中"),
+        ));
+    }
+    let custom_row = is_custom.then(|| custom_pool_row(symbol, leverage_cap(db)));
     let maximum = pool_maximum(db);
     let conn = db.conn.lock().expect("db");
     let exists: bool = conn
@@ -141,38 +199,26 @@ fn add_with_contracts(
             &format!("交易池最多允许 {maximum} 个币种；请先删除一个无持仓币种"),
         ));
     }
-    let order: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(sort_order),0)+1 FROM trading_symbols",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(1);
-    let enabled = if is_custom { 0 } else { 1 };
-    let note = if is_custom {
-        "自定义标的（无币安行情，不参与交易）".to_string()
-    } else if raw
-        .and_then(|r| r["underlyingType"].as_str())
-        .unwrap_or("")
-        .to_uppercase()
-        == "EQUITY"
-        || raw
-            .and_then(|r| r["underlyingType"].as_str())
-            .unwrap_or("")
-            .to_uppercase()
-            == "COMMODITY"
-    {
-        "股票/商品类永续".to_string()
-    } else {
-        String::new()
-    };
-    conn.execute("INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,0,?11,?12,?13,?13)",
-        rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), enabled, row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()])
+    if let Some(row) = custom_row {
+        let order: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order),0)+1 FROM trading_symbols",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        conn.execute("INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12)",
+            rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("custom"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), "自定义标的（无币安行情，不参与交易）", order, crate::now()])
+            .map_err(|_| pool_error(StatusCode::INTERNAL_SERVER_ERROR, "标的写入失败"))?;
+        let mut added = row;
+        added["enabled"] = json!(false);
+        added["custom"] = json!(true);
+        return Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":true}));
+    }
+    drop(conn);
+    let added = upsert_contract_row(db, contracts, symbol)
         .map_err(|_| pool_error(StatusCode::INTERNAL_SERVER_ERROR, "标的写入失败"))?;
-    let mut added = row;
-    added["enabled"] = json!(!is_custom);
-    added["custom"] = json!(is_custom);
-    Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":is_custom}))
+    Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":false}))
 }
 
 async fn add_symbols_bulk(
@@ -635,6 +681,36 @@ mod tests {
                 {"filterType": "MIN_NOTIONAL", "notional": "5"}
             ]
         })
+    }
+
+    #[test]
+    fn upsert_contract_row_inserts_known_contract() {
+        let db = seed(&std::env::temp_dir().join("nq-symbol-scan-upsert.db"));
+        let contracts = vec![contract("BTCUSDT", "PERPETUAL", "TRADING", "USDT")];
+        let row = upsert_contract_row(&db, &contracts, "BTCUSDT").unwrap();
+        assert_eq!(row["symbol"], "BTCUSDT");
+        assert_eq!(row["enabled"], true);
+        assert_eq!(row["custom"], false);
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM trading_symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn upsert_contract_row_rejects_symbol_missing_from_contracts() {
+        let path = std::env::temp_dir().join("nq-symbol-scan-upsert-missing.db");
+        let db = seed(&path);
+        let contracts = vec![contract("ETHUSDT", "PERPETUAL", "TRADING", "USDT")];
+        let err = upsert_contract_row(&db, &contracts, "SOLUSDT").unwrap_err();
+        assert!(
+            err.contains("不在币安合约表中"),
+            "不在合约表中的标的必须拒绝，实际错误：{err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
