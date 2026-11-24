@@ -115,7 +115,7 @@ async function confirmLive() {
         <div class="danger-box">
           <b>真实资金将开始下单。</b>
           引擎会使用已配置的<b>实盘 API Key</b> 在 <b>币安主网</b> 执行市价单，
-          盈亏不可撤销。请确认标的池、杠杆、单笔风险与止损参数均已核对。
+          盈亏不可撤销。请确认标的池、杠杆、单仓保证金与全局止盈止损均已核对。
         </div>
         <div class="field">
           <span class="label">确认短语</span>

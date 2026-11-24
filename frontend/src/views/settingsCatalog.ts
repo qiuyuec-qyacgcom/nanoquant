@@ -65,11 +65,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     {
       title: '仓位与杠杆',
       hint: '这里只设杠杆区间；开仓杠杆由 AI 在区间内按波动与置信度给出，AI 未给值时取杠杆下限',
-      fields: ['risk_per_trade_pct', 'margin_pct', 'min_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction'],
+      fields: ['margin_pct', 'min_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction'],
     },
     {
       title: '全局止盈止损',
-      hint: '按开仓价涨跌幅计算；优先于 ATR 止损、部分止盈与 ROI 阶梯，0=关闭',
+      hint: '按仓位保证金收益率计算（价格变动 × 杠杆）；优先于 ATR 止损、部分止盈与 ROI 阶梯，0=关闭',
       fields: ['global_stop_loss_pct', 'global_take_profit_pct'],
     },
     {

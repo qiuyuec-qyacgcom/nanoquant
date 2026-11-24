@@ -1972,7 +1972,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             let mut stmt = tx
                 .prepare(
                     "SELECT id,symbol,side,qty,entry_price,sl_price,tp_price,peak_price,\
-                     initial_sl_price,signal_score,partial_taken_at,opened_at FROM positions \
+                     initial_sl_price,signal_score,partial_taken_at,opened_at,leverage FROM positions \
                      WHERE mode=?1 AND status='open' ORDER BY opened_at,id",
                 )
                 .map_err(|error| error.to_string())?;
@@ -1991,6 +1991,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                        row.get::<_, Option<f64>>(12)?.unwrap_or(1.0),
                     ))
                 })
                 .map_err(|error| error.to_string())?;
@@ -2012,6 +2013,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             signal_score,
             partial,
             opened_at,
+            leverage,
         ) in rows
         {
             if blocked.contains(symbol.as_str()) {
@@ -2080,6 +2082,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 initial_sl: if initial_sl > 0.0 { initial_sl } else { sl },
                 tp_price: tp,
                 qty,
+                leverage: leverage.max(1.0),
                 partial_taken: partial.is_some(),
                 score,
                 held_minutes,
@@ -2813,13 +2816,13 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 draft.mark_price,
                 leverage,
                 &crate::risk::SizeParams {
-                    risk_per_trade_pct: cfg["risk_per_trade_pct"].as_f64().unwrap_or(10.0),
-                    margin_pct: cfg["margin_pct"].as_f64().unwrap_or(50.0),
+                    // 波动率目标仍作用于保证金比例：ATR 高于目标时缩仓，低于时放大（0.25–2x）。
+                    margin_pct: (cfg["margin_pct"].as_f64().unwrap_or(50.0)
+                        * draft.scale.clamp(0.25, 2.0))
+                    .clamp(0.0, 100.0),
                     min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
                 },
-                (draft.mark_price - stop_price).abs() / draft.mark_price,
                 &draft.filter,
-                draft.scale,
                 Some(available),
             );
             let blocked = if qty <= 0.0 {
@@ -6597,7 +6600,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
             UPDATE app_settings SET value='{"enabled":true,"mode":"demo"}' WHERE key='engine';
             UPDATE engine_state SET value='true' WHERE key='enabled';
-            INSERT INTO app_settings VALUES('risk','{"min_leverage":10,"max_leverage":20,"margin_pct":10,"risk_per_trade_pct":10,"rsi_long_max":100.1}',0);
+            INSERT INTO app_settings VALUES('risk','{"min_leverage":10,"max_leverage":20,"margin_pct":10,"rsi_long_max":100.1}',0);
             CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY,enabled INTEGER,max_leverage INTEGER,tick_sz TEXT,min_sz TEXT,min_notional REAL);
             INSERT INTO trading_symbols VALUES('BTCUSDT',1,5,'0.01','0.001',5);
             CREATE TABLE IF NOT EXISTS cooldowns(symbol TEXT PRIMARY KEY,until_ts INTEGER,reason TEXT,kind TEXT);

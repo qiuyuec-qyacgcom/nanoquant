@@ -125,29 +125,26 @@ pub fn global_gates(input: &RiskInput) -> Gate {
 /// 仓位估算用到的风控参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizeParams {
-    pub risk_per_trade_pct: f64,
     pub margin_pct: f64,
     pub min_notional_buffer: f64,
 }
 
 /// 交易所按 `availableBalance` 校验初始保证金，留 10% 安全垫。
 pub const MARGIN_SAFETY: f64 = 0.90;
-/// 为跨过最小名义额缓冲，允许对风险预算的最大放大倍数。
+/// 为跨过最小名义额缓冲，允许对目标名义额的最大放大倍数。
 const MAX_BUFFER_OVERSHOOT: f64 = 1.10;
 
-/// 风险预算 → 名义额 → 数量，返回 `(qty, 说明)`。
+/// 保证金占比 → 名义额 → 数量，返回 `(qty, 说明)`。
 ///
-/// 与 legacy 内核（已退役） `broker.estimate_qty` 同口径：名义额取「风险预算」与「保证金上限」
-/// 的较小值，再受可用余额约束；最后按步进对齐到**缓冲后**的最小量，
-/// 宁可直接拒绝，也不贴着交易所下限下单。
+/// 仓位只由 `margin_pct`（单仓保证金占权益比例）决定：
+/// `名义额 = 权益 × margin_pct% × 杠杆`，再受可用余额约束；
+/// 最后按步进对齐到**缓冲后**的最小量，宁可直接拒绝，也不贴着交易所下限下单。
 pub fn estimate_qty(
     equity: f64,
     price: f64,
     leverage: f64,
     params: &SizeParams,
-    sl_pct: f64,
     filter: &crate::live::SymbolFilter,
-    risk_scale: f64,
     available: Option<f64>,
 ) -> (f64, String) {
     if !equity.is_finite() || equity <= 0.0 || !price.is_finite() || price <= 0.0 {
@@ -156,10 +153,8 @@ pub fn estimate_qty(
     if !leverage.is_finite() || leverage <= 0.0 {
         return (0.0, "杠杆无效".into());
     }
-    let risk_budget = equity * params.risk_per_trade_pct / 100.0 * risk_scale.max(0.0);
-    let risk_notional = risk_budget / sl_pct.max(1e-6);
     let margin_cap = equity * params.margin_pct / 100.0 * leverage;
-    let mut notional = risk_notional.min(margin_cap);
+    let mut notional = margin_cap;
 
     let mut affordable = 0.0;
     if let Some(available) = available {
@@ -242,7 +237,7 @@ mod tests {
 
     fn params() -> SizeParams {
         SizeParams {
-            risk_per_trade_pct: 10.0,
+
             margin_pct: 50.0,
             min_notional_buffer: 1.05,
         }
@@ -258,9 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn sizing_takes_the_smaller_of_risk_budget_and_margin_cap() {
-        // 风险预算 100×10%÷2% = 500；保证金上限 100×50%×10 = 500。
-        let (qty, note) = estimate_qty(100.0, 100.0, 10.0, &params(), 0.02, &filter(), 1.0, None);
+    fn sizing_uses_margin_percentage_of_equity() {
+        // 保证金上限 100×50%×10 = 500 名义额 → 5 手。
+        let (qty, note) = estimate_qty(100.0, 100.0, 10.0, &params(), &filter(), None);
         assert_eq!(note, "ok");
         assert!((qty - 5.0).abs() < 1e-9);
     }
@@ -269,11 +264,10 @@ mod tests {
     fn sizing_lifts_a_floored_qty_back_to_the_buffered_minimum() {
         // 名义额 5 → 0.05 手；缓冲后门槛 5.25 → 0.053 手，放大 6% 在允许范围内。
         let params = SizeParams {
-            risk_per_trade_pct: 10.0,
             margin_pct: 50.0,
             min_notional_buffer: 1.05,
         };
-        let (qty, _) = estimate_qty(10.0, 100.0, 1.0, &params, 0.005, &filter(), 1.0, None);
+        let (qty, _) = estimate_qty(10.0, 100.0, 1.0, &params, &filter(), None);
         assert!((qty - 0.053).abs() < 1e-9, "实际 {qty}");
     }
 
@@ -285,9 +279,7 @@ mod tests {
             100.0,
             10.0,
             &params(),
-            0.02,
             &filter(),
-            1.0,
             Some(1.0),
         );
         assert!((qty - 0.09).abs() < 1e-9, "实际 {qty}");
@@ -296,11 +288,10 @@ mod tests {
     #[test]
     fn sizing_rejects_when_the_minimum_does_not_fit() {
         let params = SizeParams {
-            risk_per_trade_pct: 10.0,
             margin_pct: 5.0,
             min_notional_buffer: 1.05,
         };
-        let (qty, note) = estimate_qty(10.0, 100.0, 1.0, &params, 0.005, &filter(), 1.0, None);
+        let (qty, note) = estimate_qty(10.0, 100.0, 1.0, &params, &filter(), None);
         assert_eq!(qty, 0.0);
         assert!(note.contains("不足"), "{note}");
     }
@@ -390,9 +381,7 @@ mod tests {
             100.0,
             10.0,
             &params(),
-            0.01,
             &filter(),
-            1.0,
             Some(10.0),
         );
         assert_eq!(note, "ok");
@@ -406,9 +395,7 @@ mod tests {
             100.0,
             10.0,
             &params(),
-            0.01,
             &filter(),
-            1.0,
             Some(0.2),
         );
         assert_eq!(zero, 0.0);

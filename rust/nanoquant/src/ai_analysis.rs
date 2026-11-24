@@ -305,8 +305,8 @@ pub(crate) fn decision_messages_with_personas(
             "system",
             &[
                 "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
-             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":0.1..3,\"t\":0.1..10,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
-             a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop%; t=tp%. \
+             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":5..50,\"t\":5..100,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
+             a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop% of position margin (not price); t=tp% of position margin (not price). \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \

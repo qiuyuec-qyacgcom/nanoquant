@@ -33,7 +33,7 @@ pub struct EngineConfig {
     pub spread_bps: f64,
     pub funding_bps_8h: f64,
     pub initial_equity: f64,
-    pub risk_per_trade_pct: f64,
+
     pub margin_pct: f64,
     pub leverage: f64,
     pub maintenance_margin_rate: f64,
@@ -421,12 +421,9 @@ impl<'a> Sim<'a> {
             if sl_pct <= 0.0 || entry <= 0.0 {
                 continue;
             }
-            let risk_amount = self.equity * self.config.risk_per_trade_pct / 100.0;
-            let mut qty = risk_amount / (entry * sl_pct / 100.0);
+            // 仓位只由单仓保证金占比决定：名义额 = 权益 × margin_pct% × 杠杆。
             let max_notional = self.equity * (self.config.margin_pct / 100.0) * leverage;
-            if qty * entry > max_notional {
-                qty = max_notional / entry;
-            }
+            let qty = max_notional / entry;
             if qty <= 0.0 {
                 continue;
             }
@@ -1372,7 +1369,7 @@ mod tests {
             spread_bps: 0.0,
             funding_bps_8h: 1.0,
             initial_equity: 1_000.0,
-            risk_per_trade_pct: 1.0,
+
             margin_pct: 50.0,
             leverage: 20.0,
             maintenance_margin_rate: 0.005,
@@ -1457,6 +1454,7 @@ mod tests {
             initial_sl: 98.0,
             tp_price: 120.0,
             qty: 1.0,
+            leverage: 1.0,
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,

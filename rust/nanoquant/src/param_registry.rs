@@ -36,7 +36,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("engine", "scan_concurrency", 1.0, 20.0, 1.0),
     ("engine", "timezone_offset", -12.0, 14.0, 1.0),
     ("engine", "recv_window_ms", 1000.0, 60000.0, 1000.0),
-    ("risk", "risk_per_trade_pct", 0.1, 100.0, 0.1),
+
     ("risk", "max_leverage", 1.0, 100.0, 1.0),
     ("risk", "min_leverage", 1.0, 100.0, 1.0),
     ("risk", "margin_pct", 1.0, 100.0, 1.0),
@@ -185,7 +185,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
     (
         "risk",
         &[
-            "risk_per_trade_pct",
+
             "margin_pct",
             "min_leverage",
             "max_leverage",
@@ -572,7 +572,7 @@ mod tests {
                 .ai_writable
         );
         assert!(
-            !crate::param_registry::find("risk", "risk_per_trade_pct")
+            !crate::param_registry::find("risk", "margin_pct")
                 .unwrap()
                 .ai_writable
         );

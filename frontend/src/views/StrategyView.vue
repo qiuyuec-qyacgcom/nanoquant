@@ -45,7 +45,7 @@ const PLAIN_HINTS: Record<string, string> = {
   max_symbols_per_cycle: '每轮最多检查几个标的（按标的池顺序）',
   scan_concurrency: '同时拉几路 K 线；只影响信号新旧，不增加请求数',
   max_positions: '最多同时持有几个仓位',
-  risk_per_trade_pct: '每笔交易最多亏掉权益的百分之几；越大仓位越重',
+
   margin_pct: '单个仓位最多占用多少权益作保证金',
   max_exposure_pct: '所有持仓名义额合计最多是权益的几倍',
   max_same_direction: '同一方向最多同时持有几个仓；0=不限制',
@@ -111,8 +111,7 @@ const BASE_META: Record<string, FieldMeta> = {
   recv_window_ms: { label: '签名有效窗口', unit: 'ms', hint: '建议 5000，系统时钟漂移时调大' },
   close_on_halt: { label: '熔断时平仓', hint: '关闭则只锁新开仓，不动已有持仓' },
 
-  risk_per_trade_pct: { label: '单笔风险', unit: '%', hint: '止损打掉时的最大亏损占权益比例；与单仓保证金上限取更小值' },
-  margin_pct: { label: '单仓保证金', unit: '%', hint: '与杠杆共同决定名义额；与单笔风险同时约束仓位，取更小值' },
+  margin_pct: { label: '单仓保证金', unit: '%', hint: '单个仓位的保证金 = 权益 × 该比例；名义额再乘以杠杆' },
   min_leverage: {
     label: '杠杆下限', unit: 'x', min: 1,
     hint: '全局杠杆下限，也是 AI 未给杠杆时的回退值；AI 给出的杠杆低于该值会抬到此处',
@@ -134,8 +133,8 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
-  global_stop_loss_pct: { label: '全局止损率', unit: '%', hint: '价格相对开仓价不利变动达到该比例就整仓平仓；0=关闭' },
-  global_take_profit_pct: { label: '全局止盈率', unit: '%', hint: '价格相对开仓价有利变动达到该比例就整仓平仓；0=关闭' },
+  global_stop_loss_pct: { label: '全局止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
+  global_take_profit_pct: { label: '全局止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
   drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
   cooldown_minutes: { label: '熔断冷静期', unit: '分钟' },
@@ -430,7 +429,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: '最大持仓', group: 'engine', key: 'max_positions' },
 
   { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
-  { label: '单笔风险', group: 'risk', key: 'risk_per_trade_pct' },
+  { label: '单仓保证金', group: 'risk', key: 'margin_pct' },
   { label: '最大杠杆', group: 'risk', key: 'max_leverage' },
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
   { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },

@@ -372,7 +372,8 @@ async fn orders(State(db): State<Db>, Query(q): Query<OrdersQuery>) -> Json<Valu
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, symbol, side, order_type, qty, price, status, purpose, client_order_id, \
-             exchange_order_id, reduce_only, mode FROM orders WHERE mode = ?1 ORDER BY ts DESC LIMIT ?2",
+             exchange_order_id, reduce_only, mode FROM orders \
+             WHERE mode = ?1 AND purpose = 'entry' ORDER BY ts DESC LIMIT ?2",
         )
         .expect("prepare orders");
     let items: Vec<Value> = stmt
@@ -1042,7 +1043,7 @@ fn evaluate_admission(db: &Db) -> Value {
         "调整时段/间隔",
     ));
     let params = crate::risk::SizeParams {
-        risk_per_trade_pct: risk["risk_per_trade_pct"].as_f64().unwrap_or(10.0),
+
         margin_pct,
         min_notional_buffer: risk["min_notional_buffer"].as_f64().unwrap_or(1.05),
     };
@@ -1079,9 +1080,7 @@ fn evaluate_admission(db: &Db) -> Value {
             price,
             leverage as f64,
             &params,
-            0.005,
             &filter,
-            1.0,
             available_for_size,
         );
         let need =
@@ -1151,7 +1150,7 @@ fn evaluate_admission(db: &Db) -> Value {
             "max_positions": engine["max_positions"].as_i64().unwrap_or(2),
         },
         "params": {
-            "risk_per_trade_pct": params.risk_per_trade_pct,
+
             "margin_pct": margin_pct,
             "min_leverage": min_leverage,
             "max_leverage": max_leverage,
@@ -1820,23 +1819,29 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn orders_are_scoped_to_current_mode_newest_first() {
+    async fn orders_only_list_entries_scoped_to_current_mode_newest_first() {
         let path = std::env::temp_dir().join("nq-orders.db");
         let db = seed(&path);
         let conn = db.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO orders VALUES(1,100,'BTCUSDT','BUY','MARKET',1,100,'FILLED','open','c1','e1',0,'demo')",
+            "INSERT INTO orders VALUES(1,100,'BTCUSDT','BUY','MARKET',1,100,'FILLED','entry','c1','e1',0,'demo')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO orders VALUES(2,300,'BTCUSDT','SELL','MARKET',1,110,'FILLED','close','c2','e2',1,'demo')",
+            "INSERT INTO orders VALUES(2,300,'BTCUSDT','SELL','MARKET',1,110,'FILLED','entry','c2','e2',1,'demo')",
             [],
         )
         .unwrap();
         // 实盘单，当前模式是 demo，不应混入。
         conn.execute(
-            "INSERT INTO orders VALUES(3,400,'ETHUSDT','BUY','LIMIT',1,90,'NEW','open','c3','e3',0,'live')",
+            "INSERT INTO orders VALUES(3,400,'ETHUSDT','BUY','LIMIT',1,90,'NEW','entry','c3','e3',0,'live')",
+            [],
+        )
+        .unwrap();
+        // 保护单不属于开仓流水，同样不应出现。
+        conn.execute(
+            "INSERT INTO orders VALUES(4,200,'BTCUSDT','SELL','MARKET',1,95,'NEW','stop_loss','c4','e4',1,'demo')",
             [],
         )
         .unwrap();
@@ -1856,7 +1861,7 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 2, "实盘订单不应出现在模拟盘列表");
+        assert_eq!(items.len(), 2, "实盘订单与保护单不应出现在开仓流水");
         assert_eq!(items[0]["ts"], 300, "应按时间倒序");
         assert_eq!(items[0]["reduce_only"], true);
         assert_eq!(body["source"], "local");
@@ -2062,7 +2067,7 @@ mod tests {
              CREATE TABLE ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
              INSERT INTO engine_state VALUES('enabled','true',0),('mode','demo',0); \
              INSERT INTO app_settings VALUES('engine','{\"enabled\":true,\"mode\":\"demo\",\"trading_windows\":[\"00:00-24:00\"],\"timezone_offset\":8}',0); \
-             INSERT INTO app_settings VALUES('risk','{\"risk_per_trade_pct\":10,\"margin_pct\":50,\"min_leverage\":10,\"max_leverage\":20,\"min_equity_usdt\":0.5,\"min_notional_buffer\":1.05,\"consecutive_loss_limit\":4}',0); \
+             INSERT INTO app_settings VALUES('risk','{\"margin_pct\":50,\"min_leverage\":10,\"max_leverage\":20,\"min_equity_usdt\":0.5,\"min_notional_buffer\":1.05,\"consecutive_loss_limit\":4}',0); \
              INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"15m\",\"entry_threshold\":0.3}',0); \
              INSERT INTO app_settings VALUES('ai','{\"enabled\":false}',0); \
              INSERT INTO app_settings VALUES('data','{\"demo_api_key_enc\":\"configured\",\"demo_api_secret_enc\":\"configured\"}',0); \

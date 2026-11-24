@@ -354,10 +354,7 @@ pub(crate) fn build_config(
         spread_bps: 0.0,
         funding_bps_8h: 1.0,
         initial_equity: 100.0,
-        risk_per_trade_pct: risk
-            .get("risk_per_trade_pct")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0),
+
         margin_pct: risk
             .get("margin_pct")
             .and_then(Value::as_f64)
@@ -678,7 +675,7 @@ mod tests {
             "INSERT INTO app_settings VALUES('risk',?1,0)",
             [json!({
                 "fee_rate_taker": 0.0005,
-                "risk_per_trade_pct": 10.0,
+
                 "margin_pct": 50.0,
                 "min_leverage": 1.0
             })
@@ -774,7 +771,7 @@ mod tests {
         });
         let risk = json!({
             "fee_rate_taker": 0.0005,
-            "risk_per_trade_pct": 10.0,
+
             "margin_pct": 50.0,
             "min_leverage": 1.0
         });
@@ -793,7 +790,7 @@ mod tests {
         assert_eq!(config.spread_bps, 0.0);
         assert_eq!(config.funding_bps_8h, 1.0);
         assert_eq!(config.initial_equity, 100.0);
-        assert_eq!(config.risk_per_trade_pct, 10.0);
+
         assert_eq!(config.margin_pct, 50.0);
         assert_eq!(config.leverage, 1.0);
         assert_eq!(config.maintenance_margin_rate, 0.005);

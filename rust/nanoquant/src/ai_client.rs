@@ -1652,7 +1652,7 @@ mod tests {
 
     #[test]
     fn decision_parses_v1_param_updates() {
-        let text = r#"{"action":"hold","confidence":0.5,"params":[{"group":"risk","key":"risk_per_trade_pct","value":5,"reason":"降风险"}]}"#;
+        let text = r#"{"action":"hold","confidence":0.5,"params":[{"group":"risk","key":"margin_pct","value":5,"reason":"降风险"}]}"#;
         let decision = parse_decision(text, None).unwrap();
         assert_eq!(decision.params.len(), 1);
         assert_eq!(decision.params[0].group, "risk");

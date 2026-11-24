@@ -275,11 +275,18 @@ fn decision_to_review(
         return Ok(reject("缺少量化方向，无法与量化方向一致"));
     }
     let mark = proposal.mark_price;
+    // 杠杆由 AI 在全局区间内决定：低于下限抬回下限，高于上限压回上限。
+    // 止损/止盈百分比按保证金收益率解释，换算价格距离前必须先确定最终杠杆。
+    let upper = proposal.max_leverage.max(proposal.leverage);
+    let leverage = (decision.leverage.is_finite() && decision.leverage > 0.0)
+        .then(|| decision.leverage.clamp(proposal.leverage, upper));
+    let effective_leverage = leverage.unwrap_or(proposal.leverage).max(1.0);
     let stop_price = if decision.sl_pct > 0.0 {
+        let price_pct = decision.sl_pct / effective_leverage;
         if side == "long" {
-            mark * (1.0 - decision.sl_pct / 100.0)
+            mark * (1.0 - price_pct / 100.0)
         } else {
-            mark * (1.0 + decision.sl_pct / 100.0)
+            mark * (1.0 + price_pct / 100.0)
         }
     } else if side == proposal.side {
         proposal.stop_price
@@ -292,10 +299,11 @@ fn decision_to_review(
         }
     };
     let take_profit = if decision.tp_pct > 0.0 {
+        let price_pct = decision.tp_pct / effective_leverage;
         if side == "long" {
-            mark * (1.0 + decision.tp_pct / 100.0)
+            mark * (1.0 + price_pct / 100.0)
         } else {
-            mark * (1.0 - decision.tp_pct / 100.0)
+            mark * (1.0 - price_pct / 100.0)
         }
     } else if side == proposal.side {
         proposal.take_profit
@@ -314,10 +322,6 @@ fn decision_to_review(
     {
         return Ok(reject("AI 返回的止损/止盈价无效"));
     }
-    // 杠杆由 AI 在全局区间内决定：低于下限抬回下限，高于上限压回上限。
-    let upper = proposal.max_leverage.max(proposal.leverage);
-    let leverage = (decision.leverage.is_finite() && decision.leverage > 0.0)
-        .then(|| decision.leverage.clamp(proposal.leverage, upper));
     let leverage_changed =
         leverage.is_some_and(|value| (value - proposal.leverage).abs() > f64::EPSILON);
     let stop_tightened = match (side, side == proposal.side) {
@@ -694,7 +698,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_long".to_string(),
             confidence: 0.9,
             leverage: 4.0,
-            sl_pct: 2.0,
+            sl_pct: 8.0,
             tp_pct: 0.0,
             reason: "tighten".to_string(),
             risk_flags: Vec::new(),
@@ -716,7 +720,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_short".to_string(),
             confidence: 0.9,
             leverage: 3.0,
-            sl_pct: 2.0,
+            sl_pct: 6.0,
             tp_pct: 0.0,
             reason: "tighten".to_string(),
             risk_flags: Vec::new(),
@@ -774,7 +778,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_long".to_string(),
             confidence: 0.9,
             leverage: 0.0,
-            sl_pct: 10.0,
+            sl_pct: 20.0,
             tp_pct: 0.0,
             reason: "wider".to_string(),
             risk_flags: Vec::new(),

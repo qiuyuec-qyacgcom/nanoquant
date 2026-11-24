@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
+import { publicQuotes } from '../api/public'
 import EChart from '../components/EChart.vue'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import EventFeed from '../components/EventFeed.vue'
@@ -26,9 +27,60 @@ const busy = ref(false)
 const showPosHelp = ref(false)
 
 const status = computed(() => app.status)
-const account = computed(() => status.value?.account || ({} as any))
 const stats = computed(() => status.value?.stats || ({} as any))
-const positions = computed(() => status.value?.positions || [])
+
+/** 池内标的实时报价：让持仓浮盈与保护单距离随行情刷新，而不是等引擎周期落库。 */
+const tickers = ref<Record<string, { last: number }>>({})
+
+async function refreshQuotes() {
+  try {
+    const res = await publicQuotes()
+    tickers.value = res.tickers || {}
+  } catch {
+    /* 报价拉取失败时沿用上次读数，不打断页面 */
+  }
+}
+
+const positions = computed(() => {
+  const list: any[] = status.value?.positions || []
+  return list.map((p) => {
+    const live = Number(tickers.value[p.symbol]?.last || 0)
+    if (!(live > 0) || !(p.entry_price > 0) || !(p.qty > 0)) return p
+    const direction = p.side === 'long' ? 1 : -1
+    const unrealized = (live - p.entry_price) * p.qty * direction
+    return {
+      ...p,
+      mark_price: live,
+      notional: live * p.qty,
+      unrealized,
+      roi_pct: p.margin > 0 ? (unrealized / p.margin) * 100 : 0,
+      unrealized_source: 'live',
+    }
+  })
+})
+
+/** 账户浮盈用实时持仓汇总，权益 = 钱包 + 浮盈。 */
+const account = computed(() => {
+  const base: any = status.value?.account || {}
+  if (!positions.value.length) return base
+  const unrealized = positions.value.reduce((sum, p) => sum + Number(p.unrealized || 0), 0)
+  return { ...base, unrealized, equity: Number(base.wallet || 0) + unrealized }
+})
+
+/** 保护单用同一份实时价补标记价与距离：交易所 Algo 接口不返回 markPrice。 */
+const protectionRows = computed(() =>
+  protection.value.map((o) => {
+    const live = Number(tickers.value[o.symbol]?.last || 0)
+    const trigger = Number(o.trigger_price || 0)
+    if (!(live > 0)) return o
+    return {
+      ...o,
+      mark_price: live,
+      distance_pct: trigger > 0 ? ((trigger - live) / live) * 100 : 0,
+    }
+  }),
+)
+
 const cooldowns = computed(() => Object.entries(stats.value?.cooldowns || {}))
 const dlq = computed(() => stats.value?.dead_letters || { pending: 0, stuck: 0, last_ts: 0 })
 
@@ -186,10 +238,12 @@ async function closePosition(id: number) {
 
 
 onMounted(async () => {
+  await refreshQuotes()
   await load()
 })
 
 useSilentRefresh(load, 30000)
+useSilentRefresh(refreshQuotes, 10000)
 </script>
 
 <template>
@@ -286,7 +340,7 @@ useSilentRefresh(load, 30000)
             <router-link to="/admin/strategy?group=engine">参数配置 → 交易模式</router-link> 切为逐仓。
           </div>
           <div class="grid g3" style="gap: 10px">
-            <div class="metric"><span>单笔风险</span><span>{{ app.settings.risk?.risk_per_trade_pct ?? '-' }}%</span></div>
+
             <div class="metric"><span>杠杆区间</span><span>{{ app.settings.risk?.min_leverage ?? '-' }}–{{ app.settings.risk?.max_leverage ?? '-' }}x</span></div>
             <div class="metric"><span>日内亏损上限</span><span>{{ app.settings.risk?.daily_loss_limit_pct ?? '-' }}%</span></div>
           </div>
@@ -478,7 +532,7 @@ useSilentRefresh(load, 30000)
       <div class="panel-hd">
         <span class="panel-title">交易所保护单</span>
         <div class="right">
-          <span class="tag tag-dim">{{ protection.length }} 条</span>
+          <span class="tag tag-dim">{{ protectionRows.length }} 条</span>
           <span class="muted" style="font-size: 10.5px">挂在币安侧的 Algo 条件单，本地账本看不到</span>
         </div>
       </div>
@@ -490,13 +544,13 @@ useSilentRefresh(load, 30000)
             </tr>
           </thead>
           <tbody>
-            <tr v-for="o in protection" :key="o.algo_id">
+            <tr v-for="o in protectionRows" :key="o.algo_id">
               <td class="mono">{{ o.symbol }}</td>
               <td>{{ o.side === 'SELL' ? '卖出' : '买入' }}</td>
               <td>{{ o.type === 'STOP_MARKET' ? '止损' : o.type === 'TAKE_PROFIT_MARKET' ? '止盈' : o.type }}</td>
               <td class="mono">{{ px(o.trigger_price) }}</td>
               <td class="mono muted">{{ px(o.mark_price) }}</td>
-              <td class="mono" :class="o.distance_pct >= 0 ? 'down' : 'flat'">{{ o.distance_pct }}%</td>
+              <td class="mono" :class="o.distance_pct >= 0 ? 'down' : 'flat'">{{ Number(o.distance_pct || 0).toFixed(2) }}%</td>
               <td class="mono muted">{{ o.status }}</td>
               <td class="right">
                 <button class="btn btn-xs btn-danger" :disabled="cancelingId === o.algo_id" @click="cancelProtection(o.algo_id)">
@@ -504,7 +558,7 @@ useSilentRefresh(load, 30000)
                 </button>
               </td>
             </tr>
-            <tr v-if="!protection.length">
+            <tr v-if="!protectionRows.length">
               <td colspan="8" class="empty">
                 {{ status?.rate_limit?.banned
                   ? ((status.rate_limit.declared_remaining ?? 0) > 0

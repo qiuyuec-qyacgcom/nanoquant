@@ -218,6 +218,7 @@ mod tests {
             initial_sl: 98.0,
             tp_price: 106.0,
             qty: 1.0,
+            leverage: 1.0,
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,

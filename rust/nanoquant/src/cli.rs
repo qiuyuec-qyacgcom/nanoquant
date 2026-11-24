@@ -918,6 +918,7 @@ fn verify_partial_tp(options: &Options) -> Result<(i32, Value), (i32, String)> {
         initial_sl: entry - risk,
         tp_price: 0.0,
         qty: 1.0,
+        leverage: 1.0,
         partial_taken: false,
         score: 0.0,
         held_minutes: 0.0,

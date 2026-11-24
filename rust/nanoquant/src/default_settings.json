@@ -15,7 +15,7 @@
     "recv_window_ms": 5000
   },
   "risk": {
-    "risk_per_trade_pct": 10.0,
+
     "max_leverage": 100,
     "min_leverage": 1,
     "margin_pct": 50.0,

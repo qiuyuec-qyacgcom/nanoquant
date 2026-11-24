@@ -36,6 +36,8 @@ pub struct ManagedPosition {
     pub initial_sl: f64,
     pub tp_price: f64,
     pub qty: f64,
+    /// 该仓位的杠杆：全局止盈止损与 ROI 阶梯按保证金收益率（价格变动 × 杠杆）判断。
+    pub leverage: f64,
     /// 已部分止盈过就不再触发第二次。
     pub partial_taken: bool,
     /// 当轮重算的方向分。开仓时写入的分数不会随行情反转。
@@ -59,9 +61,9 @@ pub struct ManageConfig {
     pub exit_threshold: f64,
     /// 浮盈达到多少个 R 时把止损上移到保本，0 表示关闭。
     pub breakeven_at_r: f64,
-    /// 全局止损：价格相对开仓价不利变动达到该百分比就整仓平仓，0 表示关闭。
+    /// 全局止损：保证金亏损达到该百分比就整仓平仓（价格距离 = 该值 ÷ 杠杆），0 表示关闭。
     pub global_stop_loss_pct: f64,
-    /// 全局止盈：价格相对开仓价有利变动达到该百分比就整仓平仓，0 表示关闭。
+    /// 全局止盈：保证金盈利达到该百分比就整仓平仓（价格距离 = 该值 ÷ 杠杆），0 表示关闭。
     pub global_take_profit_pct: f64,
     pub qty_step: f64,
     pub min_qty: f64,
@@ -73,17 +75,19 @@ pub struct ManageConfig {
 
 pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
     let direction = if pos.side == "long" { 1.0 } else { -1.0 };
-    let pnl_pct = if pos.entry_price > 0.0 {
+    let price_pct = if pos.entry_price > 0.0 {
         (pos.mark_price - pos.entry_price) * direction / pos.entry_price * 100.0
     } else {
         0.0
     };
-    if cfg.global_stop_loss_pct > 0.0 && pnl_pct <= -cfg.global_stop_loss_pct {
+    // 全局止盈止损按保证金收益率判断：价格变动 × 杠杆。
+    let margin_pct = price_pct * pos.leverage.max(1.0);
+    if cfg.global_stop_loss_pct > 0.0 && margin_pct <= -cfg.global_stop_loss_pct {
         return ManageAction::Close {
             reason: "global_stop_loss".to_string(),
         };
     }
-    if cfg.global_take_profit_pct > 0.0 && pnl_pct >= cfg.global_take_profit_pct {
+    if cfg.global_take_profit_pct > 0.0 && margin_pct >= cfg.global_take_profit_pct {
         return ManageAction::Close {
             reason: "global_take_profit".to_string(),
         };
@@ -111,7 +115,8 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
     }
 
     if let Some(target) = roi_target(&cfg.roi_table, pos.held_minutes) {
-        let roi_pct = (pos.mark_price - pos.entry_price) * direction / pos.entry_price * 100.0;
+        // ROI 阶梯同样按保证金收益率，和仓位表的 roi_pct 口径一致。
+        let roi_pct = price_pct * pos.leverage.max(1.0);
         let r_ok = cfg.roi_min_r <= 0.0
             || partial_tp_r(&pos.side, pos.entry_price, pos.initial_sl, pos.mark_price)
                 >= cfg.roi_min_r;
@@ -233,6 +238,7 @@ mod tests {
             initial_sl: 98.0,
             tp_price: 106.0,
             qty: 1.0,
+            leverage: 10.0,
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,
@@ -351,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn global_stop_loss_closes_at_price_percentage() {
+    fn global_stop_loss_closes_at_margin_percentage() {
         let mut pos = long_pos();
         pos.sl_price = 0.0;
         pos.tp_price = 0.0;
-        pos.mark_price = 98.0;
+        pos.mark_price = 98.0; // 价格 -2% × 10x = 保证金 -20%
         let mut config = cfg();
-        config.global_stop_loss_pct = 2.0;
+        config.global_stop_loss_pct = 20.0;
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
@@ -367,14 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn global_take_profit_closes_short_at_price_percentage() {
+    fn global_take_profit_closes_short_at_margin_percentage() {
         let mut pos = long_pos();
         pos.side = "short".to_string();
         pos.sl_price = 0.0;
         pos.tp_price = 0.0;
-        pos.mark_price = 97.5;
+        pos.mark_price = 97.5; // 价格 +2.5% × 10x = 保证金 +25%
         let mut config = cfg();
-        config.global_take_profit_pct = 2.0;
+        config.global_take_profit_pct = 25.0;
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
@@ -387,9 +393,9 @@ mod tests {
     fn global_take_profit_takes_priority_over_per_position_tp() {
         let mut pos = long_pos();
         pos.tp_price = 101.0;
-        pos.mark_price = 105.0;
+        pos.mark_price = 105.0; // 价格 +5% × 10x = 保证金 +50%
         let mut config = cfg();
-        config.global_take_profit_pct = 3.0;
+        config.global_take_profit_pct = 30.0;
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
@@ -432,7 +438,7 @@ mod tests {
     #[test]
     fn time_ladder_holds_below_threshold() {
         let mut pos = long_pos();
-        pos.mark_price = 100.5;
+        pos.mark_price = 100.05; // 价格 +0.05% × 10x = 保证金 +0.5% < 0.8%
         pos.held_minutes = 10.0;
         let mut config = cfg();
         config.roi_table = vec![(0.0, 0.8), (15.0, 0.6), (30.0, 0.45)];

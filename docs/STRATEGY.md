@@ -210,7 +210,7 @@ if sig.direction == "flat":
 
 | 字段 | 含义 | 常用值 |
 |---|---|---|
-| `risk_per_trade_pct` | 单笔最大亏损占权益% | 2（稳）/ 10-20（激进） |
+
 | `margin_pct` | 单仓保证金占比 | 30-100 |
 | `min_leverage/max_leverage` | **全局**杠杆上下限；开仓杠杆由 AI 在区间内给出 | 1/100（项目默认，勿随意改） |
 | `max_exposure_pct` | 总敞口上限 | 2000%，满仓高杠杆需 ≥3000% |

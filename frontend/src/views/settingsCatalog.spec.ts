@@ -93,7 +93,7 @@ describe('参数配置目录', () => {
       'trailing_pct',
       'partial_tp_at_r',
       'max_spread_bps',
-      'risk_per_trade_pct',
+
       'margin_pct',
       'min_leverage',
       'max_leverage',

@@ -42,12 +42,20 @@ async fn protection_orders(
             .into_response(),
         Ok(result) if (200..300).contains(&result.status) => {
             let rows = parse_rows(&result.body);
-            let items: Vec<Value> = rows.into_iter().filter_map(protection_item).collect();
             let mode = state
                 .db
                 .as_ref()
                 .map(current_mode)
                 .unwrap_or_else(|| "demo".to_string());
+            let marks = state
+                .db
+                .as_ref()
+                .map(|db| local_marks(db, &mode))
+                .unwrap_or_default();
+            let items: Vec<Value> = rows
+                .into_iter()
+                .filter_map(|row| protection_item(row, &marks))
+                .collect();
             (
                 StatusCode::OK,
                 Json(json!({"items": items, "count": items.len(), "mode": mode})),
@@ -169,18 +177,47 @@ fn number(value: Option<&Value>) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn protection_item(row: Value) -> Option<Value> {
+/// 本地持仓的标记价：交易所 Algo 接口不返回 markPrice，用它补距离。
+fn local_marks(db: &crate::db::Db, mode: &str) -> std::collections::HashMap<String, f64> {
+    let mut marks = std::collections::HashMap::new();
+    let Ok(conn) = db.conn.lock() else {
+        return marks;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT symbol, mark_price FROM positions \
+         WHERE mode=?1 AND status='open' AND mark_price>0",
+    ) else {
+        return marks;
+    };
+    if let Ok(rows) = stmt.query_map([mode], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    }) {
+        for (symbol, mark) in rows.flatten() {
+            marks.insert(symbol, mark);
+        }
+    }
+    marks
+}
+
+fn protection_item(row: Value, marks: &std::collections::HashMap<String, f64>) -> Option<Value> {
     let object = row.as_object()?;
     let symbol = object.get("symbol")?.as_str()?;
+    let trigger_price = number(object.get("triggerPrice").or_else(|| object.get("stopPrice")));
+    let mark_price = marks.get(symbol).copied().unwrap_or(0.0);
+    let distance_pct = if mark_price > 0.0 && trigger_price > 0.0 {
+        ((trigger_price - mark_price) / mark_price * 10_000.0).round() / 100.0
+    } else {
+        0.0
+    };
     Some(json!({
         "algo_id": algo_id_of(&row).unwrap_or_default(),
         "client_algo_id": object.get("clientAlgoId").and_then(Value::as_str).unwrap_or_default(),
         "symbol": symbol,
         "side": object.get("side").and_then(Value::as_str).unwrap_or_default(),
         "type": object.get("orderType").or_else(|| object.get("type")).and_then(Value::as_str).unwrap_or_default(),
-        "trigger_price": number(object.get("triggerPrice").or_else(|| object.get("stopPrice"))),
-        "mark_price": 0.0,
-        "distance_pct": 0.0,
+        "trigger_price": trigger_price,
+        "mark_price": (mark_price * 1e8).round() / 1e8,
+        "distance_pct": distance_pct,
         "status": object.get("algoStatus").or_else(|| object.get("status")).and_then(Value::as_str).unwrap_or_default(),
         "close_position": object.get("closePosition").and_then(Value::as_bool).unwrap_or(false),
     }))
@@ -208,10 +245,18 @@ mod tests {
     #[test]
     fn parses_protection_order_fields_and_string_prices() {
         let row = parse_rows(r#"[{"algoId":42,"symbol":"BTCUSDT","side":"SELL","orderType":"STOP_MARKET","triggerPrice":"65000.5","algoStatus":"NEW","closePosition":true}]"#).remove(0);
-        let item = protection_item(row).unwrap();
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("BTCUSDT".to_string(), 70000.0);
+        let item = protection_item(row, &marks).unwrap();
         assert_eq!(item["algo_id"], "42");
         assert_eq!(item["symbol"], "BTCUSDT");
         assert_eq!(item["trigger_price"], 65000.5);
+        assert_eq!(item["mark_price"], 70000.0);
+        assert!(
+            (item["distance_pct"].as_f64().unwrap() + 7.14).abs() < 0.01,
+            "距离必须按触发价相对标记价计算: {}",
+            item["distance_pct"]
+        );
         assert_eq!(item["close_position"], true);
     }
 
