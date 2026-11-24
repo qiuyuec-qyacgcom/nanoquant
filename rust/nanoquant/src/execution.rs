@@ -620,7 +620,7 @@ mod tests {
                hold_seconds INTEGER NOT NULL, exit_reason TEXT NOT NULL, ai_confidence REAL NOT NULL,
                ai_reason TEXT NOT NULL, signal_score REAL NOT NULL, slippage_bps REAL NOT NULL,
                mode TEXT NOT NULL, reviewed BOOLEAN NOT NULL, review_note TEXT NOT NULL,
-               features JSON, mantra_ids JSON, parameter_set_id INTEGER
+               features JSON, mantra_ids JSON, ai_tuning_set_id INTEGER
              );",
         )
         .unwrap();

@@ -7989,7 +7989,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
              CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
              CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); \
-             CREATE TABLE trades(id INTEGER PRIMARY KEY, parameter_set_id INTEGER); \
+             CREATE TABLE trades(id INTEGER PRIMARY KEY, ai_tuning_set_id INTEGER); \
              INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\"}',0); \
              INSERT INTO app_settings VALUES('ai_tuning','{\"regime_confirm_sec\":0,\"regime_cooldown_sec\":0}',0); \
              INSERT INTO engine_state VALUES('market_regime.demo','chaos',0);",

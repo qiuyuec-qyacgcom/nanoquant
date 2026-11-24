@@ -972,7 +972,7 @@ fn rollback_in_savepoint(
         &previous.regime,
         previous.id,
         mode,
-        "parameter_set_rollback",
+        "ai_tuning_rollback",
     )?;
     insert_activation(
         conn,
@@ -2186,7 +2186,7 @@ mod tests {
         let rollback_changes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM parameter_changes \
-                 WHERE source='parameter_set_rollback' AND set_id=?1 AND regime='range' AND mode='demo'",
+                 WHERE source='ai_tuning_rollback' AND set_id=?1 AND regime='range' AND mode='demo'",
                 [range_id],
                 |r| r.get(0),
             )

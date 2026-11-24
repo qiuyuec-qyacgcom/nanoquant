@@ -625,7 +625,7 @@ pub(crate) fn record_set_changes(
         return Err("AI 调参 strategy 快照必须是对象".to_string());
     };
     let before = before.as_object().cloned().unwrap_or_default();
-    let reason = if source == "parameter_set_rollback" {
+    let reason = if source == "ai_tuning_rollback" {
         "AI 调参回滚"
     } else {
         "AI 调参切换"

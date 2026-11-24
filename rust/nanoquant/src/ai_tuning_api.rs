@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "手动回滚应成功: {body}");
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.50, "应恢复上一套参数");
         assert!(
-            count_changes(&db, "parameter_set_rollback", first) > 0,
+            count_changes(&db, "ai_tuning_rollback", first) > 0,
             "应写回滚审计"
         );
         assert_eq!(count_activations(&db, "rollback", first), 1, "trigger 应为 rollback");
@@ -688,7 +688,7 @@ mod tests {
                     .contains("只能回滚当前 active"),
                 "文案应说明只能回滚 active: {body}"
             );
-            assert_eq!(count_changes(&db, "parameter_set_rollback", id), 0);
+            assert_eq!(count_changes(&db, "ai_tuning_rollback", id), 0);
             assert_eq!(count_activations(&db, "rollback", id), 0);
         }
         assert_eq!(strategy_value(&db), before, "拒绝时不得改动 strategy");
@@ -728,7 +728,7 @@ mod tests {
         );
         assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");
         assert_eq!(
-            count_changes(&db, "parameter_set_rollback", chaos_active),
+            count_changes(&db, "ai_tuning_rollback", chaos_active),
             0,
             "不得写回滚审计"
         );
