@@ -8,12 +8,21 @@
 #     bash scripts/migrate-ai-tuning.sh
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DB="${1:-${NANOQUANT_DB:-data/nanoquant.db}}"
-BIN="${NANOQUANT_BIN:-./nanoquant}"
+BIN="${NANOQUANT_BIN:-$ROOT/rust/nanoquant/target/release/nanoquant}"
+
+cd "$ROOT"
 
 if [ ! -x "$BIN" ]; then
-  echo "未找到可执行文件: $BIN（可用 NANOQUANT_BIN 指定）" >&2
-  exit 2
+  if command -v nanoquant >/dev/null 2>&1; then
+    BIN="$(command -v nanoquant)"
+  else
+    echo "未找到可执行文件: $BIN" >&2
+    echo "请先构建：cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml" >&2
+    echo "或用 NANOQUANT_BIN 指定二进制路径。" >&2
+    exit 2
+  fi
 fi
 
 if [ ! -f "$DB" ]; then
