@@ -29,6 +29,22 @@ pub struct CandleSnapshot {
     pub volume: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct ExchangeTicker {
+    pub symbol: String,
+    pub quote_volume: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct BookTop {
+    pub symbol: String,
+    pub bid: f64,
+    pub ask: f64,
+    pub spread_bps: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AccountSnapshot {
     pub equity: f64,
@@ -210,6 +226,25 @@ impl BinanceProvider {
         })
     }
 
+    /// 全市场行情读取：无 API 凭证，只访问币安公开接口。
+    #[allow(dead_code)]
+    pub fn public(base_url: impl Into<String>) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        Ok(Self {
+            client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            symbols: Vec::new(),
+            api_key: String::new(),
+            secret: String::new(),
+            timeframe: "4h".into(),
+            public_book: None,
+        })
+    }
+
     /// demo 无 API 凭证：行情走公开接口，账户与持仓/订单读本地账本。
     pub fn with_symbols_public(
         base_url: impl Into<String>,
@@ -371,6 +406,43 @@ impl BinanceProvider {
             .get_json("/fapi/v1/premiumIndex", &params, true)
             .await?;
         number(&value, "markPrice")
+    }
+
+    /// 全市场 24 小时成交额，供扫描按流动性筛选标的。
+    #[allow(dead_code)]
+    pub async fn tickers_24h(&self) -> Result<Vec<ExchangeTicker>, ProviderError> {
+        let value = self.get_json("/fapi/v1/ticker/24hr", &[], false).await?;
+        parse_tickers_24h(&value)
+    }
+
+    /// 全市场买一/卖一，供扫描估算点差成本。
+    #[allow(dead_code)]
+    pub async fn book_tops(&self) -> Result<Vec<BookTop>, ProviderError> {
+        let value = self
+            .get_json("/fapi/v1/ticker/bookTicker", &[], false)
+            .await?;
+        parse_book_tops(&value)
+    }
+
+    /// 指定标的的已收盘 K 线，周期沿用 provider 的 timeframe。
+    #[allow(dead_code)]
+    pub async fn klines(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<CandleSnapshot>, ProviderError> {
+        let value = self
+            .get_json(
+                "/fapi/v1/klines",
+                &[
+                    ("symbol".into(), symbol.to_string()),
+                    ("interval".into(), self.timeframe.clone()),
+                    ("limit".into(), limit.to_string()),
+                ],
+                false,
+            )
+            .await?;
+        parse_closed_candles(&value, crate::now_millis())
     }
 
     async fn get_json(
@@ -668,6 +740,57 @@ fn parse_closed_candles(value: &Value, now_ms: i64) -> Result<Vec<CandleSnapshot
         });
     }
     Ok(candles)
+}
+
+#[allow(dead_code)]
+pub fn parse_tickers_24h(value: &Value) -> Result<Vec<ExchangeTicker>, ProviderError> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| ProviderError::InvalidData("全市场 24 小时行情响应不是数组".into()))?;
+    let mut tickers = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row["symbol"]
+            .as_str()
+            .filter(|symbol| !symbol.is_empty())
+            .ok_or_else(|| ProviderError::InvalidData("24 小时行情缺少 symbol".into()))?
+            .to_string();
+        let quote_volume = number(row, "quoteVolume")?;
+        tickers.push(ExchangeTicker {
+            symbol,
+            quote_volume,
+        });
+    }
+    Ok(tickers)
+}
+
+#[allow(dead_code)]
+pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| ProviderError::InvalidData("全市场盘口响应不是数组".into()))?;
+    let mut tops = Vec::with_capacity(rows.len());
+    for row in rows {
+        let symbol = row["symbol"]
+            .as_str()
+            .filter(|symbol| !symbol.is_empty())
+            .ok_or_else(|| ProviderError::InvalidData("盘口行情缺少 symbol".into()))?
+            .to_string();
+        let bid = number(row, "bidPrice")?;
+        let ask = number(row, "askPrice")?;
+        let mid = (bid + ask) / 2.0;
+        let spread_bps = if mid <= 0.0 {
+            f64::INFINITY
+        } else {
+            (ask - bid) / mid * 10_000.0
+        };
+        tops.push(BookTop {
+            symbol,
+            bid,
+            ask,
+            spread_bps,
+        });
+    }
+    Ok(tops)
 }
 
 fn number(value: &Value, key: &str) -> Result<f64, ProviderError> {
@@ -1105,6 +1228,43 @@ mod tests {
         .unwrap();
         assert_eq!(position.side, "short");
         assert_eq!(position.qty, 2.0);
+    }
+
+    #[test]
+    fn parses_full_market_tickers_and_book_tops() {
+        let tickers = parse_tickers_24h(&serde_json::json!([
+            {"symbol": "BTCUSDT", "quoteVolume": "12345.6"}
+        ]))
+        .unwrap();
+        assert_eq!(tickers[0].symbol, "BTCUSDT");
+        assert_eq!(tickers[0].quote_volume, 12345.6);
+
+        let tops = parse_book_tops(&serde_json::json!([
+            {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}
+        ]))
+        .unwrap();
+        assert_eq!(tops[0].symbol, "BTCUSDT");
+        assert!((tops[0].spread_bps - 99.0).abs() < 1.0, "spread 应为约 99bp");
+    }
+
+    #[test]
+    fn full_market_parsers_reject_non_array_payloads() {
+        for payload in [serde_json::json!({"symbol": "BTCUSDT"}), serde_json::json!("oops")] {
+            assert!(
+                matches!(
+                    parse_tickers_24h(&payload),
+                    Err(ProviderError::InvalidData(_))
+                ),
+                "24 小时行情非数组必须拒绝: {payload:?}"
+            );
+            assert!(
+                matches!(
+                    parse_book_tops(&payload),
+                    Err(ProviderError::InvalidData(_))
+                ),
+                "盘口行情非数组必须拒绝: {payload:?}"
+            );
+        }
     }
 
     #[test]
