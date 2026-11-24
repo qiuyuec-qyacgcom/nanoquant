@@ -77,9 +77,20 @@ const scanError = ref('')
 const requiredPhrase = computed(() => (pendingDelete.value ? `REMOVE ${pendingDelete.value.symbol}` : ''))
 const canDelete = computed(() => phrase.value.trim().toUpperCase() === requiredPhrase.value)
 const full = computed(() => count.value >= limits.maximum)
-const lastReplaceCount = computed(() => {
-  const deleted = scan.value?.last_result?.delete
-  return Array.isArray(deleted) ? deleted.length : 0
+/** 上次扫描结果字段兼容数组与数字两种形状，缺失或非法值一律按 0。 */
+function resultCount(value: unknown): number {
+  if (Array.isArray(value)) return value.length
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  return 0
+}
+const lastScan = computed(() => {
+  const result = scan.value?.last_result
+  return {
+    scanned: resultCount(result?.scanned),
+    candidates: resultCount(result?.candidates),
+    replaced: resultCount(result?.delete),
+    kept: resultCount(result?.keep),
+  }
 })
 const normalized = computed(() => {
   const cleaned = Array.from(keyword.value.trim())
@@ -354,8 +365,11 @@ onMounted(loadPool)
           <span class="tag tag-dim">{{ count }} 个</span>
           <span v-if="state.detail" class="tag tag-warn">{{ state.detail }}</span>
           <span class="scan-meta">
-            上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '尚未扫描' }} · 上次替换
-            {{ lastReplaceCount }} 个
+            上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '尚未扫描' }}
+            <template v-if="scan?.last_run_ts">
+              · 扫描 {{ lastScan.scanned }} 个 · 候选 {{ lastScan.candidates }} 个 · 替换
+              {{ lastScan.replaced }} 个 · 保留 {{ lastScan.kept }} 个
+            </template>
           </span>
           <span v-if="scanError" class="scan-error">{{ scanError }}</span>
           <button class="btn btn-sm" :disabled="scanning" @click="runScan(false)">
