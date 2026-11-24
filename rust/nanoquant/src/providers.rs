@@ -30,17 +30,18 @@ pub struct CandleSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct ExchangeTicker {
     pub symbol: String,
     pub quote_volume: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct BookTop {
     pub symbol: String,
+    // 盘口买一/卖一暂未被扫描读取，仅用于计算/审计点差。
+    #[allow(dead_code)]
     pub bid: f64,
+    #[allow(dead_code)]
     pub ask: f64,
     pub spread_bps: f64,
 }
@@ -227,7 +228,6 @@ impl BinanceProvider {
     }
 
     /// 全市场行情读取：无 API 凭证，只访问币安公开接口。
-    #[allow(dead_code)]
     pub fn public(base_url: impl Into<String>) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -409,14 +409,12 @@ impl BinanceProvider {
     }
 
     /// 全市场 24 小时成交额，供扫描按流动性筛选标的。
-    #[allow(dead_code)]
     pub async fn tickers_24h(&self) -> Result<Vec<ExchangeTicker>, ProviderError> {
         let value = self.get_json("/fapi/v1/ticker/24hr", &[], false).await?;
         parse_tickers_24h(&value)
     }
 
     /// 全市场买一/卖一，供扫描估算点差成本。
-    #[allow(dead_code)]
     pub async fn book_tops(&self) -> Result<Vec<BookTop>, ProviderError> {
         let value = self
             .get_json("/fapi/v1/ticker/bookTicker", &[], false)
@@ -426,7 +424,6 @@ impl BinanceProvider {
 
     /// 指定标的的已收盘 K 线，周期沿用 provider 的 timeframe。
     /// 只返回已收盘 K 线，条数可能少于 limit（未收盘的最新一根会被剔除）。
-    #[allow(dead_code)]
     pub async fn klines(
         &self,
         symbol: &str,
@@ -753,59 +750,99 @@ fn parse_closed_candles(value: &Value, now_ms: i64) -> Result<Vec<CandleSnapshot
     Ok(candles)
 }
 
-#[allow(dead_code)]
 pub fn parse_tickers_24h(value: &Value) -> Result<Vec<ExchangeTicker>, ProviderError> {
     let rows = value
         .as_array()
         .ok_or_else(|| ProviderError::InvalidData("全市场 24 小时行情响应不是数组".into()))?;
+    if rows.is_empty() {
+        return Err(ProviderError::InvalidData(
+            "全市场行情无有效行".into(),
+        ));
+    }
     let mut tickers = Vec::with_capacity(rows.len());
+    let mut skipped = 0_usize;
     for row in rows {
-        let symbol = row["symbol"]
+        let Some(symbol) = row["symbol"]
             .as_str()
             .filter(|symbol| !symbol.is_empty())
-            .ok_or_else(|| ProviderError::InvalidData("24 小时行情缺少 symbol".into()))?
-            .to_string();
-        let quote_volume = number(row, "quoteVolume")?;
+        else {
+            skipped += 1;
+            continue;
+        };
+        // 单行缺字段/非有限/负成交额只跳过该行，不能让整批行情失败。
+        let Ok(quote_volume) = number(row, "quoteVolume") else {
+            skipped += 1;
+            continue;
+        };
         if !quote_volume.is_finite() || quote_volume < 0.0 {
-            return Err(ProviderError::InvalidData(format!(
-                "{symbol} 24 小时成交额无效"
-            )));
+            skipped += 1;
+            continue;
         }
         tickers.push(ExchangeTicker {
-            symbol,
+            symbol: symbol.to_string(),
             quote_volume,
         });
+    }
+    if tickers.is_empty() {
+        return Err(ProviderError::InvalidData(
+            "全市场行情无有效行".into(),
+        ));
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "24 小时行情存在非法行，已跳过");
     }
     Ok(tickers)
 }
 
-#[allow(dead_code)]
 pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
     let rows = value
         .as_array()
         .ok_or_else(|| ProviderError::InvalidData("全市场盘口响应不是数组".into()))?;
+    if rows.is_empty() {
+        return Err(ProviderError::InvalidData(
+            "全市场行情无有效行".into(),
+        ));
+    }
     let mut tops = Vec::with_capacity(rows.len());
+    let mut skipped = 0_usize;
     for row in rows {
-        let symbol = row["symbol"]
+        let Some(symbol) = row["symbol"]
             .as_str()
             .filter(|symbol| !symbol.is_empty())
-            .ok_or_else(|| ProviderError::InvalidData("盘口行情缺少 symbol".into()))?
-            .to_string();
-        let bid = number(row, "bidPrice")?;
-        let ask = number(row, "askPrice")?;
-        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
-            return Err(ProviderError::InvalidData(format!(
-                "{symbol} 盘口买一/卖一无效"
-            )));
+        else {
+            skipped += 1;
+            continue;
+        };
+        // 休市/异常标的常返回 0 或交叉盘口，逐行跳过而不是整批失败。
+        let (Ok(bid), Ok(ask)) = (number(row, "bidPrice"), number(row, "askPrice")) else {
+            skipped += 1;
+            continue;
+        };
+        if !bid.is_finite()
+            || !ask.is_finite()
+            || bid <= 0.0
+            || ask <= 0.0
+            || ask < bid
+        {
+            skipped += 1;
+            continue;
         }
         let mid = (bid + ask) / 2.0;
         let spread_bps = (ask - bid) / mid * 10_000.0;
         tops.push(BookTop {
-            symbol,
+            symbol: symbol.to_string(),
             bid,
             ask,
             spread_bps,
         });
+    }
+    if tops.is_empty() {
+        return Err(ProviderError::InvalidData(
+            "全市场行情无有效行".into(),
+        ));
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "全市场盘口存在非法行，已跳过");
     }
     Ok(tops)
 }
@@ -1285,17 +1322,37 @@ mod tests {
     }
 
     #[test]
-    fn full_market_parsers_validate_invalid_rows() {
-        assert_eq!(
-            parse_tickers_24h(&serde_json::json!([])).unwrap(),
-            Vec::<ExchangeTicker>::new()
-        );
-        assert_eq!(
-            parse_book_tops(&serde_json::json!([])).unwrap(),
-            Vec::<BookTop>::new()
-        );
+    fn full_market_parsers_skip_invalid_rows_and_keep_valid_ones() {
+        let tickers = parse_tickers_24h(&serde_json::json!([
+            {"symbol": "BTCUSDT", "quoteVolume": "12345.6"},
+            {"quoteVolume": "1"},
+            {"symbol": "", "quoteVolume": "1"},
+            {"symbol": "NEGUSDT", "quoteVolume": "-1"},
+            {"symbol": "NANUSDT", "quoteVolume": "NaN"}
+        ]))
+        .unwrap();
+        assert_eq!(tickers.len(), 1, "非法行应跳过，仅保留合法行");
+        assert_eq!(tickers[0].symbol, "BTCUSDT");
+        assert_eq!(tickers[0].quote_volume, 12345.6);
 
+        let tops = parse_book_tops(&serde_json::json!([
+            {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"},
+            {"bidPrice": "100", "askPrice": "101"},
+            {"symbol": "", "bidPrice": "100", "askPrice": "101"},
+            {"symbol": "CROSSUSDT", "bidPrice": "101", "askPrice": "100"},
+            {"symbol": "ZEROUSDT", "bidPrice": "0", "askPrice": "1"},
+            {"symbol": "NEGUSDT", "bidPrice": "-1", "askPrice": "1"}
+        ]))
+        .unwrap();
+        assert_eq!(tops.len(), 1, "非法盘口应跳过，仅保留合法行");
+        assert_eq!(tops[0].symbol, "BTCUSDT");
+        assert!((tops[0].spread_bps - 99.0).abs() < 1.0, "spread 应为约 99bp");
+    }
+
+    #[test]
+    fn full_market_parsers_reject_payloads_without_valid_rows() {
         for payload in [
+            serde_json::json!([]),
             serde_json::json!([{"quoteVolume": "1"}]),
             serde_json::json!([{"symbol": "", "quoteVolume": "1"}]),
             serde_json::json!([{"symbol": "BTCUSDT"}]),
@@ -1306,11 +1363,12 @@ mod tests {
                     parse_tickers_24h(&payload),
                     Err(ProviderError::InvalidData(_))
                 ),
-                "24 小时行情非法行必须拒绝: {payload:?}"
+                "24 小时行情无有效行必须拒绝: {payload:?}"
             );
         }
 
         for payload in [
+            serde_json::json!([]),
             serde_json::json!([{"bidPrice": "100", "askPrice": "101"}]),
             serde_json::json!([{"symbol": "", "bidPrice": "100", "askPrice": "101"}]),
             serde_json::json!([{"symbol": "BTCUSDT", "askPrice": "101"}]),
@@ -1324,7 +1382,7 @@ mod tests {
                     parse_book_tops(&payload),
                     Err(ProviderError::InvalidData(_))
                 ),
-                "盘口行情非法行必须拒绝: {payload:?}"
+                "盘口行情无有效行必须拒绝: {payload:?}"
             );
         }
     }

@@ -201,6 +201,27 @@ fn suspended_in_pool(contracts: &[Value], current: &HashSet<String>) -> Vec<Stri
     suspended
 }
 
+/// 按 24h 成交额排序候选，剔除不可交易、全市场休市（BREAK）、零成交额的标的。
+/// 休市标的不能新增进池，即使成交额最高也一样；原池休市保留由 `plan` 处理。
+fn rank_candidates<'a>(
+    tickers: &'a [crate::providers::ExchangeTicker],
+    tradable: &HashSet<String>,
+    suspended: &HashSet<String>,
+    limit: usize,
+) -> Vec<&'a crate::providers::ExchangeTicker> {
+    let mut ranked: Vec<&crate::providers::ExchangeTicker> = tickers
+        .iter()
+        .filter(|ticker| {
+            tradable.contains(&ticker.symbol)
+                && !suspended.contains(&ticker.symbol)
+                && ticker.quote_volume > 0.0
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.quote_volume.total_cmp(&a.quote_volume));
+    ranked.truncate(limit);
+    ranked
+}
+
 /// 剔除用户手动禁用（enabled=0）的标的。它们仍在池表里，若进入候选会在新增时主键冲突。
 pub(crate) fn exclude_blocked(
     scanned: Vec<ScannedSymbol>,
@@ -213,6 +234,7 @@ pub(crate) fn exclude_blocked(
 }
 
 /// 扫描配置。每轮从 app_settings 现读，缺项按内置默认值补齐。
+#[derive(Debug, Clone)]
 struct Config {
     enabled: bool,
     interval_hours: i64,
@@ -221,54 +243,35 @@ struct Config {
     concurrency: usize,
     kline_limit: usize,
     atr_period: usize,
+    timeframe: String,
     gates: ScanGates,
     base_url: String,
 }
 
-// `ScanGates` 位于 scan 模块且未实现 Clone/Debug，本任务不改动它，这里按字段复制。
-impl Clone for Config {
+// `ScanGates` 定义在 scan 模块且未 derive；受本任务改动范围限制不能改 scan.rs，
+// 这里为同 crate 类型补齐 Clone/Debug，供 Config 直接 derive。
+impl Clone for ScanGates {
     fn clone(&self) -> Self {
         Self {
-            enabled: self.enabled,
-            interval_hours: self.interval_hours,
-            market_limit: self.market_limit,
-            target: self.target,
-            concurrency: self.concurrency,
-            kline_limit: self.kline_limit,
-            atr_period: self.atr_period,
-            gates: ScanGates {
-                atr_pct_min: self.gates.atr_pct_min,
-                atr_pct_max: self.gates.atr_pct_max,
-                volume_ratio_min: self.gates.volume_ratio_min,
-                min_24h_quote_volume: self.gates.min_24h_quote_volume,
-                spread_bps_max: self.gates.spread_bps_max,
-                entry_threshold: self.gates.entry_threshold,
-            },
-            base_url: self.base_url.clone(),
+            atr_pct_min: self.atr_pct_min,
+            atr_pct_max: self.atr_pct_max,
+            volume_ratio_min: self.volume_ratio_min,
+            min_24h_quote_volume: self.min_24h_quote_volume,
+            spread_bps_max: self.spread_bps_max,
+            entry_threshold: self.entry_threshold,
         }
     }
 }
 
-impl std::fmt::Debug for Config {
+impl std::fmt::Debug for ScanGates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
-            .field("enabled", &self.enabled)
-            .field("interval_hours", &self.interval_hours)
-            .field("market_limit", &self.market_limit)
-            .field("target", &self.target)
-            .field("concurrency", &self.concurrency)
-            .field("kline_limit", &self.kline_limit)
-            .field("atr_period", &self.atr_period)
-            .field("gates.atr_pct_min", &self.gates.atr_pct_min)
-            .field("gates.atr_pct_max", &self.gates.atr_pct_max)
-            .field("gates.volume_ratio_min", &self.gates.volume_ratio_min)
-            .field(
-                "gates.min_24h_quote_volume",
-                &self.gates.min_24h_quote_volume,
-            )
-            .field("gates.spread_bps_max", &self.gates.spread_bps_max)
-            .field("gates.entry_threshold", &self.gates.entry_threshold)
-            .field("base_url", &self.base_url)
+        f.debug_struct("ScanGates")
+            .field("atr_pct_min", &self.atr_pct_min)
+            .field("atr_pct_max", &self.atr_pct_max)
+            .field("volume_ratio_min", &self.volume_ratio_min)
+            .field("min_24h_quote_volume", &self.min_24h_quote_volume)
+            .field("spread_bps_max", &self.spread_bps_max)
+            .field("entry_threshold", &self.entry_threshold)
             .finish()
     }
 }
@@ -312,14 +315,30 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
         ("demo_base_url", "https://testnet.binancefuture.com")
     };
 
+    // K 线周期必须跟随策略周期，且与 with_timeframe 白名单保持一致；
+    // 非法/缺失值回退 4h，避免 provider 初始化直接失败。
+    let timeframe = match strategy["timeframe"].as_str() {
+        Some("1m" | "3m" | "5m") => "15m".to_string(),
+        Some(tf @ ("15m" | "30m" | "1h" | "4h")) => tf.to_string(),
+        _ => "4h".to_string(),
+    };
+    // 目标池大小同时受每轮上限与手动添加池上限约束，前后端 full 判定必须一致。
+    let pool_max = data["max_pool_size"]
+        .as_i64()
+        .unwrap_or(20)
+        .clamp(1, 200) as usize;
+    let target = (engine["max_symbols_per_cycle"]
+        .as_i64()
+        .unwrap_or(12)
+        .clamp(1, 100) as usize)
+        .min(pool_max)
+        .max(1);
+
     Ok(Config {
         enabled: scan["enabled"].as_bool().unwrap_or(true),
         interval_hours: scan["interval_hours"].as_i64().unwrap_or(3).clamp(1, 24),
         market_limit: scan["market_limit"].as_i64().unwrap_or(300).clamp(50, 500) as usize,
-        target: engine["max_symbols_per_cycle"]
-            .as_i64()
-            .unwrap_or(12)
-            .clamp(1, 100) as usize,
+        target,
         concurrency: engine["scan_concurrency"]
             .as_i64()
             .unwrap_or(3)
@@ -329,6 +348,7 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
             .unwrap_or(200)
             .clamp(20, 500) as usize,
         atr_period: strategy["atr_period"].as_i64().unwrap_or(14).max(1) as usize,
+        timeframe,
         gates,
         base_url: data[endpoint]
             .as_str()
@@ -593,12 +613,31 @@ fn apply_plan(
             applied.skipped.push(symbol.clone());
             continue;
         }
-        conn.execute(
-            "DELETE FROM trading_symbols WHERE symbol=?1",
-            [symbol.as_str()],
-        )
-        .map_err(|error| format!("删除标的 {symbol} 失败: {error}"))?;
-        applied.deleted.push(symbol.clone());
+        // dry-run→apply 期间用户可能把标的设为 enabled=0 并保留自定义配置，
+        // 此时不能物理删除；行不存在同样按跳过处理。
+        let enabled: Option<i64> = conn
+            .query_row(
+                "SELECT enabled FROM trading_symbols WHERE symbol=?1",
+                [symbol.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("检查 {symbol} 启用状态失败: {error}"))?;
+        if !matches!(enabled, Some(value) if value != 0) {
+            applied.skipped.push(symbol.clone());
+            continue;
+        }
+        let changes = conn
+            .execute(
+                "DELETE FROM trading_symbols WHERE symbol=?1",
+                [symbol.as_str()],
+            )
+            .map_err(|error| format!("删除标的 {symbol} 失败: {error}"))?;
+        if changes == 0 {
+            applied.skipped.push(symbol.clone());
+        } else {
+            applied.deleted.push(symbol.clone());
+        }
     }
     for symbol in &plan.add {
         let exists: i64 = conn
@@ -641,6 +680,7 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         })?;
 
     let provider = crate::providers::BinanceProvider::public(cfg.base_url.clone())
+        .and_then(|provider| provider.with_timeframe(&cfg.timeframe))
         .map_err(|error| format!("初始化行情客户端失败: {error:?}"))?;
 
     let current = current_pool(db)?;
@@ -664,15 +704,12 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
 
     // 与标的池写入共用同一套可交易规则。
     let tradable = tradable_symbols(&contracts);
+    // 全市场 BREAK 集合：候选不得新增休市标的；原池休市保留由 plan 负责。
+    let all_suspended = suspended_symbols(&contracts);
+    let ranked = rank_candidates(&tickers, &tradable, &all_suspended, cfg.market_limit);
 
-    let mut ranked: Vec<&crate::providers::ExchangeTicker> = tickers
-        .iter()
-        .filter(|ticker| tradable.contains(&ticker.symbol) && ticker.quote_volume > 0.0)
-        .collect();
-    ranked.sort_by(|a, b| b.quote_volume.total_cmp(&a.quote_volume));
-    ranked.truncate(cfg.market_limit);
-
-    // 原池标的即使跌出 Top N 也要扫描，否则会被当作缺行情误删。
+    // 原池标的即使跌出 Top N 也要扫描，否则会被当作缺行情误删；
+    // 但本轮休市标的没有 K 线，入队只会白跑请求，直接跳过。
     let mut scan_symbols: Vec<String> = Vec::with_capacity(ranked.len() + current.len());
     let mut seen: HashSet<String> = HashSet::new();
     for ticker in &ranked {
@@ -681,6 +718,9 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         }
     }
     for symbol in &current {
+        if suspended.contains(symbol) {
+            continue;
+        }
         if seen.insert(symbol.clone()) {
             scan_symbols.push(symbol.clone());
         }
@@ -768,12 +808,22 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         let result =
             merge_applied_result(plan_result(&plan, scanned.len(), true), &plan, &applied);
         let message = format!("自动换池：替换 {replaced} 个，新增 {added} 个");
+        // last_result 保留完整结果供前端读取；事件表只存精简版，避免候选数组累积膨胀。
         let payload = result.to_string();
+        let mut event_payload = result.clone();
+        if let Some(map) = event_payload.as_object_mut() {
+            let candidate_count = map
+                .remove("candidates")
+                .as_ref()
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            map.insert("candidate_count".into(), json!(candidate_count));
+        }
         upsert_state(&tx, "symbol_scan.last_run_ts", &now.to_string())?;
         upsert_state(&tx, "symbol_scan.last_result", &payload)?;
         tx.execute(
             "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'info','symbol_scan',?2,?3)",
-            (now, message, payload),
+            (now, message, event_payload.to_string()),
         )
         .map_err(|error| format!("写入换池事件失败: {error}"))?;
         tx.commit()
@@ -1033,6 +1083,53 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_skips_disabled_and_missing_symbols_on_delete() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+             CREATE TABLE positions(symbol TEXT, status TEXT, mode TEXT);
+             INSERT INTO trading_symbols VALUES('AAAUSDT',0);
+             INSERT INTO trading_symbols VALUES('BBBUSDT',1);",
+        )
+        .unwrap();
+        let plan = ScanPlan {
+            keep: vec!["BBBUSDT".into()],
+            delete: vec!["AAAUSDT".into(), "MISSINGUSDT".into()],
+            add: vec![],
+            held: vec![],
+            suspended: vec![],
+            candidates: vec![],
+            delete_reasons: vec![
+                ("AAAUSDT".into(), "量能不足".into()),
+                ("MISSINGUSDT".into(), "缺少行情数据".into()),
+            ],
+        };
+        let applied = apply_plan(&conn, "live", &plan, &[]).unwrap();
+        assert!(
+            applied.deleted.is_empty(),
+            "禁用或不存在的行不能被计入已删除"
+        );
+        assert_eq!(applied.skipped, vec!["AAAUSDT", "MISSINGUSDT"]);
+
+        let symbols: Vec<String> = conn
+            .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(symbols, vec!["AAAUSDT", "BBBUSDT"], "禁用标的必须保留");
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM trading_symbols WHERE symbol='AAAUSDT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0, "保留用户自定义的禁用状态");
+    }
+
+    #[test]
     fn merge_applied_result_aligns_reasons_and_keeps_skipped() {
         let plan = ScanPlan {
             keep: vec!["BBBUSDT".into()],
@@ -1146,6 +1243,36 @@ mod tests {
     }
 
     #[test]
+    fn rank_candidates_excludes_suspended_even_with_top_volume() {
+        let tickers = vec![
+            crate::providers::ExchangeTicker {
+                symbol: "NVDAUSDT".into(),
+                quote_volume: 1e12,
+            },
+            crate::providers::ExchangeTicker {
+                symbol: "AAAUSDT".into(),
+                quote_volume: 2e8,
+            },
+            crate::providers::ExchangeTicker {
+                symbol: "BADUSDT".into(),
+                quote_volume: 3e8,
+            },
+        ];
+        let tradable: HashSet<String> = ["NVDAUSDT", "AAAUSDT"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let suspended: HashSet<String> = ["NVDAUSDT"].into_iter().map(String::from).collect();
+
+        let ranked = rank_candidates(&tickers, &tradable, &suspended, 10);
+        assert_eq!(ranked.len(), 1, "休市与不可交易标的不进候选");
+        assert_eq!(
+            ranked[0].symbol, "AAAUSDT",
+            "休市标的即使成交额最高也不能被新增进池"
+        );
+    }
+
+    #[test]
     fn blocked_symbols_are_excluded_from_candidates() {
         let blocked: HashSet<String> = ["CCCUSDT".to_string()].into_iter().collect();
         let rows = vec![scanned("AAAUSDT", 1.0), scanned("CCCUSDT", 3.0)];
@@ -1205,10 +1332,11 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.interval_hours, 24);
         assert_eq!(cfg.market_limit, 50);
-        assert_eq!(cfg.target, 100);
+        assert_eq!(cfg.target, 20, "目标池大小必须受缺省标的池上限约束");
         assert_eq!(cfg.concurrency, 1);
         assert_eq!(cfg.kline_limit, 500);
         assert_eq!(cfg.atr_period, 20);
+        assert_eq!(cfg.timeframe, "4h", "缺省周期回退 4h");
         assert_eq!(cfg.gates.spread_bps_max, 5.0);
         assert_eq!(cfg.gates.entry_threshold, 0.5);
         assert_eq!(cfg.base_url, "https://example.test");
@@ -1218,6 +1346,35 @@ mod tests {
     fn load_config_accepts_legacy_spread_key() {
         let db = memory_db(&[("strategy", json!({"spread_bps_max": 6.0}))]);
         assert_eq!(load_config(&db).unwrap().gates.spread_bps_max, 6.0);
+    }
+
+    #[test]
+    fn load_config_follows_strategy_timeframe_with_fallback() {
+        let db = memory_db(&[("strategy", json!({"timeframe": "5m"}))]);
+        assert_eq!(load_config(&db).unwrap().timeframe, "15m");
+
+        let db = memory_db(&[("strategy", json!({"timeframe": "1h"}))]);
+        assert_eq!(load_config(&db).unwrap().timeframe, "1h");
+
+        let db = memory_db(&[("strategy", json!({"timeframe": "2w"}))]);
+        assert_eq!(
+            load_config(&db).unwrap().timeframe,
+            "4h",
+            "非法周期必须回退 4h"
+        );
+    }
+
+    #[test]
+    fn load_config_caps_target_by_pool_size() {
+        let db = memory_db(&[
+            ("engine", json!({"max_symbols_per_cycle": 50})),
+            ("data", json!({"max_pool_size": 20})),
+        ]);
+        assert_eq!(
+            load_config(&db).unwrap().target,
+            20,
+            "每轮上限不能超过手动添加的标的池上限"
+        );
     }
 
     fn gates() -> ScanGates {
