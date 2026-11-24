@@ -6,6 +6,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 #[cfg(test)]
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -15,11 +16,29 @@ pub fn routes() -> Router<Db> {
     Router::new()
         .route("/symbols", get(list_symbols).post(add_symbol))
         .route("/symbols/bulk", post(add_symbols_bulk))
+        .route("/symbols/auto-scan", post(auto_scan_symbols))
         .route("/symbols/available", get(available_symbols))
         .route(
             "/symbols/{symbol}",
             delete(delete_symbol).patch(patch_symbol),
         )
+}
+
+#[derive(Deserialize, Default)]
+struct AutoScanInput {
+    #[serde(default)]
+    apply: bool,
+}
+
+/// 手动触发一轮自动换池。默认 `apply=false` 只返回计划；`run` 内部负责防重入与事务。
+async fn auto_scan_symbols(
+    State(db): State<Db>,
+    Json(input): Json<AutoScanInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::symbol_scan::run(&db, input.apply)
+        .await
+        .map(Json)
+        .map_err(|error| pool_error(StatusCode::BAD_GATEWAY, &error))
 }
 
 #[derive(Deserialize)]
@@ -227,9 +246,7 @@ fn add_with_contracts(
         Err(message) if message.contains("已在交易池中") => {
             return Err(pool_error(StatusCode::CONFLICT, &message))
         }
-        Err(message) => {
-            return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message))
-        }
+        Err(message) => return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message)),
     };
     Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":false}))
 }
@@ -602,6 +619,28 @@ async fn list_symbols(State(db): State<Db>) -> Json<Value> {
     let items = read_symbols(&db);
     let maximum = pool_maximum(&db);
     let symbols: Vec<Value> = items.iter().map(|item| item["symbol"].clone()).collect();
+    let (scan_last, scan_result) = {
+        let conn = db.conn.lock().expect("db");
+        let scan_last: Option<String> = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='symbol_scan.last_run_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let scan_result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='symbol_scan.last_result'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        (scan_last, scan_result)
+    };
     json!({
         "items": items,
         "count": items.len(),
@@ -611,6 +650,14 @@ async fn list_symbols(State(db): State<Db>) -> Json<Value> {
             "detail": if items.is_empty() { "标的池为空, 请在「标的池」页添加币安 USDT 永续合约" } else { "" },
             "symbols": symbols,
             "limits": {"minimum": 0, "maximum": maximum, "update_interval_hint": "每次保存即时生效"},
+        },
+        "scan": {
+            "last_run_ts": scan_last
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .unwrap_or(0),
+            "last_result": scan_result
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or(Value::Null),
         },
         "limits": {"minimum": 0, "maximum": maximum, "update_interval_hint": "每次保存即时生效"},
     })
@@ -866,6 +913,48 @@ mod tests {
         assert_eq!(body["state"]["limits"]["maximum"], 20);
         assert_eq!(body["limits"]["maximum"], 20);
         assert_eq!(body["state"]["symbols"][0], "BTCUSDT");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_scan_input_defaults_to_dry_run() {
+        let input: AutoScanInput = serde_json::from_str("{}").unwrap();
+        assert!(!input.apply, "缺少 apply 时必须默认 dry-run，不能误删标的");
+        let apply: AutoScanInput = serde_json::from_str(r#"{"apply":true}"#).unwrap();
+        assert!(apply.apply);
+    }
+
+    #[tokio::test]
+    async fn list_symbols_includes_scan_state() {
+        let path = std::env::temp_dir().join("nq-symbols-scan-state.db");
+        let db = seed(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+                 INSERT INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','123',0); \
+                 INSERT INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_result','{\"delete\":[\"AAAUSDT\"]}',0);",
+            )
+            .unwrap();
+        }
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/symbols")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["scan"]["last_run_ts"], 123);
+        assert_eq!(body["scan"]["last_result"]["delete"][0], "AAAUSDT");
+        assert_eq!(body["state"]["status"], "ok", "scan 字段不能覆盖既有 state");
         let _ = std::fs::remove_file(&path);
     }
 
