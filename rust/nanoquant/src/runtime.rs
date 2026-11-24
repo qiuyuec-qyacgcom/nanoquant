@@ -3049,14 +3049,18 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     features: Some(features_text.clone()),
                 });
                 // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
-                audit.push(draft.audit_row(
-                    "pending",
-                    draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
-                    "",
-                    &reviewed.action,
-                    reviewed.confidence,
-                    &reviewed.reason,
-                ));
+                audit.push(
+                    draft
+                        .audit_row(
+                            "pending",
+                            draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                            "",
+                            &reviewed.action,
+                            reviewed.confidence,
+                            &reviewed.reason,
+                        )
+                        .with_feature("client_order_id", serde_json::json!(&draft.client_id)),
+                );
                 break;
             }
             let exists: bool = tx
@@ -3661,6 +3665,14 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     &serde_json::json!({}),
                 );
                 tx.execute("UPDATE orders SET status='FILLED',price=?1,qty=?2,exchange_order_id=?3 WHERE client_order_id=?4 AND mode='live'", (avg_price, executed_qty, order_id, client_order_id)).map_err(|e| e.to_string())?;
+                // 成交后把当时记的「挂单中」审计行改成「已开仓」，否则信号审计的已开仓统计一直是 0。
+                tx.execute(
+                    "UPDATE signals SET decision='opened' \
+                     WHERE mode='live' AND decision='pending' AND symbol=?1 \
+                       AND json_extract(CASE WHEN json_valid(features) THEN features ELSE '{}' END, '$.client_order_id')=?2",
+                    (&plan.symbol, client_order_id),
+                )
+                .map_err(|error| error.to_string())?;
                 tx.execute("DELETE FROM engine_state WHERE key=?1", [&key])
                     .map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;

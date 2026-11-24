@@ -137,6 +137,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
         normalize_ai_tuning_interval(conn)?;
         drop_legacy_default_leverage(conn)?;
         drop_legacy_removed_params(conn)?;
+        backfill_opened_signals(conn)?;
         Ok(())
     })();
     let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
@@ -309,6 +310,27 @@ fn drop_legacy_removed_params(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 历史修复：旧版本实盘成交后没有把信号审计从 pending 改成 opened。
+///
+/// 只回填能明确匹配到已成交开仓单的记录，真实挂单未成交的 pending 保持不动。
+fn backfill_opened_signals(conn: &Connection) -> Result<(), String> {
+    if !table_exists(conn, "signals")? || !table_exists(conn, "orders")? {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE signals SET decision='opened' \
+         WHERE decision='pending' AND mode='live' AND EXISTS ( \
+           SELECT 1 FROM orders o \
+           WHERE o.mode=signals.mode AND o.symbol=signals.symbol \
+             AND o.purpose='entry' AND o.status='FILLED' \
+             AND o.ts BETWEEN signals.ts - 60 AND signals.ts + 1800 \
+         )",
+        [],
+    )
+    .map_err(|e| format!("回填已开仓信号失败: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +481,41 @@ mod tests {
         );
         assert!(strategy.contains("timeframe"));
         assert!(risk.contains("margin_pct"));
+    }
+
+    #[test]
+    fn migrate_backfills_filled_live_entries_to_opened() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "DELETE FROM signals; DELETE FROM orders; \
+             INSERT INTO signals(ts,mode,symbol,direction,score,features,ai_action,ai_confidence,ai_reason,decision,reject_reason,repeats) \
+             VALUES(1000,'live','BTCUSDT','long',0.5,'{}','open_long',0.6,'','pending','',1); \
+             INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+             VALUES(1005,'BTCUSDT','BUY','MARKET',1,100,'FILLED','entry','entry-1','',0,'live',0); \
+             INSERT INTO signals(ts,mode,symbol,direction,score,features,ai_action,ai_confidence,ai_reason,decision,reject_reason,repeats) \
+             VALUES(2000,'live','ETHUSDT','short',0.4,'{}','open_short',0.5,'','pending','',1); \
+             INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
+             VALUES(2005,'ETHUSDT','SELL','MARKET',1,100,'NEW','entry','entry-2','',0,'live',0);",
+        )
+        .unwrap();
+        backfill_opened_signals(&conn).unwrap();
+        let btc: String = conn
+            .query_row(
+                "SELECT decision FROM signals WHERE symbol='BTCUSDT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let eth: String = conn
+            .query_row(
+                "SELECT decision FROM signals WHERE symbol='ETHUSDT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(btc, "opened");
+        assert_eq!(eth, "pending", "未成交的挂单不能误标为已开仓");
     }
 
     #[test]

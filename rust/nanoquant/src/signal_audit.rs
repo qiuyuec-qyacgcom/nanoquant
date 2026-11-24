@@ -82,6 +82,14 @@ impl AuditSignal {
         self.stage = stage.to_string();
         self
     }
+
+    /// 往 features 里补一个字段（例如 client_order_id），不影响已有读数。
+    pub fn with_feature(mut self, key: &str, value: Value) -> Self {
+        if let Some(object) = self.features.as_object_mut() {
+            object.insert(key.to_string(), value);
+        }
+        self
+    }
 }
 
 /// 拒绝原因归一化：去掉数字与比较符号，只留「是哪一类原因」。
