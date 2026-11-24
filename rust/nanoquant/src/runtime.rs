@@ -2168,6 +2168,150 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         Ok(closed)
     }
 
+    /// 快速对账：只拉交易所持仓，关闭本地已不存在的实盘仓位。
+    ///
+    /// 用户可能在币安 App 手动平仓，不经过引擎；主周期默认 600 秒，
+    /// 这里每 15 秒对一次，避免总览长时间显示幽灵仓位。
+    async fn sync_venue_positions(&self) -> Result<Vec<Value>, String> {
+        let mode = self
+            .db
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM engine_state WHERE key='mode'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .filter(|mode| !mode.is_empty())
+            })
+            .or_else(|| {
+                self.db
+                    .setting("engine")
+                    .ok()
+                    .flatten()
+                    .and_then(|engine| engine["mode"].as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "demo".to_string());
+        if mode != "live" {
+            return Ok(Vec::new());
+        }
+        let creds = self.live_credentials()?;
+        let locals: Vec<(String, String, f64)> = {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT symbol, side, COALESCE(mark_price,0) FROM positions \
+                     WHERE mode='live' AND status='open'",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if locals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let symbols: Vec<String> = locals
+            .iter()
+            .map(|(symbol, _, _)| symbol.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let provider = crate::providers::BinanceProvider::with_symbols(
+            &creds.base,
+            symbols,
+            creds.api_key.clone(),
+            creds.secret.clone(),
+        )
+        .map_err(|error| match error {
+            crate::providers::ProviderError::Timeout => "交易所持仓快照超时".to_string(),
+            crate::providers::ProviderError::Unavailable(message)
+            | crate::providers::ProviderError::InvalidData(message) => message,
+        })?;
+        let venue = provider
+            .positions_only()
+            .await
+            .map_err(|error| match error {
+                crate::providers::ProviderError::Timeout => "交易所持仓快照超时".to_string(),
+                crate::providers::ProviderError::Unavailable(message)
+                | crate::providers::ProviderError::InvalidData(message) => message,
+            })?;
+        let venue_keys: std::collections::BTreeSet<(&str, &str)> = venue
+            .iter()
+            .filter(|position| position.qty > 0.0)
+            .map(|position| (position.symbol.as_str(), position.side.as_str()))
+            .collect();
+        let fee_rate = self
+            .db
+            .setting("risk")
+            .ok()
+            .flatten()
+            .and_then(|risk| risk["fee_rate_taker"].as_f64())
+            .unwrap_or(0.0005);
+        let mut closed = Vec::new();
+        for (symbol, side, stored_mark) in locals {
+            if venue_keys.contains(&(symbol.as_str(), side.as_str())) {
+                continue;
+            }
+            let mark = provider
+                .mark_price(&symbol)
+                .await
+                .ok()
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .unwrap_or(stored_mark);
+            if !(mark.is_finite() && mark > 0.0) {
+                continue;
+            }
+            let mut conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|_| "数据库锁不可用".to_string())?;
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            if crate::execution::close_venue_position_tx(
+                &tx,
+                "live",
+                crate::now(),
+                fee_rate,
+                &symbol,
+                &side,
+                mark,
+            )? {
+                tx.commit().map_err(|error| error.to_string())?;
+                closed.push(serde_json::json!({
+                    "symbol": symbol,
+                    "side": side,
+                    "exit_price": mark,
+                    "reason": "venue_sync",
+                }));
+            }
+        }
+        if !closed.is_empty() {
+            self.events.record(
+                "warn",
+                "engine",
+                "交易所已平仓，已同步关闭本地仓位",
+                serde_json::json!({ "closed": closed }),
+            );
+        }
+        Ok(closed)
+    }
+
     /// 一轮调度：对账、管仓、时段与扫描全部走 `cycle::run_cycle`。
     ///
     /// 这里只产出审计结果，不落订单。返回的预览已经是可直接序列化的 JSON，
@@ -4613,6 +4757,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         self.set_runtime_task("alive");
         let mut last_config = RuntimeConfig::from_db(&self.db);
         let mut due = Instant::now();
+        let mut last_venue_sync = Instant::now();
         loop {
             if *stop.borrow() {
                 break;
@@ -4665,6 +4810,13 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     {
                         due = Instant::now();
                         last_config = latest;
+                    }
+                    // 手动平仓不经过引擎，主周期最长 10 分钟；这里 15 秒对一次持仓。
+                    if last_venue_sync.elapsed() >= Duration::from_secs(15) {
+                        last_venue_sync = Instant::now();
+                        if let Err(error) = self.sync_venue_positions().await {
+                            tracing::warn!(%error, "持仓快速对账失败");
+                        }
                     }
                 }
             }

@@ -349,6 +349,30 @@ impl BinanceProvider {
         Ok(self)
     }
 
+    /// 只拉交易所持仓，不拉行情/K 线。用于手动平仓后的快速对账。
+    pub async fn positions_only(&self) -> Result<Vec<PositionSnapshot>, ProviderError> {
+        let value = self.get_json("/fapi/v3/positionRisk", &[], true).await?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| ProviderError::InvalidData("持仓响应不是数组".into()))?;
+        let mut positions = Vec::new();
+        for row in rows {
+            if let Some(position) = parse_position(row)? {
+                positions.push(position);
+            }
+        }
+        Ok(positions)
+    }
+
+    /// 单个标的的最新标记价，用于补记手动平仓的出场价。
+    pub async fn mark_price(&self, symbol: &str) -> Result<f64, ProviderError> {
+        let params = vec![("symbol".to_string(), symbol.to_string())];
+        let value = self
+            .get_json("/fapi/v1/premiumIndex", &params, true)
+            .await?;
+        number(&value, "markPrice")
+    }
+
     async fn get_json(
         &self,
         path: &str,
