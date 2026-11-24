@@ -45,6 +45,12 @@ describe('scanCounts', () => {
     expect(scanCounts({ scanned: 10 })).toEqual({ scanned: 10, candidates: 0, deleted: 0, kept: 0, skipped: 0 })
   })
 
+  it('last_result 为 null/undefined（首次启用只写基线）时全部统计为 0', () => {
+    const zero = { scanned: 0, candidates: 0, deleted: 0, kept: 0, skipped: 0 }
+    expect(scanCounts(null)).toEqual(zero)
+    expect(scanCounts(undefined)).toEqual(zero)
+  })
+
   it('数字形状的 scanned/candidates 也能统计', () => {
     expect(scanCounts({ scanned: 40, candidates: 12, delete: 3, keep: 9 })).toEqual({
       scanned: 40,

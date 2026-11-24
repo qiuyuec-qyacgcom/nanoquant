@@ -79,6 +79,8 @@ const requiredPhrase = computed(() => (pendingDelete.value ? `REMOVE ${pendingDe
 const canDelete = computed(() => phrase.value.trim().toUpperCase() === requiredPhrase.value)
 const full = computed(() => count.value >= limits.maximum)
 const lastScan = computed(() => scanCounts(scan.value?.last_result))
+/** 后端首次启用只写时间基线、last_result 为 null，此时尚未真正扫描过。 */
+const hasScanResult = computed(() => scan.value?.last_result != null)
 const planKeepRest = computed(() =>
   keepRest(scanPlan.value?.keep, scanPlan.value?.held, scanPlan.value?.suspended),
 )
@@ -122,7 +124,7 @@ async function runScan(apply: boolean) {
   scanning.value = true
   scanError.value = ''
   try {
-    const res = await http.post('/symbols/auto-scan', { apply }, 60_000)
+    const res = await http.post('/symbols/auto-scan', { apply }, 180_000)
     if (apply) {
       showScanPlan.value = false
       scanPlan.value = null
@@ -355,11 +357,12 @@ onMounted(loadPool)
           <span class="tag tag-dim">{{ count }} 个</span>
           <span v-if="state.detail" class="tag tag-warn">{{ state.detail }}</span>
           <span class="scan-meta">
-            上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '尚未扫描' }}
-            <template v-if="scan?.last_run_ts">
+            <template v-if="hasScanResult">
+              上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '时间未知' }}
               · 扫描 {{ lastScan.scanned }} 个 · 候选 {{ lastScan.candidates }} 个 · 替换
-              {{ lastScan.deleted }} 个 · 跳过 {{ lastScan.skipped }} 个 · 保留 {{ lastScan.kept }} 个
+              {{ lastScan.deleted }} 个 · 跳过 {{ lastScan.skipped }} 个 · 保留 {{ lastScan.kept }} 个（含持仓/休市）
             </template>
+            <template v-else>尚未扫描（等待首轮）</template>
           </span>
           <span v-if="scanError" class="scan-error">{{ scanError }}</span>
           <button class="btn btn-sm" :disabled="scanning" @click="runScan(false)">

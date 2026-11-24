@@ -50,7 +50,7 @@ fn scan_error(error: String) -> (StatusCode, Json<Value>) {
     if error == crate::symbol_scan::BUSY_ERROR {
         return pool_error(StatusCode::CONFLICT, &error);
     }
-    const INTERNAL_MARKERS: [&str; 13] = [
+    const INTERNAL_MARKERS: [&str; 18] = [
         "数据库锁不可用",
         "读取配置 ",
         "读取标的池失败",
@@ -64,6 +64,11 @@ fn scan_error(error: String) -> (StatusCode, Json<Value>) {
         "检查 ",
         "删除标的 ",
         "是否已在池中失败",
+        "标的名称无效",
+        "不在币安合约表中",
+        "仅允许当前可交易的 USDT 永续合约",
+        "币安合约规格无效",
+        "标的写入失败",
     ];
     let status = if INTERNAL_MARKERS.iter().any(|marker| error.contains(marker)) {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -162,7 +167,7 @@ pub(crate) fn upsert_contract_row_conn(
         .ok()
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())
         .and_then(|risk| risk["max_leverage"].as_i64())
-        .unwrap_or(20)
+        .unwrap_or(100)
         .clamp(1, 100);
     let mut row = build_pool_row(raw, cap).ok_or_else(|| "币安合约规格无效".to_string())?;
     let underlying = raw["underlyingType"].as_str().unwrap_or("").to_uppercase();
@@ -180,7 +185,7 @@ pub(crate) fn upsert_contract_row_conn(
         .unwrap_or(1);
     conn.execute(
         "INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12)",
-        rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()],
+        rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(100), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()],
     )
     .map_err(|error| match error {
         rusqlite::Error::SqliteFailure(err, _)
@@ -265,7 +270,7 @@ fn add_with_contracts(
             )
             .unwrap_or(1);
         conn.execute("INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12)",
-            rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("custom"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), "自定义标的（无币安行情，不参与交易）", order, crate::now()])
+            rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("custom"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(100), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), "自定义标的（无币安行情，不参与交易）", order, crate::now()])
             .map_err(|_| pool_error(StatusCode::INTERNAL_SERVER_ERROR, "标的写入失败"))?;
         let mut added = row;
         added["enabled"] = json!(false);
@@ -1003,6 +1008,24 @@ mod tests {
         assert_eq!(
             scan_error("读取 24h 成交额失败: timeout".to_string()).0,
             StatusCode::BAD_GATEWAY
+        );
+        for message in [
+            "标的名称无效",
+            "NOPEUSDT 不在币安合约表中",
+            "仅允许当前可交易的 USDT 永续合约",
+            "币安合约规格无效",
+            "标的写入失败: disk I/O error",
+        ] {
+            assert_eq!(
+                scan_error(message.to_string()).0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "本地校验/落库失败（{message}）应归为 500，而不是上游 502"
+            );
+        }
+        assert_eq!(
+            scan_error("完全未知的故障".to_string()).0,
+            StatusCode::BAD_GATEWAY,
+            "未知错误默认按上游故障处理"
         );
     }
 
