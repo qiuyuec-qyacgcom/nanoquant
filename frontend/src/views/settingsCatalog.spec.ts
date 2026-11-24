@@ -31,9 +31,6 @@ describe('参数配置目录', () => {
       'weight_volume',
       'weight_funding',
       'weight_oi',
-      'ema_fast',
-      'ema_slow',
-      'rsi_period',
       'mode',
       'adx_filter',
       'adx_min',
@@ -42,30 +39,8 @@ describe('参数配置目录', () => {
       'mr_min_risk_reward',
       'mr_block_in_trend',
       'mr_trend_gap_pct',
-      'roi_min_r',
-      'max_data_gaps',
-      'data_stale_mult',
-      'stoploss_guard_count',
-      'stoploss_guard_window_min',
-      'stoploss_guard_pause_min',
-      'drawdown_peak_window_days',
-      'liquidation_warn_pct',
-      'max_slippage_pct',
       'rsi_adaptive',
       'adx_period',
-      'scan_concurrency',
-      'max_symbols_per_cycle',
-      'recv_window_ms',
-      'kline_limit',
-      'ticker_ttl_sec',
-      'request_timeout_sec',
-      'max_pool_size',
-      'alert_template',
-      'alert_digest_enabled',
-      'alert_quiet_hours',
-      'rsshub_base',
-      'max_items_per_source',
-      'ui_refresh_sec',
     ]
     for (const key of removed) {
       expect(sectionKeys, key).not.toContain(key)
@@ -155,9 +130,9 @@ describe('参数配置目录', () => {
   })
 
   it('目录失败时只显示 section 显式字段', () => {
-    const keys = visibleSettingKeys('strategy', ['ema_fast', 'entry_threshold', 'timeframe'], new Set(), true)
+    const keys = visibleSettingKeys('strategy', ['adx_period', 'entry_threshold', 'timeframe'], new Set(), true)
     expect(keys).toEqual(['entry_threshold', 'timeframe'])
-    expect(explicitKeys('strategy').has('ema_fast')).toBe(false)
+    expect(explicitKeys('strategy').has('adx_period')).toBe(false)
   })
 
   it('目录正常时保留 section 之外的字段', () => {

@@ -573,8 +573,7 @@ const currentSections = computed(() => {
     list.forEach((r) => rows.delete(r.key))
     out.push({ title: def.title, hint: def.hint || '', rows: list })
   }
-  if (rows.size && !paramCatalog.failed)
-    out.push({ title: '其他参数', hint: '未归类的字段，保持后端默认语义', rows: Array.from(rows.values()) })
+
   return out
 })
 

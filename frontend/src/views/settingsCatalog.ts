@@ -24,12 +24,12 @@ export const SETTINGS_GROUPS: readonly SettingGroup[] = [
 
 export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   engine: [
-    { title: '运行节奏', fields: ['cycle_interval_sec', 'max_positions'] },
+    { title: '运行节奏', fields: ['cycle_interval_sec', 'max_positions', 'max_symbols_per_cycle', 'scan_concurrency'] },
     { title: '交易时段', hint: '只在窗口内开新仓，持仓管理不受限', fields: ['trading_windows', 'timezone_offset'] },
-    { title: '下单', fields: ['order_type', 'close_on_halt'] },
+    { title: '下单', fields: ['order_type', 'close_on_halt', 'recv_window_ms'] },
   ],
   strategy: [
-    { title: '基础', fields: ['timeframe'] },
+    { title: '基础', fields: ['timeframe', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
     {
       title: '入场过滤',
       hint: '任一项不达标都不开仓',
@@ -40,11 +40,15 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       hint: 'AI 在开仓复核时给出每仓止损/止盈价；仓位止盈止损率是保证金收益率的强制平仓线',
       fields: [
         'trailing_pct',
+        'trailing_arm_r',
         'breakeven_at_r',
         'partial_tp_at_r',
         'partial_tp_ratio',
         'max_spread_bps',
         'roi_table',
+        'roi_min_r',
+        'max_data_gaps',
+        'data_stale_mult',
       ],
     },
     {
@@ -77,7 +81,18 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     {
       title: '高级风控',
       hint: '默认关闭或保持保守值；这些参数会实际参与仓位与保护判定',
-      fields: ['min_equity_usdt', 'category_exposure_limit_pct', 'vol_target_atr_pct', 'auto_protect_external'],
+      fields: [
+        'min_equity_usdt',
+        'category_exposure_limit_pct',
+        'vol_target_atr_pct',
+        'auto_protect_external',
+        'liquidation_warn_pct',
+        'drawdown_peak_window_days',
+        'stoploss_guard_count',
+        'stoploss_guard_window_min',
+        'stoploss_guard_pause_min',
+        'max_slippage_pct',
+      ],
     },
     {
       title: '执行成本',
@@ -88,15 +103,21 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     {
       title: '交易所网络',
       hint: '模拟盘走测试网，实盘走主网；API 凭证在上方单独维护',
-      fields: ['demo_base_url', 'live_base_url', 'backup_base_urls', 'proxy'],
+      fields: ['demo_base_url', 'live_base_url', 'backup_base_urls', 'demo_backup_urls', 'proxy'],
+    },
+    {
+      title: '行情缓存',
+      hint: '只影响引擎内部取价与 API 权重，不改变对外行情接口',
+      fields: ['kline_limit', 'ticker_ttl_sec', 'kline_ttl_sec', 'request_timeout_sec', 'max_pool_size'],
     },
   ],
   news: [
-    { title: '抓取', fields: ['enabled', 'refresh_minutes', 'keep_days', 'sources'] },
+    { title: '抓取', fields: ['enabled', 'refresh_minutes', 'keep_days', 'sources', 'max_items_per_source', 'rsshub_base'] },
     { title: '情绪', fields: ['ai_summary', 'sentiment_threshold'] },
+    { title: '网络', hint: '留空则复用「交易所 → HTTP 代理」', fields: ['proxy', 'request_timeout_sec'] },
   ],
   system: [
-    { title: '运行与日志', fields: ['log_level'] },
+    { title: '运行与日志', fields: ['log_level', 'ui_refresh_sec'] },
     { title: '数据保留', fields: ['event_retention_days', 'signal_retention_days', 'equity_retention_days'] },
     {
       title: '告警',
@@ -109,13 +130,16 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
         'alert_telegram_token',
         'alert_telegram_chat_id',
         'alert_cooldown_sec',
+        'alert_quiet_hours',
+        'alert_template',
+        'alert_digest_enabled',
+        'alert_digest_minutes',
       ],
     },
     {
-
       title: '安全与观测',
       hint: 'API 限频按 IP 计；健康检查与 /metrics 不计数',
-      fields: ['api_rate_limit_per_min', 'metrics_enabled'],
+      fields: ['api_rate_limit_per_min', 'metrics_enabled', 'risk_disclaimer_accepted'],
     },
   ],
   backup: [{ title: '备份策略', fields: ['retention', 'encrypt', 'auto_daily', 'include_logs'] }],
