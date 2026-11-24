@@ -242,8 +242,8 @@ onMounted(async () => {
   await load()
 })
 
-useSilentRefresh(load, 10000)
-useSilentRefresh(refreshQuotes, 10000)
+useSilentRefresh(load, 3000)
+useSilentRefresh(refreshQuotes, 3000)
 </script>
 
 <template>
