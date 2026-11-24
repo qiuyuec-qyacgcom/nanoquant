@@ -87,9 +87,7 @@ describe('参数配置目录', () => {
       'order_type',
       'timeframe',
       'entry_threshold',
-      'sl_atr_mult',
-      'tp_atr_mult',
-      'min_risk_reward',
+
       'trailing_pct',
       'partial_tp_at_r',
       'max_spread_bps',

@@ -65,9 +65,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "atr_pct_min", 0.0, 10.0, 0.01),
     ("strategy", "atr_pct_max", 0.1, 20.0, 0.1),
     ("strategy", "min_24h_quote_volume", 0.0, 1.0e12, 100000.0),
-    ("strategy", "sl_atr_mult", 0.1, 20.0, 0.1),
-    ("strategy", "tp_atr_mult", 0.1, 50.0, 0.1),
-    ("strategy", "min_risk_reward", 0.1, 20.0, 0.1),
+
     ("strategy", "roi_min_r", 0.0, 20.0, 0.1),
     ("strategy", "trailing_pct", 0.0, 200.0, 0.1),
     ("strategy", "trailing_arm_r", 0.0, 20.0, 0.1),
@@ -158,9 +156,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "atr_pct_min",
             "atr_pct_max",
             "min_24h_quote_volume",
-            "sl_atr_mult",
-            "tp_atr_mult",
-            "min_risk_reward",
+
             "trailing_pct",
             "breakeven_at_r",
             "partial_tp_at_r",

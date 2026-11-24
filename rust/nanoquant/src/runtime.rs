@@ -1191,8 +1191,8 @@ impl EngineRuntime {
             trailing_arm_r: strategy["trailing_arm_r"].as_f64().unwrap_or(1.5),
             exit_threshold: strategy["exit_threshold"].as_f64().unwrap_or(0.6),
             breakeven_at_r: strategy["breakeven_at_r"].as_f64().unwrap_or(1.0),
-            global_stop_loss_pct: risk["global_stop_loss_pct"].as_f64().unwrap_or(0.0),
-            global_take_profit_pct: risk["global_take_profit_pct"].as_f64().unwrap_or(0.0),
+            global_stop_loss_pct: risk["global_stop_loss_pct"].as_f64().unwrap_or(10.0),
+            global_take_profit_pct: risk["global_take_profit_pct"].as_f64().unwrap_or(20.0),
             qty_step: strategy["qty_step"].as_f64().unwrap_or(0.001),
             min_qty: strategy["min_qty"].as_f64().unwrap_or(0.001),
             roi_min_r: strategy["roi_min_r"].as_f64().unwrap_or(1.0),
@@ -1234,9 +1234,7 @@ impl EngineRuntime {
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
             atr_pct_min: num(strategy, "atr_pct_min", 0.05),
             atr_pct_max: num(strategy, "atr_pct_max", 4.0),
-            sl_atr_mult: num(strategy, "sl_atr_mult", 1.2),
-            tp_atr_mult: num(strategy, "tp_atr_mult", 2.0),
-            min_risk_reward: num(strategy, "min_risk_reward", 2.0),
+
         }
     }
     fn engine_enabled(tx: &rusqlite::Transaction<'_>, config: &Value) -> Result<bool, String> {
@@ -2601,8 +2599,6 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             );
             let (
                 side,
-                stop_price,
-                take_profit,
                 score,
                 quant_side,
                 quant_score,
@@ -2612,8 +2608,6 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             ) = match signal {
                 Some(signal) => (
                     signal.side.to_string(),
-                    signal.stop_price,
-                    signal.take_profit,
                     signal.score,
                     Some(signal.side.to_string()),
                     Some(signal.score),
@@ -2632,12 +2626,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         .filter(|item| item.side != "flat")
                         .map(|item| item.side.to_string());
                     let preview_score = preview.map(|item| item.score);
-                    let sl = metric.atr * policy.sl_atr_mult;
-                    let tp = metric.atr * policy.tp_atr_mult;
                     (
                         "long".to_string(),
-                        price - sl,
-                        price + tp,
                         0.0,
                         None,
                         None,
@@ -2647,9 +2637,6 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     )
                 }
             };
-            if stop_price <= 0.0 || take_profit <= 0.0 {
-                continue;
-            }
             let Some(exchange_max): Option<Option<i64>> = tx
                 .query_row(
                     "SELECT max_leverage FROM trading_symbols WHERE symbol=?1 AND enabled!=0",
@@ -2669,6 +2656,21 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
             // 杠杆由 AI 在 [lower, upper] 内决定；这里只给出回退值（下限）。
             let leverage = lower as f64;
+            // 仓位止盈止损率是用户的心理预期（保证金收益率）：
+            // 作为 AI 未给出止损/止盈价时的默认价，价格距离 = 保证金% ÷ 杠杆。
+            let direction = if side == "long" { 1.0 } else { -1.0 };
+            let global_stop = cfg["global_stop_loss_pct"].as_f64().unwrap_or(10.0);
+            let global_take_profit = cfg["global_take_profit_pct"].as_f64().unwrap_or(20.0);
+            let stop_price = if global_stop > 0.0 {
+                price * (1.0 - direction * global_stop / leverage / 100.0)
+            } else {
+                0.0
+            };
+            let take_profit = if global_take_profit > 0.0 {
+                price * (1.0 + direction * global_take_profit / leverage / 100.0)
+            } else {
+                0.0
+            };
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
                 (target / metric.atr_pct).clamp(0.25, 2.0)

@@ -24,10 +24,8 @@ const INTERVALS: [&str; 6] = ["5m", "15m", "30m", "1h", "4h", "1d"];
 const MAX_CONCURRENT_RUNS: usize = 2;
 const MAX_PERSISTED_RUNS: usize = 200;
 
-const BOUNDS: [(&str, f64, f64); 4] = [
+const BOUNDS: [(&str, f64, f64); 2] = [
     ("entry_threshold", 0.05, 0.95),
-    ("sl_atr_mult", 0.2, 10.0),
-    ("tp_atr_mult", 0.2, 20.0),
     ("trailing_pct", 0.0, 200.0),
 ];
 
@@ -118,10 +116,7 @@ struct BacktestGridIn {
     #[serde(default)]
     entry_threshold: Vec<f64>,
     #[serde(default)]
-    sl_atr_mult: Vec<f64>,
-    #[serde(default)]
-    tp_atr_mult: Vec<f64>,
-    #[serde(default)]
+
     trailing_pct: Vec<f64>,
     #[serde(default = "default_folds")]
     folds: i64,
@@ -225,8 +220,7 @@ fn validate_base(
 fn validate_grid(input: &BacktestGridIn) -> Result<(), (StatusCode, Json<Value>)> {
     let entries = [
         ("entry_threshold", &input.entry_threshold),
-        ("sl_atr_mult", &input.sl_atr_mult),
-        ("tp_atr_mult", &input.tp_atr_mult),
+
         ("trailing_pct", &input.trailing_pct),
     ];
     let mut any = false;
@@ -262,8 +256,7 @@ fn grid_spec(
 ) {
     let grid = vec![
         ("entry_threshold", input.entry_threshold.clone()),
-        ("sl_atr_mult", input.sl_atr_mult.clone()),
-        ("tp_atr_mult", input.tp_atr_mult.clone()),
+
         ("trailing_pct", input.trailing_pct.clone()),
     ];
     let checked = backtest_engine::grid_combinations(&grid)
@@ -662,8 +655,7 @@ pub async fn final_verdict(
         let config = engine_config(&prepared, &input);
         let grid: Vec<(&'static str, Vec<f64>)> = vec![
             ("entry_threshold", vec![0.45, 0.50, 0.55]),
-            ("sl_atr_mult", vec![1.2, 1.5, 2.0]),
-            ("tp_atr_mult", vec![2.0, 3.0]),
+
             ("trailing_pct", vec![0.0]),
         ];
         let bars_vec = series.bars.clone();
@@ -829,11 +821,11 @@ mod tests {
 
     #[test]
     fn grid_values_outside_the_bounds_are_rejected() {
-        let ok = check_grid(&[("sl_atr_mult", &[1.5, 2.0])]);
+        let ok = check_grid(&[("entry_threshold", &[0.45, 0.55])]);
         assert!(ok.is_ok());
 
-        let bad = check_grid(&[("sl_atr_mult", &[0.1])]);
-        assert!(bad.is_err(), "0.1 低于 0.2 的下限");
+        let bad = check_grid(&[("entry_threshold", &[0.01])]);
+        assert!(bad.is_err(), "0.01 低于 0.05 的下限");
 
         let empty = check_grid(&[]);
         assert!(empty.is_err(), "一个参数都不给就没有可扫的组合");
@@ -898,7 +890,7 @@ mod tests {
 
     #[test]
     fn grid_combination_cap_is_enforced_before_execution() {
-        let values = vec![1.0, 1.5, 2.0, 2.5, 3.0];
+        let values: Vec<f64> = (0..7).map(|index| 0.1 + index as f64 * 0.1).collect();
         let input = BacktestGridIn {
             base: BacktestIn {
                 symbol: "BTCUSDT".into(),
@@ -912,9 +904,7 @@ mod tests {
                 run_id: None,
             },
             entry_threshold: values.clone(),
-            sl_atr_mult: values.clone(),
-            tp_atr_mult: values,
-            trailing_pct: Vec::new(),
+            trailing_pct: values,
             folds: 3,
             train_bars: 600,
         };

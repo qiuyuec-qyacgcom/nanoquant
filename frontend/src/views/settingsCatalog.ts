@@ -37,11 +37,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
     {
       title: '出场与保护',
-      hint: '止损止盈按 ATR 计算；全局止盈止损优先于这里的 ATR 规则',
+      hint: 'AI 在开仓复核时给出每仓止损/止盈价；仓位止盈止损率是保证金收益率的强制平仓线',
       fields: [
-        'sl_atr_mult',
-        'tp_atr_mult',
-        'min_risk_reward',
         'trailing_pct',
         'breakeven_at_r',
         'partial_tp_at_r',
@@ -68,8 +65,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       fields: ['margin_pct', 'min_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction'],
     },
     {
-      title: '全局止盈止损',
-      hint: '按仓位保证金收益率计算（价格变动 × 杠杆）；优先于 ATR 止损、部分止盈与 ROI 阶梯，0=关闭',
+      title: '仓位止盈止损',
+      hint: '你的心理预期（保证金收益率）：盈利/亏损达到该比例就强制平仓；与 AI 给出的价格先触发者生效，0=关闭',
       fields: ['global_stop_loss_pct', 'global_take_profit_pct'],
     },
     {

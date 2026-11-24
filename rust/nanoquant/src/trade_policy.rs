@@ -4,9 +4,7 @@ pub(crate) struct TradePolicy {
     pub volume_ratio_min: f64,
     pub atr_pct_min: f64,
     pub atr_pct_max: f64,
-    pub sl_atr_mult: f64,
-    pub tp_atr_mult: f64,
-    pub min_risk_reward: f64,
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -21,8 +19,7 @@ pub(crate) struct MarketFeatures {
 pub(crate) struct TradeSignal {
     pub side: &'static str,
     pub score: f64,
-    pub stop_price: f64,
-    pub take_profit: f64,
+
     pub reason: String,
 }
 
@@ -203,26 +200,15 @@ pub(crate) fn evaluate(
     if core.score.abs() < policy.base_threshold {
         return None;
     }
-    let direction = core.score.signum();
     if core.agreement < 2 {
         return None;
     }
     if core.confidence < 0.55 {
         return None;
     }
-    let sl_distance = (atr * policy.sl_atr_mult.max(0.2)).max(mark * 0.0018);
-    let tp_distance =
-        (atr * policy.tp_atr_mult.max(0.2)).max(sl_distance * policy.min_risk_reward.max(0.5));
-    let stop_price = mark - direction * sl_distance;
-    let take_profit = mark + direction * tp_distance;
-    if stop_price <= 0.0 || take_profit <= 0.0 {
-        return None;
-    }
     Some(TradeSignal {
         side: if core.score > 0.0 { "long" } else { "short" },
         score: core.score,
-        stop_price,
-        take_profit,
         reason: format!(
             "fusion:score={:.4}:vol={:.2}:regime={},rs={:.2},break={:.2},carry={:.2},flow={:.2},conf={:.2},coverage={:.2}",
             core.score,
@@ -288,9 +274,7 @@ mod tests {
             volume_ratio_min: 0.5,
             atr_pct_min: 0.05,
             atr_pct_max: 4.0,
-            sl_atr_mult: 1.2,
-            tp_atr_mult: 2.0,
-            min_risk_reward: 2.0,
+
         }
     }
 

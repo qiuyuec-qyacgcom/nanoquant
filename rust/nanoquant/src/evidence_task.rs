@@ -764,10 +764,7 @@ mod tests {
             "atr_pct_min": 1.5,
             "atr_pct_max": 8.0,
             "volume_ratio_min": 1.1,
-            "entry_threshold": 0.55,
-            "sl_atr_mult": 1.2,
-            "tp_atr_mult": 2.0,
-            "min_risk_reward": 2.0
+            "entry_threshold": 0.55
         });
         let risk = json!({
             "fee_rate_taker": 0.0005,

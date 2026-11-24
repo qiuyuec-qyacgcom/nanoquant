@@ -16,7 +16,7 @@ interface PoolRow {
   symbol: string
   name: string
   tier: string
-  sl_atr_mult: number
+
   enabled: boolean
   max_leverage: number
   precision: number
@@ -300,7 +300,7 @@ onMounted(loadPool)
               <th>价格精度</th>
               <th>数量步进</th>
               <th>最小名义额</th>
-              <th>止损 ATR×</th>
+
               <th></th>
             </tr>
           </thead>
@@ -323,7 +323,7 @@ onMounted(loadPool)
               <td class="mono muted">{{ row.tick_sz }}</td>
               <td class="mono muted">{{ row.min_sz }}（{{ row.precision }} 位）</td>
               <td class="mono">{{ fmt(row.min_notional, 2) }}</td>
-              <td class="mono">{{ row.sl_atr_mult }}</td>
+
               <td>
                 <button class="btn btn-xs btn-danger" @click="openDelete(row)">移除</button>
               </td>

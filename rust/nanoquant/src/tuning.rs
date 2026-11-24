@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn tuning_context_only_exposes_strategy_numeric_fields() {
         let mut active = strategy_snapshot();
-        active["sl_atr_mult"] = json!(1.2);
+
         active["ema_fast"] = json!(9);
         active["ema_slow"] = json!(21);
         active["rsi_period"] = json!(14);
@@ -951,7 +951,7 @@ mod tests {
             "atr_pct_max",
             "volume_ratio_min",
             "entry_threshold",
-            "sl_atr_mult",
+
         ] {
             assert!(fields.contains_key(key), "strategy.{key} 应出现在可调目录");
         }
@@ -980,7 +980,7 @@ mod tests {
         assert_eq!(fields["atr_pct_min"]["current"], 1.5);
         assert_eq!(fields["atr_pct_min"]["ai_bounds"], json!([0.0, 1.0]));
         assert!(fields["atr_pct_min"]["min"].is_number());
-        assert!(fields["sl_atr_mult"].get("ai_bounds").is_none());
+
     }
 
     #[test]

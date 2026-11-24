@@ -56,8 +56,7 @@ const PLAIN_HINTS: Record<string, string> = {
   volume_ratio_min: '成交量低于该倍数时不参与',
   atr_pct_min: '波动太小（赚不回手续费）时不做',
   atr_pct_max: '波动太大（容易被扫止损）时不做',
-  sl_atr_mult: '止损距离 = ATR 的几倍；越小止损越紧',
-  tp_atr_mult: '止盈距离 = ATR 的几倍',
+
   trailing_pct: '从浮盈高点回撤这么多保证金收益率就离场（价格回撤 = 该值 ÷ 杠杆）；0=关闭',
   breakeven_at_r: '浮盈达到初始止损距离的几倍时，把止损移到开仓价',
   partial_tp_at_r: '浮盈达到初始止损距离的几倍时，先平掉一部分仓位；0=关闭',
@@ -133,8 +132,8 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
-  global_stop_loss_pct: { label: '全局止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
-  global_take_profit_pct: { label: '全局止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
+  global_stop_loss_pct: { label: '仓位止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
+  global_take_profit_pct: { label: '仓位止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
   drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
   cooldown_minutes: { label: '熔断冷静期', unit: '分钟' },
@@ -168,9 +167,7 @@ const BASE_META: Record<string, FieldMeta> = {
   atr_pct_min: { label: 'ATR 下限', unit: '%', hint: '波动太小不足以覆盖手续费' },
   atr_pct_max: { label: 'ATR 上限', unit: '%', hint: '波动过大不参与' },
   min_24h_quote_volume: { label: '24H 最小成交额', unit: 'USDT' },
-  sl_atr_mult: { label: '止损 = ATR ×' },
-  tp_atr_mult: { label: '止盈 = ATR ×' },
-  min_risk_reward: { label: '最小盈亏比', unit: 'R', hint: '止盈距离至少为止损的 N 倍；2.0=至少 2R，低于 1 扣费后通常为负期望' },
+
   trailing_pct: { label: '移动止损回撤', unit: '%', hint: '保证金收益率回撤；价格回撤 = 该值 ÷ 杠杆，0 表示关闭' },
   trailing_arm_r: { label: '移动止损激活', unit: 'R', hint: '浮盈先走到 N 倍风险才让移动止损接管，否则会在止损前被噪声扫掉（实盘 24 笔全亏的根因）' },
   breakeven_at_r: { label: '保本触发', unit: 'R', hint: '浮盈达到该 R 倍数后止损上移到开仓价' },
@@ -433,8 +430,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: '最大杠杆', group: 'risk', key: 'max_leverage' },
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
   { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },
-  { label: '止损 ATR', group: 'strategy', key: 'sl_atr_mult' },
-  { label: '止盈 ATR', group: 'strategy', key: 'tp_atr_mult' },
+
   { label: '点差闸门', group: 'strategy', key: 'max_spread_bps' },
   { label: '手续费率', group: 'risk', key: 'fee_rate_taker' },
 ]

@@ -86,7 +86,7 @@ pub(crate) fn apply_review(
     if !proposal.leverage.is_finite() || proposal.leverage <= 0.0 {
         return Err(ReviewError::new("原始杠杆无效", "reject"));
     }
-    if !proposal.stop_price.is_finite() || proposal.stop_price <= 0.0 {
+    if !proposal.stop_price.is_finite() || proposal.stop_price < 0.0 {
         return Err(ReviewError::new("原始止损价无效", "reject"));
     }
     let Some(reviewer) = reviewer else {
@@ -94,6 +94,12 @@ pub(crate) fn apply_review(
             return Err(ReviewError::new(
                 "AI 复核不可用，按 fail-closed 跳过",
                 "none",
+            ));
+        }
+        if proposal.stop_price <= 0.0 || proposal.take_profit <= 0.0 {
+            return Err(ReviewError::new(
+                "缺少有效止损/止盈价，无法开仓",
+                "reject",
             ));
         }
         return Ok(ReviewedEntry {
@@ -137,6 +143,26 @@ fn apply_decision(
     if !take_profit.is_finite() || take_profit <= 0.0 {
         return Err(ReviewError::new("AI 返回的止盈价无效", "reject"));
     }
+    // AI 可以给出任意有效的止损价；没有给时才回退到仓位止盈止损率计算出的默认价。
+    let stop_price = match decision.stop_price {
+        Some(stop) if !stop.is_finite() || stop <= 0.0 => {
+            return Err(ReviewError::new("AI 返回的止损价无效", "reject"))
+        }
+        Some(stop) => stop,
+        None if side == proposal.side && proposal.stop_price > 0.0 => proposal.stop_price,
+        None if proposal.stop_price > 0.0 => {
+            let distance = (proposal.mark_price - proposal.stop_price).abs();
+            if side == "long" {
+                proposal.mark_price - distance
+            } else {
+                proposal.mark_price + distance
+            }
+        }
+        None => return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject")),
+    };
+    if !stop_price.is_finite() || stop_price <= 0.0 {
+        return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject"));
+    }
     let confidence = decision.confidence;
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
@@ -146,7 +172,7 @@ fn apply_decision(
                 decision.leverage.filter(|v| v.is_finite() && *v > 0.0),
             )
             .map_err(|error| ReviewError::new(error, "reject"))?,
-            stop_price: proposal.stop_price,
+            stop_price,
             take_profit,
             reason: decision.reason,
             action: action_for(&side),
@@ -173,23 +199,6 @@ fn apply_decision(
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
                 .map_err(|error| ReviewError::new(error, "reject"))?;
-            let stop_price = match decision.stop_price {
-                Some(stop) if !stop.is_finite() || stop <= 0.0 => {
-                    return Err(ReviewError::new("AI 返回的止损价无效", "reject"))
-                }
-                Some(stop) if side != proposal.side => stop,
-                Some(stop) if side == "long" => stop.max(proposal.stop_price),
-                Some(stop) => stop.min(proposal.stop_price),
-                None if side == proposal.side => proposal.stop_price,
-                None => {
-                    let distance = (proposal.mark_price - proposal.stop_price).abs();
-                    if side == "long" {
-                        proposal.mark_price - distance
-                    } else {
-                        proposal.mark_price + distance
-                    }
-                }
-            };
             Ok(ReviewedEntry {
                 side: side.clone(),
                 leverage,
@@ -262,7 +271,7 @@ mod tests {
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
-        assert_eq!(reviewed.stop_price, 95.0, "AI 只能收紧多单止损");
+        assert_eq!(reviewed.stop_price, 90.0, "AI 给出的止损价直接生效");
 
         let raised = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,

@@ -49,8 +49,7 @@ const pnlClass = (v: number) => (v > 0 ? 'up' : v < 0 ? 'down' : 'flat')
 // ---------------------------------------------------------------- 参数网格
 const gridForm = ref({
   entry_threshold: '0.2, 0.3, 0.4',
-  sl_atr_mult: '1.0, 1.2, 1.5',
-  tp_atr_mult: '',
+
   trailing_pct: '',
 })
 const gridRunning = ref(false)
@@ -124,11 +123,9 @@ async function runGrid() {
     funding_bps_8h: form.value.funding_bps_8h,
     initial_equity: form.value.initial_equity,
     entry_threshold: parseList(gridForm.value.entry_threshold),
-    sl_atr_mult: parseList(gridForm.value.sl_atr_mult),
-    tp_atr_mult: parseList(gridForm.value.tp_atr_mult),
     trailing_pct: parseList(gridForm.value.trailing_pct),
   }
-  if (!payload.entry_threshold.length && !payload.sl_atr_mult.length && !payload.tp_atr_mult.length && !payload.trailing_pct.length) {
+  if (!payload.entry_threshold.length && !payload.trailing_pct.length) {
     gridError.value = '至少填写一个参数的一组取值（逗号分隔）'
     return
   }
@@ -165,13 +162,11 @@ async function runWalkforward() {
     funding_bps_8h: form.value.funding_bps_8h,
     initial_equity: form.value.initial_equity,
     entry_threshold: parseList(gridForm.value.entry_threshold),
-    sl_atr_mult: parseList(gridForm.value.sl_atr_mult),
-    tp_atr_mult: parseList(gridForm.value.tp_atr_mult),
     trailing_pct: parseList(gridForm.value.trailing_pct),
     folds: wfForm.value.folds,
     train_bars: wfForm.value.train_bars,
   }
-  if (!payload.entry_threshold.length && !payload.sl_atr_mult.length && !payload.tp_atr_mult.length && !payload.trailing_pct.length) {
+  if (!payload.entry_threshold.length && !payload.trailing_pct.length) {
     wfError.value = '至少填写一个参数的一组取值（与上方参数网格共用）'
     return
   }
@@ -518,14 +513,7 @@ onMounted(async () => {
             <input v-model="gridForm.entry_threshold" class="input mono" placeholder="0.2, 0.3, 0.4" />
           </label>
           <label class="field">
-            <span class="label">止损 ATR 倍数</span>
-            <input v-model="gridForm.sl_atr_mult" class="input mono" placeholder="1.0, 1.2, 1.5" />
-          </label>
-          <label class="field">
-            <span class="label">止盈 ATR 倍数</span>
-            <input v-model="gridForm.tp_atr_mult" class="input mono" placeholder="1.5, 2.0, 2.5" />
-          </label>
-          <label class="field">
+
             <span class="label">移动止损 %（保证金）</span>
             <input v-model="gridForm.trailing_pct" class="input mono" placeholder="0.6, 0.8" />
           </label>

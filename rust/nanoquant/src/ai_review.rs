@@ -773,7 +773,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     #[test]
-    fn wider_ai_stop_is_not_used_for_an_agree_decision() {
+    fn ai_stop_is_used_for_an_agree_decision() {
         let wider = ai_client::Decision {
             action: "open_long".to_string(),
             confidence: 0.9,
@@ -803,7 +803,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         let clamped =
             crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
         assert_eq!(clamped.leverage, 2.0, "AI 未给杠杆时取全局下限");
-        assert_eq!(clamped.stop_price, 95.0, "更宽的 AI 止损不能被主机采纳");
+        assert_eq!(clamped.stop_price, 90.0, "AI 给出的止损价直接生效");
     }
 
     #[test]

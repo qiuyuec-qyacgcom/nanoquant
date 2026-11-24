@@ -1694,8 +1694,8 @@ mod tests {
         let keys = [
             "entry_threshold",
             "exit_threshold",
-            "sl_atr_mult",
-            "tp_atr_mult",
+            "roi_min_r",
+            "trailing_pct",
         ];
         let patch: Vec<ParamUpdate> = keys
             .iter()
@@ -1846,11 +1846,11 @@ mod tests {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
         let mut active = seeded_snapshot(&conn, "range");
-        active["sl_atr_mult"] = json!(2.0);
+        active["trailing_pct"] = json!(2.0);
 
         let patch = [
-            param_update("sl_atr_mult", json!(2.4)),
-            param_update("sl_atr_mult", json!(2.9)),
+            param_update("trailing_pct", json!(2.4)),
+            param_update("trailing_pct", json!(2.9)),
         ];
         assert!(
             validate_candidate(&active, &patch).is_err(),

@@ -440,9 +440,9 @@ impl<'a> Sim<'a> {
             let direction = direction_of(signal.side);
             let next = self.bars[index + 1];
             let entry = fill_price(next.open, self.slip_bps(), direction, true);
-            let sl_pct = ((bar.close - signal.stop_price) / bar.close * 100.0).abs();
-            let tp_pct = ((signal.take_profit - bar.close) / bar.close * 100.0).abs();
-            if sl_pct <= 0.0 || entry <= 0.0 {
+            let sl_pct = self.config.manage.global_stop_loss_pct / leverage;
+            let tp_pct = self.config.manage.global_take_profit_pct / leverage;
+            if sl_pct <= 0.0 || tp_pct <= 0.0 || entry <= 0.0 {
                 continue;
             }
             // 仓位只由单仓保证金占比决定：名义额 = 权益 × margin_pct% × 杠杆。
@@ -780,8 +780,7 @@ fn apply_params(config: &mut EngineConfig, params: &[(&'static str, f64)]) {
     for (key, value) in params {
         match *key {
             "entry_threshold" => config.policy.base_threshold = *value,
-            "sl_atr_mult" => config.policy.sl_atr_mult = *value,
-            "tp_atr_mult" => config.policy.tp_atr_mult = *value,
+
             "trailing_pct" => config.manage.trailing_pct = *value,
             _ => {}
         }
@@ -920,12 +919,7 @@ pub fn run_walkforward(
         let Some(best) = searched.get("best").filter(|value| !value.is_null()) else {
             continue;
         };
-        let params: Vec<(&'static str, f64)> = [
-            "entry_threshold",
-            "sl_atr_mult",
-            "tp_atr_mult",
-            "trailing_pct",
-        ]
+        let params: Vec<(&'static str, f64)> = ["entry_threshold", "trailing_pct"]
         .iter()
         .filter_map(|key| {
             best["params"]
@@ -1403,9 +1397,7 @@ mod tests {
                 volume_ratio_min: 0.0,
                 atr_pct_min: 0.05,
                 atr_pct_max: 4.0,
-                sl_atr_mult: 1.0,
-                tp_atr_mult: 10.0,
-                min_risk_reward: 0.5,
+
             },
             manage: ManageConfig {
                 partial_tp_at_r: 1.0,
@@ -1414,8 +1406,8 @@ mod tests {
                 trailing_arm_r: 1.5,
                 exit_threshold: 0.6,
                 breakeven_at_r: 1.0,
-                global_stop_loss_pct: 0.0,
-                global_take_profit_pct: 0.0,
+                global_stop_loss_pct: 10.0,
+                global_take_profit_pct: 20.0,
                 qty_step: 0.001,
                 min_qty: 0.001,
                 roi_min_r: 0.0,
@@ -1501,8 +1493,7 @@ mod tests {
 
     #[test]
     fn partial_take_profit_is_recorded_and_moves_stop_to_breakeven() {
-        let mut cfg = config();
-        cfg.policy.tp_atr_mult = 20.0;
+        let cfg = config();
         let result = run(&trending_bars(400), &cfg).unwrap();
         assert!(
             result.count("partial_tp_count") >= 1,
@@ -1540,11 +1531,10 @@ mod tests {
 
     #[test]
     fn grid_rejects_more_than_the_run_cap() {
-        let values: Vec<f64> = (0..5).map(|index| 0.1 + index as f64 * 0.1).collect();
+        let values: Vec<f64> = (0..7).map(|index| 0.1 + index as f64 * 0.1).collect();
         let error = grid_combinations(&[
             ("entry_threshold", values.clone()),
-            ("sl_atr_mult", values.clone()),
-            ("tp_atr_mult", values),
+            ("trailing_pct", values),
         ])
         .unwrap_err();
         assert!(error.contains("超过上限"));
@@ -1560,7 +1550,7 @@ mod tests {
     fn grid_rows_are_comparable_and_share_the_same_metric_columns() {
         let mut cfg = config();
         cfg.manage.partial_tp_at_r = 0.0;
-        cfg.policy.tp_atr_mult = 1.0;
+
         let result = run_grid(
             &trending_bars(400),
             &cfg,
@@ -1595,17 +1585,15 @@ mod tests {
 
     #[test]
     fn walkforward_exposes_in_sample_out_sample_and_gap() {
-        let bars = trending_bars(400);
+let bars = trending_bars(1200);
         let mut cfg = config();
         cfg.manage.partial_tp_at_r = 0.0;
-        cfg.policy.tp_atr_mult = 1.0;
-        cfg.policy.sl_atr_mult = 0.5;
         let result = run_walkforward(
             &bars,
             &cfg,
             &[("entry_threshold", vec![0.05, 0.1])],
             2,
-            120,
+            600,
             &AtomicBool::new(false),
         )
         .unwrap();
