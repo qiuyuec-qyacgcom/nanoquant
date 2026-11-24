@@ -88,14 +88,14 @@
                   <div class="right"><span class="tag">每仓</span></div>
                 </div>
                 <div class="field-row">
-                  <div><div class="field-label">全局止损率</div><div class="field-hint">价格相对开仓价不利变动达到该比例，整仓平仓</div></div>
+                  <div><div class="field-label">全局止损率</div><div class="field-hint">保证金亏损达到该比例，整仓平仓（价格距离 = 该值 ÷ 杠杆）</div></div>
                   <div><input class="input gold" value="2.0" /><div class="field-hint">% · 0 = 关闭</div></div>
                 </div>
                 <div class="field-row">
-                  <div><div class="field-label">全局止盈率</div><div class="field-hint">价格相对开仓价有利变动达到该比例，整仓平仓</div></div>
+                  <div><div class="field-label">全局止盈率</div><div class="field-hint">保证金盈利达到该比例，整仓平仓（价格距离 = 该值 ÷ 杠杆）</div></div>
                   <div><input class="input gold" value="6.0" /><div class="field-hint">% · 0 = 关闭</div></div>
                 </div>
-                <div style="padding:0 16px 13px"><div class="savebar" style="padding:9px 11px"><span class="dot" style="color:var(--gold)"></span>按开仓价涨跌幅计算，优先于 ATR 止损与部分止盈</div></div>
+                <div style="padding:0 16px 13px"><div class="savebar" style="padding:9px 11px"><span class="dot" style="color:var(--gold)"></span>按仓位保证金收益率计算，优先于 ATR 止损与部分止盈</div></div>
               </div>
 
               <div class="card">

@@ -168,7 +168,7 @@ impl Default for SignalSettings {
             max_per_hour: 6,
             auto_add_symbol: true,
             strict_events: false,
-            default_sl_pct: 1.2,
+            default_sl_pct: 10.0,
             sizing_mode: "margin_pct".to_string(),
             margin_pct_override: 0.0,
             dry_run: true,

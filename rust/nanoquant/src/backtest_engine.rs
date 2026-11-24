@@ -292,6 +292,26 @@ impl<'a> Sim<'a> {
                     continue;
                 }
 
+                // 全局止盈止损按保证金收益率，优先于 ATR 止损/止盈（与实盘 manage 同序）。
+                let bar_margin_pct = if entry > 0.0 {
+                    (bar.close - entry) * direction / entry * 100.0
+                        * self.config.leverage.max(1.0)
+                } else {
+                    0.0
+                };
+                if self.config.manage.global_stop_loss_pct > 0.0
+                    && bar_margin_pct <= -self.config.manage.global_stop_loss_pct
+                {
+                    self.close_position(bar.close, index, "global_stop_loss");
+                    continue;
+                }
+                if self.config.manage.global_take_profit_pct > 0.0
+                    && bar_margin_pct >= self.config.manage.global_take_profit_pct
+                {
+                    self.close_position(bar.close, index, "global_take_profit");
+                    continue;
+                }
+
                 if stop_price > 0.0
                     && ((direction > 0.0 && bar.low <= stop_price)
                         || (direction < 0.0 && bar.high >= stop_price))
@@ -366,7 +386,9 @@ impl<'a> Sim<'a> {
                     } else {
                         0.0
                     };
-                    if target > 0.0 && profit_pct >= target {
+                    // ROI 阶梯按保证金收益率，与实盘 manage 同口径。
+                    let margin_pct = profit_pct * self.config.leverage.max(1.0);
+                    if target > 0.0 && margin_pct >= target {
                         self.close_position(bar.close, index, "roi");
                         continue;
                     }

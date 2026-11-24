@@ -62,7 +62,7 @@ const PLAIN_HINTS: Record<string, string> = {
   breakeven_at_r: '浮盈达到初始止损距离的几倍时，把止损移到开仓价',
   partial_tp_at_r: '浮盈达到初始止损距离的几倍时，先平掉一部分仓位；0=关闭',
   partial_tp_ratio: '部分止盈先平掉几成仓位（0.5 = 平一半）',
-  roi_table: '按盈利百分比自动平仓：每档填「持仓分钟 + 价格涨到百分之几就全平」，可增删档位自行配比；清空=关闭',
+  roi_table: '按保证金收益率自动平仓：每档填「持仓分钟 + 保证金赚到百分之几就全平」，可增删档位自行配比；清空=关闭',
   max_spread_bps: '买卖价差超过该值就放弃；短线建议 5–12bps',
   min_notional_buffer: '交易所最小下单额的倍数，防止下单被拒',
   fee_rate_taker: '吃单手续费率，0.0005 = 0.05%',
@@ -180,7 +180,7 @@ const BASE_META: Record<string, FieldMeta> = {
   roi_table: {
     label: '时间阶梯止盈',
     widget: 'roi',
-    hint: '按盈利百分比自动平仓：每档填「持仓分钟 + 价格涨到百分之几就全平」，可增删档位自行配比',
+    hint: '按保证金收益率自动平仓：每档填「持仓分钟 + 保证金赚到百分之几就全平」，可增删档位自行配比',
   },
 
   live_base_url: { label: '实盘域名', hint: '币安 U 本位主网 fapi 地址' },
@@ -868,7 +868,7 @@ function applyJson(key: string) {
   }
 }
 
-/** 阶梯止盈：两列档位编辑器，保存时仍是 [[分钟, 收益率%], ...] */
+/** 阶梯止盈：两列档位编辑器，保存时仍是 [[分钟, 保证金收益率%], ...] */
 function roiRows(key: string): number[][] {
   const raw = draft.value[key]
   return Array.isArray(raw) ? raw.map((r: any) => [Number(r?.[0] ?? 0), Number(r?.[1] ?? 0)]) : []
