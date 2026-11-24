@@ -86,7 +86,7 @@ async fn add_symbol(
 }
 
 /// 把一只已知的币安合约写入标的池。`symbol` 必须存在于 `contracts` 且当前可交易；
-/// 调用方负责池上限与重复检查（`upsert` 供事务内自动扫描复用，冲突时刷新合约规格）。
+/// 调用方负责池上限与重复检查。函数只做纯插入，主键冲突由 SQLite 报错，绝不改动既有行。
 pub(crate) fn upsert_contract_row_conn(
     conn: &rusqlite::Connection,
     contracts: &[Value],
@@ -128,8 +128,7 @@ pub(crate) fn upsert_contract_row_conn(
         )
         .unwrap_or(1);
     conn.execute(
-        "INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12) \
-         ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,tier=excluded.tier,sl_atr_mult=excluded.sl_atr_mult,enabled=excluded.enabled,max_leverage=excluded.max_leverage,precision=excluded.precision,tick_sz=excluded.tick_sz,min_sz=excluded.min_sz,min_notional=excluded.min_notional,ct_val=excluded.ct_val,min_score=excluded.min_score,note=excluded.note,updated_at=excluded.updated_at",
+        "INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,1,0,?10,?11,?12,?12)",
         rusqlite::params![symbol, row["name"].as_str().unwrap_or(symbol), row["tier"].as_str().unwrap_or("tier_2_momentum"), row["sl_atr_mult"].as_f64().unwrap_or(2.2), row["max_leverage"].as_i64().unwrap_or(20), row["precision"].as_i64().unwrap_or(3), row["tick_sz"].as_str().unwrap_or("0.0001"), row["min_sz"].as_str().unwrap_or("0.001"), row["min_notional"].as_f64().unwrap_or(5.0), note, order, crate::now()],
     )
     .map_err(|_| "标的写入失败".to_string())?;
@@ -685,10 +684,16 @@ mod tests {
 
     #[test]
     fn upsert_contract_row_inserts_known_contract() {
-        let db = seed(&std::env::temp_dir().join("nq-symbol-scan-upsert.db"));
-        let contracts = vec![contract("BTCUSDT", "PERPETUAL", "TRADING", "USDT")];
-        let row = upsert_contract_row(&db, &contracts, "BTCUSDT").unwrap();
-        assert_eq!(row["symbol"], "BTCUSDT");
+        let path = std::env::temp_dir().join("nq-symbol-scan-upsert.db");
+        let db = seed(&path);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM trading_symbols", [])
+            .unwrap();
+        let contracts = vec![contract("ETHUSDT", "PERPETUAL", "TRADING", "USDT")];
+        let row = upsert_contract_row(&db, &contracts, "ETHUSDT").unwrap();
+        assert_eq!(row["symbol"], "ETHUSDT");
         assert_eq!(row["enabled"], true);
         assert_eq!(row["custom"], false);
         let count: i64 = db
@@ -698,6 +703,37 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM trading_symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_contract_row_does_not_overwrite_existing_configuration() {
+        let path = std::env::temp_dir().join("nq-symbol-scan-upsert-conflict.db");
+        let db = seed(&path);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE trading_symbols SET enabled=0, min_score=9 WHERE symbol='BTCUSDT'",
+                [],
+            )
+            .unwrap();
+        let contracts = vec![contract("BTCUSDT", "PERPETUAL", "TRADING", "USDT")];
+        let err = upsert_contract_row(&db, &contracts, "BTCUSDT").unwrap_err();
+        assert!(err.contains("写入失败"), "主键冲突必须报错，实际错误：{err}");
+        let (enabled, min_score): (i64, f64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT enabled, min_score FROM trading_symbols WHERE symbol='BTCUSDT'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0, "冲突不能把用户手动禁用的标的重新启用");
+        assert_eq!(min_score, 9.0, "冲突不能覆盖既有评分门槛");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
