@@ -11,6 +11,7 @@ import { http } from '../api/client'
 import Modal from '../components/Modal.vue'
 import { useAppStore } from '../stores/app'
 import { fmt, timeStr } from '../utils/format'
+import { deleteReason, keepRest, resultCount, scanCounts, skippedText } from '../utils/symbolScan'
 
 interface PoolRow {
   symbol: string
@@ -77,21 +78,14 @@ const scanError = ref('')
 const requiredPhrase = computed(() => (pendingDelete.value ? `REMOVE ${pendingDelete.value.symbol}` : ''))
 const canDelete = computed(() => phrase.value.trim().toUpperCase() === requiredPhrase.value)
 const full = computed(() => count.value >= limits.maximum)
-/** 上次扫描结果字段兼容数组与数字两种形状，缺失或非法值一律按 0。 */
-function resultCount(value: unknown): number {
-  if (Array.isArray(value)) return value.length
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  return 0
-}
-const lastScan = computed(() => {
-  const result = scan.value?.last_result
-  return {
-    scanned: resultCount(result?.scanned),
-    candidates: resultCount(result?.candidates),
-    replaced: resultCount(result?.delete),
-    kept: resultCount(result?.keep),
-  }
-})
+const lastScan = computed(() => scanCounts(scan.value?.last_result))
+const planKeepRest = computed(() =>
+  keepRest(scanPlan.value?.keep, scanPlan.value?.held, scanPlan.value?.suspended),
+)
+/** dry-run 阶段两路跳过名单都为 null，此时只提示一次「执行时二次检查」。 */
+const skipPending = computed(
+  () => scanPlan.value?.delete_skipped == null && scanPlan.value?.add_skipped == null,
+)
 const normalized = computed(() => {
   const cleaned = Array.from(keyword.value.trim())
     .filter((ch) => /[\p{L}\p{N}]/u.test(ch))
@@ -115,6 +109,7 @@ async function loadPool() {
     state.detail = res.state?.detail || ''
     scan.value = res.scan || null
     envLabel.value = app.status?.env_label || ''
+    scanError.value = ''
   } catch (err: any) {
     app.notify(err.message, 'error')
   } finally {
@@ -123,6 +118,7 @@ async function loadPool() {
 }
 
 async function runScan(apply: boolean) {
+  if (scanning.value) return
   scanning.value = true
   scanError.value = ''
   try {
@@ -131,13 +127,27 @@ async function runScan(apply: boolean) {
       showScanPlan.value = false
       scanPlan.value = null
       await loadPool()
-      app.notify(`已替换 ${res.delete?.length || 0} 个，新增 ${res.add?.length || 0} 个`, 'ok')
+      const skipped = resultCount(res.delete_skipped) + resultCount(res.add_skipped)
+      app.notify(
+        `已替换 ${resultCount(res.delete)} 个，新增 ${resultCount(res.add)} 个，跳过 ${skipped} 个`,
+        'ok',
+      )
     } else {
       scanPlan.value = res
       showScanPlan.value = true
     }
   } catch (err: any) {
-    scanError.value = err?.message || '扫描失败'
+    if (apply && err?.status === 0) {
+      // 超时/网络中断时服务端可能已经执行：先刷新，再让用户核对「上次扫描」
+      try {
+        await loadPool()
+      } catch {
+        // 刷新失败不覆盖原错误
+      }
+      scanError.value = '执行结果未知，请核对上方「上次扫描」数据'
+    } else {
+      scanError.value = err?.message || '扫描失败'
+    }
     app.notify(scanError.value, 'error')
   } finally {
     scanning.value = false
@@ -150,26 +160,6 @@ function closeScanPlan() {
   scanPlan.value = null
 }
 
-/** 删除原因兼容两种形状：`{symbol, reason}` 对象与 `[symbol, reason]` 数组。 */
-function deleteReason(symbol: string): string {
-  const reasons = scanPlan.value?.delete_reasons
-  if (!Array.isArray(reasons)) return ''
-  for (const entry of reasons) {
-    if (Array.isArray(entry)) {
-      if (entry[0] === symbol) return String(entry[1] ?? '')
-    } else if (entry && entry.symbol === symbol) {
-      return String(entry.reason ?? '')
-    }
-  }
-  return ''
-}
-
-/** 执行后才知道的跳过名单：dry-run 阶段为 null，表示要等真正执行时才二次检查。 */
-function skippedText(value: unknown): string {
-  if (value === null || value === undefined) return '仅执行时检查'
-  if (Array.isArray(value) && value.length) return value.join('、')
-  return '无'
-}
 
 async function search() {
   const q = keyword.value.trim()
@@ -368,7 +358,7 @@ onMounted(loadPool)
             上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '尚未扫描' }}
             <template v-if="scan?.last_run_ts">
               · 扫描 {{ lastScan.scanned }} 个 · 候选 {{ lastScan.candidates }} 个 · 替换
-              {{ lastScan.replaced }} 个 · 保留 {{ lastScan.kept }} 个
+              {{ lastScan.deleted }} 个 · 跳过 {{ lastScan.skipped }} 个 · 保留 {{ lastScan.kept }} 个
             </template>
           </span>
           <span v-if="scanError" class="scan-error">{{ scanError }}</span>
@@ -461,7 +451,7 @@ onMounted(loadPool)
           <div v-if="scanPlan.delete?.length" class="scan-list">
             <span v-for="symbol in scanPlan.delete" :key="symbol" class="scan-item">
               <b class="mono">{{ symbol }}</b>
-              <span v-if="deleteReason(symbol)" class="scan-reason">{{ deleteReason(symbol) }}</span>
+              <span v-if="deleteReason(scanPlan, symbol)" class="scan-reason">{{ deleteReason(scanPlan, symbol) }}</span>
             </span>
           </div>
           <div v-else class="hint">无</div>
@@ -478,9 +468,9 @@ onMounted(loadPool)
         </div>
 
         <div class="scan-row">
-          <div class="scan-row-hd">保留（{{ scanPlan.keep?.length || 0 }}）</div>
-          <div v-if="scanPlan.keep?.length" class="scan-list">
-            <span v-for="symbol in scanPlan.keep" :key="symbol" class="scan-item">
+          <div class="scan-row-hd">保留（其余）· {{ planKeepRest.length }} 个</div>
+          <div v-if="planKeepRest.length" class="scan-list">
+            <span v-for="symbol in planKeepRest" :key="symbol" class="scan-item">
               <b class="mono">{{ symbol }}</b>
             </span>
           </div>
@@ -509,7 +499,10 @@ onMounted(loadPool)
 
         <div class="scan-row">
           <div class="scan-row-hd">跳过</div>
-          <div class="scan-skipped">
+          <div v-if="skipPending" class="scan-skipped">
+            <span>跳过项将在执行时二次检查</span>
+          </div>
+          <div v-else class="scan-skipped">
             <span>删除跳过：{{ skippedText(scanPlan.delete_skipped) }}</span>
             <span>新增跳过：{{ skippedText(scanPlan.add_skipped) }}</span>
           </div>
@@ -519,6 +512,9 @@ onMounted(loadPool)
           计划仅为预览，不会自动执行。确认后将按上述替换/新增写入标的池；执行时会再次检查持仓与合约可用性，
           被跳过的标的会保留在原池。
         </div>
+      </div>
+      <div v-if="scanError" class="scan-error scan-error-inline" role="alert" aria-live="assertive">
+        {{ scanError }}
       </div>
       <template #footer>
         <button class="btn btn-sm" :disabled="scanning" @click="closeScanPlan">取消</button>
@@ -535,14 +531,27 @@ onMounted(loadPool)
   flex-wrap: wrap;
   row-gap: 6px;
 }
+.scan-hd .right {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 .scan-meta {
   font-size: 10.5px;
   color: var(--muted);
-  white-space: nowrap;
+  white-space: normal;
 }
 .scan-error {
   font-size: 11px;
   color: var(--warn);
+}
+.scan-error-inline {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--warn);
+  background: rgba(255, 176, 32, 0.1);
+  line-height: 1.6;
+  text-align: left;
 }
 .scan-plan {
   max-height: 60vh;
