@@ -18,7 +18,7 @@ pub(crate) struct ParamMeta {
 pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
 
 /// 组级黑名单：即使整组对 AI 不可见也不得写入，避免新组默认变成可写。
-const AI_BLOCKED_GROUPS: &[&str] = &["parameter_set", "risk"];
+const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
 const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
@@ -75,17 +75,17 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
-    ("parameter_set", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
+    ("ai_tuning", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
     (
-        "parameter_set",
+        "ai_tuning",
         "no_candidate_rollback_sec",
         60.0,
         86400.0,
         60.0,
     ),
-    ("parameter_set", "regime_confirm_sec", 60.0, 86400.0, 60.0),
-    ("parameter_set", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
-    ("parameter_set", "min_oos_trades", 1.0, 1000.0, 1.0),
+    ("ai_tuning", "regime_confirm_sec", 60.0, 86400.0, 60.0),
+    ("ai_tuning", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
+    ("ai_tuning", "min_oos_trades", 1.0, 1000.0, 1.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
     ("ai", "param_tuning_min_interval_sec", 60.0, 604800.0, 60.0),
     ("ai", "max_calls_per_hour", 1.0, 10000.0, 1.0),
@@ -166,7 +166,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "parameter_set",
+        "ai_tuning",
         &[
             "enabled",
             "auto_apply",
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn parameter_set_group_is_visible_but_ai_blocked() {
         let value = crate::param_registry::catalog();
-        let group = &value["groups"]["parameter_set"];
+        let group = &value["groups"]["ai_tuning"];
         assert_eq!(group["writable"], serde_json::json!([]));
         for key in [
             "enabled",
@@ -611,6 +611,6 @@ mod tests {
         );
         assert_eq!(ai_bounds("risk", "max_leverage"), None);
         assert_eq!(ai_bounds("strategy", "ema_fast"), None);
-        assert_eq!(ai_bounds("parameter_set", "min_oos_trades"), None);
+        assert_eq!(ai_bounds("ai_tuning", "min_oos_trades"), None);
     }
 }

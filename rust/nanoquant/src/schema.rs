@@ -131,6 +131,7 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport, String> {
             }
         }
         backfill_sort_order(conn)?;
+        migrate_ai_tuning_names(conn)?;
         ensure_parameter_changes(conn)?;
         ensure_parameter_sets(conn)?;
         normalize_ai_tuning_interval(conn)?;
@@ -153,21 +154,78 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
 }
 
+/// 旧版「参数集」命名迁移到「AI 调参」：表、索引、配置键、事件分类与状态键一次迁移完。
+fn migrate_ai_tuning_names(conn: &Connection) -> Result<(), String> {
+    if table_exists(conn, "parameter_sets")? && !table_exists(conn, "ai_tuning_sets")? {
+        conn.execute_batch("ALTER TABLE parameter_sets RENAME TO ai_tuning_sets;")
+            .map_err(|e| format!("迁移 ai_tuning_sets 失败: {e}"))?;
+    }
+    if table_exists(conn, "parameter_set_activations")?
+        && !table_exists(conn, "ai_tuning_activations")?
+    {
+        conn.execute_batch("ALTER TABLE parameter_set_activations RENAME TO ai_tuning_activations;")
+            .map_err(|e| format!("迁移 ai_tuning_activations 失败: {e}"))?;
+    }
+    if table_exists(conn, "ai_tuning_sets")? {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS ix_parameter_sets_active_regime; \
+             DROP INDEX IF EXISTS ix_parameter_sets_regime_status; \
+             CREATE UNIQUE INDEX IF NOT EXISTS ix_ai_tuning_sets_active_regime \
+             ON ai_tuning_sets(regime) WHERE status='active'; \
+             CREATE INDEX IF NOT EXISTS ix_ai_tuning_sets_regime_status \
+             ON ai_tuning_sets(regime,status);",
+        )
+        .map_err(|e| format!("重建 ai_tuning_sets 索引失败: {e}"))?;
+    }
+    if table_exists(conn, "ai_tuning_activations")? {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS ix_parameter_set_activations_ts; \
+             DROP INDEX IF EXISTS ix_parameter_set_activations_set_id; \
+             CREATE INDEX IF NOT EXISTS ix_ai_tuning_activations_ts ON ai_tuning_activations(ts); \
+             CREATE INDEX IF NOT EXISTS ix_ai_tuning_activations_set_id ON ai_tuning_activations(set_id);",
+        )
+        .map_err(|e| format!("重建 ai_tuning_activations 索引失败: {e}"))?;
+    }
+    if table_exists(conn, "app_settings")? {
+        conn.execute(
+            "UPDATE OR IGNORE app_settings SET key='ai_tuning' WHERE key='parameter_set'",
+            [],
+        )
+        .map_err(|e| format!("迁移 ai_tuning 配置键失败: {e}"))?;
+    }
+    if table_exists(conn, "engine_events")? {
+        conn.execute(
+            "UPDATE engine_events SET category='ai_tuning' WHERE category='parameter_set'",
+            [],
+        )
+        .map_err(|e| format!("迁移 ai_tuning 事件分类失败: {e}"))?;
+    }
+    if table_exists(conn, "engine_state")? {
+        conn.execute(
+            "UPDATE engine_state SET key=replace(key,'parameter_set.','ai_tuning.') \
+             WHERE key LIKE 'parameter_set.%'",
+            [],
+        )
+        .map_err(|e| format!("迁移 ai_tuning 状态键失败: {e}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_parameter_sets(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS parameter_sets(\
+        "CREATE TABLE IF NOT EXISTS ai_tuning_sets(\
          id INTEGER PRIMARY KEY, name TEXT NOT NULL, regime TEXT NOT NULL, timeframe TEXT NOT NULL, \
          version INTEGER NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, \
          evidence TEXT NOT NULL DEFAULT '{}', parent_id INTEGER, created_at INTEGER NOT NULL, activated_at INTEGER); \
-         CREATE UNIQUE INDEX IF NOT EXISTS ix_parameter_sets_active_regime ON parameter_sets(regime) WHERE status='active'; \
-         CREATE INDEX IF NOT EXISTS ix_parameter_sets_regime_status ON parameter_sets(regime,status); \
-         CREATE TABLE IF NOT EXISTS parameter_set_activations(\
+         CREATE UNIQUE INDEX IF NOT EXISTS ix_ai_tuning_sets_active_regime ON ai_tuning_sets(regime) WHERE status='active'; \
+         CREATE INDEX IF NOT EXISTS ix_ai_tuning_sets_regime_status ON ai_tuning_sets(regime,status); \
+         CREATE TABLE IF NOT EXISTS ai_tuning_activations(\
          id INTEGER PRIMARY KEY, set_id INTEGER NOT NULL, regime TEXT NOT NULL, previous_set_id INTEGER, \
          ts INTEGER NOT NULL, trigger TEXT NOT NULL); \
-         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_ts ON parameter_set_activations(ts); \
-         CREATE INDEX IF NOT EXISTS ix_parameter_set_activations_set_id ON parameter_set_activations(set_id);",
+         CREATE INDEX IF NOT EXISTS ix_ai_tuning_activations_ts ON ai_tuning_activations(ts); \
+         CREATE INDEX IF NOT EXISTS ix_ai_tuning_activations_set_id ON ai_tuning_activations(set_id);",
     )
-    .map_err(|e| format!("建表 parameter_sets 失败: {e}"))?;
+    .map_err(|e| format!("建表 ai_tuning_sets 失败: {e}"))?;
     if !column_exists(conn, "parameter_changes", "set_id")? {
         conn.execute_batch("ALTER TABLE parameter_changes ADD COLUMN set_id INTEGER;")
             .map_err(|e| format!("补列 parameter_changes.set_id 失败: {e}"))?;

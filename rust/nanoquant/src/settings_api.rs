@@ -35,7 +35,7 @@ const GROUPS: [&str; 14] = [
     "engine",
     "risk",
     "strategy",
-    "parameter_set",
+    "ai_tuning",
     "ai",
     "data",
     "news",
@@ -236,7 +236,7 @@ async fn write_group(
     deep_merge(&mut candidate, &stored(&conn, &group));
     deep_merge(&mut candidate, &Value::Object(body.patch.clone()));
     drop_removed_keys(&group, &mut candidate);
-    if group == "parameter_set" {
+    if group == "ai_tuning" {
         if let Some(timeframes) = candidate.get_mut("auto_apply_timeframes") {
             if let Some(text) = timeframes.as_str() {
                 *timeframes = json!(text.trim().to_ascii_lowercase());
@@ -554,7 +554,7 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
             continue;
         };
         if candidate.is_null() {
-            if group == "parameter_set" {
+            if group == "ai_tuning" {
                 return Err(format!("{key}: 不允许为 null"));
             }
             continue;
@@ -563,7 +563,7 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         if actual != meta.kind {
             return Err(format!("{key}: 类型应为 {}", meta.kind));
         }
-        if group == "parameter_set" && key == "auto_apply_timeframes" {
+        if group == "ai_tuning" && key == "auto_apply_timeframes" {
             let allowed = candidate.as_str().is_some_and(|text| {
                 let text = text.trim();
                 // 空串表示不自动切换；非空项仍只接受 1h。
@@ -590,19 +590,19 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// 参数集候选校验复用同一套配置规则，避免另维护一份边界。
+/// AI 调参候选校验复用同一套配置规则，避免另维护一份边界。
 pub(crate) fn validate_group(group: &str, value: &Value) -> Result<(), String> {
     validate(group, value)
 }
 
-/// 供参数集物化时读取合并了默认值的完整配置快照。
+/// 供AI 调参物化时读取合并了默认值的完整配置快照。
 pub(crate) fn group_value_public(conn: &rusqlite::Connection, name: &str) -> Value {
     group_value(conn, name)
 }
 
 /// 把原始配置归一化为完整值：补默认、剔除历史键并执行迁移。
 ///
-/// 参数集激活比较与物化都走这里，避免历史快照里的隐藏键（如 `weight_trend`）
+/// AI 调参激活比较与物化都走这里，避免历史快照里的隐藏键（如 `weight_trend`）
 /// 在每次切换时被重新写回 strategy。
 pub(crate) fn normalized_group_value(group: &str, raw: &Value) -> Value {
     let mut merged = defaults_of(group);
@@ -611,7 +611,7 @@ pub(crate) fn normalized_group_value(group: &str, raw: &Value) -> Value {
     merged
 }
 
-/// 参数集激活/回滚时逐键记录到 `parameter_changes`，与人工/AI 调参共用审计表。
+/// AI 调参激活/回滚时逐键记录到 `parameter_changes`，与人工/AI 调参共用审计表。
 pub(crate) fn record_set_changes(
     conn: &rusqlite::Connection,
     before: &Value,
@@ -622,13 +622,13 @@ pub(crate) fn record_set_changes(
     source: &str,
 ) -> Result<(), String> {
     let Some(after) = after.as_object() else {
-        return Err("参数集 strategy 快照必须是对象".to_string());
+        return Err("AI 调参 strategy 快照必须是对象".to_string());
     };
     let before = before.as_object().cloned().unwrap_or_default();
     let reason = if source == "parameter_set_rollback" {
-        "参数集回滚"
+        "AI 调参回滚"
     } else {
-        "参数集切换"
+        "AI 调参切换"
     };
     let now = crate::now();
     for (key, new) in after {
@@ -652,7 +652,7 @@ pub(crate) fn record_set_changes(
                 regime,
             ],
         )
-        .map_err(|error| format!("写入参数集变更记录失败: {error}"))?;
+        .map_err(|error| format!("写入AI 调参变更记录失败: {error}"))?;
     }
     Ok(())
 }
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn parameter_set_validation_rejects_invalid_values() {
-        assert!(validate("parameter_set", &defaults_of("parameter_set")).is_ok());
+        assert!(validate("ai_tuning", &defaults_of("ai_tuning")).is_ok());
         for (key, bad) in [
             ("enabled", json!("yes")),
             ("enabled", Value::Null),
@@ -792,9 +792,9 @@ mod tests {
             ("auto_apply_timeframes", json!("4h")),
             ("auto_apply_timeframes", Value::Null),
         ] {
-            let mut value = defaults_of("parameter_set");
+            let mut value = defaults_of("ai_tuning");
             value[key] = bad;
-            assert!(validate("parameter_set", &value).is_err(), "{key} 应被拒绝");
+            assert!(validate("ai_tuning", &value).is_err(), "{key} 应被拒绝");
         }
     }
 
@@ -808,7 +808,7 @@ mod tests {
 
         let (status, body) = put_settings(
             app.clone(),
-            "parameter_set",
+            "ai_tuning",
             r#"{"auto_apply_timeframes":"1H"}"#,
         )
         .await;
@@ -819,7 +819,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                "SELECT value FROM app_settings WHERE key='ai_tuning'",
                 [],
                 |row| row.get(0),
             )
@@ -831,7 +831,7 @@ mod tests {
 
         let (status, body) = put_settings(
             app.clone(),
-            "parameter_set",
+            "ai_tuning",
             r#"{"auto_apply_timeframes":" 1h "}"#,
         )
         .await;
@@ -843,13 +843,13 @@ mod tests {
             r#"{"auto_apply_timeframes":null}"#,
             r#"{"enabled":null}"#,
         ] {
-            let (status, body) = put_settings(app.clone(), "parameter_set", patch).await;
+            let (status, body) = put_settings(app.clone(), "ai_tuning", patch).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}: {body}");
         }
 
         let (status, body) = put_settings(
             app.clone(),
-            "parameter_set",
+            "ai_tuning",
             r#"{"auto_apply_timeframes":""}"#,
         )
         .await;
@@ -860,7 +860,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                "SELECT value FROM app_settings WHERE key='ai_tuning'",
                 [],
                 |row| row.get(0),
             )

@@ -1,5 +1,5 @@
 //! 独立调参任务：按 `ai.param_tuning_min_interval_sec` 周期性让 AI 生成参数增量，
-//! 校验后只落一条 `candidate` 参数集。绝不写 `app_settings.strategy`、绝不激活参数集；
+//! 校验后只落一条 `candidate` AI 调参。绝不写 `app_settings.strategy`、绝不激活AI 调参；
 //! 证据门与启用由 B/C 期负责。
 
 use std::time::Duration;
@@ -56,7 +56,7 @@ pub(crate) fn spawn_tuning_task(
                     if let Err(error) = crate::evidence_task::sweep_pending(&sweep_state, 1).await {
                         tracing::warn!(
                             error = %sanitize_error(&error),
-                            "候选参数集证据门扫描失败"
+                            "候选AI 调参证据门扫描失败"
                         );
                     }
                 });
@@ -76,7 +76,7 @@ pub(crate) fn spawn_tuning_task(
                             tracing::warn!(
                                 set_id,
                                 error = %sanitize_error(&error),
-                                "候选参数集证据门失败, 保留 candidate 待重试"
+                                "候选AI 调参证据门失败, 保留 candidate 待重试"
                             );
                         }
                     });
@@ -149,7 +149,7 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
                 "info",
                 "调参未产生候选",
                 json!({
-                    "event": "parameter_set.no_candidate",
+                    "event": "ai_tuning.no_candidate",
                     "regime": prepared.regime,
                     "timeframe": prepared.active.timeframe,
                 }),
@@ -169,9 +169,9 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
             record_event(
                 &tx,
                 "info",
-                "生成参数集候选",
+                "生成AI 调参候选",
                 json!({
-                    "event": "parameter_set.candidate",
+                    "event": "ai_tuning.candidate",
                     "set_id": set_id,
                     "regime": prepared.regime,
                     "timeframe": prepared.active.timeframe,
@@ -208,24 +208,24 @@ fn prepare(state: &AiState) -> Result<Option<Prepared>, String> {
     if !flag(&ai, "allow_param_tuning", true) {
         return Ok(None);
     }
-    let parameter_set = group_json(&conn, "parameter_set");
-    if !flag(&parameter_set, "enabled", true) {
+    let ai_tuning = group_json(&conn, "ai_tuning");
+    if !flag(&ai_tuning, "enabled", true) {
         return Ok(None);
     }
     let mode = current_mode(&conn);
     let requested = read_market_regime(&conn, &mode).unwrap_or_else(|| "range".to_string());
     let mut active = active_for_regime(&conn, &requested)?;
     if active.is_none() && requested == "trend" {
-        // trend 没有独立参数集时按规格回退到 range 父集。
+        // trend 没有独立AI 调参时按规格回退到 range 父集。
         active = active_for_regime(&conn, "range")?;
     }
     let Some(active) = active else {
         record_event(
             &conn,
             "warn",
-            "参数集父集缺失",
+            "AI 调参父集缺失",
             json!({
-                "event": "parameter_set.parent_missing",
+                "event": "ai_tuning.parent_missing",
                 "mode": mode,
                 "regime": requested,
             }),
@@ -236,7 +236,7 @@ fn prepare(state: &AiState) -> Result<Option<Prepared>, String> {
     let regime = active.regime.clone();
     let now = crate::now();
     let interval = tuning_interval_sec(&ai);
-    if let Some(last) = state_i64(&conn, "parameter_set.last_tuning_ts") {
+    if let Some(last) = state_i64(&conn, "ai_tuning.last_tuning_ts") {
         if now - last < interval {
             return Ok(None);
         }
@@ -331,7 +331,7 @@ const INTEGER_STRATEGY_KEYS: &[&str] = &[
 ];
 
 /// 只暴露 strategy 组里 AI 可写的数字字段，并附带当前值与人工范围/专用边界。
-/// 不注入 risk/engine/parameter_set/ai，也不暴露 timeframe、字符串、数组字段。
+/// 不注入 risk/engine/ai_tuning/ai，也不暴露 timeframe、字符串、数组字段。
 fn writable_strategy_parameters(active: &Value) -> Value {
     let catalog = crate::param_registry::catalog();
     let Some(meta) = catalog
@@ -388,15 +388,15 @@ fn writable_strategy_parameters(active: &Value) -> Value {
 
 fn record_failure(state: &AiState, error: &str) {
     let detail = sanitize_error(error);
-    tracing::warn!(error = %detail, "参数集调参任务失败");
+    tracing::warn!(error = %detail, "AI 调参调参任务失败");
     let Ok(conn) = state.db.conn.lock() else {
         return;
     };
     let _ = record_event(
         &conn,
         "warn",
-        "参数集调参失败",
-        json!({ "event": "parameter_set.tuning_failed", "error": detail }),
+        "AI 调参调参失败",
+        json!({ "event": "ai_tuning.tuning_failed", "error": detail }),
     );
 }
 
@@ -439,16 +439,16 @@ fn record_event(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO engine_events(ts,level,category,message,payload) \
-         VALUES(?1,?2,'parameter_set',?3,?4)",
+         VALUES(?1,?2,'ai_tuning',?3,?4)",
         params![crate::now(), level, message, payload.to_string()],
     )
-    .map_err(|error| format!("写入参数集事件失败: {error}"))?;
+    .map_err(|error| format!("写入AI 调参事件失败: {error}"))?;
     Ok(())
 }
 
 fn write_last_tuning_ts(conn: &Connection, now: i64) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO engine_state(key,value,updated_at) VALUES('parameter_set.last_tuning_ts',?1,?2) \
+        "INSERT INTO engine_state(key,value,updated_at) VALUES('ai_tuning.last_tuning_ts',?1,?2) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         params![now.to_string(), now],
     )
@@ -622,7 +622,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO app_settings VALUES('parameter_set',?1,0)",
+            "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
             [
                 json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"})
                     .to_string(),
@@ -698,7 +698,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM parameter_sets WHERE source='ai'",
+                "SELECT COUNT(*) FROM ai_tuning_sets WHERE source='ai'",
                 [],
                 |row| row.get(0),
             )
@@ -708,7 +708,7 @@ mod tests {
     fn event_payloads(db: &Db) -> Vec<Value> {
         let conn = db.conn.lock().unwrap();
         let mut statement = conn
-            .prepare("SELECT payload FROM engine_events WHERE category='parameter_set' ORDER BY id")
+            .prepare("SELECT payload FROM engine_events WHERE category='ai_tuning' ORDER BY id")
             .unwrap();
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -735,7 +735,7 @@ mod tests {
         );
 
         assert_eq!(candidate_count(&db), 0, "关闭总开关不应生成候选");
-        assert!(event_payloads(&db).is_empty(), "关闭总开关不应写参数集事件");
+        assert!(event_payloads(&db).is_empty(), "关闭总开关不应写AI 调参事件");
     }
 
     #[tokio::test]
@@ -756,14 +756,14 @@ mod tests {
         assert_eq!(candidate_count(&db), 0, "AI 总开关关闭不应生成候选");
         assert!(
             event_payloads(&db).is_empty(),
-            "AI 总开关关闭不应写参数集事件"
+            "AI 总开关关闭不应写AI 调参事件"
         );
         let last_ts: Option<String> = db
             .conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT value FROM engine_state WHERE key='parameter_set.last_tuning_ts'",
+                "SELECT value FROM engine_state WHERE key='ai_tuning.last_tuning_ts'",
                 [],
                 |row| row.get(0),
             )
@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(candidate_count(&db), 0);
         let payloads = event_payloads(&db);
         assert_eq!(payloads.len(), 1, "只应写一条父集缺失事件");
-        assert_eq!(payloads[0]["event"], "parameter_set.parent_missing");
+        assert_eq!(payloads[0]["event"], "ai_tuning.parent_missing");
         assert_eq!(payloads[0]["regime"], "range");
     }
 
@@ -814,14 +814,14 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         let parent_id: i64 = conn
             .query_row(
-                "SELECT id FROM parameter_sets WHERE regime='range' AND status='active'",
+                "SELECT id FROM ai_tuning_sets WHERE regime='range' AND status='active'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         let (status, source, timeframe, parent, params): (String, String, String, Option<i64>, String) =
             conn.query_row(
-                "SELECT status,source,timeframe,parent_id,params FROM parameter_sets WHERE source='ai'",
+                "SELECT status,source,timeframe,parent_id,params FROM ai_tuning_sets WHERE source='ai'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
@@ -836,7 +836,7 @@ mod tests {
 
         let last_ts: String = conn
             .query_row(
-                "SELECT value FROM engine_state WHERE key='parameter_set.last_tuning_ts'",
+                "SELECT value FROM engine_state WHERE key='ai_tuning.last_tuning_ts'",
                 [],
                 |row| row.get(0),
             )
@@ -846,15 +846,15 @@ mod tests {
         let (message, payload): (String, String) = conn
             .query_row(
                 "SELECT message,payload FROM engine_events \
-                 WHERE category='parameter_set' AND message='生成参数集候选' ORDER BY id DESC LIMIT 1",
+                 WHERE category='ai_tuning' AND message='生成AI 调参候选' ORDER BY id DESC LIMIT 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(message, "生成参数集候选");
+        assert_eq!(message, "生成AI 调参候选");
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["set_id"].as_i64(), Some(set_id));
-        assert_eq!(payload["event"], "parameter_set.candidate");
+        assert_eq!(payload["event"], "ai_tuning.candidate");
         assert_eq!(payload["regime"], "range");
         assert_eq!(payload["timeframe"], "1h");
         drop(conn);
@@ -877,7 +877,7 @@ mod tests {
             crate::parameter_sets::seed_bootstrap(&conn).unwrap();
             conn.execute(
                 "INSERT INTO engine_state(key,value,updated_at) \
-                 VALUES('parameter_set.last_tuning_ts',?1,0)",
+                 VALUES('ai_tuning.last_tuning_ts',?1,0)",
                 [(crate::now() - 10).to_string()],
             )
             .unwrap();
@@ -915,14 +915,14 @@ mod tests {
         assert_eq!(candidate_count(&db), 0, "p:[] 不应生成候选");
         let payloads = event_payloads(&db);
         assert_eq!(payloads.len(), 1, "只应写一条无候选事件");
-        assert_eq!(payloads[0]["event"], "parameter_set.no_candidate");
+        assert_eq!(payloads[0]["event"], "ai_tuning.no_candidate");
 
         let last_ts: String = db
             .conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT value FROM engine_state WHERE key='parameter_set.last_tuning_ts'",
+                "SELECT value FROM engine_state WHERE key='ai_tuning.last_tuning_ts'",
                 [],
                 |row| row.get(0),
             )
@@ -974,7 +974,7 @@ mod tests {
             !fields.contains_key("trailing_arm_r"),
             "active 缺少当前值的键不应出现，否则整轮候选会被缺基线拒绝"
         );
-        for forbidden in ["risk", "engine", "parameter_set", "ai"] {
+        for forbidden in ["risk", "engine", "ai_tuning", "ai"] {
             assert!(writable.get(forbidden).is_none(), "{forbidden} 组不应出现");
         }
         assert_eq!(fields["atr_pct_min"]["current"], 1.5);

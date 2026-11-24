@@ -1669,7 +1669,7 @@ impl EngineRuntime {
         preview_value["executed"] = serde_json::json!(executed);
         preview_value["venue_closed"] = serde_json::json!(venue_closed);
         preview_value["halt_flatten"] = serde_json::json!(halt_flatten);
-        // 周期尾推进 regime 状态机并切换参数集；失败只告警，不阻断本轮。
+        // 周期尾推进 regime 状态机并切换AI 调参；失败只告警，不阻断本轮。
         if let Err(error) = apply_regime_transition(&tx, mode) {
             tracing::warn!(%error, %mode, "regime 切换处理失败，不影响本轮周期");
         }
@@ -1687,7 +1687,7 @@ impl EngineRuntime {
             !report.skipped.is_empty(),
             crate::now(),
         ) {
-            tracing::warn!(%error, %mode, "参数集自动启用/无候选守卫失败，不影响本轮周期");
+            tracing::warn!(%error, %mode, "AI 调参自动启用/无候选守卫失败，不影响本轮周期");
         }
         upsert_state(
             &tx,
@@ -4896,7 +4896,7 @@ fn upsert_state(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<(
     ).map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// 读取某 mode 的 regime 状态机并推进一轮；切换时按新 regime 激活参数集。
+/// 读取某 mode 的 regime 状态机并推进一轮；切换时按新 regime 激活AI 调参。
 ///
 /// C 期只做 regime 切换触发激活，不实现 C3 的自动启用与无候选回滚。
 fn apply_regime_transition(conn: &rusqlite::Connection, mode: &str) -> Result<(), String> {
@@ -4924,7 +4924,7 @@ fn apply_regime_transition_at(
         // 本轮有效标的不足 quorum：保持当前 regime，不重置 pending。
         return Ok(());
     };
-    let config = crate::settings_api::group_value_public(conn, "parameter_set");
+    let config = crate::settings_api::group_value_public(conn, "ai_tuning");
     let confirm_sec = config
         .get("regime_confirm_sec")
         .and_then(Value::as_i64)
@@ -4994,20 +4994,20 @@ fn apply_regime_transition_at(
             );
             // 首次失败后 current 为空，下轮会立即重试；事件与日志按小时限流，
             // 避免每 15 秒刷一条。
-            let failed_key = format!("parameter_set.regime_activation_failed_ts.{mode}");
+            let failed_key = format!("ai_tuning.regime_activation_failed_ts.{mode}");
             let last_failed =
                 read_state(failed_key.clone()).and_then(|raw| raw.parse::<i64>().ok());
             let should_log =
                 !last_failed.is_some_and(|last| now - last < REGIME_ACTIVATION_FAILURE_LOG_SEC);
             if should_log {
-                tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活参数集失败");
+                tracing::warn!(%error, regime = regime.as_str(), %mode, "regime 切换激活AI 调参失败");
                 let _ = upsert_state(conn, &failed_key, &now.to_string());
                 let _ = conn.execute(
                     "INSERT INTO engine_events(ts,level,category,message,payload) \
-                     VALUES(?1,'warn','parameter_set',?2,?3)",
+                     VALUES(?1,'warn','ai_tuning',?2,?3)",
                     (
                         now,
-                        format!("parameter_set.regime_activation_failed: {error}"),
+                        format!("ai_tuning.regime_activation_failed: {error}"),
                         json!({
                             "mode": mode,
                             "regime": regime.as_str(),
@@ -5028,12 +5028,12 @@ fn apply_regime_transition_at(
                         set.id,
                         now,
                     ) {
-                        tracing::warn!(%error, regime = regime.as_str(), %mode, "参数集守卫初始化失败");
+                        tracing::warn!(%error, regime = regime.as_str(), %mode, "AI 调参守卫初始化失败");
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(%error, regime = regime.as_str(), %mode, "读取激活参数集失败");
+                    tracing::warn!(%error, regime = regime.as_str(), %mode, "读取激活AI 调参失败");
                 }
             }
         }
@@ -5041,7 +5041,7 @@ fn apply_regime_transition_at(
     Ok(())
 }
 
-/// 周期尾参数集治理：自动启用 approved 候选，再推进无候选守卫。
+/// 周期尾AI 调参治理：自动启用 approved 候选，再推进无候选守卫。
 ///
 /// 调用方在 regime 切换处理后、同一事务内调用；错误由调用方告警，不阻断周期。
 fn apply_parameter_set_governance(
@@ -5081,10 +5081,10 @@ fn apply_parameter_set_governance(
             // 自动启用失败要留事件，不能只靠日志；guard 仍继续推进。
             if let Err(record_error) = conn.execute(
                 "INSERT INTO engine_events(ts,level,category,message,payload) \
-                 VALUES(?1,'warn','parameter_set',?2,?3)",
+                 VALUES(?1,'warn','ai_tuning',?2,?3)",
                 (
                     now,
-                    format!("parameter_set.auto_apply_failed: {error}"),
+                    format!("ai_tuning.auto_apply_failed: {error}"),
                     json!({
                         "mode": mode,
                         "regime": current_regime,
@@ -5093,7 +5093,7 @@ fn apply_parameter_set_governance(
                     .to_string(),
                 ),
             ) {
-                tracing::warn!(%record_error, "写入参数集自动启用失败事件失败");
+                tracing::warn!(%record_error, "写入AI 调参自动启用失败事件失败");
             }
             Some(error)
         }
@@ -7915,7 +7915,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let failures: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_events \
-                 WHERE level='warn' AND category='parameter_set' \
+                 WHERE level='warn' AND category='ai_tuning' \
                  AND message LIKE '%regime_activation_failed%'",
                 [],
                 |row| row.get(0),
@@ -7931,7 +7931,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let failure_count = |conn: &rusqlite::Connection| -> i64 {
             conn.query_row(
                 "SELECT COUNT(*) FROM engine_events \
-                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                 WHERE category='ai_tuning' AND message LIKE '%regime_activation_failed%'",
                 [],
                 |row| row.get(0),
             )
@@ -7942,7 +7942,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         apply_regime_transition_at(&conn, "demo", base + 3_599).unwrap();
         assert_eq!(failure_count(&conn), 1, "3600 秒内失败事件必须限流");
         assert_eq!(
-            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            regime_state(&conn, "ai_tuning.regime_activation_failed_ts.demo"),
             base.to_string()
         );
         assert_eq!(
@@ -7954,7 +7954,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         apply_regime_transition_at(&conn, "demo", base + 3_600).unwrap();
         assert_eq!(failure_count(&conn), 2, "满 3600 秒后可再写一条");
         assert_eq!(
-            regime_state(&conn, "parameter_set.regime_activation_failed_ts.demo"),
+            regime_state(&conn, "ai_tuning.regime_activation_failed_ts.demo"),
             (base + 3_600).to_string()
         );
     }
@@ -7975,7 +7975,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let failures: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_events \
-                 WHERE category='parameter_set' AND message LIKE '%regime_activation_failed%'",
+                 WHERE category='ai_tuning' AND message LIKE '%regime_activation_failed%'",
                 [],
                 |row| row.get(0),
             )
@@ -7991,7 +7991,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
              CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); \
              CREATE TABLE trades(id INTEGER PRIMARY KEY, parameter_set_id INTEGER); \
              INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\"}',0); \
-             INSERT INTO app_settings VALUES('parameter_set','{\"regime_confirm_sec\":0,\"regime_cooldown_sec\":0}',0); \
+             INSERT INTO app_settings VALUES('ai_tuning','{\"regime_confirm_sec\":0,\"regime_cooldown_sec\":0}',0); \
              INSERT INTO engine_state VALUES('market_regime.demo','chaos',0);",
         )
         .unwrap();
@@ -8080,7 +8080,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
 
     fn enable_auto_apply(conn: &rusqlite::Connection, since: &str) {
         conn.execute(
-            "INSERT INTO app_settings(key,value,updated_at) VALUES('parameter_set',?1,0) \
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('ai_tuning',?1,0) \
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [serde_json::json!({
                 "enabled": true,
@@ -8092,7 +8092,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         .unwrap();
         conn.execute(
             "INSERT INTO engine_state(key,value,updated_at) \
-             VALUES('parameter_set.auto_apply_since',?1,0) \
+             VALUES('ai_tuning.auto_apply_since',?1,0) \
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [since],
         )
@@ -8128,7 +8128,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         );
         let trigger: String = conn
             .query_row(
-                "SELECT trigger FROM parameter_set_activations ORDER BY id DESC LIMIT 1",
+                "SELECT trigger FROM ai_tuning_activations ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -8136,7 +8136,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert_eq!(trigger, "auto_apply");
         let guard_raw: String = conn
             .query_row(
-                "SELECT value FROM engine_state WHERE key='parameter_set.guard.range'",
+                "SELECT value FROM engine_state WHERE key='ai_tuning.guard.range'",
                 [],
                 |row| row.get(0),
             )
@@ -8151,7 +8151,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let conn = parameter_set_governance_fixture();
         let bootstrap_id: i64 = conn
             .query_row(
-                "SELECT id FROM parameter_sets WHERE name='range-bootstrap'",
+                "SELECT id FROM ai_tuning_sets WHERE name='range-bootstrap'",
                 [],
                 |row| row.get(0),
             )
@@ -8184,7 +8184,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         );
         let trigger: String = conn
             .query_row(
-                "SELECT trigger FROM parameter_set_activations WHERE set_id=?1 \
+                "SELECT trigger FROM ai_tuning_activations WHERE set_id=?1 \
                  ORDER BY id DESC LIMIT 1",
                 [bootstrap_id],
                 |row| row.get(0),
@@ -8194,7 +8194,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let warnings: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_events WHERE level='warn' \
-                 AND message LIKE 'parameter_set.no_candidate_rollback%'",
+                 AND message LIKE 'ai_tuning.no_candidate_rollback%'",
                 [],
                 |row| row.get(0),
             )
@@ -8222,7 +8222,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         );
         let paused: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM engine_events WHERE message LIKE 'parameter_set.guard_paused%'",
+                "SELECT COUNT(*) FROM engine_events WHERE message LIKE 'ai_tuning.guard_paused%'",
                 [],
                 |row| row.get(0),
             )

@@ -11,7 +11,7 @@ describe('参数配置目录', () => {
     expect(groupIds).toEqual([
       'engine',
       'strategy',
-      'parameter_set',
+      'ai_tuning',
       'risk',
       'data',
       'news',
@@ -127,8 +127,8 @@ describe('参数配置目录', () => {
     }
   })
 
-  it('参数集分组覆盖全部八键', () => {
-    const keys = [...explicitKeys('parameter_set')].sort()
+  it('AI 调参分组覆盖全部八键', () => {
+    const keys = [...explicitKeys('ai_tuning')].sort()
     expect(keys).toEqual([
       'auto_apply',
       'auto_apply_timeframes',

@@ -319,7 +319,7 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   data: {
     request_timeout_sec: { label: '行情请求超时', unit: '秒', hint: '只作用于交易所行情接口' },
   },
-  parameter_set: {
+  ai_tuning: {
     enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择、自动启用与无候选回滚；手动启用/回滚保留' },
     auto_apply: { label: '自动启用', hint: '证据门通过后自动启用 approved 候选；关闭则只允许手动启用' },
     max_auto_apply_per_24h: { label: '24h 自动启用上限', unit: '次', min: 1, max: 100, hint: '滚动 24 小时只统计 auto_apply' },

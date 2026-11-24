@@ -1,4 +1,4 @@
-//! 参数集接口。B 期只读列表、当前视图与完整证据；C 期追加手动启用/回滚，
+//! AI 调参接口。B 期只读列表、当前视图与完整证据；C 期追加手动启用/回滚，
 //! 复用 `parameter_sets` 的 SAVEPOINT 事务与审计，不在 API 层另写 `strategy`。
 
 use axum::extract::{Path, Query, State};
@@ -20,11 +20,11 @@ const ACTIVE_REGIMES: [&str; 3] = ["trend", "range", "chaos"];
 
 pub fn routes() -> Router<Db> {
     Router::new()
-        .route("/parameter-sets", get(list_sets))
-        .route("/parameter-sets/current", get(current_view))
-        .route("/parameter-sets/{id}/evidence", get(set_evidence))
-        .route("/parameter-sets/{id}/activate", post(activate_set))
-        .route("/parameter-sets/{id}/rollback", post(rollback_set))
+        .route("/ai-tuning", get(list_sets))
+        .route("/ai-tuning/current", get(current_view))
+        .route("/ai-tuning/{id}/evidence", get(set_evidence))
+        .route("/ai-tuning/{id}/activate", post(activate_set))
+        .route("/ai-tuning/{id}/rollback", post(rollback_set))
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -71,7 +71,7 @@ fn current_regime(conn: &Connection, mode: &str) -> String {
 fn ensure_set_exists(conn: &Connection, id: i64) -> Result<(), ApiError> {
     let exists: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM parameter_sets WHERE id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM ai_tuning_sets WHERE id=?1)",
             [id],
             |row| row.get(0),
         )
@@ -79,7 +79,7 @@ fn ensure_set_exists(conn: &Connection, id: i64) -> Result<(), ApiError> {
     if exists {
         Ok(())
     } else {
-        Err(not_found(format!("参数集 {id} 不存在")))
+        Err(not_found(format!("AI 调参 {id} 不存在")))
     }
 }
 
@@ -122,7 +122,7 @@ async fn list_sets(
     let status = query.status.filter(|value| !value.is_empty());
     let conn = lock(&db)?;
     let sql = format!(
-        "SELECT {SET_COLUMNS} FROM parameter_sets \
+        "SELECT {SET_COLUMNS} FROM ai_tuning_sets \
          WHERE (?1 IS NULL OR regime=?1) AND (?2 IS NULL OR status=?2) \
          ORDER BY id DESC LIMIT {LIST_LIMIT}"
     );
@@ -170,7 +170,7 @@ fn active_entry(regime: &str, set: Option<ParameterSet>) -> Value {
 fn guard_view(conn: &Connection) -> Result<Value, ApiError> {
     let mut guard = serde_json::Map::new();
     for regime in ACTIVE_REGIMES {
-        let key = format!("parameter_set.guard.{regime}");
+        let key = format!("ai_tuning.guard.{regime}");
         if let Some(raw) = read_engine_state(conn, &key).map_err(server_error)? {
             if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
                 guard.insert(regime.to_string(), parsed);
@@ -181,7 +181,7 @@ fn guard_view(conn: &Connection) -> Result<Value, ApiError> {
 }
 
 fn auto_apply_since(conn: &Connection) -> Result<i64, ApiError> {
-    Ok(read_engine_state(conn, "parameter_set.auto_apply_since")
+    Ok(read_engine_state(conn, "ai_tuning.auto_apply_since")
         .map_err(server_error)?
         .and_then(|raw| raw.trim().parse::<i64>().ok())
         .unwrap_or(0))
@@ -224,7 +224,7 @@ async fn activate_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<
     let set = load_set(&conn, id).map_err(server_error)?;
     if set.regime != regime {
         return Err(bad_request(format!(
-            "只能启用当前 regime 的参数集；非当前 regime 由自动切换处理（参数集 {} 属于 {}，当前为 {}）",
+            "只能启用当前 regime 的AI 调参；非当前 regime 由自动切换处理（AI 调参 {} 属于 {}，当前为 {}）",
             id, set.regime, regime
         )));
     }
@@ -242,7 +242,7 @@ async fn rollback_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<
     let set = load_set(&conn, id).map_err(server_error)?;
     if set.regime != regime {
         return Err(bad_request(format!(
-            "只能回滚当前 regime 的参数集；跨 regime 回滚由自动切换处理（参数集 {} 属于 {}，当前为 {}）",
+            "只能回滚当前 regime 的AI 调参；跨 regime 回滚由自动切换处理（AI 调参 {} 属于 {}，当前为 {}）",
             id, set.regime, regime
         )));
     }
@@ -256,7 +256,7 @@ async fn set_evidence(
 ) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
     let raw = conn.query_row(
-        "SELECT evidence FROM parameter_sets WHERE id=?1",
+        "SELECT evidence FROM ai_tuning_sets WHERE id=?1",
         [id],
         |row| row.get::<_, String>(0),
     );
@@ -265,8 +265,8 @@ async fn set_evidence(
             let evidence = serde_json::from_str(&raw).unwrap_or(Value::Null);
             Ok(json!({ "id": id, "evidence": evidence }).into())
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Err(not_found(format!("参数集 {id} 不存在"))),
-        Err(error) => Err(server_error(format!("读取参数集 {id} 证据失败: {error}"))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(not_found(format!("AI 调参 {id} 不存在"))),
+        Err(error) => Err(server_error(format!("读取AI 调参 {id} 证据失败: {error}"))),
     }
 }
 
@@ -290,7 +290,7 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         let activated_at = if status == "active" { Some(1000i64) } else { None };
         conn.execute(
-            "INSERT INTO parameter_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
+            "INSERT INTO ai_tuning_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
              VALUES(?1,?2,'1h',1,'{\"timeframe\":\"1h\"}',?3,'bootstrap',?4,NULL,1000,?5)",
             params![name, regime, status, evidence, activated_at],
         )
@@ -328,7 +328,7 @@ mod tests {
     ) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO parameter_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
+            "INSERT INTO ai_tuning_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
              VALUES(?1,?2,'1h',1,?3,?4,'manual','{\"kind\":\"manual\"}',NULL,1000,NULL)",
             params![name, regime, params.to_string(), status],
         )
@@ -387,7 +387,7 @@ mod tests {
     fn count_activations(db: &Db, trigger: &str, set_id: i64) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row(
-            "SELECT COUNT(*) FROM parameter_set_activations WHERE trigger=?1 AND set_id=?2",
+            "SELECT COUNT(*) FROM ai_tuning_activations WHERE trigger=?1 AND set_id=?2",
             params![trigger, set_id],
             |row| row.get(0),
         )
@@ -428,7 +428,7 @@ mod tests {
             "{\"kind\":\"ai\",\"gate\":{\"pass\":true}}",
         );
 
-        let (status, body) = get(app(db), "/api/v1/parameter-sets").await;
+        let (status, body) = get(app(db), "/api/v1/ai-tuning").await;
         assert_eq!(status, StatusCode::OK, "列表应成功: {body}");
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 3);
@@ -460,7 +460,7 @@ mod tests {
             "{\"kind\":\"ai\"}",
         );
 
-        let (status, body) = get(app(db), "/api/v1/parameter-sets?regime=chaos&status=active").await;
+        let (status, body) = get(app(db), "/api/v1/ai-tuning?regime=chaos&status=active").await;
         assert_eq!(status, StatusCode::OK);
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -476,7 +476,7 @@ mod tests {
         set_engine_state(&db, "mode", "demo");
         set_engine_state(&db, "market_regime.demo", "range");
 
-        let (status, body) = get(app(db), "/api/v1/parameter-sets/current").await;
+        let (status, body) = get(app(db), "/api/v1/ai-tuning/current").await;
         assert_eq!(status, StatusCode::OK, "当前视图应成功: {body}");
         assert_eq!(body["market_regime"], "range");
         let active = body["active"].as_array().unwrap();
@@ -504,7 +504,7 @@ mod tests {
         insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
         set_engine_state(&db, "mode", "demo");
 
-        let (status, body) = get(app(db), "/api/v1/parameter-sets/current").await;
+        let (status, body) = get(app(db), "/api/v1/ai-tuning/current").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["market_regime"].is_null(), "诊断键缺失应为 null");
     }
@@ -520,7 +520,7 @@ mod tests {
             "{\"kind\":\"ai\",\"gate\":{\"pass\":true,\"reasons\":[]}}",
         );
 
-        let (status, body) = get(app(db.clone()), &format!("/api/v1/parameter-sets/{id}/evidence")).await;
+        let (status, body) = get(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/evidence")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["id"], id);
         assert_eq!(
@@ -529,9 +529,9 @@ mod tests {
         );
 
         let (missing_status, missing_body) =
-            get(app(db), "/api/v1/parameter-sets/999999/evidence").await;
+            get(app(db), "/api/v1/ai-tuning/999999/evidence").await;
         assert_eq!(missing_status, StatusCode::NOT_FOUND);
-        assert_eq!(missing_body["detail"], "参数集 999999 不存在");
+        assert_eq!(missing_body["detail"], "AI 调参 999999 不存在");
     }
 
     #[tokio::test]
@@ -542,12 +542,12 @@ mod tests {
         set_engine_state(&db, "market_regime.demo", "range");
         set_engine_state(
             &db,
-            "parameter_set.guard.range",
+            "ai_tuning.guard.range",
             "{\"set_id\":1,\"last_candidate_at\":123}",
         );
-        set_engine_state(&db, "parameter_set.auto_apply_since", "1700000000");
+        set_engine_state(&db, "ai_tuning.auto_apply_since", "1700000000");
 
-        let (status, body) = get(app(db), "/api/v1/parameter-sets/current").await;
+        let (status, body) = get(app(db), "/api/v1/ai-tuning/current").await;
         assert_eq!(status, StatusCode::OK, "当前视图应成功: {body}");
         assert_eq!(body["guard"]["range"]["set_id"], 1);
         assert_eq!(body["guard"]["range"]["last_candidate_at"], 123);
@@ -561,12 +561,12 @@ mod tests {
         set_engine_state(&db, "mode", "demo");
         let id = insert_set_with_params(&db, "range-manual", "range", "manual", params_with_threshold(0.50));
 
-        let (status, body) = post(app(db.clone()), &format!("/api/v1/parameter-sets/{id}/activate")).await;
+        let (status, body) = post(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/activate")).await;
         assert_eq!(status, StatusCode::OK, "手动启用应成功: {body}");
         assert_eq!(body["ok"], true);
         assert_eq!(body["id"], id);
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.50);
-        assert!(count_changes(&db, "parameter_set", id) > 0, "应写参数集切换审计");
+        assert!(count_changes(&db, "ai_tuning", id) > 0, "应写AI 调参切换审计");
         assert_eq!(count_activations(&db, "manual", id), 1, "trigger 应为 manual");
     }
 
@@ -580,15 +580,15 @@ mod tests {
         let second = insert_set_with_params(&db, "range-second", "range", "manual", params_with_threshold(0.52));
 
         let (activate_first, _) =
-            post(app(db.clone()), &format!("/api/v1/parameter-sets/{first}/activate")).await;
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{first}/activate")).await;
         assert_eq!(activate_first, StatusCode::OK);
         let (activate_second, activate_body) =
-            post(app(db.clone()), &format!("/api/v1/parameter-sets/{second}/activate")).await;
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{second}/activate")).await;
         assert_eq!(activate_second, StatusCode::OK, "第二套应可启用: {activate_body}");
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.52);
 
         let (status, body) =
-            post(app(db.clone()), &format!("/api/v1/parameter-sets/{second}/rollback")).await;
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{second}/rollback")).await;
         assert_eq!(status, StatusCode::OK, "手动回滚应成功: {body}");
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.50, "应恢复上一套参数");
         assert!(
@@ -599,7 +599,7 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let statuses: Vec<(i64, String)> = conn
-            .prepare("SELECT id,status FROM parameter_sets ORDER BY id")
+            .prepare("SELECT id,status FROM ai_tuning_sets ORDER BY id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -617,16 +617,16 @@ mod tests {
         let no_history = insert_set_with_params(&db, "range-manual", "range", "active", params_with_threshold(0.5));
 
         let (missing_activate, missing_activate_body) =
-            post(app(db.clone()), "/api/v1/parameter-sets/999999/activate").await;
+            post(app(db.clone()), "/api/v1/ai-tuning/999999/activate").await;
         assert_eq!(missing_activate, StatusCode::NOT_FOUND);
-        assert_eq!(missing_activate_body["detail"], "参数集 999999 不存在");
+        assert_eq!(missing_activate_body["detail"], "AI 调参 999999 不存在");
 
         let (missing_rollback, _) =
-            post(app(db.clone()), "/api/v1/parameter-sets/999999/rollback").await;
+            post(app(db.clone()), "/api/v1/ai-tuning/999999/rollback").await;
         assert_eq!(missing_rollback, StatusCode::NOT_FOUND);
 
         let (bad_status, bad_body) =
-            post(app(db.clone()), &format!("/api/v1/parameter-sets/{pending}/activate")).await;
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{pending}/activate")).await;
         assert_eq!(bad_status, StatusCode::BAD_REQUEST);
         assert!(
             bad_body["detail"].as_str().unwrap_or("").contains("不允许激活"),
@@ -634,7 +634,7 @@ mod tests {
         );
 
         let (no_previous, no_previous_body) =
-            post(app(db), &format!("/api/v1/parameter-sets/{no_history}/rollback")).await;
+            post(app(db), &format!("/api/v1/ai-tuning/{no_history}/rollback")).await;
         assert_eq!(no_previous, StatusCode::BAD_REQUEST);
         assert!(
             no_previous_body["detail"].as_str().unwrap_or("").contains("没有上一套"),
@@ -652,17 +652,17 @@ mod tests {
         let before = strategy_value(&db);
 
         let (status, body) =
-            post(app(db.clone()), &format!("/api/v1/parameter-sets/{trend_id}/activate")).await;
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{trend_id}/activate")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "跨 regime 应拒绝: {body}");
         assert!(
             body["detail"]
                 .as_str()
                 .unwrap_or("")
-                .contains("只能启用当前 regime 的参数集"),
+                .contains("只能启用当前 regime 的AI 调参"),
             "文案应说明仅当前 regime 可启用: {body}"
         );
         assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");
-        assert_eq!(count_changes(&db, "parameter_set", trend_id), 0, "不得写切换审计");
+        assert_eq!(count_changes(&db, "ai_tuning", trend_id), 0, "不得写切换审计");
         assert_eq!(count_activations(&db, "manual", trend_id), 0, "不得写激活记录");
     }
 
@@ -679,7 +679,7 @@ mod tests {
 
         for id in [retired, approved] {
             let (status, body) =
-                post(app(db.clone()), &format!("/api/v1/parameter-sets/{id}/rollback")).await;
+                post(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/rollback")).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "非 active 不可回滚: {body}");
             assert!(
                 body["detail"]
@@ -711,7 +711,7 @@ mod tests {
 
         let (status, body) = post(
             app(db.clone()),
-            &format!("/api/v1/parameter-sets/{chaos_active}/rollback"),
+            &format!("/api/v1/ai-tuning/{chaos_active}/rollback"),
         )
         .await;
         assert_eq!(
@@ -723,7 +723,7 @@ mod tests {
             body["detail"]
                 .as_str()
                 .unwrap_or("")
-                .contains("只能回滚当前 regime 的参数集"),
+                .contains("只能回滚当前 regime 的AI 调参"),
             "文案应说明仅当前 regime 可回滚: {body}"
         );
         assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");

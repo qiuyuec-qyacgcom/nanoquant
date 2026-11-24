@@ -47,7 +47,7 @@ pub fn initialize(
     crate::parameter_sets::seed_bootstrap(&conn)?;
     // C 期启用失败只告警，不能阻断服务启动。
     if let Err(error) = crate::parameter_sets::enable_c_phase(&conn) {
-        tracing::warn!(%error, "C 期参数集启用失败，等待人工处理");
+        tracing::warn!(%error, "C 期AI 调参启用失败，等待人工处理");
     }
 
     if created_database {
@@ -349,7 +349,7 @@ mod tests {
 
         let conn = Connection::open(&db).unwrap();
         let rows: Vec<(String, String)> = conn
-            .prepare("SELECT name,status FROM parameter_sets")
+            .prepare("SELECT name,status FROM ai_tuning_sets")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(strategy["timeframe"], "4h");
         let config_raw: String = conn
             .query_row(
-                "SELECT value FROM app_settings WHERE key='parameter_set'",
+                "SELECT value FROM app_settings WHERE key='ai_tuning'",
                 [],
                 |row| row.get(0),
             )
@@ -383,7 +383,7 @@ mod tests {
         );
         let since = conn
             .query_row(
-                "SELECT value FROM engine_state WHERE key='parameter_set.auto_apply_since'",
+                "SELECT value FROM engine_state WHERE key='ai_tuning.auto_apply_since'",
                 [],
                 |row| row.get::<_, String>(0),
             )

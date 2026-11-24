@@ -1,6 +1,6 @@
-//! 候选参数集证据门：按 B 期规则拉真实历史、跑固定 walk-forward 并落 approved/rejected。
+//! 候选AI 调参证据门：按 B 期规则拉真实历史、跑固定 walk-forward 并落 approved/rejected。
 //!
-//! 只写参数集状态与审计事件：不激活参数集、不写 `app_settings.strategy`。
+//! 只写AI 调参状态与审计事件：不激活AI 调参、不写 `app_settings.strategy`。
 //! 历史数据不可用或回测本身出错时返回 Err 并记 `parameter_set.evidence_failed`，
 //! 候选保持 `candidate`，绝不把「没数据」误判成「策略不达标」。
 
@@ -23,7 +23,7 @@ const BARS_LIMIT: i64 = 2_000;
 const MIN_SYMBOLS: usize = 6;
 const DEFAULT_MIN_OOS_TRADES: f64 = 30.0;
 const DEFAULT_TIMEFRAME: &str = "1h";
-const EVENT_CATEGORY: &str = "parameter_set";
+const EVENT_CATEGORY: &str = "ai_tuning";
 const PENDING_WINDOW_SEC: i64 = 7 * 24 * 3600;
 const ATTEMPT_COOLDOWN_SEC: i64 = 6 * 3600;
 const SWEEP_INTERVAL_SEC: i64 = 6 * 3600;
@@ -176,7 +176,7 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
     }
     let strategy = group_json(&conn, "strategy")?;
     let risk = group_json(&conn, "risk")?;
-    let parameter_set = group_json(&conn, "parameter_set")?;
+    let parameter_set = group_json(&conn, "ai_tuning")?;
     let live_timeframe = strategy
         .get("timeframe")
         .and_then(Value::as_str)
@@ -214,7 +214,7 @@ fn parse_timeframes(parameter_set: &Value) -> Result<Vec<String>, String> {
         return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
     }
     let Some(raw) = value.as_str() else {
-        return Err("parameter_set.auto_apply_timeframes 必须是逗号分隔字符串".to_string());
+        return Err("ai_tuning.auto_apply_timeframes 必须是逗号分隔字符串".to_string());
     };
     // 显式空白名单表示「不自动切换」，不能静默补 1h；交由证据门按 §7.3 拒绝。
     if raw.trim().is_empty() {
@@ -228,7 +228,7 @@ fn parse_timeframes(parameter_set: &Value) -> Result<Vec<String>, String> {
         }
         if frame != DEFAULT_TIMEFRAME {
             return Err(format!(
-                "parameter_set.auto_apply_timeframes 仅支持 {DEFAULT_TIMEFRAME}，发现 {frame}"
+                "ai_tuning.auto_apply_timeframes 仅支持 {DEFAULT_TIMEFRAME}，发现 {frame}"
             ));
         }
         if !frames.iter().any(|existing| existing == frame) {
@@ -387,9 +387,9 @@ fn write_outcome(
         .map_err(|error| format!("开启证据门事务失败: {error}"))?;
     parameter_sets::mark_evidence(&tx, set_id, report.pass, evidence)?;
     let (level, message, event) = if report.pass {
-        ("info", "参数集证据门通过", "parameter_set.evidence_pass")
+        ("info", "AI 调参证据门通过", "ai_tuning.evidence_pass")
     } else {
-        ("warn", "参数集证据门未通过", "parameter_set.evidence_fail")
+        ("warn", "AI 调参证据门未通过", "ai_tuning.evidence_fail")
     };
     record_event(
         &tx,
@@ -409,14 +409,14 @@ fn write_outcome(
 
 fn record_failed(state: &AiState, set_id: i64, error: &str) {
     let detail = crate::tuning::sanitize_error(error);
-    tracing::warn!(set_id, error = %detail, "候选参数集证据门执行失败");
+    tracing::warn!(set_id, error = %detail, "候选AI 调参证据门执行失败");
     let Ok(conn) = state.db.conn.lock() else {
         return;
     };
     // 只有回滚后仍是 candidate 才写失败事件；已 approved/rejected 的不能再被覆盖语义。
     let status: Option<String> = conn
         .query_row(
-            "SELECT status FROM parameter_sets WHERE id=?1",
+            "SELECT status FROM ai_tuning_sets WHERE id=?1",
             [set_id],
             |row| row.get(0),
         )
@@ -429,9 +429,9 @@ fn record_failed(state: &AiState, set_id: i64, error: &str) {
     let _ = record_event(
         &conn,
         "warn",
-        "参数集证据门执行失败",
+        "AI 调参证据门执行失败",
         json!({
-            "event": "parameter_set.evidence_failed",
+            "event": "ai_tuning.evidence_failed",
             "set_id": set_id,
             "error": detail,
         }),
@@ -455,7 +455,7 @@ fn record_event(
             payload.to_string()
         ],
     )
-    .map_err(|error| format!("写入参数集证据事件失败: {error}"))?;
+    .map_err(|error| format!("写入AI 调参证据事件失败: {error}"))?;
     Ok(())
 }
 
@@ -522,7 +522,7 @@ pub(crate) fn sweep_due(state: &AiState) -> bool {
 fn sweep_due_at(conn: &Connection, now: i64) -> Result<bool, String> {
     let last: Option<i64> = conn
         .query_row(
-            "SELECT value FROM engine_state WHERE key='parameter_set.evidence_sweep_ts'",
+            "SELECT value FROM engine_state WHERE key='ai_tuning.evidence_sweep_ts'",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -537,7 +537,7 @@ fn sweep_due_at(conn: &Connection, now: i64) -> Result<bool, String> {
     }
     conn.execute(
         "INSERT INTO engine_state(key,value,updated_at) \
-         VALUES('parameter_set.evidence_sweep_ts',?1,?1) \
+         VALUES('ai_tuning.evidence_sweep_ts',?1,?1) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         [now.to_string()],
     )
@@ -554,9 +554,9 @@ fn select_pending(conn: &Connection, limit: usize, now: i64) -> Result<Vec<i64>,
     let cooldown_before = now - ATTEMPT_COOLDOWN_SEC;
     let mut statement = conn
         .prepare(
-            "SELECT p.id FROM parameter_sets p \
+            "SELECT p.id FROM ai_tuning_sets p \
              LEFT JOIN engine_state e \
-               ON e.key = 'parameter_set.evidence_attempt.' || p.id \
+               ON e.key = 'ai_tuning.evidence_attempt.' || p.id \
              WHERE p.source='ai' AND p.status='candidate' AND p.created_at > ?1 \
                AND (e.value IS NULL OR CAST(e.value AS INTEGER) <= ?2) \
              ORDER BY p.id ASC LIMIT ?3",
@@ -577,7 +577,7 @@ fn write_attempt(conn: &Connection, id: i64, now: i64) -> Result<(), String> {
         "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?2) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         params![
-            format!("parameter_set.evidence_attempt.{id}"),
+            format!("ai_tuning.evidence_attempt.{id}"),
             now.to_string()
         ],
     )
@@ -683,7 +683,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO app_settings VALUES('parameter_set',?1,0)",
+            "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
             [json!({
                 "enabled": true,
                 "auto_apply": false,
@@ -747,7 +747,7 @@ mod tests {
     fn events(state: &AiState) -> Vec<Value> {
         let conn = state.db.conn.lock().unwrap();
         let mut statement = conn
-            .prepare("SELECT payload FROM engine_events WHERE category='parameter_set' ORDER BY id")
+            .prepare("SELECT payload FROM engine_events WHERE category='ai_tuning' ORDER BY id")
             .unwrap();
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -823,7 +823,7 @@ mod tests {
         drop(conn);
         let payloads = events(&state);
         assert_eq!(payloads.len(), 1, "应写一条 evidence_fail 事件");
-        assert_eq!(payloads[0]["event"], "parameter_set.evidence_fail");
+        assert_eq!(payloads[0]["event"], "ai_tuning.evidence_fail");
         assert_eq!(payloads[0]["set_id"], candidate_id);
         assert!(payloads[0]["reasons"].is_array());
     }
@@ -846,13 +846,13 @@ mod tests {
         assert!(
             payloads
                 .iter()
-                .any(|payload| payload["event"] == "parameter_set.evidence_failed"),
+                .any(|payload| payload["event"] == "ai_tuning.evidence_failed"),
             "数据失败必须留审计事件"
         );
         assert!(!payloads
             .iter()
-            .any(|payload| payload["event"] == "parameter_set.evidence_pass"
-                || payload["event"] == "parameter_set.evidence_fail"));
+            .any(|payload| payload["event"] == "ai_tuning.evidence_pass"
+                || payload["event"] == "ai_tuning.evidence_fail"));
     }
 
     #[tokio::test]
@@ -864,7 +864,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE parameter_sets SET status='approved' WHERE id=?1",
+                "UPDATE ai_tuning_sets SET status='approved' WHERE id=?1",
                 [candidate_id],
             )
             .unwrap();
@@ -986,11 +986,11 @@ mod tests {
 
         conn.execute(
             "DELETE FROM engine_state WHERE key=?1",
-            [format!("parameter_set.evidence_attempt.{candidate_id}")],
+            [format!("ai_tuning.evidence_attempt.{candidate_id}")],
         )
         .unwrap();
         conn.execute(
-            "UPDATE parameter_sets SET created_at=?1 WHERE id=?2",
+            "UPDATE ai_tuning_sets SET created_at=?1 WHERE id=?2",
             params![now - PENDING_WINDOW_SEC - 1, candidate_id],
         )
         .unwrap();
@@ -1016,7 +1016,7 @@ mod tests {
         let (state, candidate_id) = setup("1h");
         {
             let conn = state.db.conn.lock().unwrap();
-            conn.execute("DELETE FROM app_settings WHERE key='parameter_set'", [])
+            conn.execute("DELETE FROM app_settings WHERE key='ai_tuning'", [])
                 .unwrap();
         }
 
@@ -1036,7 +1036,7 @@ mod tests {
         {
             let conn = state.db.conn.lock().unwrap();
             conn.execute(
-                "UPDATE app_settings SET value='{invalid' WHERE key='parameter_set'",
+                "UPDATE app_settings SET value='{invalid' WHERE key='ai_tuning'",
                 [],
             )
             .unwrap();
@@ -1096,7 +1096,7 @@ mod tests {
         let attempt: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key=?1",
-                [format!("parameter_set.evidence_attempt.{candidate_id}")],
+                [format!("ai_tuning.evidence_attempt.{candidate_id}")],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_state WHERE key=?1",
-                [format!("parameter_set.evidence_attempt.{candidate_id}")],
+                [format!("ai_tuning.evidence_attempt.{candidate_id}")],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1136,7 +1136,7 @@ mod tests {
         {
             let conn = state.db.conn.lock().unwrap();
             conn.execute(
-                "UPDATE app_settings SET value=?1 WHERE key='parameter_set'",
+                "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
                 [json!({
                     "enabled": true,
                     "auto_apply": false,
@@ -1174,7 +1174,7 @@ mod tests {
         {
             let conn = state.db.conn.lock().unwrap();
             conn.execute(
-                "UPDATE app_settings SET value=?1 WHERE key='parameter_set'",
+                "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
                 [json!({
                     "enabled": true,
                     "auto_apply": false,

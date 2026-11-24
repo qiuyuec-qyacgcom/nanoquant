@@ -116,8 +116,8 @@ async function load(silent = false) {
   if (!silent) loading.value = true
   try {
     const [list, view] = await Promise.all([
-      http.get('/parameter-sets'),
-      http.get('/parameter-sets/current'),
+      http.get('/ai-tuning'),
+      http.get('/ai-tuning/current'),
     ])
     sets.value = Array.isArray(list?.items) ? list.items : []
     current.value = view || null
@@ -138,7 +138,7 @@ async function act(item: SetItem, action: 'activate' | 'rollback') {
   error.value = ''
   notice.value = ''
   try {
-    await http.post(`/parameter-sets/${item.id}/${action}`)
+    await http.post(`/ai-tuning/${item.id}/${action}`)
     notice.value = action === 'activate' ? '已启用，参数已物化。' : '已回滚到上一套。'
     await load(true)
   } catch (err: any) {

@@ -84,7 +84,7 @@
       ]
     ]
   },
-  "parameter_set": {
+  "ai_tuning": {
     "enabled": true,
     "auto_apply": false,
     "max_auto_apply_per_24h": 1,
