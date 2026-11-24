@@ -30,7 +30,7 @@ pub struct ScanPlan {
     /// 本轮有持仓的标的。恒为 `keep` 的子集（`held ⊆ keep`），下游不要重复计数。
     pub held: Vec<String>,
     pub candidates: Vec<String>,
-    /// 与 `delete` 一一对应的删除原因（symbol, risk_gate 原因）。
+    /// 与 `delete` 一一对应的删除原因（闸门失败原因，或缺少行情数据）。
     pub delete_reasons: Vec<(String, String)>,
 }
 
@@ -56,14 +56,24 @@ pub fn plan(
     gates: &ScanGates,
     target: usize,
 ) -> ScanPlan {
+    // `HashMap::collect` 对重复 symbol 保留最后一条扫描记录；原池判定与候选生成共用它，
+    // 避免同一标的在两处采用不同行。如需首条优先，应在扫描层先去重。
     let by_symbol: HashMap<&str, &ScannedSymbol> =
         scanned.iter().map(|s| (s.symbol.as_str(), s)).collect();
-    let current_set: HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
+
+    // 原池输入可能重复（例如上游拼接了多个来源），按首次出现顺序去重，
+    // 否则同一标的会重复进入 keep / delete / delete_reasons。
+    let mut seen: HashSet<&str> = HashSet::new();
+    let current_unique: Vec<&String> = current
+        .iter()
+        .filter(|symbol| seen.insert(symbol.as_str()))
+        .collect();
+    let current_set: HashSet<&str> = current_unique.iter().map(|s| s.as_str()).collect();
 
     let mut plan = ScanPlan::default();
     let mut to_replace: Vec<(String, String)> = Vec::new();
 
-    for symbol in current {
+    for symbol in current_unique.iter().copied() {
         if held.contains(symbol) {
             plan.keep.push(symbol.clone());
             plan.held.push(symbol.clone());
@@ -102,6 +112,7 @@ pub fn plan(
 
     // 先按「合格 keep + 已替换数量」算空位，再把未被替换的标的并入 keep，
     // 否则剩余标的会先撑大 keep，导致 target 补足算少。
+    // leftover（未替换的原池标的）与剩余候选互斥，所以 leftover 必须在 slots 计算之后并入 keep。
     let slots = target.saturating_sub(plan.keep.len() + replace_count);
     let fill = candidates.len().saturating_sub(replace_count).min(slots);
     plan.add.extend(
@@ -334,6 +345,30 @@ mod tests {
         assert_eq!(plan.add, owned(&["CCCUSDT", "BBBUSDT"]));
         let unique: HashSet<&String> = plan.candidates.iter().collect();
         assert_eq!(unique.len(), plan.candidates.len(), "候选不得重复");
+    }
+
+    #[test]
+    fn duplicate_current_symbols_are_deduplicated() {
+        let current = owned(&["AAAUSDT", "AAAUSDT", "BBBUSDT"]);
+        let rows = vec![
+            scanned("AAAUSDT", 0.5),
+            scanned("BBBUSDT", 1.5),
+            scanned("CCCUSDT", 1.8),
+            scanned("DDDUSDT", 2.0),
+        ];
+        let deduped = plan(&current, &HashSet::new(), &rows, &gates(), 2);
+
+        assert_eq!(deduped.keep, owned(&["BBBUSDT"]));
+        assert_eq!(deduped.delete, owned(&["AAAUSDT"]), "AAA 只能删除一次");
+        assert_eq!(deduped.delete_reasons.len(), 1);
+        assert_eq!(deduped.delete_reasons[0].0, "AAAUSDT");
+        assert_eq!(deduped.add, owned(&["DDDUSDT"]));
+
+        // 全部通过时，重复的原池标的在 keep 中同样只出现一次。
+        let current = owned(&["AAAUSDT", "AAAUSDT"]);
+        let rows = vec![scanned("AAAUSDT", 1.0)];
+        let all_pass = plan(&current, &HashSet::new(), &rows, &gates(), 1);
+        assert_eq!(all_pass.keep, owned(&["AAAUSDT"]));
     }
 
     #[test]
