@@ -147,6 +147,7 @@ mod tests {
             global_take_profit_pct: 0.0,
             qty_step: 0.001,
             min_qty: 0.001,
+            roi_min_r: 0.0,
             roi_table: Vec::new(),
         }
     }

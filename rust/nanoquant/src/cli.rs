@@ -970,6 +970,8 @@ fn verify_partial_tp(options: &Options) -> Result<(i32, Value), (i32, String)> {
         "detail": format!("{:?}", action).replace('\n', " "),
     }));
 
+    let mut ladder_cfg = cfg.clone();
+    ladder_cfg.roi_min_r = 0.0;
     let mut roi_rows = Vec::new();
     for (minutes, target) in &cfg.roi_table {
         let mut hit_row = base.clone();
@@ -978,13 +980,13 @@ fn verify_partial_tp(options: &Options) -> Result<(i32, Value), (i32, String)> {
         hit_row.held_minutes = *minutes;
         hit_row.mark_price = entry * (1.0 + (target + 0.01) / 100.0);
         let hit = matches!(
-            manage(&hit_row, &cfg),
+            manage(&hit_row, &ladder_cfg),
             ManageAction::Close { ref reason } if reason == "roi_target"
         );
         let mut miss_row = hit_row.clone();
         miss_row.mark_price = entry * (1.0 + (target - 0.01) / 100.0);
         let miss = !matches!(
-            manage(&miss_row, &cfg),
+            manage(&miss_row, &ladder_cfg),
             ManageAction::Close { ref reason } if reason == "roi_target"
         );
         roi_rows.push(json!({
@@ -1002,6 +1004,30 @@ fn verify_partial_tp(options: &Options) -> Result<(i32, Value), (i32, String)> {
         "name": "时间阶梯止盈比例",
         "ok": roi_ok,
         "detail": format!("{} 档", roi_rows.len()),
+    }));
+
+    let mut gate_cfg = cfg.clone();
+    gate_cfg.partial_tp_at_r = 0.0;
+    gate_cfg.roi_table = vec![(0.0, 0.6)];
+    let mut gate_row = base.clone();
+    gate_row.sl_price = 0.0;
+    gate_row.tp_price = 0.0;
+    gate_row.held_minutes = 15.0;
+    gate_row.partial_taken = true;
+    gate_row.mark_price = entry * 1.0061;
+    let below_r_holds = !matches!(
+        manage(&gate_row, &gate_cfg),
+        ManageAction::Close { ref reason } if reason == "roi_target"
+    );
+    gate_row.mark_price = entry * 1.05;
+    let at_r_closes = matches!(
+        manage(&gate_row, &gate_cfg),
+        ManageAction::Close { ref reason } if reason == "roi_target"
+    );
+    checks.push(json!({
+        "name": "roi_min_r 门槛",
+        "ok": below_r_holds && at_r_closes,
+        "detail": format!("roi_min_r={} below_r_holds={} at_r_closes={}", cfg.roi_min_r, below_r_holds, at_r_closes),
     }));
 
     let pool = db

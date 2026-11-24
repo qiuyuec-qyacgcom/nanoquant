@@ -733,6 +733,14 @@ async fn sleep_backoff(attempt: usize) {
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiPersona {
+    pub name: String,
+    pub weight: f64,
+    pub focus: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct AiConfig {
     pub enabled: bool,
@@ -745,6 +753,11 @@ pub struct AiConfig {
     pub timeout_sec: i64,
     pub temperature: f64,
     pub decision_schema_version: i64,
+    pub inject_news: bool,
+    pub inject_mantras: bool,
+    pub require_agreement: bool,
+    pub allow_ai_override: bool,
+    pub personas: Vec<AiPersona>,
 }
 
 impl Default for AiConfig {
@@ -760,6 +773,11 @@ impl Default for AiConfig {
             timeout_sec: 45,
             temperature: 0.2,
             decision_schema_version: 2,
+            inject_news: true,
+            inject_mantras: true,
+            require_agreement: true,
+            allow_ai_override: false,
+            personas: Vec::new(),
         }
     }
 }
@@ -813,6 +831,39 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     }
     if let Some(item) = value.get("decision_schema_version").and_then(Value::as_i64) {
         cfg.decision_schema_version = item;
+    }
+    if let Some(item) = value.get("inject_news").and_then(Value::as_bool) {
+        cfg.inject_news = item;
+    }
+    if let Some(item) = value.get("inject_mantras").and_then(Value::as_bool) {
+        cfg.inject_mantras = item;
+    }
+    if let Some(item) = value.get("require_agreement").and_then(Value::as_bool) {
+        cfg.require_agreement = item;
+    }
+    if let Some(item) = value.get("allow_ai_override").and_then(Value::as_bool) {
+        cfg.allow_ai_override = item;
+    }
+    if let Some(items) = value.get("personas").and_then(Value::as_array) {
+        cfg.personas = items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name").and_then(Value::as_str)?;
+                Some(AiPersona {
+                    name: name.to_string(),
+                    weight: item.get("weight").and_then(Value::as_f64).unwrap_or(0.0),
+                    focus: item
+                        .get("focus")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    enabled: item
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                })
+            })
+            .collect();
     }
     cfg
 }

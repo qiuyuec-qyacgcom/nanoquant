@@ -96,7 +96,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             .lock()
             .map_err(|_| "数据库锁不可用".to_string())?;
         let evolution = crate::evolution_api::evolution_cfg(&conn);
-        let (mantra_text, mantra_ids) = crate::evolution_api::injection_payload(&conn, &evolution);
+        let (mantra_text, mantra_ids) = if cfg.inject_mantras {
+            crate::evolution_api::injection_payload(&conn, &evolution)
+        } else {
+            (String::new(), Vec::new())
+        };
         let journal_snapshot = json!({
             "atr_pct": features["atr_pct"],
             "funding": market.funding_rate,
@@ -111,7 +115,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         );
         (mantra_text, mantra_ids, experiences)
     };
-    let news = crate::ai_analysis::news_digest(&state, 8);
+    let news = if cfg.inject_news {
+        crate::ai_analysis::news_digest(&state, 8)
+    } else {
+        Vec::new()
+    };
     let quant_signal = proposal.quant_side.as_ref().map(|side| {
         json!({
             "side": side,
@@ -121,7 +129,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "mark_price": proposal.mark_price,
         })
     });
-    let context = json!({
+    let mut context = json!({
         "analysis_order": [
             "global_strategy",
             "self_evolving_mantras",
@@ -172,7 +180,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "mark_price": proposal.mark_price,
         },
     });
-    let messages = crate::ai_analysis::decision_messages(&context);
+    crate::ai_analysis::gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
+    let messages = crate::ai_analysis::decision_messages_with_personas(&context, &cfg.personas);
     let mut call = ChatCall::new(&messages, "engine_review");
     call.temperature = Some(cfg.temperature);
     let outcome =
@@ -189,7 +198,14 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .and_then(|filters| filters.get("side"))
         .and_then(Value::as_str)
         .unwrap_or("any");
-    decision_to_review(&proposal, side_lock, &decision, cfg.min_confidence)
+    decision_to_review(
+        &proposal,
+        side_lock,
+        &decision,
+        cfg.min_confidence,
+        cfg.require_agreement,
+        cfg.allow_ai_override,
+    )
 }
 
 fn reject(reason: impl Into<String>) -> ReviewDecision {
@@ -209,6 +225,8 @@ fn decision_to_review(
     side_lock: &str,
     decision: &ai_client::Decision,
     min_confidence: f64,
+    require_agreement: bool,
+    allow_ai_override: bool,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
         let mut rejected = reject(format!(
@@ -243,6 +261,18 @@ fn decision_to_review(
     }
     if side_lock == "short" && side == "long" {
         return Ok(reject("策略只允许做空，AI 方向相反"));
+    }
+    if let Some(quant_side) = proposal.quant_side.as_deref() {
+        if quant_side != side {
+            if require_agreement {
+                return Ok(reject("AI 与量化方向不一致"));
+            }
+            if !allow_ai_override {
+                return Ok(reject("AI 与量化方向不一致，且未允许 AI 覆盖"));
+            }
+        }
+    } else if require_agreement {
+        return Ok(reject("缺少量化方向，无法与量化方向一致"));
     }
     let mark = proposal.mark_price;
     let stop_price = if decision.sl_pct > 0.0 {
@@ -350,6 +380,8 @@ mod tests {
             "long",
             &decision("open_short", 0.8),
             0.45,
+            true,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -363,6 +395,8 @@ mod tests {
             "short",
             &decision("open_long", 0.8),
             0.45,
+            true,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -372,20 +406,41 @@ mod tests {
     #[test]
     fn matching_ai_entry_is_approved() {
         let result =
-            decision_to_review(&proposal("long"), "long", &decision("open_long", 0.8), 0.45)
-                .unwrap();
+            decision_to_review(
+                &proposal("long"),
+                "long",
+                &decision("open_long", 0.8),
+                0.45,
+                true,
+                false,
+            )
+            .unwrap();
         assert_eq!(result.action, ReviewAction::Agree);
     }
 
     #[test]
     fn low_confidence_is_rejected_and_hold_keeps_ai_confidence() {
-        let low = decision_to_review(&proposal("long"), "any", &decision("open_long", 0.2), 0.45)
-            .unwrap();
+        let low = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_long", 0.2),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(low.action, ReviewAction::Reject);
         assert!((low.confidence - 0.2).abs() < 1e-9);
 
-        let hold =
-            decision_to_review(&proposal("long"), "any", &decision("hold", 0.9), 0.45).unwrap();
+        let hold = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("hold", 0.9),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(hold.action, ReviewAction::Hold);
         assert!((hold.confidence - 0.9).abs() < 1e-9);
         assert_eq!(hold.reason, "test");
@@ -646,7 +701,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             invalidation: String::new(),
             params: Vec::new(),
         };
-        let reviewed = decision_to_review(&proposal("long"), "any", &long, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("long"), "any", &long, 0.45, true, false).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Tighten);
         assert_eq!(reviewed.leverage, Some(4.0));
         let long_stop = reviewed.stop_price.expect("多单应收紧止损");
@@ -667,7 +723,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             invalidation: String::new(),
             params: Vec::new(),
         };
-        let reviewed = decision_to_review(&proposal("short"), "any", &short, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("short"), "any", &short, 0.45, true, false).unwrap();
         assert_eq!(reviewed.leverage, Some(3.0));
         let short_stop = reviewed.stop_price.expect("空单应收紧止损");
         assert!(
@@ -690,21 +747,24 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             invalidation: String::new(),
             params: Vec::new(),
         };
-        let reviewed = decision_to_review(&proposal("long"), "any", &raised, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("long"), "any", &raised, 0.45, true, false).unwrap();
         assert_eq!(reviewed.leverage, Some(12.0), "区间内允许上调杠杆");
 
         let too_high = ai_client::Decision {
             leverage: 80.0,
             ..raised.clone()
         };
-        let reviewed = decision_to_review(&proposal("long"), "any", &too_high, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false).unwrap();
         assert_eq!(reviewed.leverage, Some(20.0), "超过上限压回上限");
 
         let too_low = ai_client::Decision {
             leverage: 1.0,
             ..raised
         };
-        let reviewed = decision_to_review(&proposal("long"), "any", &too_low, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("long"), "any", &too_low, 0.45, true, false).unwrap();
         assert_eq!(reviewed.leverage, Some(2.0), "低于下限抬回下限");
     }
 
@@ -721,7 +781,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             invalidation: String::new(),
             params: Vec::new(),
         };
-        let reviewed = decision_to_review(&proposal("long"), "any", &wider, 0.45).unwrap();
+        let reviewed =
+            decision_to_review(&proposal("long"), "any", &wider, 0.45, true, false).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
         assert_eq!(reviewed.leverage, None);
         assert_eq!(reviewed.stop_price, Some(90.0));
@@ -743,22 +804,250 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
 
     #[test]
     fn ai_side_can_override_the_quant_signal() {
-        let conflict =
-            decision_to_review(&proposal("long"), "any", &decision("open_short", 0.9), 0.45)
-                .unwrap();
+        let blocked = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_short", 0.9),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(blocked.action, ReviewAction::Reject, "默认必须与量化方向一致");
+
+        let conflict = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_short", 0.9),
+            0.45,
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(conflict.action, ReviewAction::Tighten);
         assert_eq!(conflict.side.as_deref(), Some("short"));
     }
 
+    fn proposal_without_quant(side: &str) -> EntryProposal {
+        let mut item = proposal(side);
+        item.quant_side = None;
+        item.quant_score = None;
+        item
+    }
+
+    #[test]
+    fn require_agreement_blocks_ai_against_quant_side() {
+        let result = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_short", 0.9),
+            0.45,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("AI 与量化方向不一致"));
+
+        let agree = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_long", 0.9),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(agree.action, ReviewAction::Agree);
+    }
+
+    #[test]
+    fn allow_ai_override_false_blocks_ai_against_quant_side() {
+        let result = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_short", 0.9),
+            0.45,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("未允许 AI 覆盖"));
+    }
+
+    #[test]
+    fn allow_ai_override_true_permits_a_side_flip() {
+        let result = decision_to_review(
+            &proposal("short"),
+            "any",
+            &decision("open_long", 0.9),
+            0.45,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Tighten);
+        assert_eq!(result.side.as_deref(), Some("long"));
+    }
+
+    #[test]
+    fn require_agreement_without_quant_side_rejects_preview_entry() {
+        let result = decision_to_review(
+            &proposal_without_quant("long"),
+            "any",
+            &decision("open_long", 0.9),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("缺少量化方向"));
+
+        let ai_first = decision_to_review(
+            &proposal_without_quant("long"),
+            "any",
+            &decision("open_long", 0.9),
+            0.45,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ai_first.action, ReviewAction::Agree, "无量化方向时 AI 仍是第一决策者");
+    }
+
+    #[test]
+    fn hold_is_held_regardless_of_agreement_flags() {
+        for (require_agreement, allow_ai_override) in [(true, false), (false, true)] {
+            let result = decision_to_review(
+                &proposal("long"),
+                "any",
+                &decision("hold", 0.9),
+                0.45,
+                require_agreement,
+                allow_ai_override,
+            )
+            .unwrap();
+            assert_eq!(result.action, ReviewAction::Hold);
+            assert_eq!(result.side, None);
+        }
+    }
+
     #[test]
     fn confidence_equal_to_threshold_is_accepted() {
-        let result =
-            decision_to_review(&proposal("long"), "any", &decision("open_long", 0.45), 0.45)
-                .unwrap();
+        let result = decision_to_review(
+            &proposal("long"),
+            "any",
+            &decision("open_long", 0.45),
+            0.45,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             result.action,
             ReviewAction::Agree,
             "置信度等于门槛时应放行，而不是被 < 误杀"
         );
+    }
+
+    struct CapturingTransport {
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl crate::ai_client::AiTransport for CapturingTransport {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            body: &'a Value,
+            _timeout_secs: u64,
+        ) -> crate::ai_client::BoxFuture<'a, Result<crate::ai_client::HttpReply, String>> {
+            let bodies = self.bodies.clone();
+            let body = body.clone();
+            Box::pin(async move {
+                bodies.lock().unwrap().push(body);
+                Ok(crate::ai_client::HttpReply {
+                    status: 200,
+                    body: r#"{"choices":[{"message":{"content":"{\"a\":\"L\",\"c\":0.8,\"l\":0,\"s\":0,\"t\":0,\"r\":[1],\"k\":[9],\"x\":2}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_string(),
+                })
+            })
+        }
+
+        fn get_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _timeout_secs: u64,
+        ) -> crate::ai_client::BoxFuture<'a, Result<crate::ai_client::HttpReply, String>> {
+            Box::pin(async move {
+                Ok(crate::ai_client::HttpReply {
+                    status: 404,
+                    body: "not found".to_string(),
+                })
+            })
+        }
+    }
+
+    async fn review_context_with(inject: bool, tag: &str) -> Value {
+        let path = std::env::temp_dir().join(format!("nq-ai-review-inject-{tag}.db"));
+        let db = fixture(&path);
+        let ai_value = json!({
+            "enabled": true,
+            "mode": "single",
+            "provider_id": 1,
+            "fallback_provider_ids": [],
+            "min_confidence": 0.45,
+            "max_calls_per_hour": 30,
+            "monthly_budget_usd": 3,
+            "temperature": 0.2,
+            "timeout_sec": 5,
+            "decision_schema_version": 2,
+            "inject_news": inject,
+            "inject_mantras": inject,
+        });
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='ai'",
+                [serde_json::to_string(&ai_value).unwrap()],
+            )
+            .unwrap();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            std::sync::Arc::new(CapturingTransport {
+                bodies: bodies.clone(),
+            }),
+        )
+        .with_market(std::sync::Arc::new(StaticMarket));
+        let reviewed = EngineAiReviewer::new(state)
+            .review(&proposal("long"))
+            .unwrap();
+        assert_eq!(reviewed.action, ReviewAction::Agree);
+        let _ = std::fs::remove_file(&path);
+        let body = bodies.lock().unwrap().pop().expect("已捕获复核请求");
+        let user = body["messages"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["role"] == "user"))
+            .expect("复核请求缺少 user 消息");
+        serde_json::from_str(user["content"].as_str().expect("user content 不是字符串")).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inject_news_and_inject_mantras_gate_review_prompt() {
+        let off = review_context_with(false, "off").await;
+        assert!(off.get("news").is_none(), "关闭时复核 prompt 不含 news: {off}");
+        assert!(
+            off.get("mantras").is_none(),
+            "关闭时复核 prompt 不含 mantras: {off}"
+        );
+
+        let on = review_context_with(true, "on").await;
+        assert!(on.get("news").is_some(), "打开时复核 prompt 含 news");
+        assert!(on.get("mantras").is_some(), "打开时复核 prompt 含 mantras");
     }
 }

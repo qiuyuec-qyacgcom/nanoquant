@@ -65,6 +65,8 @@ pub struct ManageConfig {
     pub global_take_profit_pct: f64,
     pub qty_step: f64,
     pub min_qty: f64,
+    /// 时间阶梯止盈的 R 门槛：浮盈达到该 R 倍数后才启用 roi_table，0 表示关闭门槛。
+    pub roi_min_r: f64,
     /// 时间阶梯止盈 [[分钟, 收益率%]]。
     pub roi_table: Vec<(f64, f64)>,
 }
@@ -110,7 +112,10 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
 
     if let Some(target) = roi_target(&cfg.roi_table, pos.held_minutes) {
         let roi_pct = (pos.mark_price - pos.entry_price) * direction / pos.entry_price * 100.0;
-        if roi_pct >= target {
+        let r_ok = cfg.roi_min_r <= 0.0
+            || partial_tp_r(&pos.side, pos.entry_price, pos.initial_sl, pos.mark_price)
+                >= cfg.roi_min_r;
+        if r_ok && roi_pct >= target {
             return ManageAction::Close {
                 reason: "roi_target".to_string(),
             };
@@ -246,6 +251,7 @@ mod tests {
             global_take_profit_pct: 0.0,
             qty_step: 0.001,
             min_qty: 0.001,
+            roi_min_r: 0.0,
             roi_table: Vec::new(),
         }
     }
@@ -431,5 +437,51 @@ mod tests {
         let mut config = cfg();
         config.roi_table = vec![(0.0, 0.8), (15.0, 0.6), (30.0, 0.45)];
         assert_eq!(manage(&pos, &config), ManageAction::Hold);
+    }
+
+    #[test]
+    fn roi_min_r_gates_the_time_ladder() {
+        let mut pos = long_pos();
+        pos.sl_price = 0.0;
+        pos.tp_price = 0.0;
+        pos.held_minutes = 31.0;
+        let mut config = cfg();
+        config.roi_table = vec![(0.0, 0.3)];
+        config.roi_min_r = 1.0;
+
+        pos.mark_price = 101.6; // 0.8R，收益 1.6% 已超过 0.3%，但 R 门槛未到
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Hold,
+            "r < roi_min_r 时不得触发时间阶梯止盈"
+        );
+
+        pos.mark_price = 102.0; // 1.0R
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "roi_target".to_string()
+            },
+            "r >= roi_min_r 后按 roi_table 继续执行"
+        );
+    }
+
+    #[test]
+    fn roi_min_r_zero_disables_the_gate() {
+        let mut pos = long_pos();
+        pos.sl_price = 0.0;
+        pos.tp_price = 0.0;
+        pos.held_minutes = 31.0;
+        pos.mark_price = 100.6; // 0.3R，收益 0.6% ≥ 0.3%
+        let mut config = cfg();
+        config.roi_table = vec![(0.0, 0.3)];
+        config.roi_min_r = 0.0;
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "roi_target".to_string()
+            },
+            "roi_min_r <= 0 视为关闭门槛"
+        );
     }
 }

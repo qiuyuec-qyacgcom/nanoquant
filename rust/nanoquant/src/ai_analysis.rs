@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::ai_client::{self, ChatCall, ChatMessage};
+use crate::ai_client::{self, AiPersona, ChatCall, ChatMessage};
 use crate::ai_providers::{provider_chain, AiState};
 use crate::providers::{candle_metrics, CandleSnapshot, MarketSnapshot};
 
@@ -291,8 +291,16 @@ fn analyze_messages(symbol: &str, snapshot: &Value) -> Vec<ChatMessage> {
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
-    vec![
+    decision_messages_with_personas(compact, &[])
+}
+
+pub(crate) fn decision_messages_with_personas(
+    compact: &Value,
+    personas: &[AiPersona],
+) -> Vec<ChatMessage> {
+    let mut messages = vec![
         ChatMessage::new(
             "system",
             &[
@@ -320,7 +328,57 @@ pub(crate) fn decision_messages(compact: &Value) -> Vec<ChatMessage> {
             "user",
             &serde_json::to_string(compact).unwrap_or_else(|_| "{}".to_string()),
         ),
-    ]
+    ];
+    if let Some(hint) = persona_system_hint(personas) {
+        messages[0].content.push(' ');
+        messages[0].content.push_str(&hint);
+    }
+    messages
+}
+
+/// 把启用的 persona 拼成一段附加系统提示：单次调用按权重综合判断，不拆多次模型调用。
+pub(crate) fn persona_system_hint(personas: &[AiPersona]) -> Option<String> {
+    let enabled: Vec<&AiPersona> = personas
+        .iter()
+        .filter(|persona| persona.enabled && !persona.name.trim().is_empty())
+        .collect();
+    if enabled.is_empty() {
+        return None;
+    }
+    let panel = enabled
+        .iter()
+        .map(|persona| {
+            format!(
+                "{} (weight {:.2}): {}",
+                persona.name.trim(),
+                persona.weight,
+                persona.focus.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Persona panel (single call, weighted): {panel}. \
+         Weigh these perspectives by their weights and produce one final judgement; \
+         do not role-play or emit per-persona answers."
+    ))
+}
+
+/// 按开关移除上下文中不应注入的资讯/心法字段；字段缺失时保持原样。
+pub(crate) fn gate_injected_context(
+    context: &mut Value,
+    inject_news: bool,
+    inject_mantras: bool,
+) {
+    let Some(map) = context.as_object_mut() else {
+        return;
+    };
+    if !inject_news {
+        map.remove("news");
+    }
+    if !inject_mantras {
+        map.remove("mantras");
+    }
 }
 
 /// 独立调参任务的提示词：只产出 strategy 组参数增量，绝不涉及 risk/parameter_set/timeframe。
@@ -479,7 +537,7 @@ async fn decision_preview(
     let slow = features["ema_slow"].as_f64().unwrap_or(0.0);
     let risk = risk_config(&state);
     let (cfg, chain) = provider_chain(&state);
-    let context = json!({
+    let mut context = json!({
         "symbol": symbol,
         "price": market.mark_price,
         "score": round4(ema_gap / 0.22),
@@ -510,7 +568,8 @@ async fn decision_preview(
         "news": if body.include_news { news_digest(&state, 6) } else { Vec::new() },
         "mantras": top_mantras(&state, 5),
     });
-    let messages = decision_messages(&context);
+    gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
+    let messages = decision_messages_with_personas(&context, &cfg.personas);
     let prompt_tokens_est = ai_client::estimate_tokens(
         &messages
             .iter()
@@ -703,6 +762,74 @@ mod tests {
         assert!(system.contains("Do not propose or modify any parameters"));
         assert!(system.contains("constraints.min_leverage"));
         assert!(system.contains("constraints.max_leverage"));
+    }
+
+    fn persona(name: &str, weight: f64, focus: &str, enabled: bool) -> AiPersona {
+        AiPersona {
+            name: name.to_string(),
+            weight,
+            focus: focus.to_string(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn personas_prompt_only_includes_enabled_entries() {
+        let messages = decision_messages_with_personas(
+            &json!({}),
+            &[
+                persona("趋势研判官", 0.35, "多周期趋势与关键价位", true),
+                persona("风险审计官", 0.3, "回撤与流动性风险", false),
+            ],
+        );
+        let system = &messages[0].content;
+        assert!(system.contains("趋势研判官"));
+        assert!(system.contains("0.35"));
+        assert!(system.contains("多周期趋势与关键价位"));
+        assert!(system.contains("Persona panel"));
+        assert!(!system.contains("风险审计官"), "禁用的 persona 不应注入");
+    }
+
+    #[test]
+    fn personas_prompt_is_absent_when_disabled_or_empty() {
+        let base = decision_messages(&json!({}));
+        let empty = decision_messages_with_personas(&json!({}), &[]);
+        assert_eq!(base[0].content, empty[0].content);
+        assert!(!empty[0].content.contains("Persona panel"));
+
+        let disabled =
+            decision_messages_with_personas(&json!({}), &[persona("风险审计官", 0.3, "", false)]);
+        assert!(!disabled[0].content.contains("Persona panel"));
+        assert!(!disabled[0].content.contains("风险审计官"));
+    }
+
+    #[test]
+    fn inject_news_and_inject_mantras_gate_context_fields() {
+        let mut context = json!({
+            "news": [{"title": "headline"}],
+            "mantras": {"text": "rule", "ids": [1]},
+            "symbol": "BTCUSDT",
+        });
+        gate_injected_context(&mut context, false, false);
+        assert!(context.get("news").is_none(), "关闭后 context 不含 news");
+        assert!(context.get("mantras").is_none(), "关闭后 context 不含 mantras");
+        assert_eq!(context["symbol"], json!("BTCUSDT"));
+
+        let mut both = json!({
+            "news": [{"title": "headline"}],
+            "mantras": {"text": "rule", "ids": [1]},
+        });
+        gate_injected_context(&mut both, true, true);
+        assert!(both.get("news").is_some(), "打开时保留 news");
+        assert!(both.get("mantras").is_some(), "打开时保留 mantras");
+
+        let mut split = json!({
+            "news": [{"title": "headline"}],
+            "mantras": {"text": "rule", "ids": [1]},
+        });
+        gate_injected_context(&mut split, false, true);
+        assert!(split.get("news").is_none());
+        assert!(split.get("mantras").is_some());
     }
 
     struct StaticMarket {

@@ -1195,6 +1195,7 @@ impl EngineRuntime {
             global_take_profit_pct: risk["global_take_profit_pct"].as_f64().unwrap_or(0.0),
             qty_step: strategy["qty_step"].as_f64().unwrap_or(0.001),
             min_qty: strategy["min_qty"].as_f64().unwrap_or(0.001),
+            roi_min_r: strategy["roi_min_r"].as_f64().unwrap_or(1.0),
             roi_table: Self::roi_table(&strategy["roi_table"]),
         }
     }
@@ -5005,6 +5006,21 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn roi_min_r_reads_strategy_and_matches_backtest_config() {
+        let strategy = json!({"roi_min_r": 2.5});
+        let risk = json!({});
+        let live = EngineRuntime::manage_config(&strategy, &risk);
+        assert_eq!(live.roi_min_r, 2.5);
+        assert_eq!(
+            EngineRuntime::manage_config(&json!({}), &json!({})).roi_min_r,
+            1.0,
+            "strategy.roi_min_r 缺省 1.0"
+        );
+        let backtest = EngineRuntime::manage_config(&strategy, &risk);
+        assert_eq!(backtest, live, "回测与实盘共用同一 manage_config");
+    }
 
     #[test]
     fn scan_concurrency_falls_back_to_one_for_zero_or_invalid_values() {
