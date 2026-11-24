@@ -7,12 +7,34 @@
 // TODO(任务6): 接入后台循环后移除上面的 dead_code 豁免。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::scan::{risk_gate, Candidate, ScanGates};
+
+/// 全进程扫描防重入。手动 API 与后台调度可能并发触发同一轮扫描。
+static SCAN_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// RAII 防重入 guard。获取失败表示已有扫描在跑；离开作用域自动释放，早退也不会卡死。
+struct BusyGuard;
+
+impl BusyGuard {
+    fn acquire() -> Option<Self> {
+        SCAN_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        SCAN_BUSY.store(false, Ordering::Release);
+    }
+}
 
 /// 一个标的的本轮扫描特征，只保留换池要看的字段。
 #[derive(Debug, Clone)]
@@ -393,6 +415,7 @@ fn plan_result(plan: &ScanPlan, scanned: usize, applied: bool) -> Value {
         "delete": plan.delete.clone(),
         // dry-run 无法预知二次持仓检查；null 表示不适用，apply 时由 merge_applied_result 写入。
         "delete_skipped": Value::Null,
+        "add_skipped": Value::Null,
         "add": plan.add.clone(),
         "delete_reasons": plan
             .delete_reasons
@@ -423,6 +446,7 @@ fn merge_applied_result(mut result: Value, plan: &ScanPlan, applied: &AppliedPla
     result["delete"] = json!(applied.deleted);
     result["delete_reasons"] = json!(reasons);
     result["delete_skipped"] = json!(applied.skipped);
+    result["add_skipped"] = json!(applied.add_skipped);
     result["add"] = json!(applied.added);
     result
 }
@@ -433,7 +457,10 @@ fn merge_applied_result(mut result: Value, plan: &ScanPlan, applied: &AppliedPla
 struct AppliedPlan {
     deleted: Vec<String>,
     added: Vec<String>,
+    /// 删除时因持仓被二次检查跳过的标的。
     skipped: Vec<String>,
+    /// 新增时因已在池中（含手动禁用）而跳过的标的，与删除跳过分开。
+    add_skipped: Vec<String>,
 }
 
 /// 把计划落到库里。删除前再查一次持仓，持仓标的跳过；写入新增标的。
@@ -465,8 +492,25 @@ fn apply_plan(
         applied.deleted.push(symbol.clone());
     }
     for symbol in &plan.add {
-        crate::symbols::upsert_contract_row_conn(conn, contracts, symbol)?;
-        applied.added.push(symbol.clone());
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trading_symbols WHERE symbol=?1",
+                [symbol.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("检查 {symbol} 是否已在池中失败: {error}"))?;
+        if exists > 0 {
+            applied.add_skipped.push(symbol.clone());
+            continue;
+        }
+        match crate::symbols::upsert_contract_row_conn(conn, contracts, symbol) {
+            Ok(_) => applied.added.push(symbol.clone()),
+            // 并发窗口内被别的写入抢先时，同样按已存在跳过，不整轮回滚。
+            Err(error) if error.contains("已在交易池中") => {
+                applied.add_skipped.push(symbol.clone());
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(applied)
 }
@@ -474,6 +518,7 @@ fn apply_plan(
 /// 执行一轮换池扫描。`apply=false` 只返回计划，不写库、不更新上次运行时间。
 /// 行情或合约表读取失败直接返回错误，不修改标的池。
 pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
+    let _busy = BusyGuard::acquire().ok_or_else(|| "自动换池正在执行".to_string())?;
     let cfg = load_config(db)?;
     let mode = crate::symbols::current_mode(db);
 
@@ -708,6 +753,7 @@ mod tests {
         assert_eq!(applied.deleted, vec!["AAAUSDT"]);
         assert_eq!(applied.added, vec!["CCCUSDT"]);
         assert!(applied.skipped.is_empty());
+        assert!(applied.add_skipped.is_empty());
         let symbols: Vec<String> = conn
             .prepare("SELECT symbol FROM trading_symbols ORDER BY sort_order, symbol")
             .unwrap()
@@ -748,6 +794,50 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_skips_existing_symbols_without_overwrite() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+             CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, name TEXT, tier TEXT, sl_atr_mult REAL,
+               enabled INTEGER, max_leverage INTEGER, precision INTEGER, tick_sz TEXT, min_sz TEXT,
+               min_notional REAL, ct_val REAL, min_score REAL, note TEXT, sort_order INTEGER,
+               created_at INTEGER, updated_at INTEGER);
+             CREATE TABLE positions(symbol TEXT, status TEXT, mode TEXT);
+             INSERT INTO app_settings VALUES('risk','{\"max_leverage\":50}',0);
+             INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at)
+               VALUES('CCCUSDT','CCC','tier_1_bluechip',1.8,0,20,2,'0.1','0.01',10.0,1.0,0.0,'手动禁用',5,1,1);",
+        )
+        .unwrap();
+        let plan = ScanPlan {
+            keep: vec![],
+            delete: vec![],
+            add: vec!["CCCUSDT".into()],
+            held: vec![],
+            suspended: vec![],
+            candidates: vec!["CCCUSDT".into()],
+            delete_reasons: vec![],
+        };
+        let applied = apply_plan(&conn, "live", &plan, &[contract("CCCUSDT")]).unwrap();
+        assert!(applied.added.is_empty(), "已存在的标的不能重复写入");
+        assert_eq!(applied.add_skipped, vec!["CCCUSDT"]);
+        assert!(applied.deleted.is_empty(), "删除跳过与新增跳过不能混用");
+        assert!(applied.skipped.is_empty(), "删除跳过与新增跳过不能混用");
+
+        let (enabled, tier, note, count): (i64, String, String, i64) = conn
+            .query_row(
+                "SELECT enabled, tier, note, (SELECT COUNT(*) FROM trading_symbols) \
+                 FROM trading_symbols WHERE symbol='CCCUSDT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0, "不能自动重新启用用户手动禁用的标的");
+        assert_eq!(tier, "tier_1_bluechip");
+        assert_eq!(note, "手动禁用");
+        assert_eq!(count, 1, "最终池不变");
+    }
+
+    #[test]
     fn apply_plan_skips_delete_when_position_is_open() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -770,6 +860,10 @@ mod tests {
         let applied = apply_plan(&conn, "live", &plan, &[]).unwrap();
         assert!(applied.deleted.is_empty(), "有持仓的标的实际未删除");
         assert_eq!(applied.skipped, vec!["AAAUSDT"]);
+        assert!(
+            applied.add_skipped.is_empty(),
+            "删除跳过与新增跳过不能混用"
+        );
         let symbols: Vec<String> = conn
             .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
             .unwrap()
@@ -802,10 +896,16 @@ mod tests {
             deleted: vec!["AAAUSDT".into()],
             added: vec!["CCCUSDT".into()],
             skipped: vec!["DDDUSDT".into()],
+            add_skipped: vec!["EEEUSDT".into()],
         };
         let result = merge_applied_result(plan_result(&plan, 4, true), &plan, &applied);
         assert_eq!(result["delete"], json!(["AAAUSDT"]));
         assert_eq!(result["delete_skipped"], json!(["DDDUSDT"]));
+        assert_eq!(
+            result["add_skipped"],
+            json!(["EEEUSDT"]),
+            "新增跳过与删除跳过必须分开呈现"
+        );
         assert_eq!(
             result["delete_reasons"],
             json!([{"symbol": "AAAUSDT", "reason": "量能不足"}]),
@@ -815,6 +915,14 @@ mod tests {
         assert_eq!(keep, vec!["BBBUSDT", "DDDUSDT"], "跳过的标的不再丢失");
         assert_eq!(result["add"], json!(["CCCUSDT"]));
         assert_eq!(result["applied"], json!(true));
+    }
+
+    #[test]
+    fn busy_guard_rejects_concurrent_acquisition_and_releases_on_drop() {
+        let first = BusyGuard::acquire().expect("首次应获取");
+        assert!(BusyGuard::acquire().is_none(), "执行中不能重复获取");
+        drop(first);
+        assert!(BusyGuard::acquire().is_some(), "释放后应可再次获取");
     }
 
     #[test]
