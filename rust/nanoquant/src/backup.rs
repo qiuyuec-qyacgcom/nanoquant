@@ -1584,6 +1584,38 @@ mod tests {
             .collect();
         let expected: Vec<String> = GROUPS.iter().map(|group| group.to_string()).collect();
         assert_eq!(listed, expected, "导出必须覆盖全部白名单组");
+
+        let filtered = create_backup_inner(
+            &state,
+            CreateIn {
+                name: "filtered".into(),
+                settings_groups: Some(vec!["engine".into(), "evil_group".into()]),
+                tables: None,
+                files: None,
+                encrypt: Some(false),
+                created_by: None,
+            },
+        )
+        .expect("备份应成功");
+        let filtered_groups: Vec<String> = filtered["manifest"]["settings_groups"]
+            .as_array()
+            .expect("manifest 必须列出设置组")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            filtered_groups,
+            vec!["engine".to_string()],
+            "导出必须过滤请求中的非法组"
+        );
+        let path = filtered["path"].as_str().expect("备份必须返回路径");
+        let entries = archive::read(&std::fs::read(path).unwrap()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"settings/engine.json"), "合法组必须入包");
+        assert!(
+            !names.contains(&"settings/evil_group.json"),
+            "非法组不得入包"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1663,10 +1695,81 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_tables_outside_the_allow_list() {
-        // 只允许 BACKUP_TABLES 中的表，防止 manifest 被篡改后写任意表。
-        assert!(BACKUP_TABLES.contains(&"app_settings"));
-        assert!(!BACKUP_TABLES.contains(&"sqlite_master"));
+    fn restore_skips_tables_outside_the_allow_list() {
+        let dir = std::env::temp_dir().join(format!("nq-restore-tables-{}", crate::now_millis()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        crate::bootstrap::initialize(&db_path, &dir.join(".master_key"), Some("test-password"))
+            .unwrap();
+        let zip = archive::build(&[
+            Entry {
+                name: "manifest.json".into(),
+                data: serde_json::to_vec(&json!({
+                    "version": 1,
+                    "settings_groups": [],
+                    "tables": ["app_settings", "evil_table"],
+                }))
+                .unwrap(),
+            },
+            Entry {
+                name: "tables/app_settings.json".into(),
+                data: serde_json::to_vec(&json!([
+                    {"key": "engine", "value": "{\"enabled\":false}", "updated_at": 0}
+                ]))
+                .unwrap(),
+            },
+            Entry {
+                name: "tables/evil_table.json".into(),
+                data: serde_json::to_vec(&json!([{"id": 1, "payload": "hacked"}])).unwrap(),
+            },
+        ])
+        .unwrap();
+        let zip_path = dir.join("tables.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let digest = hex::encode(Sha256::digest(&zip));
+        let db = Db::open(&db_path.to_string_lossy()).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE evil_table(id INTEGER PRIMARY KEY, payload TEXT);
+                 INSERT INTO evil_table(id,payload) VALUES(1,'original');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO backup_jobs(id,ts,name,scope,file_path,size,sha256,encrypted,status,message,created_by) \
+                 VALUES(1,0,'tables','{}',?1,?2,?3,0,'ok','','manual')",
+                rusqlite::params![zip_path.to_string_lossy(), zip.len() as i64, digest],
+            )
+            .unwrap();
+        }
+        let state = test_state(db.clone());
+        let outcome = restore_inner(
+            &state,
+            1,
+            &json!({"restore_settings": false, "restore_tables": true}),
+        )
+        .expect("还原应成功");
+        assert_eq!(outcome["ok"], true);
+        let conn = db.conn.lock().unwrap();
+        let engine: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='engine'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(engine.contains("\"enabled\":false"), "合法表应被还原");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM evil_table WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, "original", "非法表必须被白名单跳过");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
