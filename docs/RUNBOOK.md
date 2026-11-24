@@ -177,14 +177,4 @@ Webhook（钉钉/飞书/企业微信机器人）或 Telegram Bot，然后用「�
 
 P4 已完成 legacy 后端与虚拟环境退役，迁移期回滚开关不再存在。当前唯一内核为 Rust 二进制：
 `rust/nanoquant/target/release/nanoquant`。启动/停止/状态请使用 `scripts/start.sh|stop.sh|status.sh`。
-### 8.8 旧库升级到 AI 调参命名
 
-升级到包含 `ai_tuning` 命名的版本前，先停服并备份数据库，然后执行一次迁移命令：
-
-```bash
-rust/nanoquant/target/release/nanoquant ops migrate-ai-tuning \
-  --db data/nanoquant.db --format json
-```
-
-命令会迁移表名、`trades` 列名、索引、配置键、事件分类/前缀、状态键和审计来源；
-幂等，可重复运行。服务启动本身不再做这套旧名迁移，避免启动时悄悄改表。

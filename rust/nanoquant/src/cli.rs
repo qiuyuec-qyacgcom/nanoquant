@@ -37,10 +37,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "seed-symbols",
         "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
     ),
-    (
-        "migrate-ai-tuning",
-        "迁移旧参数集命名为 AI 调参（表/列/索引/配置/事件/审计）",
-    ),
+
     ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
     ("verify-partial-tp", "部分止盈复核"),
@@ -362,7 +359,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "verify-exec-core" => verify_exec_core_command(&options),
         "show-exec-secret" => show_exec_secret(&options, config),
         "seed-symbols" => seed_symbols(&options),
-        "migrate-ai-tuning" => migrate_ai_tuning(&options),
+
         "contract-diff" => contract_diff_command(&options, config),
         "zero-python" => zero_python(&options, config),
         _ => Err((
@@ -496,23 +493,6 @@ fn print_zero_python_human(value: &Value) {
     }
 }
 
-/// 一次性把旧「参数集」命名迁移为「AI 调参」。
-fn migrate_ai_tuning(options: &Options) -> Result<(i32, Value), (i32, String)> {
-    let db = open_db(&options.db_path)?;
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| (1, "数据库连接锁被占用".to_string()))?;
-    let steps = crate::schema::migrate_ai_tuning_legacy(&conn).map_err(|error| (1, error))?;
-    Ok((
-        0,
-        json!({
-            "ok": true,
-            "db": options.db_path,
-            "steps": steps,
-        }),
-    ))
-}
 
 /// 为既有数据库补默认标的池。
 ///
@@ -1805,7 +1785,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 21);
+        assert_eq!(text.len(), 20);
         for name in [
             "preflight",
             "reconcile",
@@ -1827,7 +1807,7 @@ mod tests {
             "verify-partial-tp",
             "contract-diff",
             "zero-python",
-            "migrate-ai-tuning",
+
         ] {
             assert!(text.contains(&name), "缺少命令 {name}");
         }
