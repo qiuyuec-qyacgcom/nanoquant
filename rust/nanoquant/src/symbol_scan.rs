@@ -33,6 +33,8 @@ pub struct ScanPlan {
     pub add: Vec<String>,
     /// 本轮有持仓的标的。恒为 `keep` 的子集（`held ⊆ keep`），下游不要重复计数。
     pub held: Vec<String>,
+    /// 原池中的休市标的（股票/商品类永续 `BREAK`）。与 `held` 分开，避免把休市误当持仓。
+    pub suspended: Vec<String>,
     pub candidates: Vec<String>,
     /// 与 `delete` 一一对应的删除原因（闸门失败原因，或缺少行情数据）。
     pub delete_reasons: Vec<(String, String)>,
@@ -56,6 +58,7 @@ fn as_candidate(row: &ScannedSymbol) -> Candidate {
 pub fn plan(
     current: &[String],
     held: &HashSet<String>,
+    suspended: &HashSet<String>,
     scanned: &[ScannedSymbol],
     gates: &ScanGates,
     target: usize,
@@ -78,6 +81,12 @@ pub fn plan(
     let mut to_replace: Vec<(String, String)> = Vec::new();
 
     for symbol in current_unique.iter().copied() {
+        // 休市优先于持仓：没有行情是预期状态，保留且只记一次。
+        if suspended.contains(symbol) {
+            plan.keep.push(symbol.clone());
+            plan.suspended.push(symbol.clone());
+            continue;
+        }
         if held.contains(symbol) {
             plan.keep.push(symbol.clone());
             plan.held.push(symbol.clone());
@@ -145,7 +154,7 @@ pub(crate) fn tradable_symbols(contracts: &[Value]) -> HashSet<String> {
         .iter()
         .filter_map(|row| {
             let symbol = row["symbol"].as_str()?;
-            crate::symbols::valid_contract(row, symbol).then(|| symbol.to_string())
+            crate::symbols::valid_contract(row, symbol).then_some(symbol.to_string())
         })
         .collect()
 }
@@ -154,11 +163,32 @@ pub(crate) fn tradable_symbols(contracts: &[Value]) -> HashSet<String> {
 pub(crate) fn suspended_symbols(contracts: &[Value]) -> HashSet<String> {
     contracts
         .iter()
-        .filter(|row| {
-            row["contractType"].as_str() == Some("TRADIFI_PERPETUAL")
-                && row["status"].as_str() == Some("BREAK")
+        .filter(|row| row["status"].as_str() == Some("BREAK"))
+        .filter_map(|row| {
+            let symbol = row["symbol"].as_str()?;
+            crate::symbols::valid_contract(row, symbol).then_some(symbol.to_string())
         })
-        .filter_map(|row| row["symbol"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// 全市场休市集合与当前池求交，结果排序以便稳定输出。
+fn suspended_in_pool(contracts: &[Value], current: &HashSet<String>) -> Vec<String> {
+    let mut suspended: Vec<String> = suspended_symbols(contracts)
+        .into_iter()
+        .filter(|symbol| current.contains(symbol))
+        .collect();
+    suspended.sort();
+    suspended
+}
+
+/// 剔除用户手动禁用（enabled=0）的标的。它们仍在池表里，若进入候选会在新增时主键冲突。
+pub(crate) fn exclude_blocked(
+    scanned: Vec<ScannedSymbol>,
+    blocked: &HashSet<String>,
+) -> Vec<ScannedSymbol> {
+    scanned
+        .into_iter()
+        .filter(|row| !blocked.contains(&row.symbol))
         .collect()
 }
 
@@ -299,6 +329,18 @@ fn current_pool(db: &crate::db::Db) -> Result<Vec<String>, String> {
         .map_err(|error| format!("读取标的池失败: {error}"))
 }
 
+fn all_pool_symbols(db: &crate::db::Db) -> Result<HashSet<String>, String> {
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT symbol FROM trading_symbols")
+        .map_err(|error| format!("读取全部标的失败: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取全部标的失败: {error}"))?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| format!("读取全部标的失败: {error}"))
+}
+
 fn held_symbols(db: &crate::db::Db, mode: &str) -> Result<HashSet<String>, String> {
     let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
     let mut stmt = conn
@@ -341,20 +383,16 @@ fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<(), String>
     .map_err(|error| format!("写入 engine_state.{key} 失败: {error}"))
 }
 
-fn plan_result(
-    plan: &ScanPlan,
-    scanned: usize,
-    applied: bool,
-    suspended: &[String],
-) -> Value {
+fn plan_result(plan: &ScanPlan, scanned: usize, applied: bool) -> Value {
     json!({
         "scanned": scanned,
         "candidates": plan.candidates.clone(),
         "keep": plan.keep.clone(),
         "held": plan.held.clone(),
-        "suspended": suspended,
+        "suspended": plan.suspended.clone(),
         "delete": plan.delete.clone(),
-        "delete_skipped": Vec::<String>::new(),
+        // dry-run 无法预知二次持仓检查；null 表示不适用，apply 时由 merge_applied_result 写入。
+        "delete_skipped": Value::Null,
         "add": plan.add.clone(),
         "delete_reasons": plan
             .delete_reasons
@@ -363,6 +401,30 @@ fn plan_result(
             .collect::<Vec<_>>(),
         "applied": applied,
     })
+}
+
+/// 用实际执行结果校正对外结果：删除原因只保留真正删除的标的，
+/// 被二次持仓检查跳过的标的并入 keep，保证 keep ∪ delete ∪ add 可重建最终池。
+fn merge_applied_result(mut result: Value, plan: &ScanPlan, applied: &AppliedPlan) -> Value {
+    let deleted: HashSet<&str> = applied.deleted.iter().map(String::as_str).collect();
+    let reasons: Vec<Value> = plan
+        .delete_reasons
+        .iter()
+        .filter(|(symbol, _)| deleted.contains(symbol.as_str()))
+        .map(|(symbol, reason)| json!({"symbol": symbol, "reason": reason}))
+        .collect();
+    let mut keep = plan.keep.clone();
+    for symbol in &applied.skipped {
+        if !keep.contains(symbol) {
+            keep.push(symbol.clone());
+        }
+    }
+    result["keep"] = json!(keep);
+    result["delete"] = json!(applied.deleted);
+    result["delete_reasons"] = json!(reasons);
+    result["delete_skipped"] = json!(applied.skipped);
+    result["add"] = json!(applied.added);
+    result
 }
 
 /// `apply_plan` 的实际执行结果。删除前的二次持仓检查可能让计划落空，
@@ -428,7 +490,14 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         .map_err(|error| format!("初始化行情客户端失败: {error:?}"))?;
 
     let current = current_pool(db)?;
-
+    let current_set: HashSet<String> = current.iter().cloned().collect();
+    let all_pool = all_pool_symbols(db)?;
+    // 用户手动禁用的标的仍在池表里，不能进入候选，否则新增会主键冲突。
+    let blocked: HashSet<String> = all_pool.difference(&current_set).cloned().collect();
+    // 休市保护只针对当前池：全市场休市标的与池求交后才是本轮要保留的。
+    let suspended: HashSet<String> = suspended_in_pool(&contracts, &current_set)
+        .into_iter()
+        .collect();
 
     let tickers = provider
         .tickers_24h()
@@ -439,11 +508,8 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         .await
         .map_err(|error| format!("读取盘口失败: {error:?}"))?;
 
-    // 与标的池写入共用同一套可交易规则；休市标的另记集合，本轮保留。
+    // 与标的池写入共用同一套可交易规则。
     let tradable = tradable_symbols(&contracts);
-    let suspended = suspended_symbols(&contracts);
-    let mut suspended_list: Vec<String> = suspended.into_iter().collect();
-    suspended_list.sort();
 
     let mut ranked: Vec<&crate::providers::ExchangeTicker> = tickers
         .iter()
@@ -525,13 +591,13 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         });
     }
 
-    let mut held = held_symbols(db, &mode)?;
-    // 休市标的没有行情，但必须保留，否则会被当作缺数据替换掉。
-    held.extend(suspended_list.iter().cloned());
-    let plan = plan(&current, &held, &scanned, &cfg.gates, cfg.target);
+    let scanned = exclude_blocked(scanned, &blocked);
+
+    let held = held_symbols(db, &mode)?;
+    let plan = plan(&current, &held, &suspended, &scanned, &cfg.gates, cfg.target);
 
     if !apply {
-        return Ok(plan_result(&plan, scanned.len(), false, &suspended_list));
+        return Ok(plan_result(&plan, scanned.len(), false));
     }
 
     let now = crate::now();
@@ -545,10 +611,8 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         let applied = apply_plan(&tx, &mode, &plan, &contracts)?;
         let replaced = applied.deleted.len();
         let added = applied.added.len();
-        let mut result = plan_result(&plan, scanned.len(), true, &suspended_list);
-        result["delete"] = json!(applied.deleted);
-        result["add"] = json!(applied.added);
-        result["delete_skipped"] = json!(applied.skipped);
+        let result =
+            merge_applied_result(plan_result(&plan, scanned.len(), true), &plan, &applied);
         let message = format!("自动换池：替换 {replaced} 个，新增 {added} 个");
         let payload = result.to_string();
         upsert_state(&tx, "symbol_scan.last_run_ts", &now.to_string())?;
@@ -635,6 +699,7 @@ mod tests {
             delete: vec!["AAAUSDT".into()],
             add: vec!["CCCUSDT".into()],
             held: vec!["BBBUSDT".into()],
+            suspended: vec![],
             candidates: vec!["CCCUSDT".into()],
             delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
         };
@@ -698,6 +763,7 @@ mod tests {
             delete: vec!["AAAUSDT".into()],
             add: vec![],
             held: vec!["AAAUSDT".into()],
+            suspended: vec![],
             candidates: vec![],
             delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
         };
@@ -716,6 +782,39 @@ mod tests {
             vec!["AAAUSDT", "BBBUSDT"],
             "有持仓的标的不能被二次检查删除"
         );
+    }
+
+    #[test]
+    fn merge_applied_result_aligns_reasons_and_keeps_skipped() {
+        let plan = ScanPlan {
+            keep: vec!["BBBUSDT".into()],
+            delete: vec!["AAAUSDT".into(), "DDDUSDT".into()],
+            add: vec!["CCCUSDT".into()],
+            held: vec!["BBBUSDT".into()],
+            suspended: vec![],
+            candidates: vec!["CCCUSDT".into()],
+            delete_reasons: vec![
+                ("AAAUSDT".into(), "量能不足".into()),
+                ("DDDUSDT".into(), "缺少行情数据".into()),
+            ],
+        };
+        let applied = AppliedPlan {
+            deleted: vec!["AAAUSDT".into()],
+            added: vec!["CCCUSDT".into()],
+            skipped: vec!["DDDUSDT".into()],
+        };
+        let result = merge_applied_result(plan_result(&plan, 4, true), &plan, &applied);
+        assert_eq!(result["delete"], json!(["AAAUSDT"]));
+        assert_eq!(result["delete_skipped"], json!(["DDDUSDT"]));
+        assert_eq!(
+            result["delete_reasons"],
+            json!([{"symbol": "AAAUSDT", "reason": "量能不足"}]),
+            "删除原因必须与实际的 delete 一一对应"
+        );
+        let keep: Vec<String> = serde_json::from_value(result["keep"].clone()).unwrap();
+        assert_eq!(keep, vec!["BBBUSDT", "DDDUSDT"], "跳过的标的不再丢失");
+        assert_eq!(result["add"], json!(["CCCUSDT"]));
+        assert_eq!(result["applied"], json!(true));
     }
 
     #[test]
@@ -750,14 +849,59 @@ mod tests {
             "只有 TRADIFI_PERPETUAL + BREAK 算休市"
         );
 
-        // 休市标的没有 K 线，并入 held 后必须保留，不能被替换掉。
-        let mut protected = HashSet::new();
-        protected.extend(suspended.iter().cloned());
+        // 休市标的没有 K 线，但 suspended 优先保留，不依赖 held。
         let current = vec!["NVDAUSDT".to_string()];
-        let no_data = plan(&current, &protected, &[], &gates(), 12);
+        let suspended_set: HashSet<String> = suspended.clone();
+        let no_data = plan(
+            &current,
+            &HashSet::new(),
+            &suspended_set,
+            &[],
+            &gates(),
+            12,
+        );
         assert_eq!(no_data.keep, vec!["NVDAUSDT"]);
-        assert_eq!(no_data.held, vec!["NVDAUSDT"]);
+        assert_eq!(no_data.suspended, vec!["NVDAUSDT"]);
+        assert!(no_data.held.is_empty(), "休市不等于持仓");
         assert!(no_data.delete.is_empty(), "休市标的不能被替换");
+    }
+
+    #[test]
+    fn suspended_is_limited_to_current_pool() {
+        let contracts = vec![
+            contract_with("NVDAUSDT", "TRADIFI_PERPETUAL", "BREAK", "USDT"),
+            contract_with("NVDLUSDT", "TRADIFI_PERPETUAL", "BREAK", "USDT"),
+            contract_with("ETHUSDT", "PERPETUAL", "TRADING", "USDT"),
+        ];
+        let current: HashSet<String> = ["ETHUSDT".to_string(), "NVDAUSDT".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            suspended_in_pool(&contracts, &current),
+            vec!["NVDAUSDT"],
+            "全市场休市集合只保留当前池内的标的"
+        );
+    }
+
+    #[test]
+    fn blocked_symbols_are_excluded_from_candidates() {
+        let blocked: HashSet<String> = ["CCCUSDT".to_string()].into_iter().collect();
+        let rows = vec![scanned("AAAUSDT", 1.0), scanned("CCCUSDT", 3.0)];
+        let kept = exclude_blocked(rows, &blocked);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol, "AAAUSDT");
+
+        let current = owned(&["AAAUSDT"]);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &kept,
+            &gates(),
+            2,
+        );
+        assert!(plan.candidates.is_empty(), "禁用标的不能成为候选");
+        assert!(plan.add.is_empty(), "禁用标的不能被新增");
     }
 
     #[test]
@@ -844,7 +988,7 @@ mod tests {
     fn all_current_pass_keeps_everything_without_replacements() {
         let current = owned(&["AAAUSDT", "BBBUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.5), scanned("BBBUSDT", 2.0)];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT", "BBBUSDT"]));
         assert!(plan.delete.is_empty(), "全部通过不应删除任何标的");
@@ -862,7 +1006,7 @@ mod tests {
             scanned("CCCUSDT", 1.0),
             scanned("DDDUSDT", 2.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert_eq!(plan.delete, owned(&["BBBUSDT"]));
@@ -876,12 +1020,27 @@ mod tests {
         let current = owned(&["AAAUSDT", "BBBUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.5), scanned("BBBUSDT", 0.5)];
         let held: HashSet<String> = ["BBBUSDT".to_string()].into_iter().collect();
-        let plan = plan(&current, &held, &rows, &gates(), 2);
+        let plan = plan(&current, &held, &HashSet::new(), &rows, &gates(), 2);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT", "BBBUSDT"]));
         assert_eq!(plan.held, owned(&["BBBUSDT"]));
         assert!(plan.delete.is_empty(), "持仓标的永不删除");
         assert!(plan.add.is_empty());
+    }
+
+    #[test]
+    fn suspended_symbols_are_kept_without_counting_as_held() {
+        let current = owned(&["AAAUSDT", "NVDAUSDT"]);
+        let held: HashSet<String> = ["AAAUSDT".to_string(), "NVDAUSDT".to_string()]
+            .into_iter()
+            .collect();
+        let suspended: HashSet<String> = ["NVDAUSDT".to_string()].into_iter().collect();
+        let plan = plan(&current, &held, &suspended, &[], &gates(), 2);
+
+        assert_eq!(plan.keep, owned(&["AAAUSDT", "NVDAUSDT"]));
+        assert_eq!(plan.held, owned(&["AAAUSDT"]), "休市标的不能混入 held");
+        assert_eq!(plan.suspended, owned(&["NVDAUSDT"]));
+        assert!(plan.delete.is_empty());
     }
 
     #[test]
@@ -892,7 +1051,7 @@ mod tests {
             scanned("BBBUSDT", 2.0),
             scanned("CCCUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert!(plan.delete.is_empty());
@@ -909,7 +1068,7 @@ mod tests {
             scanned("CCCUSDT", 0.5),
             scanned("DDDUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
 
         assert_eq!(plan.keep, owned(&["BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
@@ -930,7 +1089,7 @@ mod tests {
             scanned("BBBUSDT", 1.0),
             scanned("CCCUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT", "BBBUSDT", "CCCUSDT"]));
         assert!(plan.delete.is_empty());
@@ -949,7 +1108,7 @@ mod tests {
         let mut bad_candidate = scanned("EEEUSDT", 5.0);
         bad_candidate.spread_bps = 9.0;
         let rows = vec![high_atr, thin, wide, scanned("DDDUSDT", 1.0), bad_candidate];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
 
         assert_eq!(plan.keep, owned(&["BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
@@ -961,7 +1120,7 @@ mod tests {
     fn missing_scanned_symbol_is_deleted_with_reason() {
         let current = owned(&["AAAUSDT"]);
         let rows = vec![scanned("DDDUSDT", 1.0)];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 1);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 1);
 
         assert!(plan.keep.is_empty());
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
@@ -989,7 +1148,7 @@ mod tests {
             scanned("EEEUSDT", 2.0),
             scanned("FFFUSDT", 1.5),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
 
         assert_eq!(plan.delete, owned(&["AAAUSDT", "BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete_reasons.len(), 3);
@@ -1015,7 +1174,7 @@ mod tests {
             scanned("BBBUSDT", 2.0),
             scanned("CCCUSDT", 3.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
 
         assert_eq!(plan.candidates, owned(&["CCCUSDT", "BBBUSDT"]));
         assert_eq!(plan.add, owned(&["CCCUSDT", "BBBUSDT"]));
@@ -1032,7 +1191,7 @@ mod tests {
             scanned("CCCUSDT", 1.8),
             scanned("DDDUSDT", 2.0),
         ];
-        let deduped = plan(&current, &HashSet::new(), &rows, &gates(), 2);
+        let deduped = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
 
         assert_eq!(deduped.keep, owned(&["BBBUSDT"]));
         assert_eq!(deduped.delete, owned(&["AAAUSDT"]), "AAA 只能删除一次");
@@ -1043,7 +1202,7 @@ mod tests {
         // 全部通过时，重复的原池标的在 keep 中同样只出现一次。
         let current = owned(&["AAAUSDT", "AAAUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.0)];
-        let all_pass = plan(&current, &HashSet::new(), &rows, &gates(), 1);
+        let all_pass = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 1);
         assert_eq!(all_pass.keep, owned(&["AAAUSDT"]));
     }
 
@@ -1056,7 +1215,7 @@ mod tests {
             scanned("CCCUSDT", 3.0),
             scanned("DDDUSDT", 2.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 5);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 5);
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert_eq!(plan.candidates, owned(&["CCCUSDT", "DDDUSDT", "BBBUSDT"]));
@@ -1065,7 +1224,7 @@ mod tests {
 
     #[test]
     fn empty_input_and_zero_target_are_handled() {
-        let first = plan(&[], &HashSet::new(), &[], &gates(), 0);
+        let first = plan(&[], &HashSet::new(), &HashSet::new(), &[], &gates(), 0);
         assert!(first.keep.is_empty());
         assert!(first.delete.is_empty());
         assert!(first.add.is_empty());
@@ -1076,7 +1235,7 @@ mod tests {
         // target = 0 且全部通过时不裁减合格标的。
         let current = owned(&["AAAUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.0)];
-        let plan = plan(&current, &HashSet::new(), &rows, &gates(), 0);
+        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 0);
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert!(plan.delete.is_empty());
         assert!(plan.add.is_empty());
