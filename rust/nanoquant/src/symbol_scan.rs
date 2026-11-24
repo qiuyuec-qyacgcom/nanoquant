@@ -393,69 +393,114 @@ fn set_last_run_ts(db: &crate::db::Db, ts: i64) -> Result<(), String> {
     upsert_state(&conn, "symbol_scan.last_run_ts", &ts.to_string())
 }
 
-/// 是否到期换池。`last_run_ts == 0` 表示尚未建立基线，不能算到期。
+/// 是否到期换池。`last_run_ts <= 0` 表示尚未建立基线（含历史负值），不能算到期。
 pub fn due(last_run_ts: i64, now: i64, interval_hours: i64) -> bool {
     last_run_ts > 0
-        && now.saturating_sub(last_run_ts) >= interval_hours.max(1) * 3600
+        && now.saturating_sub(last_run_ts) >= interval_hours.max(1).saturating_mul(3600)
 }
 
 fn record_event(db: &crate::db::Db, level: &str, message: &str, payload: Value) {
-    let Ok(conn) = db.conn.lock() else {
-        return;
+    let conn = match db.conn.lock() {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::debug!(%error, "获取数据库锁失败，丢弃 symbol_scan 事件");
+            return;
+        }
     };
-    let _ = conn.execute(
+    if let Err(error) = conn.execute(
         "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,?2,'symbol_scan',?3,?4)",
         (crate::now(), level, message, payload.to_string()),
+    ) {
+        tracing::debug!(%error, "写入 symbol_scan 事件失败");
+    }
+}
+
+fn record_scan_failure(
+    db: &crate::db::Db,
+    error: &str,
+    interval_hours: Option<i64>,
+    last_run_ts: i64,
+    retry_at: i64,
+) {
+    record_event(
+        db,
+        "warn",
+        "自动换池失败",
+        json!({
+            "error": error,
+            "interval_hours": interval_hours,
+            "last_run_ts": last_run_ts,
+            "retry_at": retry_at,
+        }),
     );
 }
+
+/// 后台循环的检查周期（秒）。
+const CHECK_INTERVAL_SECS: i64 = 60;
+/// 失败后的退避时长（秒）。连续失败期间不再重试、不再写事件。
+const RETRY_BACKOFF_SECS: i64 = 900;
+/// `run` 因手动 API 正在扫描而拒绝执行时的错误文案，属于正常并发而非故障。
+const BUSY_ERROR: &str = "自动换池正在执行";
 
 /// 独立后台换池循环：与交易引擎解耦，仅共享 SQLite 锁。
 ///
 /// 首次启用不立即扫描，只落基线时间；满一个间隔后才自动换池。
-pub fn spawn_loop(
-    db: crate::db::Db,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if *stop.borrow() {
-                break;
-            }
+/// 失败后进入退避期，避免持续抖动时每分钟重跑全市场扫描。
+pub async fn run_loop(db: crate::db::Db, mut stop: tokio::sync::watch::Receiver<bool>) {
+    let mut next_retry_ts = crate::now().saturating_add(CHECK_INTERVAL_SECS);
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        let now = crate::now();
+        if now >= next_retry_ts {
             match load_config(&db) {
                 Ok(cfg) if cfg.enabled => {
                     let last = last_run_ts(&db).unwrap_or(0);
-                    let now = crate::now();
-                    if last == 0 {
+                    if last <= 0 {
                         if let Err(error) = set_last_run_ts(&db, now) {
-                            record_event(
+                            next_retry_ts = now.saturating_add(RETRY_BACKOFF_SECS);
+                            record_scan_failure(
                                 &db,
-                                "warn",
-                                "自动换池失败",
-                                json!({ "error": error }),
+                                &error,
+                                Some(cfg.interval_hours),
+                                last,
+                                next_retry_ts,
                             );
+                        } else {
+                            next_retry_ts = 0;
                         }
                     } else if due(last, now, cfg.interval_hours) {
-                        if let Err(error) = run(&db, true).await {
-                            record_event(
-                                &db,
-                                "warn",
-                                "自动换池失败",
-                                json!({ "error": error }),
-                            );
+                        match run(&db, true).await {
+                            Ok(_) => next_retry_ts = 0,
+                            Err(error) if error == BUSY_ERROR => {
+                                next_retry_ts = now.saturating_add(CHECK_INTERVAL_SECS);
+                            }
+                            Err(error) => {
+                                next_retry_ts = now.saturating_add(RETRY_BACKOFF_SECS);
+                                record_scan_failure(
+                                    &db,
+                                    &error,
+                                    Some(cfg.interval_hours),
+                                    last,
+                                    next_retry_ts,
+                                );
+                            }
                         }
                     }
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    record_event(&db, "warn", "自动换池失败", json!({ "error": error }));
+                    next_retry_ts = now.saturating_add(RETRY_BACKOFF_SECS);
+                    record_scan_failure(&db, &error, None, 0, next_retry_ts);
                 }
             }
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}
-                _ = stop.changed() => break,
-            }
         }
-    })
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(CHECK_INTERVAL_SECS as u64)) => {}
+            _ = stop.changed() => break,
+        }
+    }
 }
 
 fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
@@ -773,6 +818,10 @@ mod tests {
         assert!(!due(now - 2 * 3600, now, 3));
         assert!(due(now - 3600, now, 1));
         assert!(!due(now - 3600, now, 2));
+        assert!(due(now - 3600, now, -1));
+        assert!(due(now - 3600, now, 0));
+        assert!(!due(-100, now, 3));
+        assert!(!due(now, now - 100, 3));
     }
 
     #[test]
