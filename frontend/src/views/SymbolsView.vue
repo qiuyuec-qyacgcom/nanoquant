@@ -10,7 +10,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { http } from '../api/client'
 import Modal from '../components/Modal.vue'
 import { useAppStore } from '../stores/app'
-import { fmt } from '../utils/format'
+import { fmt, timeStr } from '../utils/format'
 
 interface PoolRow {
   symbol: string
@@ -44,6 +44,11 @@ interface Candidate {
   in_pool: boolean
 }
 
+interface ScanState {
+  last_run_ts: number
+  last_result: any
+}
+
 const app = useAppStore()
 const pool = ref<PoolRow[]>([])
 const candidates = ref<Candidate[]>([])
@@ -63,9 +68,19 @@ const phrase = ref('')
 const deleteError = ref('')
 const deleting = ref(false)
 
+const scan = ref<ScanState | null>(null)
+const scanning = ref(false)
+const scanPlan = ref<any | null>(null)
+const showScanPlan = ref(false)
+const scanError = ref('')
+
 const requiredPhrase = computed(() => (pendingDelete.value ? `REMOVE ${pendingDelete.value.symbol}` : ''))
 const canDelete = computed(() => phrase.value.trim().toUpperCase() === requiredPhrase.value)
 const full = computed(() => count.value >= limits.maximum)
+const lastReplaceCount = computed(() => {
+  const deleted = scan.value?.last_result?.delete
+  return Array.isArray(deleted) ? deleted.length : 0
+})
 const normalized = computed(() => {
   const cleaned = Array.from(keyword.value.trim())
     .filter((ch) => /[\p{L}\p{N}]/u.test(ch))
@@ -87,12 +102,62 @@ async function loadPool() {
     }
     state.status = res.state?.status || ''
     state.detail = res.state?.detail || ''
+    scan.value = res.scan || null
     envLabel.value = app.status?.env_label || ''
   } catch (err: any) {
     app.notify(err.message, 'error')
   } finally {
     loading.value = false
   }
+}
+
+async function runScan(apply: boolean) {
+  scanning.value = true
+  scanError.value = ''
+  try {
+    const res = await http.post('/symbols/auto-scan', { apply }, 60_000)
+    if (apply) {
+      showScanPlan.value = false
+      scanPlan.value = null
+      await loadPool()
+      app.notify(`已替换 ${res.delete?.length || 0} 个，新增 ${res.add?.length || 0} 个`, 'ok')
+    } else {
+      scanPlan.value = res
+      showScanPlan.value = true
+    }
+  } catch (err: any) {
+    scanError.value = err?.message || '扫描失败'
+    app.notify(scanError.value, 'error')
+  } finally {
+    scanning.value = false
+  }
+}
+
+function closeScanPlan() {
+  if (scanning.value) return
+  showScanPlan.value = false
+  scanPlan.value = null
+}
+
+/** 删除原因兼容两种形状：`{symbol, reason}` 对象与 `[symbol, reason]` 数组。 */
+function deleteReason(symbol: string): string {
+  const reasons = scanPlan.value?.delete_reasons
+  if (!Array.isArray(reasons)) return ''
+  for (const entry of reasons) {
+    if (Array.isArray(entry)) {
+      if (entry[0] === symbol) return String(entry[1] ?? '')
+    } else if (entry && entry.symbol === symbol) {
+      return String(entry.reason ?? '')
+    }
+  }
+  return ''
+}
+
+/** 执行后才知道的跳过名单：dry-run 阶段为 null，表示要等真正执行时才二次检查。 */
+function skippedText(value: unknown): string {
+  if (value === null || value === undefined) return '仅执行时检查'
+  if (Array.isArray(value) && value.length) return value.join('、')
+  return '无'
 }
 
 async function search() {
@@ -283,11 +348,19 @@ onMounted(loadPool)
     </div>
 
     <div class="panel">
-      <div class="panel-hd">
+      <div class="panel-hd scan-hd">
         <span class="panel-title">当前标的池</span>
         <div class="right">
           <span class="tag tag-dim">{{ count }} 个</span>
           <span v-if="state.detail" class="tag tag-warn">{{ state.detail }}</span>
+          <span class="scan-meta">
+            上次扫描：{{ scan?.last_run_ts ? timeStr(scan.last_run_ts, false) : '尚未扫描' }} · 上次替换
+            {{ lastReplaceCount }} 个
+          </span>
+          <span v-if="scanError" class="scan-error">{{ scanError }}</span>
+          <button class="btn btn-sm" :disabled="scanning" @click="runScan(false)">
+            {{ scanning ? '扫描中…' : '立即扫描' }}
+          </button>
         </div>
       </div>
       <div class="panel-body flush table-scroll" style="max-height: 520px">
@@ -359,5 +432,145 @@ onMounted(loadPool)
         </button>
       </template>
     </Modal>
+
+    <Modal v-if="showScanPlan && scanPlan" title="自动换池计划" wide @close="closeScanPlan">
+      <div class="stack scan-plan" style="gap: 12px">
+        <div class="scan-summary">
+          <span class="tag tag-dim">扫描 {{ scanPlan.scanned ?? 0 }} 个</span>
+          <span class="tag tag-dim">候选 {{ scanPlan.candidates?.length || 0 }} 个</span>
+          <span class="tag tag-warn">将替换 {{ scanPlan.delete?.length || 0 }} 个</span>
+          <span class="tag tag-long">将新增 {{ scanPlan.add?.length || 0 }} 个</span>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">将替换（{{ scanPlan.delete?.length || 0 }}）</div>
+          <div v-if="scanPlan.delete?.length" class="scan-list">
+            <span v-for="symbol in scanPlan.delete" :key="symbol" class="scan-item">
+              <b class="mono">{{ symbol }}</b>
+              <span v-if="deleteReason(symbol)" class="scan-reason">{{ deleteReason(symbol) }}</span>
+            </span>
+          </div>
+          <div v-else class="hint">无</div>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">将新增（{{ scanPlan.add?.length || 0 }}）</div>
+          <div v-if="scanPlan.add?.length" class="scan-list">
+            <span v-for="symbol in scanPlan.add" :key="symbol" class="scan-item">
+              <b class="mono">{{ symbol }}</b>
+            </span>
+          </div>
+          <div v-else class="hint">无</div>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">保留（{{ scanPlan.keep?.length || 0 }}）</div>
+          <div v-if="scanPlan.keep?.length" class="scan-list">
+            <span v-for="symbol in scanPlan.keep" :key="symbol" class="scan-item">
+              <b class="mono">{{ symbol }}</b>
+            </span>
+          </div>
+          <div v-else class="hint">无</div>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">持仓保留（{{ scanPlan.held?.length || 0 }}）</div>
+          <div v-if="scanPlan.held?.length" class="scan-list">
+            <span v-for="symbol in scanPlan.held" :key="symbol" class="scan-item scan-item-held">
+              <b class="mono">{{ symbol }}</b>
+            </span>
+          </div>
+          <div v-else class="hint">无</div>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">休市保留（{{ scanPlan.suspended?.length || 0 }}）</div>
+          <div v-if="scanPlan.suspended?.length" class="scan-list">
+            <span v-for="symbol in scanPlan.suspended" :key="symbol" class="scan-item">
+              <b class="mono">{{ symbol }}</b>
+            </span>
+          </div>
+          <div v-else class="hint">无</div>
+        </div>
+
+        <div class="scan-row">
+          <div class="scan-row-hd">跳过</div>
+          <div class="scan-skipped">
+            <span>删除跳过：{{ skippedText(scanPlan.delete_skipped) }}</span>
+            <span>新增跳过：{{ skippedText(scanPlan.add_skipped) }}</span>
+          </div>
+        </div>
+
+        <div class="hint">
+          计划仅为预览，不会自动执行。确认后将按上述替换/新增写入标的池；执行时会再次检查持仓与合约可用性，
+          被跳过的标的会保留在原池。
+        </div>
+      </div>
+      <template #footer>
+        <button class="btn btn-sm" :disabled="scanning" @click="closeScanPlan">取消</button>
+        <button class="btn btn-sm btn-primary" :disabled="scanning" @click="runScan(true)">
+          {{ scanning ? '执行中…' : '确认执行' }}
+        </button>
+      </template>
+    </Modal>
   </div>
 </template>
+
+<style scoped>
+.scan-hd {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.scan-meta {
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.scan-error {
+  font-size: 11px;
+  color: var(--warn);
+}
+.scan-plan {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.scan-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.scan-row-hd {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.scan-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.scan-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  font-size: 11px;
+}
+.scan-item-held {
+  border-color: var(--up-soft);
+}
+.scan-reason {
+  color: var(--warn);
+  font-size: 10.5px;
+}
+.scan-skipped {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+</style>
