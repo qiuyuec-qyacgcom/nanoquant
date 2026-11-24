@@ -1,10 +1,10 @@
-//! 自动换池的纯函数替换计划。
+//! 自动换池：纯函数替换计划 + 行情扫描执行。
 //!
-//! 输入当前池、持仓集合、本轮扫描特征与闸门，输出「保留 / 删除 / 新增 / 持仓 / 候选」。
-//! 本模块不访问网络与数据库，只做纯计算；执行层由调用方负责。
+//! `plan` 根据当前池、持仓、扫描特征与闸门，输出「保留 / 删除 / 新增 / 持仓 / 候选」，
+//! 不访问外部资源；`run` 负责拉取合约表与行情，并在单事务内落库。
 
 #![cfg_attr(not(test), allow(dead_code))]
-// TODO(任务5): 接线后移除上面的 dead_code 豁免。
+// TODO(任务6): 接入后台循环后移除上面的 dead_code 豁免。
 
 use std::collections::{HashMap, HashSet};
 
@@ -136,6 +136,30 @@ pub fn plan(
     );
 
     plan
+}
+
+/// 当前可交易（含休市）的 USDT 永续合约。规则与标的池写入共用 `symbols::valid_contract`，
+/// 避免扫描层与写入层各有一套口径。
+pub(crate) fn tradable_symbols(contracts: &[Value]) -> HashSet<String> {
+    contracts
+        .iter()
+        .filter_map(|row| {
+            let symbol = row["symbol"].as_str()?;
+            crate::symbols::valid_contract(row, symbol).then(|| symbol.to_string())
+        })
+        .collect()
+}
+
+/// 休市中的股票/商品类永续。行情缺失是预期状态，本轮必须保留在池中。
+pub(crate) fn suspended_symbols(contracts: &[Value]) -> HashSet<String> {
+    contracts
+        .iter()
+        .filter(|row| {
+            row["contractType"].as_str() == Some("TRADIFI_PERPETUAL")
+                && row["status"].as_str() == Some("BREAK")
+        })
+        .filter_map(|row| row["symbol"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// 扫描配置。每轮从 app_settings 现读，缺项按内置默认值补齐。
@@ -317,13 +341,20 @@ fn upsert_state(conn: &Connection, key: &str, value: &str) -> Result<(), String>
     .map_err(|error| format!("写入 engine_state.{key} 失败: {error}"))
 }
 
-fn plan_result(plan: &ScanPlan, scanned: usize, applied: bool) -> Value {
+fn plan_result(
+    plan: &ScanPlan,
+    scanned: usize,
+    applied: bool,
+    suspended: &[String],
+) -> Value {
     json!({
         "scanned": scanned,
         "candidates": plan.candidates.clone(),
         "keep": plan.keep.clone(),
         "held": plan.held.clone(),
+        "suspended": suspended,
         "delete": plan.delete.clone(),
+        "delete_skipped": Vec::<String>::new(),
         "add": plan.add.clone(),
         "delete_reasons": plan
             .delete_reasons
@@ -334,6 +365,15 @@ fn plan_result(plan: &ScanPlan, scanned: usize, applied: bool) -> Value {
     })
 }
 
+/// `apply_plan` 的实际执行结果。删除前的二次持仓检查可能让计划落空，
+/// 调用方应以本结果覆盖对外结果，避免宣称已删除。
+#[derive(Debug, Clone, Default)]
+struct AppliedPlan {
+    deleted: Vec<String>,
+    added: Vec<String>,
+    skipped: Vec<String>,
+}
+
 /// 把计划落到库里。删除前再查一次持仓，持仓标的跳过；写入新增标的。
 /// 状态与事件由调用方在同一事务内负责，本函数不写。
 fn apply_plan(
@@ -341,7 +381,8 @@ fn apply_plan(
     mode: &str,
     plan: &ScanPlan,
     contracts: &[Value],
-) -> Result<(), String> {
+) -> Result<AppliedPlan, String> {
+    let mut applied = AppliedPlan::default();
     for symbol in &plan.delete {
         let open: i64 = conn
             .query_row(
@@ -351,6 +392,7 @@ fn apply_plan(
             )
             .map_err(|error| format!("检查 {symbol} 持仓失败: {error}"))?;
         if open > 0 {
+            applied.skipped.push(symbol.clone());
             continue;
         }
         conn.execute(
@@ -358,11 +400,13 @@ fn apply_plan(
             [symbol.as_str()],
         )
         .map_err(|error| format!("删除标的 {symbol} 失败: {error}"))?;
+        applied.deleted.push(symbol.clone());
     }
     for symbol in &plan.add {
         crate::symbols::upsert_contract_row_conn(conn, contracts, symbol)?;
+        applied.added.push(symbol.clone());
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// 执行一轮换池扫描。`apply=false` 只返回计划，不写库、不更新上次运行时间。
@@ -395,15 +439,11 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         .await
         .map_err(|error| format!("读取盘口失败: {error:?}"))?;
 
-    let tradable: HashSet<String> = contracts
-        .iter()
-        .filter(|row| {
-            row["contractType"].as_str() == Some("PERPETUAL")
-                && row["status"].as_str() == Some("TRADING")
-                && row["quoteAsset"].as_str() == Some("USDT")
-        })
-        .filter_map(|row| row["symbol"].as_str().map(str::to_string))
-        .collect();
+    // 与标的池写入共用同一套可交易规则；休市标的另记集合，本轮保留。
+    let tradable = tradable_symbols(&contracts);
+    let suspended = suspended_symbols(&contracts);
+    let mut suspended_list: Vec<String> = suspended.into_iter().collect();
+    suspended_list.sort();
 
     let mut ranked: Vec<&crate::providers::ExchangeTicker> = tickers
         .iter()
@@ -485,28 +525,32 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         });
     }
 
-    let held = held_symbols(db, &mode)?;
+    let mut held = held_symbols(db, &mode)?;
+    // 休市标的没有行情，但必须保留，否则会被当作缺数据替换掉。
+    held.extend(suspended_list.iter().cloned());
     let plan = plan(&current, &held, &scanned, &cfg.gates, cfg.target);
 
     if !apply {
-        return Ok(plan_result(&plan, scanned.len(), false));
+        return Ok(plan_result(&plan, scanned.len(), false, &suspended_list));
     }
 
-    let result = plan_result(&plan, scanned.len(), true);
-    let payload = result.to_string();
-    let message = format!(
-        "自动换池：替换 {} 个，新增 {} 个",
-        plan.delete.len(),
-        plan.add.len()
-    );
     let now = crate::now();
-    {
+    let result = {
         // 锁只覆盖同步落库段，不跨 await，避免 future 失去 Send。
         let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|error| format!("开启换池事务失败: {error}"))?;
-        apply_plan(&tx, &mode, &plan, &contracts)?;
+        // 二次持仓检查可能跳过删除，对外结果以实际执行列表为准。
+        let applied = apply_plan(&tx, &mode, &plan, &contracts)?;
+        let replaced = applied.deleted.len();
+        let added = applied.added.len();
+        let mut result = plan_result(&plan, scanned.len(), true, &suspended_list);
+        result["delete"] = json!(applied.deleted);
+        result["add"] = json!(applied.added);
+        result["delete_skipped"] = json!(applied.skipped);
+        let message = format!("自动换池：替换 {replaced} 个，新增 {added} 个");
+        let payload = result.to_string();
         upsert_state(&tx, "symbol_scan.last_run_ts", &now.to_string())?;
         upsert_state(&tx, "symbol_scan.last_result", &payload)?;
         tx.execute(
@@ -516,7 +560,8 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         .map_err(|error| format!("写入换池事件失败: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交换池事务失败: {error}"))?;
-    }
+        result
+    };
     Ok(result)
 }
 
@@ -548,34 +593,93 @@ mod tests {
         }
     }
 
+    fn contract_with(symbol: &str, contract_type: &str, status: &str, quote: &str) -> Value {
+        json!({
+            "symbol": symbol,
+            "baseAsset": symbol.strip_suffix("USDT").unwrap_or(symbol),
+            "contractType": contract_type,
+            "status": status,
+            "quoteAsset": quote,
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.0010", "minQty": "0.0010"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.010"},
+                {"filterType": "MIN_NOTIONAL", "notional": "5"}
+            ]
+        })
+    }
+
+    fn contract(symbol: &str) -> Value {
+        contract_with(symbol, "PERPETUAL", "TRADING", "USDT")
+    }
+
     #[test]
     fn apply_plan_keeps_held_symbols_and_replaces_the_rest() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+             CREATE TABLE trading_symbols(symbol TEXT PRIMARY KEY, name TEXT, tier TEXT, sl_atr_mult REAL,
+               enabled INTEGER, max_leverage INTEGER, precision INTEGER, tick_sz TEXT, min_sz TEXT,
+               min_notional REAL, ct_val REAL, min_score REAL, note TEXT, sort_order INTEGER,
+               created_at INTEGER, updated_at INTEGER);
              CREATE TABLE positions(symbol TEXT, status TEXT, mode TEXT);
-             INSERT INTO trading_symbols VALUES('AAAUSDT',1);
-             INSERT INTO trading_symbols VALUES('BBBUSDT',1);
+             INSERT INTO app_settings VALUES('risk','{\"max_leverage\":50}',0);
+             INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at)
+               VALUES('AAAUSDT','AAA','tier_2_momentum',2.2,1,20,3,'0.001','0.001',5.0,1.0,0.0,'',1,1,1);
+             INSERT INTO trading_symbols(symbol,name,tier,sl_atr_mult,enabled,max_leverage,precision,tick_sz,min_sz,min_notional,ct_val,min_score,note,sort_order,created_at,updated_at)
+               VALUES('BBBUSDT','BBB','tier_2_momentum',2.2,1,20,3,'0.001','0.001',5.0,1.0,0.0,'',2,1,1);
              INSERT INTO positions VALUES('BBBUSDT','open','live');",
         )
         .unwrap();
         let plan = ScanPlan {
             keep: vec!["BBBUSDT".into()],
             delete: vec!["AAAUSDT".into()],
-            add: vec![],
+            add: vec!["CCCUSDT".into()],
             held: vec!["BBBUSDT".into()],
-            candidates: vec![],
+            candidates: vec!["CCCUSDT".into()],
             delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
         };
-        apply_plan(&conn, "live", &plan, &[]).unwrap();
+        let contracts = vec![contract("CCCUSDT")];
+        let applied = apply_plan(&conn, "live", &plan, &contracts).unwrap();
+        assert_eq!(applied.deleted, vec!["AAAUSDT"]);
+        assert_eq!(applied.added, vec!["CCCUSDT"]);
+        assert!(applied.skipped.is_empty());
         let symbols: Vec<String> = conn
-            .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
+            .prepare("SELECT symbol FROM trading_symbols ORDER BY sort_order, symbol")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(symbols, vec!["BBBUSDT"]);
+        assert_eq!(symbols, vec!["BBBUSDT", "CCCUSDT"]);
+        let spec: (String, i64, String, String, f64, i64) = conn
+            .query_row(
+                "SELECT tier, max_leverage, tick_sz, min_sz, min_notional, precision \
+                 FROM trading_symbols WHERE symbol='CCCUSDT'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            spec,
+            (
+                "tier_2_momentum".to_string(),
+                50,
+                "0.010".to_string(),
+                "0.0010".to_string(),
+                5.0,
+                3
+            ),
+            "新增标的的规格必须按合约表写入"
+        );
     }
 
     #[test]
@@ -597,7 +701,9 @@ mod tests {
             candidates: vec![],
             delete_reasons: vec![("AAAUSDT".into(), "量能不足".into())],
         };
-        apply_plan(&conn, "live", &plan, &[]).unwrap();
+        let applied = apply_plan(&conn, "live", &plan, &[]).unwrap();
+        assert!(applied.deleted.is_empty(), "有持仓的标的实际未删除");
+        assert_eq!(applied.skipped, vec!["AAAUSDT"]);
         let symbols: Vec<String> = conn
             .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
             .unwrap()
@@ -610,6 +716,48 @@ mod tests {
             vec!["AAAUSDT", "BBBUSDT"],
             "有持仓的标的不能被二次检查删除"
         );
+    }
+
+    #[test]
+    fn tradable_and_suspended_contracts_align_with_pool_rules() {
+        let contracts = vec![
+            contract_with("AAAUSDT", "PERPETUAL", "TRADING", "USDT"),
+            contract_with("NVDAUSDT", "TRADIFI_PERPETUAL", "BREAK", "USDT"),
+            contract_with("ETHUSDT", "PERPETUAL", "BREAK", "USDT"),
+            contract_with("BADUSDT", "PERPETUAL", "TRADING", "BUSD"),
+            contract_with("NVDLUSDT", "TRADIFI_PERPETUAL", "TRADING", "USDT"),
+        ];
+
+        let tradable = tradable_symbols(&contracts);
+        assert!(tradable.contains("AAAUSDT"));
+        assert!(
+            tradable.contains("NVDAUSDT"),
+            "休市的股票类永续仍属可交易（本轮保留）"
+        );
+        assert!(tradable.contains("NVDLUSDT"));
+        assert!(
+            !tradable.contains("ETHUSDT"),
+            "非 TRADIFI 的 BREAK 合约不可交易"
+        );
+        assert!(!tradable.contains("BADUSDT"), "非 USDT 报价不可交易");
+
+        let suspended = suspended_symbols(&contracts);
+        let mut suspended_list: Vec<&str> = suspended.iter().map(String::as_str).collect();
+        suspended_list.sort();
+        assert_eq!(
+            suspended_list,
+            vec!["NVDAUSDT"],
+            "只有 TRADIFI_PERPETUAL + BREAK 算休市"
+        );
+
+        // 休市标的没有 K 线，并入 held 后必须保留，不能被替换掉。
+        let mut protected = HashSet::new();
+        protected.extend(suspended.iter().cloned());
+        let current = vec!["NVDAUSDT".to_string()];
+        let no_data = plan(&current, &protected, &[], &gates(), 12);
+        assert_eq!(no_data.keep, vec!["NVDAUSDT"]);
+        assert_eq!(no_data.held, vec!["NVDAUSDT"]);
+        assert!(no_data.delete.is_empty(), "休市标的不能被替换");
     }
 
     #[test]

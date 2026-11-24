@@ -342,7 +342,7 @@ fn plausible_symbol(symbol: &str) -> bool {
         && symbol.chars().all(|c| c.is_alphanumeric())
 }
 
-fn valid_contract(row: &Value, symbol: &str) -> bool {
+pub(crate) fn valid_contract(row: &Value, symbol: &str) -> bool {
     row["symbol"].as_str() == Some(symbol)
         && matches!(
             row["contractType"].as_str(),
