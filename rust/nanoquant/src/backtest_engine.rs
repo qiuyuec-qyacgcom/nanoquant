@@ -344,10 +344,12 @@ impl<'a> Sim<'a> {
                         0.0
                     };
                     let armed = favor_pct >= risk_pct * self.config.manage.trailing_arm_r;
+                    // 回撤阈值按保证金收益率：价格回撤 = 配置值 ÷ 杠杆。
+                    let pullback = self.config.manage.trailing_pct / leverage / 100.0;
                     let pulled_back = if direction > 0.0 {
-                        bar.close <= new_peak * (1.0 - self.config.manage.trailing_pct / 100.0)
+                        bar.close <= new_peak * (1.0 - pullback)
                     } else {
-                        bar.close >= new_peak * (1.0 + self.config.manage.trailing_pct / 100.0)
+                        bar.close >= new_peak * (1.0 + pullback)
                     };
                     if armed && pulled_back {
                         self.close_position(bar.close, index, "trailing_stop");

@@ -53,7 +53,7 @@ pub struct ManageConfig {
     pub partial_tp_at_r: f64,
     /// 部分止盈平掉的比例。
     pub partial_tp_ratio: f64,
-    /// 移动止损回撤百分比，0 表示关闭。
+    /// 移动止损回撤：保证金收益率回撤百分比（价格回撤 = 该值 ÷ 杠杆），0 表示关闭。
     pub trailing_pct: f64,
     /// 移动止损激活门槛：浮盈先达到多少个 R 才开始追踪。
     pub trailing_arm_r: f64,
@@ -135,10 +135,12 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
         };
         let favor = (pos.peak_price - pos.entry_price) * direction;
         if favor >= risk * cfg.trailing_arm_r {
+            // 回撤阈值按保证金收益率：价格回撤 = 配置值 ÷ 杠杆。
+            let pullback = cfg.trailing_pct / pos.leverage.max(1.0) / 100.0;
             let pulled_back = if direction > 0.0 {
-                pos.mark_price <= pos.peak_price * (1.0 - cfg.trailing_pct / 100.0)
+                pos.mark_price <= pos.peak_price * (1.0 - pullback)
             } else {
-                pos.mark_price >= pos.peak_price * (1.0 + cfg.trailing_pct / 100.0)
+                pos.mark_price >= pos.peak_price * (1.0 + pullback)
             };
             if pulled_back {
                 return ManageAction::Close {
@@ -272,6 +274,24 @@ mod tests {
             manage(&pos, &cfg()),
             ManageAction::Hold,
             "未激活的移动止损会在硬止损前被噪声扫掉"
+        );
+    }
+
+    #[test]
+    fn trailing_stop_uses_margin_pullback() {
+        let mut pos = long_pos();
+        pos.peak_price = 110.0;
+        pos.mark_price = 108.9; // 价格回撤 1% × 10x = 保证金回撤 10%
+        pos.tp_price = 0.0; // 排除持仓自身止盈先命中
+        let mut config = cfg();
+        config.partial_tp_at_r = 0.0;
+        config.trailing_pct = 10.0;
+        config.trailing_arm_r = 0.0;
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "trailing_stop".to_string()
+            }
         );
     }
 

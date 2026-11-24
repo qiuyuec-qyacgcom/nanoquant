@@ -28,7 +28,7 @@ const BOUNDS: [(&str, f64, f64); 4] = [
     ("entry_threshold", 0.05, 0.95),
     ("sl_atr_mult", 0.2, 10.0),
     ("tp_atr_mult", 0.2, 20.0),
-    ("trailing_pct", 0.0, 20.0),
+    ("trailing_pct", 0.0, 200.0),
 ];
 
 pub fn check_interval(interval: &str) -> Result<(), String> {

@@ -76,7 +76,7 @@ const busy = ref(false)
 const DEFAULTS: FollowSettings = {
   enabled: false, jsonl_path: '', poll_sec: 1, ingest_token: '',
   leverage_bonus: 10, max_age_sec: 180, max_per_hour: 6,
-  auto_add_symbol: true, strict_events: false, default_sl_pct: 1.2, margin_pct_override: 0, dry_run: true,
+  auto_add_symbol: true, strict_events: false, default_sl_pct: 10, margin_pct_override: 0, dry_run: true,
 }
 const form = reactive<FollowSettings>({ ...DEFAULTS })
 
@@ -104,7 +104,7 @@ const numberFields: { key: NumKey; label: string; hint: string; min: number; max
   { key: 'max_age_sec', label: '信号有效期', hint: '超时跳过，防重启补开旧单', min: 5, max: 3600, step: 1, unit: '秒' },
   { key: 'leverage_bonus', label: '杠杆加成', hint: '原信号杠杆 +N，仍受系统上限钳制', min: 0, max: 100, step: 1, unit: 'x' },
   { key: 'max_per_hour', label: '每小时跟单上限', hint: '按已成交笔数做频控', min: 1, max: 100, step: 1, unit: '笔' },
-  { key: 'default_sl_pct', label: '缺省止损', hint: '信号未给止损时使用', min: 0.1, max: 20, step: 0.1, unit: '%' },
+  { key: 'default_sl_pct', label: '缺省止损（保证金）', hint: '信号未给止损时使用；价格距离 = 该值 ÷ 杠杆', min: 0.1, max: 100, step: 0.1, unit: '%' },
   {
     key: 'margin_pct_override',
     label: '跟单单仓占比',

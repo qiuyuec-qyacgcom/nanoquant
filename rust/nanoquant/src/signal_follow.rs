@@ -783,7 +783,8 @@ fn open_demo(
     let sl_pct = if p.stop > 0.0 {
         ((p.entry - p.stop).abs() / p.entry * 100.0).clamp(0.05, 20.0)
     } else {
-        cfg.default_sl_pct.clamp(0.05, 20.0)
+        // 缺省止损按保证金收益率：价格距离 = 保证金% ÷ 杠杆。
+        (cfg.default_sl_pct / leverage as f64).clamp(0.05, 20.0)
     };
     let tp_pct = if p.tp > 0.0 {
         ((p.tp - p.entry).abs() / p.entry * 100.0).clamp(0.1, 100.0)

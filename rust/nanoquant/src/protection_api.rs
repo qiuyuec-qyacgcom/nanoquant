@@ -47,11 +47,42 @@ async fn protection_orders(
                 .as_ref()
                 .map(current_mode)
                 .unwrap_or_else(|| "demo".to_string());
-            let marks = state
+            let mut marks = state
                 .db
                 .as_ref()
                 .map(|db| local_marks(db, &mode))
                 .unwrap_or_default();
+            // 本地没有持仓的标的（外部仓/手工仓）直接向交易所补标记价，
+            // 否则保护单列表会出现 mark_price=0、距离=0。
+            let missing: std::collections::BTreeSet<String> = rows
+                .iter()
+                .filter_map(|row| row.get("symbol").and_then(Value::as_str).map(str::to_string))
+                .filter(|symbol| !marks.contains_key(symbol))
+                .collect();
+            for symbol in missing {
+                let params = vec![("symbol".to_string(), symbol.clone())];
+                let Ok(reply) = state
+                    .engine_control
+                    .protection_request("GET", "/fapi/v1/premiumIndex", &params)
+                    .await
+                else {
+                    continue;
+                };
+                if !(200..300).contains(&reply.status) {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&reply.body) else {
+                    continue;
+                };
+                if let Some(price) = value
+                    .get("markPrice")
+                    .and_then(Value::as_str)
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .filter(|price| price.is_finite() && *price > 0.0)
+                {
+                    marks.insert(symbol, price);
+                }
+            }
             let items: Vec<Value> = rows
                 .into_iter()
                 .filter_map(|row| protection_item(row, &marks))
@@ -369,11 +400,18 @@ mod tests {
     #[tokio::test]
     async fn protection_list_returns_items_on_success() {
         let (status, body) = call(
-            state(vec![(
-                200,
-                r#"{"orders":[{"algoId":42,"symbol":"BTCUSDT","side":"SELL","orderType":"STOP_MARKET","triggerPrice":"95","algoStatus":"NEW","closePosition":true}]}"#.to_string(),
-                false,
-            )]),
+            state(vec![
+                (
+                    200,
+                    r#"{"orders":[{"algoId":42,"symbol":"BTCUSDT","side":"SELL","orderType":"STOP_MARKET","triggerPrice":"95","algoStatus":"NEW","closePosition":true}]}"#.to_string(),
+                    false,
+                ),
+                (
+                    200,
+                    r#"{"symbol":"BTCUSDT","markPrice":"100"}"#.to_string(),
+                    false,
+                ),
+            ]),
             "GET",
             "/engine/protection",
         )
@@ -381,6 +419,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["count"], 1);
         assert_eq!(body["items"][0]["algo_id"], "42");
+        assert_eq!(body["items"][0]["mark_price"], 100.0);
+        assert_eq!(body["items"][0]["distance_pct"], -5.0);
     }
 
     #[tokio::test]

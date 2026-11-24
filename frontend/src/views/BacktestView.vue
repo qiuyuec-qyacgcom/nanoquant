@@ -526,7 +526,7 @@ onMounted(async () => {
             <input v-model="gridForm.tp_atr_mult" class="input mono" placeholder="1.5, 2.0, 2.5" />
           </label>
           <label class="field">
-            <span class="label">移动止损 %</span>
+            <span class="label">移动止损 %（保证金）</span>
             <input v-model="gridForm.trailing_pct" class="input mono" placeholder="0.6, 0.8" />
           </label>
         </div>

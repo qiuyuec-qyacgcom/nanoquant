@@ -69,7 +69,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "tp_atr_mult", 0.1, 50.0, 0.1),
     ("strategy", "min_risk_reward", 0.1, 20.0, 0.1),
     ("strategy", "roi_min_r", 0.0, 20.0, 0.1),
-    ("strategy", "trailing_pct", 0.0, 10.0, 0.1),
+    ("strategy", "trailing_pct", 0.0, 200.0, 0.1),
     ("strategy", "trailing_arm_r", 0.0, 20.0, 0.1),
     ("strategy", "breakeven_at_r", 0.0, 20.0, 0.1),
     ("strategy", "max_data_gaps", 0.0, 10.0, 1.0),
