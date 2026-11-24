@@ -713,6 +713,9 @@ fn restore_inner(
                 let Some(group) = group.as_str() else {
                     continue;
                 };
+                if !GROUPS.contains(&group) {
+                    continue;
+                }
                 let Some(entry) = archive::find(&entries, &format!("settings/{group}.json")) else {
                     continue;
                 };
@@ -1552,14 +1555,111 @@ mod tests {
     }
 
     #[test]
-    fn backup_whitelist_matches_settings_api_groups() {
-        assert_eq!(
-            GROUPS.as_slice(),
-            crate::settings_api::GROUPS.as_slice(),
-            "备份白名单必须复用 settings_api::GROUPS，避免两处漂移"
-        );
-        assert!(GROUPS.contains(&"symbol_scan"));
-        assert!(GROUPS.contains(&"ai_tuning"));
+    fn create_backup_manifest_lists_every_allowed_settings_group() {
+        let dir = std::env::temp_dir().join(format!("nq-backup-manifest-{}", crate::now_millis()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        crate::bootstrap::initialize(&db_path, &dir.join(".master_key"), Some("test-password"))
+            .unwrap();
+        let db = Db::open(&db_path.to_string_lossy()).unwrap();
+        let state = test_state(db);
+        let created = create_backup_inner(
+            &state,
+            CreateIn {
+                name: "manifest".into(),
+                settings_groups: None,
+                tables: None,
+                files: None,
+                encrypt: Some(false),
+                created_by: None,
+            },
+        )
+        .expect("备份应成功");
+        let listed: Vec<String> = created["manifest"]["settings_groups"]
+            .as_array()
+            .expect("manifest 必须列出设置组")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        let expected: Vec<String> = GROUPS.iter().map(|group| group.to_string()).collect();
+        assert_eq!(listed, expected, "导出必须覆盖全部白名单组");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_skips_settings_groups_outside_the_allow_list() {
+        let dir = std::env::temp_dir().join(format!("nq-restore-groups-{}", crate::now_millis()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        crate::bootstrap::initialize(&db_path, &dir.join(".master_key"), Some("test-password"))
+            .unwrap();
+        let zip = archive::build(&[
+            Entry {
+                name: "manifest.json".into(),
+                data: serde_json::to_vec(&json!({
+                    "version": 1,
+                    "settings_groups": ["symbol_scan", "evil_group"],
+                    "tables": [],
+                }))
+                .unwrap(),
+            },
+            Entry {
+                name: "settings/symbol_scan.json".into(),
+                data: serde_json::to_vec(&json!({
+                    "enabled": true,
+                    "interval_hours": 3,
+                    "market_limit": 300,
+                }))
+                .unwrap(),
+            },
+            Entry {
+                name: "settings/evil_group.json".into(),
+                data: serde_json::to_vec(&json!({"hacked": true})).unwrap(),
+            },
+        ])
+        .unwrap();
+        let zip_path = dir.join("tampered.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let digest = hex::encode(Sha256::digest(&zip));
+        let db = Db::open(&db_path.to_string_lossy()).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO backup_jobs(id,ts,name,scope,file_path,size,sha256,encrypted,status,message,created_by) \
+                 VALUES(1,0,'tampered','{}',?1,?2,?3,0,'ok','','manual')",
+                rusqlite::params![zip_path.to_string_lossy(), zip.len() as i64, digest],
+            )
+            .unwrap();
+        }
+        let state = test_state(db.clone());
+        let outcome = restore_inner(
+            &state,
+            1,
+            &json!({"restore_settings": true, "restore_tables": true}),
+        )
+        .expect("还原应成功");
+        assert_eq!(outcome["ok"], true);
+        let conn = db.conn.lock().unwrap();
+        let saved: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='symbol_scan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(saved.contains("market_limit"), "合法组应写入");
+        let evil: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_settings WHERE key='evil_group'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evil, 0, "非法组必须被白名单跳过");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

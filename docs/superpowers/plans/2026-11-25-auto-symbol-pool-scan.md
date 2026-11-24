@@ -35,6 +35,8 @@
 **文件：**
 - 修改：`rust/nanoquant/src/default_settings.json`
 - 修改：`rust/nanoquant/src/param_registry.rs`
+- 修改：`rust/nanoquant/src/settings_api.rs`
+- 修改：`rust/nanoquant/src/backup.rs`
 - 修改：`frontend/src/views/settingsCatalog.ts`
 - 修改：`frontend/src/views/StrategyView.vue`
 - 测试：`frontend/src/views/settingsCatalog.spec.ts`
