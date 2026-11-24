@@ -31,7 +31,7 @@ pub fn routes() -> Router<Db> {
         .route("/system/system-settings", get(system_settings))
 }
 
-const GROUPS: [&str; 15] = [
+pub(crate) const GROUPS: [&str; 15] = [
     "engine",
     "risk",
     "strategy",
@@ -1226,7 +1226,11 @@ mod tests {
 
     #[test]
     fn defaults_cover_every_group_and_risk_leverage_is_present() {
-        assert_eq!(GROUPS.len(), 15);
+        assert_eq!(
+            GROUPS.len(),
+            all_defaults().as_object().unwrap().len(),
+            "GROUPS 必须与 default_settings.json 的组数一致"
+        );
         for group in GROUPS {
             let value = defaults_of(group);
             assert!(

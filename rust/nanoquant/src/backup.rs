@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::app_state::AppState;
 use crate::archive::{self, Entry};
 use crate::db::Db;
+use crate::settings_api::GROUPS;
 
 const AUTO_INTERVAL_SEC: i64 = 24 * 3600;
 const AUTO_RETRY_SEC: i64 = 3600;
@@ -30,23 +31,7 @@ const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_LISTED_FILES: usize = 200;
 
-const SETTINGS_GROUPS: [&str; 15] = [
-    "engine",
-    "risk",
-    "strategy",
-    "ai_tuning",
-    "symbol_scan",
-    "ai",
-    "data",
-    "news",
-    "evolution",
-    "backup",
-    "security",
-    "system",
-    "public",
-    "signal_follow",
-    "journal",
-];
+
 const DEFAULT_TABLES: [&str; 6] = [
     "app_settings",
     "ai_providers",
@@ -269,7 +254,7 @@ async fn options(State(state): State<AppState>) -> Json<Value> {
     };
     let conn = db.conn.lock().expect("db");
     let cfg = backup_config(&conn);
-    let groups: Vec<&str> = SETTINGS_GROUPS.to_vec();
+    let groups: Vec<&str> = GROUPS.to_vec();
     let tables: Vec<&str> = BACKUP_TABLES.to_vec();
     let (auto_daily, last_run_ts) = (
         cfg["auto_daily"].as_bool().unwrap_or(true),
@@ -396,13 +381,13 @@ fn create_backup_inner(
     let groups: Vec<String> = input
         .settings_groups
         .unwrap_or_else(|| {
-            SETTINGS_GROUPS
+            GROUPS
                 .iter()
                 .map(|value| value.to_string())
                 .collect()
         })
         .into_iter()
-        .filter(|group| SETTINGS_GROUPS.contains(&group.as_str()))
+        .filter(|group| GROUPS.contains(&group.as_str()))
         .collect();
     let tables: Vec<String> = input
         .tables
@@ -1567,13 +1552,14 @@ mod tests {
     }
 
     #[test]
-    fn backup_whitelist_covers_every_settings_group() {
-        for group in ["symbol_scan", "ai_tuning"] {
-            assert!(
-                SETTINGS_GROUPS.contains(&group),
-                "{group} 必须在备份白名单中，否则备份/还原会静默丢配置"
-            );
-        }
+    fn backup_whitelist_matches_settings_api_groups() {
+        assert_eq!(
+            GROUPS.as_slice(),
+            crate::settings_api::GROUPS.as_slice(),
+            "备份白名单必须复用 settings_api::GROUPS，避免两处漂移"
+        );
+        assert!(GROUPS.contains(&"symbol_scan"));
+        assert!(GROUPS.contains(&"ai_tuning"));
     }
 
     #[test]

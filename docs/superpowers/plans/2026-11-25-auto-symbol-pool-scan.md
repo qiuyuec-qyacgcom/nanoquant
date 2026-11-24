@@ -20,6 +20,8 @@
 | `rust/nanoquant/src/main.rs` | 启动独立 `symbol_scan` 后台任务 |
 | `rust/nanoquant/src/default_settings.json` | 新增 `symbol_scan` 默认配置 |
 | `rust/nanoquant/src/param_registry.rs` | `symbol_scan` 范围与可见性 |
+| `rust/nanoquant/src/settings_api.rs` | 设置组白名单；`GET/PUT` 分组读写 |
+| `rust/nanoquant/src/backup.rs` | 备份/还原复用同一设置组白名单 |
 | `frontend/src/views/settingsCatalog.ts` | 新增「自动换池」分组与字段 |
 | `frontend/src/views/StrategyView.vue` | 分组中文标签与说明 |
 | `frontend/src/views/SymbolsView.vue` | 扫描状态、立即扫描按钮、计划确认弹窗 |
@@ -37,7 +39,7 @@
 - 修改：`frontend/src/views/StrategyView.vue`
 - 测试：`frontend/src/views/settingsCatalog.spec.ts`
 
-- [ ] **步骤 1：写失败测试**
+- [x] **步骤 1：写失败测试**
 
 在 `settingsCatalog.spec.ts` 的 groupIds 断言中加入 `symbol_scan`：
 
@@ -56,12 +58,12 @@ expect(groupIds).toEqual([
 ])
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`cd frontend && npm run test -- settingsCatalog`
 预期：FAIL，`symbol_scan` 不在分组列表中。
 
-- [ ] **步骤 3：实现配置**
+- [x] **步骤 3：实现配置**
 
 `default_settings.json` 增加：
 
@@ -117,17 +119,19 @@ symbol_scan: {
 },
 ```
 
-- [ ] **步骤 4：运行测试确认通过**
+- [x] **步骤 4：运行测试确认通过**
 
 运行：`cd frontend && npm run test -- settingsCatalog`
 预期：PASS。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add rust/nanoquant/src/default_settings.json rust/nanoquant/src/param_registry.rs frontend/src/views/settingsCatalog.ts frontend/src/views/settingsCatalog.spec.ts frontend/src/views/StrategyView.vue
 git commit -m "feat(symbol-scan): 新增自动换池配置分组"
 ```
+
+已由 581a26a、29247fa 及本次修复提交完成
 
 ---
 
@@ -1130,7 +1134,11 @@ git commit -m "feat(symbol-scan): 标的池页增加扫描状态与立即扫描"
 运行：`cd frontend && npm run typecheck && npm run test && npm run build`
 预期：通过。
 
-- [ ] **步骤 4：提交推送**
+- [ ] **步骤 4：推送前检查**
+
+确认 `symbol_scan` 后台任务与 API 已落地，否则不要推送。
+
+- [ ] **步骤 5：提交推送**
 
 ```bash
 git add -A
