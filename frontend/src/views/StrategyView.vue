@@ -10,12 +10,12 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, http } from '../api/client'
+import { http } from '../api/client'
 import EnvironmentSwitch from '../components/EnvironmentSwitch.vue'
 import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { useParamCatalogStore } from '../stores/paramCatalog'
-import { loadParamChanges, rollbackParamChange, rollbackWarning, showParamChanges, type ParamChange } from './paramChanges'
+
 import { SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
@@ -135,8 +135,8 @@ const BASE_META: Record<string, FieldMeta> = {
   global_stop_loss_pct: { label: '仓位止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
   global_take_profit_pct: { label: '仓位止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
   drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
-  consecutive_loss_limit: { label: '连亏熔断', unit: '笔' },
-  cooldown_minutes: { label: '熔断冷静期', unit: '分钟' },
+  consecutive_loss_limit: { label: '连亏熔断', unit: '笔', hint: '连续亏损达到该笔数就暂停开新仓' },
+  cooldown_minutes: { label: '熔断冷静期', unit: '分钟', hint: '熔断后暂停开新仓的分钟数' },
   symbol_cooldown_minutes: { label: '单标的冷却', unit: '分钟', hint: '亏损后该标的的冷却时间' },
   stoploss_guard_count: { label: '止损熔断阈值', unit: '次', hint: '窗口内触发这么多次止损就全局暂停开仓；0=关闭' },
   stoploss_guard_window_min: { label: '止损熔断窗口', unit: '分钟', hint: '统计窗口' },
@@ -157,12 +157,12 @@ const BASE_META: Record<string, FieldMeta> = {
     ],
     hint: '15–60 分钟短线主周期',
   },
-  ema_fast: { label: '快线 EMA' },
-  ema_slow: { label: '慢线 EMA' },
-  rsi_period: { label: 'RSI 周期' },
-  atr_period: { label: 'ATR 周期' },
+  ema_fast: { label: '快线 EMA', hint: '短周期均线，用于判断短期趋势方向' },
+  ema_slow: { label: '慢线 EMA', hint: '长周期均线，用于判断中期趋势方向' },
+  rsi_period: { label: 'RSI 周期', hint: 'RSI 计算使用的 K 线根数' },
+  atr_period: { label: 'ATR 周期', hint: 'ATR 计算使用的 K 线根数' },
   entry_threshold: { label: '开仓信号阈值', hint: '综合分绝对值高于该值才考虑开仓' },
-  exit_threshold: { label: '反转平仓阈值' },
+  exit_threshold: { label: '反转平仓阈值', hint: '反向信号分超过该值就平掉当前仓位' },
   volume_ratio_min: { label: '最小量比', hint: '低于该值的信号被过滤' },
   atr_pct_min: { label: 'ATR 下限', unit: '%', hint: '波动太小不足以覆盖手续费' },
   atr_pct_max: { label: 'ATR 上限', unit: '%', hint: '波动过大不参与' },
@@ -180,8 +180,13 @@ const BASE_META: Record<string, FieldMeta> = {
     hint: '按保证金收益率自动平仓：每档填「持仓分钟 + 保证金赚到百分之几就全平」，可增删档位自行配比',
   },
 
+  roi_min_r: { label: 'ROI 阶梯最低 R', unit: 'R', hint: '浮盈先达到该 R 倍数，时间阶梯止盈才生效；0=不设门槛' },
+  max_data_gaps: { label: '最大数据缺口', unit: '根', hint: 'K 线允许缺失的根数；超过就视为行情不可用' },
+  data_stale_mult: { label: '行情过期倍数', hint: '最新 K 线超过「周期 × 该倍数」就停止开仓' },
+
   live_base_url: { label: '实盘域名', hint: '币安 U 本位主网 fapi 地址' },
   demo_base_url: { label: '模拟盘域名', hint: '币安测试网地址（模拟盘真实下单环境）' },
+  demo_backup_urls: { label: '模拟盘备用域名', widget: 'tags', hint: '测试网主域名不可达时按顺序尝试' },
   backup_base_urls: { label: '实盘备用域名', widget: 'tags', hint: '主域名不可达时按顺序尝试' },
   proxy: { label: 'HTTP 代理', hint: '形如 http://127.0.0.1:7890，留空不使用' },
   kline_limit: { label: 'K 线长度', unit: '根', hint: '引擎内部取价使用，不作为对外行情接口' },
@@ -190,37 +195,39 @@ const BASE_META: Record<string, FieldMeta> = {
   request_timeout_sec: { label: '请求超时', unit: '秒' },
   max_pool_size: { label: '标的池上限', unit: '个', hint: '与 astra 规则一致，超限拒绝添加' },
 
-  refresh_minutes: { label: '刷新间隔', unit: '分钟' },
+  refresh_minutes: { label: '刷新间隔', unit: '分钟', hint: '资讯抓取的时间间隔' },
   sources: { label: '资讯源', widget: 'tags', hint: 'coindesk / binance_square / binance_announcement 等' },
-  keep_days: { label: '保留天数', unit: '天' },
-  ai_summary: { label: 'AI 摘要' },
+  keep_days: { label: '保留天数', unit: '天', hint: '超过该天数的资讯会被清理' },
+  ai_summary: { label: 'AI 摘要', hint: '开启后对新资讯生成情绪摘要' },
   sentiment_threshold: { label: '情绪阈值', hint: '绝对值超过该值才标记为显著情绪' },
   max_items_per_source: { label: '单源最多条数', unit: '条' },
   rsshub_base: { label: 'RSSHub 地址', hint: '可选，自建实例用于抓取币安公告' },
 
-  review_on_close: { label: '平仓即复盘' },
-  max_injected: { label: '最多注入心法', unit: '条' },
+  review_on_close: { label: '平仓即复盘', hint: '每笔平仓后自动做一次复盘' },
+  max_injected: { label: '最多注入心法', unit: '条', hint: '每次决策最多注入几条心法' },
   ttl_days: { label: '心法有效期', unit: '天', hint: '过期自动退出注入' },
-  min_confidence: { label: '心法最低置信度' },
-  global_review_every_trades: { label: '全局复盘间隔', unit: '笔' },
+  min_confidence: { label: '心法最低置信度', hint: '低于该置信度的复盘结论不进入心法库' },
+  global_review_every_trades: { label: '全局复盘间隔', unit: '笔', hint: '每多少笔交易做一次全局复盘' },
   guard_strict: { label: '严格防污染', hint: '拦截放宽风控类结论' },
   auto_disable_negative: { label: '负向心法自动降权' },
   max_rule_chars: { label: '心法最大字数', unit: '字' },
 
-  retention: { label: '备份保留份数', unit: '份' },
+  retention: { label: '备份保留份数', unit: '份', hint: '只保留最近几份备份' },
   encrypt: { label: '备份加密', hint: 'Fernet 对称加密' },
-  auto_daily: { label: '每日自动备份' },
-  include_logs: { label: '包含日志文件' },
+  auto_daily: { label: '每日自动备份', hint: '每天自动生成一次备份' },
+  include_logs: { label: '包含日志文件', hint: '备份时是否一并打包日志' },
 
-  username: { label: '管理员账号' },
-  require_login: { label: '强制登录' },
-  session_ttl_hours: { label: '会话有效期', unit: '小时' },
-  login_fail_limit: { label: '登录失败锁定阈值', unit: '次' },
+  username: { label: '管理员账号', hint: '后台登录使用的账号名' },
+  password_is_default: { label: '仍为默认密码', hint: '仅展示；首次登录后应尽快修改密码' },
+  require_login: { label: '强制登录', hint: '关闭后访问后台不再要求登录（不建议）' },
+  session_ttl_hours: { label: '会话有效期', unit: '小时', hint: '登录后多久需要重新认证' },
+  login_fail_limit: { label: '登录失败锁定阈值', unit: '次', hint: '同一 IP 连续失败达到该次数就锁定' },
   login_fail_window_sec: { label: '失败计数窗口', unit: '秒', hint: '窗口内同一 IP 失败达阈值即锁定；按 IP 隔离，攻击者刷错密码不会锁死管理员' },
 
   log_level: {
     label: '日志级别',
     widget: 'seg',
+    hint: 'DEBUG 最详细；生产建议 INFO，排查问题再临时调到 DEBUG',
     options: [
       ['DEBUG', 'DEBUG'],
       ['INFO', 'INFO'],
@@ -228,15 +235,16 @@ const BASE_META: Record<string, FieldMeta> = {
       ['ERROR', 'ERROR'],
     ],
   },
-  event_retention_days: { label: '事件保留', unit: '天' },
+  event_retention_days: { label: '事件保留', unit: '天', hint: '事件日志保留天数，过期清理' },
   signal_retention_days: { label: '信号保留', unit: '天', hint: '过期先归档到 data/archive/ 再删除' },
-  equity_retention_days: { label: '权益曲线保留', unit: '天' },
-  ui_refresh_sec: { label: '面板刷新', unit: '秒' },
-  risk_disclaimer_accepted: { label: '已确认风险声明' },
+  equity_retention_days: { label: '权益曲线保留', unit: '天', hint: '权益采样保留天数' },
+  ui_refresh_sec: { label: '面板刷新', unit: '秒', hint: '前端面板静默刷新间隔' },
+  risk_disclaimer_accepted: { label: '已确认风险声明', hint: '首次进入实盘前需要确认；仅展示状态' },
   alert_enabled: { label: '启用告警', hint: '事件级别达到阈值时推送，失败不影响交易' },
   alert_min_level: {
     label: '最低级别',
     widget: 'seg',
+    hint: '达到该级别才推送；info 最吵，error 只推严重问题',
     options: [
       ['info', 'INFO'],
       ['warn', 'WARN'],
@@ -245,13 +253,13 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   alert_webhook_url: { label: 'Webhook 地址', hint: '钉钉 / 飞书 / 企业微信 文本机器人 URL' },
   alert_error_webhook_url: { label: 'Error 专用 Webhook', hint: '值班群；留空则回落到上面的默认 Webhook' },
-  alert_telegram_token: { label: 'Telegram Bot Token' },
-  alert_telegram_chat_id: { label: 'Telegram Chat ID' },
+  alert_telegram_token: { label: 'Telegram Bot Token', hint: '向 BotFather 申请；留空则不发 Telegram' },
+  alert_telegram_chat_id: { label: 'Telegram Chat ID', hint: '接收告警的会话或群组 ID' },
   alert_cooldown_sec: { label: '同类告警冷却', unit: '秒', hint: '同一类别在窗口内只发一次' },
   alert_quiet_hours: { label: '静默时段', hint: '如 23:00-07:00，期间只放行 error；留空=不静默' },
   alert_template: { label: '消息模板', hint: '支持 {level} {category} {message} {time}；留空=默认格式' },
   alert_digest_enabled: { label: '摘要模式', hint: '开启后 warn 攒到间隔合并成一条，error 仍然即时' },
-  alert_digest_minutes: { label: '摘要间隔', unit: '分钟' },
+  alert_digest_minutes: { label: '摘要间隔', unit: '分钟', hint: 'warn 级告警合并成一条的间隔' },
 
   api_rate_limit_per_min: {
     label: 'API 限频',
@@ -264,8 +272,8 @@ const BASE_META: Record<string, FieldMeta> = {
   },
 
   site_enabled: { label: '启用公开前台', hint: '关闭后访客只能看到维护页，后台不受影响' },
-  site_title: { label: '站点名称' },
-  site_tagline: { label: '站点副标题' },
+  site_title: { label: '站点名称', hint: '公开前台顶部显示的站点名' },
+  site_tagline: { label: '站点副标题', hint: '公开前台顶部显示的副标题' },
   hero_note: { label: '首页备注', hint: '可选，展示在首页英雄区' },
   show_engine_status: { label: '展示引擎状态', hint: '仅开关与模式，不含资金数据' },
   show_mantras: { label: '展示分析心法', hint: '脱敏展示：仅标题/分类/健康度' },
@@ -281,6 +289,13 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       label: '交易环境', widget: 'select',
       options: [['demo', 'demo 模拟盘（测试网）'], ['live', 'live 实盘（主网）']],
       hint: '与「策略 → 信号模型」的 mode 不是一回事；切换前先确认对应环境的 API 凭证',
+    },
+  },
+  strategy: {
+    mode: {
+      label: '信号模型', widget: 'select',
+      options: [['fusion', 'NQ-Fusion（当前）']],
+      hint: '当前唯一信号模型；按 regime 加权相对强弱、波动突破、资金费率与 OI/订单流',
     },
   },
   ai: {
@@ -357,10 +372,7 @@ const tagDraft = reactive<Record<string, string>>({})
 const jsonText = reactive<Record<string, string>>({})
 const jsonError = reactive<Record<string, string>>({})
 const engineBusy = ref(false)
-const paramChanges = ref<ParamChange[]>([])
-const paramChangesBusy = ref(false)
-const paramChangesError = ref('')
-let paramChangesTimer: number | null = null
+
 
 const currentGroup = computed(() => groups.find((g) => g.id === current.value))
 const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(baseline.value))
@@ -964,45 +976,6 @@ async function changePassword() {
   }
 }
 
-function displayParamValue(raw: string | null | undefined): string {
-  if (raw === null || raw === undefined || raw === '') return '—'
-  try {
-    return JSON.stringify(JSON.parse(raw))
-  } catch {
-    return raw
-  }
-}
-
-async function refreshParamChanges() {
-  try {
-    paramChanges.value = await loadParamChanges(api, 20)
-    paramChangesError.value = ''
-  } catch (err: any) {
-    paramChangesError.value = err?.message || '加载失败'
-  }
-}
-
-async function rollbackChange(id: number) {
-  const changedGroup = paramChanges.value.find((row) => row.id === id)?.group
-  const sameGroup = changedGroup === current.value
-  // 回滚会覆盖本组未保存的编辑，必须让用户先确认
-  if (!confirm(rollbackWarning(dirty.value, sameGroup))) return
-  paramChangesBusy.value = true
-  try {
-    await rollbackParamChange(api, id)
-    await Promise.all([refreshParamChanges(), app.loadSettings()])
-    if (sameGroup) {
-      draft.value = clone(app.settings[current.value] || {})
-      baseline.value = clone(app.settings[current.value] || {})
-      syncJsonText()
-    }
-    app.notify('已回滚该次 AI 调参', 'ok')
-  } catch (err: any) {
-    app.notify(err.message, 'error')
-  } finally {
-    paramChangesBusy.value = false
-  }
-}
 
 watch(current, (id) => {
   draft.value = clone(app.settings[id] || {})
@@ -1013,7 +986,7 @@ watch(current, (id) => {
 onMounted(async () => {
   window.addEventListener('keydown', onHotkey)
   if (!Object.keys(app.settings).length) await app.loadSettings()
-  await Promise.all([app.loadStatus(), paramCatalog.load(), refreshParamChanges()])
+  await Promise.all([app.loadStatus(), paramCatalog.load()])
   const wanted = String(route.query.group || '')
   const group = groups.some((g) => g.id === wanted) ? wanted : 'engine'
   loadGroup(group)
@@ -1021,18 +994,10 @@ onMounted(async () => {
   // 支持 ?group=risk&key=max_drawdown_pct 直达某个参数（文档与提示可以精确指路）
   const key = String(route.query.key || '')
   if (key) await jumpTo(group, key)
-  // AI 调参在后台发生，页面停留时也要能看到新记录
-  if (paramChangesTimer === null) {
-    paramChangesTimer = window.setInterval(() => void refreshParamChanges(), 60_000)
-  }
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onHotkey)
-  if (paramChangesTimer !== null) {
-    window.clearInterval(paramChangesTimer)
-    paramChangesTimer = null
-  }
 })
 </script>
 
@@ -1466,43 +1431,6 @@ onUnmounted(() => {
 
             </div>
 
-            <!-- AI 调参记录固定在分组之外：只看改动不会把它一起隐藏 -->
-            <div v-if="showParamChanges(current)" class="section param-changes">
-              <div class="section-hd">
-                <span class="section-title">AI 调参记录</span>
-                <span class="section-hint">最近 20 条；回滚按旧值写回并再次留痕；每分钟自动刷新</span>
-              </div>
-              <div v-if="paramChangesError" class="empty" style="padding: 10px">
-                调参记录加载失败：{{ paramChangesError }}
-              </div>
-              <div v-else-if="!paramChanges.length" class="empty" style="padding: 10px">暂无 AI 调参记录</div>
-              <div v-else class="change-table">
-                <div class="change-row change-head">
-                  <span>时间</span>
-                  <span>字段</span>
-                  <span>旧值 → 新值</span>
-                  <span>原因</span>
-                  <span>效果</span>
-                  <span>操作</span>
-                </div>
-                <div v-for="row in paramChanges" :key="row.id" class="change-row">
-                  <span class="muted">{{ tsText(row.ts) }}</span>
-                  <span class="mono">{{ row.group }}.{{ row.key }}</span>
-                  <span class="mono">
-                    <s>{{ displayParamValue(row.old_value) }}</s>
-                    →
-                    {{ displayParamValue(row.new_value) }}
-                  </span>
-                  <span>{{ row.reason }}</span>
-                  <span class="muted">
-                    {{ row.effect?.trades ?? 0 }} 笔 · {{ (row.effect?.pnl ?? 0).toFixed(2) }} USDT
-                  </span>
-                  <button class="btn btn-xs" :disabled="paramChangesBusy" @click="rollbackChange(row.id)">
-                    回滚
-                  </button>
-                </div>
-              </div>
-            </div>
 
             <div v-if="auditRows.length" class="section">
               <div class="section-hd">
@@ -1847,41 +1775,6 @@ onUnmounted(() => {
   }
 }
 
-/* ------------------------------------------------ AI 调参记录 */
-.change-table {
-  display: flex;
-  flex-direction: column;
-  font-size: 11px;
-}
-.change-row {
-  display: grid;
-  grid-template-columns: 84px 150px minmax(0, 1.2fr) minmax(0, 1fr) 120px 58px;
-  gap: 10px;
-  align-items: center;
-  padding: 7px 0;
-  border-top: 1px dashed rgba(26, 41, 66, 0.6);
-}
-.change-row:first-of-type {
-  border-top: none;
-}
-.change-head {
-  color: var(--muted);
-  font-size: 10.5px;
-}
-.change-row s {
-  color: var(--muted);
-  text-decoration-color: rgba(240, 75, 90, 0.6);
-}
-@media (max-width: 720px) {
-  .change-row {
-    grid-template-columns: 76px minmax(0, 1fr) 56px;
-  }
-  .change-row > :nth-child(3),
-  .change-row > :nth-child(4),
-  .change-row > :nth-child(5) {
-    display: none;
-  }
-}
 
 /* ------------------------------------------------ 参数变更记录 */
 .audit-row {

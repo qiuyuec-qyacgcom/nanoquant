@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import {
-  loadParamChanges,
-  rollbackParamChange,
-  rollbackWarning,
-  showParamChanges,
-} from './paramChanges'
+import { loadParamChanges, rollbackParamChange, rollbackWarning } from './paramChanges'
 
 describe('AI 调参记录', () => {
   it('loads parameter changes and calls rollback', async () => {
@@ -46,8 +41,4 @@ describe('调参记录 UI 辅助', () => {
     expect(rollbackWarning(true, false)).toContain('确认回滚')
   })
 
-  it('调参记录只在策略分组显示', () => {
-    expect(showParamChanges('strategy')).toBe(true)
-    expect(showParamChanges('risk')).toBe(false)
-  })
 })

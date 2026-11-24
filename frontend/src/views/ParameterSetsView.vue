@@ -4,10 +4,11 @@
  * 并允许人工启用 approved/manual 集或回滚当前 active 集。
  * 所有操作走后端同一事务与审计，页面只做确认与刷新。
  */
-import { computed, onMounted, ref } from 'vue'
-import { http } from '../api/client'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { api, http } from '../api/client'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { ago, timeStr } from '../utils/format'
+import { loadParamChanges, rollbackParamChange, rollbackWarning, type ParamChange } from './paramChanges'
 import {
   canManuallyActivate,
   canRollback as canRollbackSet,
@@ -64,6 +65,10 @@ const busyId = ref(0)
 const error = ref('')
 const notice = ref('')
 const evidenceTarget = ref<SetItem | null>(null)
+const paramChanges = ref<ParamChange[]>([])
+const paramChangesBusy = ref(false)
+const paramChangesError = ref('')
+let paramChangesTimer: number | null = null
 
 const grouped = computed(() => {
   const map = new Map<string, SetItem[]>()
@@ -147,11 +152,55 @@ function openEvidence(item: SetItem) {
   evidenceTarget.value = item
 }
 
+function displayParamValue(raw: string | null | undefined): string {
+  if (raw === null || raw === undefined || raw === '') return '—'
+  try {
+    return JSON.stringify(JSON.parse(raw))
+  } catch {
+    return raw
+  }
+}
+
+async function refreshParamChanges() {
+  try {
+    paramChanges.value = await loadParamChanges(api, 20)
+    paramChangesError.value = ''
+  } catch (err: any) {
+    paramChangesError.value = err?.message || '加载失败'
+  }
+}
+
+async function rollbackChange(id: number) {
+  if (!confirm(rollbackWarning(false, false))) return
+  paramChangesBusy.value = true
+  try {
+    await rollbackParamChange(api, id)
+    await Promise.all([refreshParamChanges(), load(true)])
+    notice.value = '已回滚该次 AI 调参。'
+  } catch (err: any) {
+    error.value = err?.message || '回滚失败'
+  } finally {
+    paramChangesBusy.value = false
+  }
+}
+
 function numberOf(value: unknown): number | undefined {
   return typeof value === 'number' ? value : undefined
 }
 
-onMounted(() => load())
+onMounted(() => {
+  void load()
+  void refreshParamChanges()
+  if (paramChangesTimer === null) {
+    paramChangesTimer = window.setInterval(() => void refreshParamChanges(), 60_000)
+  }
+})
+onUnmounted(() => {
+  if (paramChangesTimer !== null) {
+    window.clearInterval(paramChangesTimer)
+    paramChangesTimer = null
+  }
+})
 useSilentRefresh(() => load(true), 30000)
 </script>
 
@@ -160,7 +209,7 @@ useSilentRefresh(() => load(true), 30000)
     <div class="panel">
       <div class="panel-body" style="padding: 16px 20px">
         <div class="row" style="gap: 10px; flex-wrap: wrap">
-          <span class="panel-title" style="font-size: 14px">参数集</span>
+          <span class="panel-title" style="font-size: 14px">AI 调参</span>
           <span class="tag tag-dim">当前 regime {{ marketRegimeText }}</span>
           <span v-for="entry in activeEntries" :key="entry.regime" class="tag tag-long">
             {{ regimeLabel(entry.regime) }} #{{ entry.set_id }} {{ entry.name }}
@@ -169,7 +218,7 @@ useSilentRefresh(() => load(true), 30000)
           <span class="muted" style="font-size: 11px">每 30s 静默刷新 · 手动操作需确认</span>
         </div>
         <div class="hint" style="margin-top: 8px">
-          参数集按 regime 保存 strategy 数值快照。approve 后的候选通常由引擎自动启用；
+          AI 每周期自动调整隐藏参数。系统按 regime 保存候选快照，approve 后通常由引擎自动启用；
                   这里提供人工兜底：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
                   跨 regime 的启用与回滚由自动切换处理。
         </div>
@@ -214,12 +263,12 @@ useSilentRefresh(() => load(true), 30000)
     </div>
 
     <div v-if="loading" class="empty" style="padding: 40px">加载中…</div>
-    <div v-else-if="!grouped.length" class="empty" style="padding: 40px">暂无参数集</div>
+    <div v-else-if="!grouped.length" class="empty" style="padding: 40px">暂无调参候选</div>
 
     <div v-for="group in grouped" :key="group.regime" class="panel">
       <div class="panel-hd">
         <span class="panel-title">{{ regimeLabel(group.regime) }}</span>
-        <span class="muted" style="font-size: 11px">{{ group.items.length }} 个参数集</span>
+        <span class="muted" style="font-size: 11px">{{ group.items.length }} 套参数</span>
       </div>
       <div class="panel-body" style="padding: 0">
         <table class="table">
@@ -312,6 +361,41 @@ useSilentRefresh(() => load(true), 30000)
         <pre class="evidence-json">{{ JSON.stringify(evidenceTarget.evidence, null, 2) }}</pre>
       </div>
     </Modal>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">AI 调参记录</span>
+        <span class="muted" style="font-size: 11px">最近 20 条 · 每分钟自动刷新</span>
+      </div>
+      <div class="panel-body" style="padding: 10px 16px">
+        <div v-if="paramChangesError" class="hint" style="color: var(--warn)">
+          调参记录加载失败：{{ paramChangesError }}
+        </div>
+        <div v-else-if="!paramChanges.length" class="empty" style="padding: 20px">暂无 AI 调参记录</div>
+        <div v-else class="change-table">
+          <div class="change-row change-head">
+            <span>时间</span>
+            <span>字段</span>
+            <span>旧值 → 新值</span>
+            <span>原因</span>
+            <span>效果</span>
+            <span>操作</span>
+          </div>
+          <div v-for="row in paramChanges" :key="row.id" class="change-row">
+            <span class="muted">{{ timeStr(row.ts, false) }}</span>
+            <span class="mono">{{ row.group }}.{{ row.key }}</span>
+            <span class="mono">
+              <s>{{ displayParamValue(row.old_value) }}</s>
+              →
+              {{ displayParamValue(row.new_value) }}
+            </span>
+            <span>{{ row.reason }}</span>
+            <span class="muted">{{ row.effect?.trades ?? 0 }} 笔 · {{ (row.effect?.pnl ?? 0).toFixed(2) }} USDT</span>
+            <button class="btn btn-xs" :disabled="paramChangesBusy" @click="rollbackChange(row.id)">回滚</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -348,5 +432,40 @@ useSilentRefresh(() => load(true), 30000)
   border-radius: 6px;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.change-table {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+}
+.change-row {
+  display: grid;
+  grid-template-columns: 84px 150px minmax(0, 1.2fr) minmax(0, 1fr) 120px 58px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 0;
+  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+}
+.change-row:first-of-type {
+  border-top: none;
+}
+.change-head {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.change-row s {
+  color: var(--muted);
+  text-decoration-color: rgba(240, 75, 90, 0.6);
+}
+@media (max-width: 720px) {
+  .change-row {
+    grid-template-columns: 76px minmax(0, 1fr) 56px;
+  }
+  .change-row > :nth-child(3),
+  .change-row > :nth-child(4),
+  .change-row > :nth-child(5) {
+    display: none;
+  }
 }
 </style>

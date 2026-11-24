@@ -26,7 +26,3 @@ export function rollbackWarning(dirty: boolean, sameGroup: boolean): string {
   if (sameGroup && dirty) return '当前分组有未保存的修改，回滚会覆盖它们。继续？'
   return '确认回滚这次 AI 调参？'
 }
-
-export function showParamChanges(group: string): boolean {
-  return group === 'strategy'
-}
