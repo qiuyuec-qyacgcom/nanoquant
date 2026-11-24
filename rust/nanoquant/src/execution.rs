@@ -112,6 +112,7 @@ fn apply_fill_tx(
         now,
         &fill.reason,
         features.as_deref(),
+        fee,
     )?;
     if existing.is_some() {
         // 提交前已经写过 SUBMITTING 行：这里只推进状态，不能插第二条。
@@ -176,6 +177,7 @@ fn record_trade(
     now: i64,
     reason: &str,
     features: Option<&str>,
+    fee: f64,
 ) -> Result<Option<i64>, String> {
     let trades_table: bool = tx
         .query_row(
@@ -215,6 +217,84 @@ fn record_trade(
     .all(|column| columns.iter().any(|name| name == column));
     if !complete {
         return Ok(None);
+    }
+    let full = [
+        "leverage",
+        "notional",
+        "pnl_pct",
+        "roi_pct",
+        "fees",
+        "ai_confidence",
+        "ai_reason",
+        "signal_score",
+        "slippage_bps",
+        "reviewed",
+        "review_note",
+        "features",
+        "mantra_ids",
+    ]
+    .iter()
+    .all(|column| columns.iter().any(|name| name == column));
+    if full {
+        let meta: Option<(f64, f64, f64, String)> = tx
+            .query_row(
+                "SELECT COALESCE(leverage,1.0), COALESCE(signal_score,0.0), \
+                 COALESCE(ai_confidence,0.0), COALESCE(ai_reason,'') \
+                 FROM positions WHERE symbol=?1 AND side=?2 AND mode=?3 AND status='open' \
+                 ORDER BY id LIMIT 1",
+                (symbol, position_side, mode),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let (leverage, signal_score, ai_confidence, ai_reason) =
+            meta.unwrap_or((1.0, 0.0, 0.0, String::new()));
+        let leverage = if leverage.is_finite() && leverage > 0.0 {
+            leverage
+        } else {
+            1.0
+        };
+        let notional = qty * entry_price;
+        let pnl_pct = if notional.is_finite() && notional > 0.0 {
+            pnl / notional * 100.0
+        } else {
+            0.0
+        };
+        let roi_pct = pnl_pct * leverage;
+        let ai_reason = if ai_reason.trim().is_empty() {
+            reason.to_string()
+        } else {
+            ai_reason
+        };
+        tx.execute(
+            "INSERT INTO trades(symbol,side,qty,entry_price,exit_price,leverage,notional,pnl,pnl_pct,roi_pct,fees,opened_at,closed_at,hold_seconds,exit_reason,ai_confidence,ai_reason,signal_score,slippage_bps,mode,reviewed,review_note,features,mantra_ids) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,0,'',?21,'[]')",
+            rusqlite::params![
+                symbol,
+                position_side,
+                qty,
+                entry_price,
+                exit_price,
+                leverage,
+                notional,
+                pnl,
+                pnl_pct,
+                roi_pct,
+                fee,
+                opened_at,
+                now,
+                now.saturating_sub(opened_at),
+                reason,
+                ai_confidence,
+                ai_reason,
+                signal_score,
+                0.0_f64,
+                mode,
+                features,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(Some(tx.last_insert_rowid()));
     }
     tx.execute(
         "INSERT INTO trades(symbol,side,qty,entry_price,exit_price,pnl,opened_at,closed_at,hold_seconds,exit_reason,mode) \
@@ -384,6 +464,7 @@ pub(crate) fn close_position(
         crate::now(),
         reason,
         features.as_deref(),
+        fee,
     )?;
     write_close(
         &tx,
@@ -459,6 +540,7 @@ pub(crate) fn close_venue_position_tx(
         now,
         "venue_sync",
         features.as_deref(),
+        fee,
     )?;
     write_close(tx, id, qty, qty, exit_price, now, "venue_sync", pnl, fee)?;
     if let Some(trade_id) = trade_id {
@@ -521,8 +603,70 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY,ts INTEGER,symbol TEXT,side TEXT,order_type TEXT,qty REAL,price REAL,status TEXT,purpose TEXT,client_order_id TEXT,exchange_order_id TEXT,reduce_only INTEGER,mode TEXT,latency_ms INTEGER NOT NULL); CREATE TABLE positions(id INTEGER PRIMARY KEY,symbol TEXT,side TEXT,qty REAL,entry_price REAL,mark_price REAL,leverage REAL,margin REAL,sl_price REAL,tp_price REAL,peak_price REAL,initial_sl_price REAL,signal_score REAL,opened_at INTEGER,closed_at INTEGER,exit_price REAL,exit_reason TEXT,realized_pnl REAL,fees REAL,status TEXT,mode TEXT,venue_unrealized REAL,venue_ts INTEGER,partial_taken_at INTEGER); INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,status,mode,opened_at) VALUES(1,'BTCUSDT','long',0.25,100000,98500,'open','demo',1);") .unwrap();
+        conn.execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY,ts INTEGER,symbol TEXT,side TEXT,order_type TEXT,qty REAL,price REAL,status TEXT,purpose TEXT,client_order_id TEXT,exchange_order_id TEXT,reduce_only INTEGER,mode TEXT,latency_ms INTEGER NOT NULL); CREATE TABLE positions(id INTEGER PRIMARY KEY,symbol TEXT,side TEXT,qty REAL,entry_price REAL,mark_price REAL,leverage REAL,margin REAL,sl_price REAL,tp_price REAL,peak_price REAL,initial_sl_price REAL,signal_score REAL,opened_at INTEGER,closed_at INTEGER,exit_price REAL,exit_reason TEXT,realized_pnl REAL,fees REAL,status TEXT,mode TEXT,venue_unrealized REAL,venue_ts INTEGER,partial_taken_at INTEGER,ai_confidence REAL DEFAULT 0,ai_reason TEXT DEFAULT ''); INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,status,mode,opened_at) VALUES(1,'BTCUSDT','long',0.25,100000,98500,'open','demo',1);") .unwrap();
         conn
+    }
+
+    #[test]
+    fn closing_fill_satisfies_production_trades_schema() {
+        let conn = db();
+        conn.execute_batch(
+            "UPDATE positions SET leverage=5, signal_score=0.4, ai_confidence=0.6, ai_reason='test' WHERE id=1;
+             CREATE TABLE trades(
+               id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, qty REAL NOT NULL,
+               entry_price REAL NOT NULL, exit_price REAL NOT NULL, leverage REAL NOT NULL,
+               notional REAL NOT NULL, pnl REAL NOT NULL, pnl_pct REAL NOT NULL, roi_pct REAL NOT NULL,
+               fees REAL NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER NOT NULL,
+               hold_seconds INTEGER NOT NULL, exit_reason TEXT NOT NULL, ai_confidence REAL NOT NULL,
+               ai_reason TEXT NOT NULL, signal_score REAL NOT NULL, slippage_bps REAL NOT NULL,
+               mode TEXT NOT NULL, reviewed BOOLEAN NOT NULL, review_note TEXT NOT NULL,
+               features JSON, mantra_ids JSON, parameter_set_id INTEGER
+             );",
+        )
+        .unwrap();
+        let fill = DemoFill {
+            client_order_id: "demo-cycle-42-BTCUSDT-close".into(),
+            exchange_order_id: String::new(),
+            symbol: "BTCUSDT".into(),
+            side: "SELL".into(),
+            qty: 0.25,
+            price: 98_500.0,
+            reduce_only: true,
+            reason: "stop_loss".into(),
+        };
+        let trade_id = apply_demo_fill(&conn, "demo", 42, 0.0005, &fill)
+            .unwrap()
+            .1
+            .expect("生产 schema 下平仓必须能写入成交");
+        let (leverage, fees, pnl_pct, roi_pct, ai_confidence, ai_reason): (
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT leverage,fees,pnl_pct,roi_pct,ai_confidence,ai_reason FROM trades WHERE id=?1",
+                [trade_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(leverage, 5.0);
+        assert!((fees - 98_500.0 * 0.25 * 0.0005).abs() < 1e-9);
+        assert!(pnl_pct < 0.0);
+        assert!((roi_pct - pnl_pct * 5.0).abs() < 1e-9);
+        assert_eq!(ai_confidence, 0.6);
+        assert_eq!(ai_reason, "test");
     }
 
     #[test]
