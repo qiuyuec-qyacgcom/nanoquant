@@ -4,9 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-#[cfg(test)]
 use rusqlite::Connection;
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -31,14 +29,48 @@ struct AutoScanInput {
 }
 
 /// 手动触发一轮自动换池。默认 `apply=false` 只返回计划；`run` 内部负责防重入与事务。
+///
+/// 没有 JSON body 时也按 dry-run 处理，避免“先看一看”的请求被 415 拒绝。
 async fn auto_scan_symbols(
     State(db): State<Db>,
-    Json(input): Json<AutoScanInput>,
+    input: Option<Json<AutoScanInput>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    crate::symbol_scan::run(&db, input.apply)
+    let apply = input.map(|Json(input)| input.apply).unwrap_or(false);
+    crate::symbol_scan::run(&db, apply)
         .await
         .map(Json)
-        .map_err(|error| pool_error(StatusCode::BAD_GATEWAY, &error))
+        .map_err(scan_error)
+}
+
+/// `run` 只返回扁平字符串，无法携带错误类别，这里按调用链的固定文案分类：
+/// - 防重入失败是正常并发冲突 -> 409；
+/// - 数据库、配置、事务等本地故障 -> 500，不能伪装成上游故障；
+/// - 其余视为合约表/行情网络失败 -> 502。
+fn scan_error(error: String) -> (StatusCode, Json<Value>) {
+    if error == crate::symbol_scan::BUSY_ERROR {
+        return pool_error(StatusCode::CONFLICT, &error);
+    }
+    const INTERNAL_MARKERS: [&str; 13] = [
+        "数据库锁不可用",
+        "读取配置 ",
+        "读取标的池失败",
+        "读取全部标的失败",
+        "读取持仓失败",
+        "读取上次换池时间失败",
+        "事务失败",
+        "写入换池事件失败",
+        "写入 engine_state.",
+        "初始化行情客户端失败",
+        "检查 ",
+        "删除标的 ",
+        "是否已在池中失败",
+    ];
+    let status = if INTERNAL_MARKERS.iter().any(|marker| error.contains(marker)) {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    pool_error(status, &error)
 }
 
 #[derive(Deserialize)]
@@ -246,7 +278,9 @@ fn add_with_contracts(
         Err(message) if message.contains("已在交易池中") => {
             return Err(pool_error(StatusCode::CONFLICT, &message))
         }
-        Err(message) => return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message)),
+        Err(message) => {
+            return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message))
+        }
     };
     Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":false}))
 }
@@ -423,12 +457,8 @@ fn leverage_cap(db: &Db) -> i64 {
 }
 
 fn pool_maximum(db: &Db) -> i64 {
-    db.setting("data")
-        .ok()
-        .flatten()
-        .and_then(|v| v["max_pool_size"].as_i64())
-        .unwrap_or(20)
-        .clamp(1, 200)
+    let conn = db.conn.lock().expect("db");
+    pool_maximum_from(&conn)
 }
 
 #[derive(Deserialize, Default)]
@@ -616,31 +646,11 @@ fn mode_from_conn(conn: &rusqlite::Connection) -> String {
 }
 
 async fn list_symbols(State(db): State<Db>) -> Json<Value> {
-    let items = read_symbols(&db);
-    let maximum = pool_maximum(&db);
-    let symbols: Vec<Value> = items.iter().map(|item| item["symbol"].clone()).collect();
-    let (scan_last, scan_result) = {
+    let (items, maximum, scan_last, scan_result) = {
         let conn = db.conn.lock().expect("db");
-        let scan_last: Option<String> = conn
-            .query_row(
-                "SELECT value FROM engine_state WHERE key='symbol_scan.last_run_ts'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let scan_result: Option<String> = conn
-            .query_row(
-                "SELECT value FROM engine_state WHERE key='symbol_scan.last_result'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        (scan_last, scan_result)
+        pool_snapshot(&conn).expect("symbols snapshot")
     };
+    let symbols: Vec<Value> = items.iter().map(|item| item["symbol"].clone()).collect();
     json!({
         "items": items,
         "count": items.len(),
@@ -652,27 +662,29 @@ async fn list_symbols(State(db): State<Db>) -> Json<Value> {
             "limits": {"minimum": 0, "maximum": maximum, "update_interval_hint": "每次保存即时生效"},
         },
         "scan": {
-            "last_run_ts": scan_last
-                .and_then(|raw| raw.parse::<i64>().ok())
-                .unwrap_or(0),
-            "last_result": scan_result
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .unwrap_or(Value::Null),
+            "last_run_ts": scan_last,
+            "last_result": scan_result,
         },
         "limits": {"minimum": 0, "maximum": maximum, "update_interval_hint": "每次保存即时生效"},
     })
     .into()
 }
 
+/// 仅供测试直接断言池内容；生产列表走 [`pool_snapshot`]，只加锁一次。
+#[cfg(test)]
 fn read_symbols(db: &Db) -> Vec<Value> {
     let conn = db.conn.lock().expect("db");
+    read_symbols_from(&conn).expect("读取标的池失败")
+}
+
+fn read_symbols_from(conn: &Connection) -> Result<Vec<Value>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT symbol, name, tier, sl_atr_mult, enabled, max_leverage, precision, tick_sz, \
              min_sz, min_notional, ct_val, min_score, note, sort_order, created_at, updated_at \
              FROM trading_symbols ORDER BY sort_order, symbol",
         )
-        .expect("prepare symbols");
+        .map_err(|error| format!("读取标的池失败: {error}"))?;
     let rows = stmt
         .query_map([], |r| {
             Ok(json!({
@@ -694,10 +706,61 @@ fn read_symbols(db: &Db) -> Vec<Value> {
                 "updated_at": r.get::<_, i64>(15)?,
             }))
         })
-        .expect("query symbols")
+        .map_err(|error| format!("读取标的池失败: {error}"))?
         .collect::<Result<Vec<_>, _>>()
-        .expect("rows");
-    rows
+        .map_err(|error| format!("读取标的池失败: {error}"))?;
+    Ok(rows)
+}
+
+/// 列表页的一次性快照：同一把连接锁内读取标的、池上限与换池状态。
+fn pool_snapshot(conn: &Connection) -> Result<(Vec<Value>, i64, i64, Value), String> {
+    let items = read_symbols_from(conn)?;
+    let maximum = pool_maximum_from(conn);
+    let (last_run_ts, last_result) = scan_state_from(conn);
+    Ok((items, maximum, last_run_ts, last_result))
+}
+
+/// 读取 scan 的两个状态键。`engine_state` 在测试夹具或旧库里可能不存在：
+/// 查询失败一律当成“尚无扫描记录”，不能拖垮列表接口。
+fn scan_state_from(conn: &Connection) -> (i64, Value) {
+    let mut last_run = None;
+    let mut last_result = None;
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT key, value FROM engine_state WHERE key IN \
+         ('symbol_scan.last_run_ts','symbol_scan.last_result')",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for (key, value) in rows.flatten() {
+                match key.as_str() {
+                    "symbol_scan.last_run_ts" => last_run = Some(value),
+                    "symbol_scan.last_result" => last_result = Some(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let last_run_ts = last_run
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let last_result = last_result
+        .and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok())
+        .unwrap_or(Value::Null);
+    (last_run_ts, last_result)
+}
+
+fn pool_maximum_from(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key='data'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|value| value["max_pool_size"].as_i64())
+    .unwrap_or(20)
+    .clamp(1, 200)
 }
 
 /// 测试夹具：建一张只含本模块用到的表的最小库。
@@ -913,7 +976,34 @@ mod tests {
         assert_eq!(body["state"]["limits"]["maximum"], 20);
         assert_eq!(body["limits"]["maximum"], 20);
         assert_eq!(body["state"]["symbols"][0], "BTCUSDT");
+        assert_eq!(body["scan"]["last_run_ts"], 0);
+        assert!(
+            body["scan"]["last_result"].is_null(),
+            "夹具未建 engine_state 时 scan 必须兜底而非 500"
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_error_classifies_busy_internal_and_network_failures() {
+        assert_eq!(
+            scan_error(crate::symbol_scan::BUSY_ERROR.to_string()).0,
+            StatusCode::CONFLICT,
+            "并发扫描属于正常冲突"
+        );
+        assert_eq!(
+            scan_error("数据库锁不可用".to_string()).0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "本地数据库故障不能伪装成上游故障"
+        );
+        assert_eq!(
+            scan_error("读取配置 symbol_scan 失败: x".to_string()).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            scan_error("读取 24h 成交额失败: timeout".to_string()).0,
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]
@@ -931,9 +1021,9 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             conn.execute_batch(
-                "CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
-                 INSERT INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','123',0); \
-                 INSERT INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_result','{\"delete\":[\"AAAUSDT\"]}',0);",
+                "CREATE TABLE IF NOT EXISTS engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+                 INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','123',0); \
+                 INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_result','{\"delete\":[\"AAAUSDT\"]}',0);",
             )
             .unwrap();
         }
@@ -955,6 +1045,43 @@ mod tests {
         assert_eq!(body["scan"]["last_run_ts"], 123);
         assert_eq!(body["scan"]["last_result"]["delete"][0], "AAAUSDT");
         assert_eq!(body["state"]["status"], "ok", "scan 字段不能覆盖既有 state");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn list_symbols_tolerates_corrupt_scan_state() {
+        let path = std::env::temp_dir().join("nq-symbols-scan-corrupt.db");
+        let db = seed(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+                 INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','abc',0); \
+                 INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_result','{not json',0);",
+            )
+            .unwrap();
+        }
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/symbols")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["scan"]["last_run_ts"], 0, "损坏的时间戳必须回退 0");
+        assert!(
+            body["scan"]["last_result"].is_null(),
+            "损坏的结果 JSON 必须回退 null"
+        );
+        assert_eq!(body["state"]["status"], "ok");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -440,7 +440,8 @@ const CHECK_INTERVAL_SECS: i64 = 60;
 /// 失败后的退避时长（秒）。连续失败期间不再重试、不再写事件。
 const RETRY_BACKOFF_SECS: i64 = 900;
 /// `run` 因手动 API 正在扫描而拒绝执行时的错误文案，属于正常并发而非故障。
-const BUSY_ERROR: &str = "自动换池正在执行";
+/// 手动 API 需要按文案把它映射成 409，因此对外可见。
+pub(crate) const BUSY_ERROR: &str = "自动换池正在执行";
 
 /// 独立后台换池循环：与交易引擎解耦，仅共享 SQLite 锁。
 ///
@@ -626,7 +627,7 @@ fn apply_plan(
 /// 执行一轮换池扫描。`apply=false` 只返回计划，不写库、不更新上次运行时间。
 /// 行情或合约表读取失败直接返回错误，不修改标的池。
 pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
-    let _busy = BusyGuard::acquire().ok_or_else(|| "自动换池正在执行".to_string())?;
+    let _busy = BusyGuard::acquire().ok_or_else(|| BUSY_ERROR.to_string())?;
     let cfg = load_config(db)?;
     let mode = crate::symbols::current_mode(db);
 
