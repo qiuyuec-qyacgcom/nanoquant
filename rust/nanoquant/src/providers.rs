@@ -425,12 +425,18 @@ impl BinanceProvider {
     }
 
     /// 指定标的的已收盘 K 线，周期沿用 provider 的 timeframe。
+    /// 只返回已收盘 K 线，条数可能少于 limit（未收盘的最新一根会被剔除）。
     #[allow(dead_code)]
     pub async fn klines(
         &self,
         symbol: &str,
         limit: usize,
     ) -> Result<Vec<CandleSnapshot>, ProviderError> {
+        if !(1..=1500).contains(&limit) {
+            return Err(ProviderError::InvalidData(
+                "K 线条数必须在 1..=1500 之间".into(),
+            ));
+        }
         let value = self
             .get_json(
                 "/fapi/v1/klines",
@@ -451,6 +457,11 @@ impl BinanceProvider {
         params: &[(String, String)],
         signed: bool,
     ) -> Result<Value, ProviderError> {
+        if signed && (self.api_key.trim().is_empty() || self.secret.trim().is_empty()) {
+            return Err(ProviderError::Unavailable(
+                "未配置交易所 API 凭证，公开 provider 不支持签名接口".into(),
+            ));
+        }
         let timestamp = crate::now_millis();
         let query = if signed {
             let refs: Vec<(&str, &str)> = params
@@ -755,6 +766,11 @@ pub fn parse_tickers_24h(value: &Value) -> Result<Vec<ExchangeTicker>, ProviderE
             .ok_or_else(|| ProviderError::InvalidData("24 小时行情缺少 symbol".into()))?
             .to_string();
         let quote_volume = number(row, "quoteVolume")?;
+        if !quote_volume.is_finite() || quote_volume < 0.0 {
+            return Err(ProviderError::InvalidData(format!(
+                "{symbol} 24 小时成交额无效"
+            )));
+        }
         tickers.push(ExchangeTicker {
             symbol,
             quote_volume,
@@ -777,12 +793,13 @@ pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
             .to_string();
         let bid = number(row, "bidPrice")?;
         let ask = number(row, "askPrice")?;
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
+            return Err(ProviderError::InvalidData(format!(
+                "{symbol} 盘口买一/卖一无效"
+            )));
+        }
         let mid = (bid + ask) / 2.0;
-        let spread_bps = if mid <= 0.0 {
-            f64::INFINITY
-        } else {
-            (ask - bid) / mid * 10_000.0
-        };
+        let spread_bps = (ask - bid) / mid * 10_000.0;
         tops.push(BookTop {
             symbol,
             bid,
@@ -1264,6 +1281,82 @@ mod tests {
                 ),
                 "盘口行情非数组必须拒绝: {payload:?}"
             );
+        }
+    }
+
+    #[test]
+    fn full_market_parsers_validate_invalid_rows() {
+        assert_eq!(
+            parse_tickers_24h(&serde_json::json!([])).unwrap(),
+            Vec::<ExchangeTicker>::new()
+        );
+        assert_eq!(
+            parse_book_tops(&serde_json::json!([])).unwrap(),
+            Vec::<BookTop>::new()
+        );
+
+        for payload in [
+            serde_json::json!([{"quoteVolume": "1"}]),
+            serde_json::json!([{"symbol": "", "quoteVolume": "1"}]),
+            serde_json::json!([{"symbol": "BTCUSDT"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "quoteVolume": "-1"}]),
+        ] {
+            assert!(
+                matches!(
+                    parse_tickers_24h(&payload),
+                    Err(ProviderError::InvalidData(_))
+                ),
+                "24 小时行情非法行必须拒绝: {payload:?}"
+            );
+        }
+
+        for payload in [
+            serde_json::json!([{"bidPrice": "100", "askPrice": "101"}]),
+            serde_json::json!([{"symbol": "", "bidPrice": "100", "askPrice": "101"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "askPrice": "101"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "bidPrice": "100"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "bidPrice": "101", "askPrice": "100"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "bidPrice": "0", "askPrice": "1"}]),
+            serde_json::json!([{"symbol": "BTCUSDT", "bidPrice": "1", "askPrice": "0"}]),
+        ] {
+            assert!(
+                matches!(
+                    parse_book_tops(&payload),
+                    Err(ProviderError::InvalidData(_))
+                ),
+                "盘口行情非法行必须拒绝: {payload:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn klines_rejects_limit_out_of_range() {
+        let provider = BinanceProvider::public("http://127.0.0.1:1").unwrap();
+        for limit in [0_usize, 1_501] {
+            assert!(
+                matches!(
+                    provider.klines("BTCUSDT", limit).await,
+                    Err(ProviderError::InvalidData(_))
+                ),
+                "K 线条数 {limit} 越界必须拒绝"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_provider_rejects_signed_endpoints() {
+        let provider = BinanceProvider::public("http://127.0.0.1:1").unwrap();
+        for error in [
+            provider.positions_only().await.unwrap_err(),
+            provider.mark_price("BTCUSDT").await.unwrap_err(),
+        ] {
+            match error {
+                ProviderError::Unavailable(message) => assert!(
+                    message.contains("未配置交易所 API 凭证"),
+                    "签名接口应提示缺少凭证: {message}"
+                ),
+                other => panic!("公开 provider 调用签名接口应为 Unavailable: {other:?}"),
+            }
         }
     }
 
