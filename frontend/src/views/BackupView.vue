@@ -28,10 +28,17 @@ const GROUP_LABELS: Record<string, string> = {
 
 async function load() {
   try {
-    const [opt, job] = await Promise.all([http.get('/backup/options'), http.get('/backup/jobs')])
+    const [opt, job, diag] = await Promise.all([
+      http.get('/backup/options'),
+      http.get('/backup/jobs'),
+      http.get('/system/diagnostics').catch(() => null),
+    ])
     options.value = opt
     jobs.value = job.items
-    usage.value = job.usage
+    usage.value = {
+      ...(job.usage || {}),
+      free_bytes: diag?.free_bytes ?? job.usage?.free_bytes ?? 0,
+    }
     if (!selectedGroups.value.length) selectedGroups.value = [...opt.settings_groups]
     if (!selectedTables.value.length) selectedTables.value = [...opt.default_tables]
     if (encrypt.value === undefined) encrypt.value = true
