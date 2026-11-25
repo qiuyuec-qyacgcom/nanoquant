@@ -606,6 +606,8 @@ const tradeMode = ref<any>(null)
 const tradeModeBusy = ref(false)
 const tradeModeResults = ref<any[]>([])
 const tradeModeError = ref('')
+const isolatedOnly = computed(() => app.settings.engine?.isolated === true)
+const isolatedBusy = ref(false)
 
 const tradeModeLabel = computed(() => {
   if (tradeModeBusy.value) return '切换中…'
@@ -650,6 +652,38 @@ async function fixTradeMode() {
     app.notify(err.message, 'error')
   } finally {
     tradeModeBusy.value = false
+  }
+}
+
+async function toggleIsolated(event: Event) {
+  const input = event.target as HTMLInputElement
+  const enabled = input.checked
+  isolatedBusy.value = true
+  try {
+    await app.saveGroup('engine', { isolated: enabled })
+    if (enabled && tradeMode.value?.can_switch) {
+      const res = await http.post(
+        '/engine/trade-mode',
+        { hedge: Boolean(tradeMode.value?.hedge_mode), isolated: true },
+        15000,
+      )
+      tradeModeResults.value = res.results || []
+      const firstFail = (res.results || []).find((item: any) => !item.ok)
+      app.notify(
+        res.ok ? '已开启全局逐仓并完成切换' : firstFail?.detail || '逐仓开关已保存，部分标的切换失败',
+        res.ok ? 'ok' : 'error',
+      )
+      await loadTradeMode()
+    } else if (enabled) {
+      app.notify('已开启全局逐仓开单；现有仓位保持原模式，新开仓会自动切逐仓', 'info')
+    } else {
+      app.notify('已关闭全局逐仓开单', 'ok')
+    }
+  } catch (err: any) {
+    input.checked = isolatedOnly.value
+    app.notify(err.message, 'error')
+  } finally {
+    isolatedBusy.value = false
   }
 }
 
@@ -1141,9 +1175,22 @@ onUnmounted(() => {
             <div v-if="current === 'engine'" class="section">
               <div class="section-hd">
                 <span class="section-title">交易模式</span>
-                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；切换需无持仓/挂单，各标的逐仓由开仓前自动保证</span>
+                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；全局逐仓开关控制开仓前自动切换，手动全局切换需无持仓/挂单</span>
               </div>
               <div v-if="tradeMode" class="trade-mode">
+                <div class="tm-row">
+                  <span class="tm-label">全局逐仓开单</span>
+                  <label class="row" style="gap: 6px; font-size: 12px; cursor: pointer">
+                    <input
+                      type="checkbox"
+                      :checked="isolatedOnly"
+                      :disabled="isolatedBusy"
+                      @change="toggleIsolated"
+                    />
+                    <span>{{ isolatedOnly ? '开启' : '关闭' }}</span>
+                  </label>
+                  <span class="muted tm-note">开启后新开仓前自动确保逐仓；已有全仓仓位需先平仓</span>
+                </div>
                 <div class="tm-row">
                   <span class="tm-label">持仓模式</span>
                   <span class="tag" :class="tradeMode.hedge_mode ? 'tag-long' : 'tag-warn'">

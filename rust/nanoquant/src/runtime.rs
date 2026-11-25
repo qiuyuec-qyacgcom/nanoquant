@@ -3873,6 +3873,51 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         crate::live::Reply::Unknown
     }
 
+    /// 全局逐仓开单开关：只在参数配置显式开启时生效。
+    fn isolated_only(&self) -> bool {
+        self.db
+            .setting("engine")
+            .ok()
+            .flatten()
+            .and_then(|value| value.get("isolated").and_then(Value::as_bool))
+            .unwrap_or(false)
+    }
+
+    /// 开仓前按标的确保逐仓；已有全仓仓位时交易所会拒绝，直接跳过这笔新开仓。
+    async fn ensure_isolated(
+        &self,
+        gate: &mut crate::submit::BanGate,
+        creds: &LiveCreds,
+        gateway: &dyn crate::live::Gateway,
+        symbol: &str,
+    ) -> Result<(), String> {
+        let params = [
+            ("symbol".to_string(), symbol.to_string()),
+            ("marginType".to_string(), "ISOLATED".to_string()),
+        ];
+        let request = self
+            .build_live(
+                gate,
+                creds,
+                "POST",
+                "/fapi/v1/marginType",
+                &params,
+            )
+            .await?;
+        let reply = gateway.send(&request).await;
+        if reply.transport_failed {
+            return Err("结果未知，已阻止本次开仓".to_string());
+        }
+        if (200..300).contains(&reply.status) || reply.body.contains("-4046") {
+            return Ok(());
+        }
+        Err(format!(
+            "HTTP {}: {}",
+            reply.status,
+            truncate_body(&reply.body)
+        ))
+    }
+
     async fn run_live_with(
         &self,
         creds: &LiveCreds,
@@ -3911,6 +3956,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     continue;
                 }
             };
+            if plan.purpose == "entry" && self.isolated_only() {
+                if let Err(error) = self
+                    .ensure_isolated(&mut gate, creds, gateway, &plan.symbol)
+                    .await
+                {
+                    failures.push(format!("{} 逐仓切换失败：{error}", plan.symbol));
+                    self.report_segments(&[("total", elapsed_ms(t_total))]);
+                    continue;
+                }
+            }
             if let Some(entry) = &plan.entry {
                 let leverage = entry.leverage as i64;
                 let params = [

@@ -12,6 +12,7 @@
     "timezone_offset": 8,
     "close_on_halt": false,
     "order_type": "market",
+    "isolated": false,
     "recv_window_ms": 5000
   },
   "risk": {
