@@ -72,6 +72,7 @@ describe('参数配置目录', () => {
       'min_leverage',
       'max_leverage',
       'max_exposure_pct',
+      'atr_stop_mult',
       'min_equity_usdt',
       'category_exposure_limit_pct',
       'vol_target_atr_pct',
