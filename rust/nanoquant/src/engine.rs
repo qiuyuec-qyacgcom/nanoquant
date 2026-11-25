@@ -1336,12 +1336,37 @@ fn account_view(conn: &rusqlite::Connection, mode: &str) -> Value {
     let snapshot_equity = snapshot
         .as_ref()
         .and_then(|value| value["account"]["equity"].as_f64());
-    let snapshot_wallet = snapshot
+    let live = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key='account.live'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let live_fresh = live
         .as_ref()
-        .and_then(|value| value["account"]["wallet"].as_f64());
-    let snapshot_available = snapshot
+        .and_then(|value| value["ts"].as_i64())
+        .map(|ts| ts > 0 && now - ts < 10)
+        .unwrap_or(false);
+    let snapshot_wallet = live
         .as_ref()
-        .and_then(|value| value["account"]["available_balance"].as_f64());
+        .filter(|_| live_fresh)
+        .and_then(|value| value["wallet"].as_f64())
+        .or_else(|| {
+            snapshot
+                .as_ref()
+                .and_then(|value| value["account"]["wallet"].as_f64())
+        });
+    let snapshot_available = live
+        .as_ref()
+        .filter(|_| live_fresh)
+        .and_then(|value| value["available"].as_f64())
+        .or_else(|| {
+            snapshot
+                .as_ref()
+                .and_then(|value| value["account"]["available_balance"].as_f64())
+        });
     let point: Option<(f64, f64)> = conn
         .query_row(
             "SELECT wallet, available FROM equity_points WHERE mode=?1 ORDER BY ts DESC LIMIT 1",
@@ -1363,7 +1388,7 @@ fn account_view(conn: &rusqlite::Connection, mode: &str) -> Value {
         (Some(equity), _) => (
             snapshot_wallet.unwrap_or_else(|| (equity - unrealized).max(0.0)),
             snapshot_available.unwrap_or(0.0),
-            "snapshot",
+            if live_fresh { "live" } else { "snapshot" },
         ),
         (None, Some((wallet, available))) => (wallet, available, "ledger"),
         (None, None) => (initial, initial, "initial"),

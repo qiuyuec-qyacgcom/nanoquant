@@ -311,7 +311,13 @@ async fn main() {
         tokio::spawn(crate::symbol_scan::run_loop(db.clone(), stop_tx.subscribe()));
         // 账户面板的标记价刷新独立于策略周期，避免权益/浮盈要等 10 分钟一轮才变。
         tokio::spawn(crate::runtime::run_position_mark_task(
+            db.clone(),
+            stop_tx.subscribe(),
+        ));
+        // 可用余额/钱包直接读交易所账户接口，同样不受策略周期限制。
+        tokio::spawn(crate::runtime::run_account_balance_task(
             db,
+            master_key.clone(),
             stop_tx.subscribe(),
         ));
     }

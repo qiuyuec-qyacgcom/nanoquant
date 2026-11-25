@@ -1065,6 +1065,24 @@ impl EngineControl {
         })
     }
 
+    /// 账户面板专用：只拉钱包/可用/权益，不走完整行情快照。
+    pub(crate) async fn account_snapshot(
+        &self,
+        mode: &str,
+    ) -> Result<crate::providers::AccountSnapshot, String> {
+        let creds = self.credentials_for_mode(mode)?;
+        let provider = crate::providers::BinanceProvider::for_account(
+            creds.base,
+            creds.api_key,
+            creds.secret,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        provider
+            .account_snapshot()
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
     fn mode(&self) -> String {
         self.db
             .conn
@@ -5267,6 +5285,63 @@ async fn refresh_position_marks(db: &crate::db::Db) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     }
     tx.commit().map_err(|error| error.to_string())
+}
+
+/// 账户面板专用：每 3 秒从交易所账户接口刷新钱包/可用/权益。
+pub(crate) async fn run_account_balance_task(
+    db: crate::db::Db,
+    master_key: Vec<u8>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let control = EngineControl::new(db.clone(), master_key);
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        if let Err(error) = refresh_account_balance(&db, &control).await {
+            tracing::debug!(%error, "账户余额刷新失败");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
+async fn refresh_account_balance(
+    db: &crate::db::Db,
+    control: &EngineControl,
+) -> Result<(), String> {
+    let mode: String = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        conn.query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| "demo".to_string())
+    };
+    if mode != "live" {
+        return Ok(());
+    }
+    let account = control.account_snapshot("live").await?;
+    let payload = serde_json::json!({
+        "ts": crate::now(),
+        "equity": account.equity,
+        "wallet": account.wallet,
+        "available": account.available_balance,
+    });
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| "数据库锁不可用".to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO engine_state(key,value) VALUES('account.live',?1)",
+        [payload.to_string()],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

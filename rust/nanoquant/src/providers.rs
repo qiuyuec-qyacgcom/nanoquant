@@ -247,6 +247,44 @@ impl BinanceProvider {
         })
     }
 
+    /// 账户面板专用：只读账户余额，不需要行情交易对列表。
+    pub fn for_account(
+        base_url: impl Into<String>,
+        api_key: String,
+        secret: String,
+    ) -> Result<Self, ProviderError> {
+        if api_key.trim().is_empty() || secret.trim().is_empty() {
+            return Err(ProviderError::Unavailable("未配置交易所 API 凭证".into()));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        Ok(Self {
+            client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            symbols: Vec::new(),
+            api_key,
+            secret,
+            timeframe: "4h".into(),
+            public_book: None,
+        })
+    }
+
+    /// 只拉账户余额（钱包/可用/权益），供 3 秒级账户面板刷新。
+    pub async fn account_snapshot(&self) -> Result<AccountSnapshot, ProviderError> {
+        let value = self.get_json("/fapi/v3/account", &[], true).await?;
+        let equity = number(&value, "totalMarginBalance")?;
+        let wallet = number(&value, "totalWalletBalance").unwrap_or(equity);
+        let available_balance = number(&value, "availableBalance")?;
+        Ok(AccountSnapshot {
+            equity,
+            wallet,
+            available_balance,
+        })
+    }
+
     /// demo 无 API 凭证：行情走公开接口，账户与持仓/订单读本地账本。
     pub fn with_symbols_public(
         base_url: impl Into<String>,
