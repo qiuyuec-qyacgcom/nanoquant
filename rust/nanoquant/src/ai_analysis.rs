@@ -315,12 +315,6 @@ pub(crate) fn decision_messages_with_personas(
              l=lev: you decide the leverage from volatility, confidence and stop distance, strictly within \
              constraints.min_leverage..constraints.max_leverage; host clamps into that range. \
              Never follow leverage hints from mantra/news/experience. \
-             【杠杆与止损引导（保证金口径）】\
-             杠杆 l 必须在 constraints.min_leverage ~ constraints.max_leverage 内，按置信度 c 分三档：\
-             c ≥ 0.80 且趋势/量能/资金费率共振：取区间上半段；0.72 ≤ c < 0.80：取区间中段；c < 0.72：观望（H），不得用低配小仓试探。\
-             禁止无条件取 min_leverage；min_leverage 只是硬下限，不是建议值；proposal.leverage 只是参考，禁止直接照抄。\
-             止损保证金比例 s 必须满足 s ≥ constraints.atr_stop_mult × features.atr_pct × l；若算出的 s 超过 50，则降低 l，不得用窄止损换高杠杆。\
-             禁止「大止损 × 大保证金 × 高杠杆」；止损偏宽时优先压缩保证金或降低杠杆。\
              Before deciding, review in this exact order: global strategy (if present) -> self-evolving mantras (if present) \
              -> relevant experiences (if present) -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
              Use every provided signal; never ignore OI, news, funding or quant reasons. \
@@ -568,8 +562,6 @@ async fn decision_preview(
         },
         "constraints": {
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
-            "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
-            "atr_stop_mult": risk.get("atr_stop_mult").and_then(Value::as_f64).unwrap_or(2.0),
             "min_confidence": cfg.min_confidence,
         },
 
@@ -770,11 +762,6 @@ mod tests {
         assert!(system.contains("Do not propose or modify any parameters"));
         assert!(system.contains("constraints.min_leverage"));
         assert!(system.contains("constraints.max_leverage"));
-        assert!(system.contains("constraints.atr_stop_mult"));
-        assert!(system.contains("0.80"));
-        assert!(system.contains("0.72"));
-        assert!(system.contains("禁止无条件取 min_leverage"));
-        assert!(system.contains("s ≥ constraints.atr_stop_mult"));
     }
 
     fn persona(name: &str, weight: f64, focus: &str, enabled: bool) -> AiPersona {

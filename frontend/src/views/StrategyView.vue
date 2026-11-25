@@ -111,11 +111,6 @@ const BASE_META: Record<string, FieldMeta> = {
   close_on_halt: { label: '熔断时平仓', hint: '关闭则只锁新开仓，不动已有持仓' },
 
   margin_pct: { label: '单仓保证金', unit: '%', hint: '单个仓位的保证金 = 权益 × 该比例；名义额再乘以杠杆' },
-  atr_stop_mult: {
-    label: '止损 ATR 倍数',
-    unit: '×',
-    hint: '提示 AI：止损保证金比例 ≥ 该倍数 × ATR% × 杠杆；只做提示词引导，不强制校验',
-  },
   min_leverage: {
     label: '杠杆下限', unit: 'x', min: 1,
     hint: '全局杠杆下限，也是 AI 未给杠杆时的回退值；AI 给出的杠杆低于该值会抬到此处',
