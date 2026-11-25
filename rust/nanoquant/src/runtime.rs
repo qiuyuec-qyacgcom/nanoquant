@@ -2837,8 +2837,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             };
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
-                // 波动率目标只允许缩仓，不允许把单仓保证金放大到参数上限之上。
-                (target / metric.atr_pct).clamp(0.25, 1.0)
+                (target / metric.atr_pct).clamp(0.25, 2.0)
             } else {
                 1.0
             };
@@ -2983,9 +2982,9 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 draft.mark_price,
                 leverage,
                 &crate::risk::SizeParams {
-                    // 波动率目标只缩小保证金比例；参数里的 margin_pct 是单仓上限，不能再被放大。
+                    // 波动率目标仍作用于保证金比例：ATR 高于目标时缩仓，低于时放大（0.25–2x）。
                     margin_pct: (cfg["margin_pct"].as_f64().unwrap_or(50.0)
-                        * draft.scale.clamp(0.25, 1.0))
+                        * draft.scale.clamp(0.25, 2.0))
                     .clamp(0.0, 100.0),
                     min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
                 },
