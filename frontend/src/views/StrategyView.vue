@@ -46,7 +46,7 @@ const PLAIN_HINTS: Record<string, string> = {
   scan_concurrency: '同时拉几路 K 线；只影响信号新旧，不增加请求数',
   max_positions: '最多同时持有几个仓位',
 
-  margin_pct: '单个仓位最多占用多少权益作保证金',
+  margin_pct: '单仓保证金中心值；AI 按波动率在 ±5 个百分点内调整',
   max_exposure_pct: '所有持仓名义额合计最多是权益的几倍',
   max_same_direction: '同一方向最多同时持有几个仓；0=不限制',
   daily_loss_limit_pct: '当天亏到这个比例就停止开新仓',
@@ -110,7 +110,11 @@ const BASE_META: Record<string, FieldMeta> = {
   recv_window_ms: { label: '签名有效窗口', unit: 'ms', hint: '建议 5000，系统时钟漂移时调大' },
   close_on_halt: { label: '熔断时平仓', hint: '关闭则只锁新开仓，不动已有持仓' },
 
-  margin_pct: { label: '单仓保证金', unit: '%', hint: '单个仓位的保证金 = 权益 × 该比例；名义额再乘以杠杆' },
+  margin_pct: {
+    label: '单仓保证金中枢',
+    unit: '%',
+    hint: '中心值 = 权益 × 该比例；AI 按波动率在 ±5 个百分点内调整（如 20% → 15%–25%），最终仍受可用余额与最小名义额约束',
+  },
   atr_stop_mult: {
     label: '止损 ATR 倍数',
     unit: '×',
@@ -448,7 +452,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: '最大持仓', group: 'engine', key: 'max_positions' },
 
   { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
-  { label: '单仓保证金', group: 'risk', key: 'margin_pct' },
+  { label: '单仓保证金中枢', group: 'risk', key: 'margin_pct' },
   { label: '最大杠杆', group: 'risk', key: 'max_leverage' },
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
   { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },

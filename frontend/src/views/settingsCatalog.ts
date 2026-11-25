@@ -69,7 +69,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   risk: [
     {
       title: '仓位与杠杆',
-      hint: '这里只设杠杆区间；AI 按置信度三档取区间上/中段，未给值时取杠杆下限；ATR 倍数仅用于提示止损宽度（s ≥ 倍数 × ATR% × 杠杆）',
+      hint: '这里只设杠杆区间；单仓保证金是中心值，AI 按波动率在 ±5 个百分点内调整；杠杆按置信度三档取区间上/中段，未给值时取杠杆下限；ATR 倍数仅用于提示止损宽度（s ≥ 倍数 × ATR% × 杠杆）',
       fields: ['margin_pct', 'min_leverage', 'max_leverage', 'max_exposure_pct', 'max_same_direction', 'atr_stop_mult'],
     },
     {
