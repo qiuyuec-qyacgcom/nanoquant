@@ -169,6 +169,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         "constraints": {
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
+            "atr_stop_mult": risk.get("atr_stop_mult").and_then(Value::as_f64).unwrap_or(1.3),
             "min_confidence": cfg.min_confidence,
         },
         "news": news,

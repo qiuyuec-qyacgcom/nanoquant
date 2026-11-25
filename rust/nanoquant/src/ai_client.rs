@@ -1026,7 +1026,7 @@ impl Decision {
         };
         self.confidence = self.confidence.clamp(0.0, 1.0);
         self.leverage = self.leverage.clamp(0.0, 125.0);
-        self.sl_pct = self.sl_pct.clamp(0.0, 50.0);
+        self.sl_pct = self.sl_pct.clamp(0.0, 100.0);
         self.tp_pct = self.tp_pct.clamp(0.0, 100.0);
         self.reason = self.reason.chars().take(800).collect();
         self.risk_flags.truncate(6);
@@ -1631,6 +1631,13 @@ mod tests {
         assert!(decision.reason.contains("fade rally"));
         assert_eq!(decision.risk_flags.len(), 1);
         assert!(decision.invalidation.contains("EMA21"));
+    }
+
+    #[test]
+    fn sl_pct_is_clamped_to_the_100_margin_ceiling() {
+        let text = r#"{"a":"S","c":0.7,"l":10,"s":150,"t":50,"r":[1],"k":[1],"x":1,"f":"x"}"#;
+        let decision = parse_decision(text, None).unwrap();
+        assert_eq!(decision.sl_pct, 100.0);
     }
 
     #[test]
