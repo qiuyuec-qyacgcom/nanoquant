@@ -314,6 +314,12 @@ async fn main() {
             db.clone(),
             stop_tx.subscribe(),
         ));
+        // 只要存在仓位，0.5 秒风控任务会直接检查止盈止损并平仓，不再等 480 秒周期。
+        tokio::spawn(crate::runtime::run_fast_risk_task(
+            db.clone(),
+            master_key.clone(),
+            stop_tx.subscribe(),
+        ));
         // 可用余额/钱包直接读交易所账户接口，同样不受策略周期限制。
         tokio::spawn(crate::runtime::run_account_balance_task(
             db,

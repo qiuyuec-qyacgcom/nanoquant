@@ -5362,6 +5362,130 @@ async fn refresh_position_marks(db: &crate::db::Db) -> Result<(), String> {
     tx.commit().map_err(|error| error.to_string())
 }
 
+/// 持仓风控专用：有仓位时每 0.5 秒用公开标记价检查全局/单仓止盈止损，
+/// 命中后立即走平仓链路，不再等待 480 秒策略周期。
+pub(crate) async fn run_fast_risk_task(
+    db: crate::db::Db,
+    master_key: Vec<u8>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let control = EngineControl::new(db.clone(), master_key);
+    let mut closing = std::collections::HashSet::new();
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        if let Err(error) = fast_risk_cycle(&db, &control, &mut closing).await {
+            tracing::debug!(%error, "快速风控检查失败");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
+async fn fast_risk_cycle(
+    db: &crate::db::Db,
+    control: &EngineControl,
+    closing: &mut std::collections::HashSet<i64>,
+) -> Result<(), String> {
+    let (rows, global_stop, global_tp) = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let mode: String = conn
+            .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|_| "demo".to_string());
+        if mode != "live" {
+            return Ok(());
+        }
+        let risk = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='risk'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| json!({}));
+        let global_stop = risk["global_stop_loss_pct"].as_f64().unwrap_or(10.0);
+        let global_tp = risk["global_take_profit_pct"].as_f64().unwrap_or(15.0);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty \
+                 FROM positions WHERE mode='live' AND status='open' AND qty > 0",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
+                    row.get::<_, f64>(7)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        (rows, global_stop, global_tp)
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
+        .map_err(|error| format!("{error:?}"))?;
+    for (id, symbol, side, entry, sl, tp, leverage, qty) in rows {
+        if closing.contains(&id) {
+            continue;
+        }
+        let Ok(mark) = provider.public_mark_price(&symbol).await else {
+            continue;
+        };
+        if !mark.is_finite() || mark <= 0.0 || entry <= 0.0 {
+            continue;
+        }
+        let direction = if side == "long" { 1.0 } else { -1.0 };
+        let price_pct = (mark - entry) * direction / entry * 100.0;
+        let margin_pct = price_pct * leverage.max(1.0);
+        if let Ok(conn) = db.conn.lock() {
+            let _ = conn.execute(
+                "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
+                 WHERE id=?4 AND status='open'",
+                (mark, (mark - entry) * qty * direction, crate::now(), id),
+            );
+        }
+        let reason = if global_stop > 0.0 && margin_pct <= -global_stop {
+            Some("global_stop_loss")
+        } else if global_tp > 0.0 && margin_pct >= global_tp {
+            Some("global_take_profit")
+        } else if sl > 0.0 && ((direction > 0.0 && mark <= sl) || (direction < 0.0 && mark >= sl)) {
+            Some("stop_loss")
+        } else if tp > 0.0 && ((direction > 0.0 && mark >= tp) || (direction < 0.0 && mark <= tp)) {
+            Some("take_profit")
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
+        closing.insert(id);
+        if let Err(error) = control.close_position(id, reason).await {
+            tracing::debug!(error = ?error, symbol = %symbol, reason, "快速风控平仓失败");
+        }
+        closing.remove(&id);
+    }
+    Ok(())
+}
+
 /// 账户面板专用：每 3 秒从交易所账户接口刷新钱包/可用/权益。
 pub(crate) async fn run_account_balance_task(
     db: crate::db::Db,
