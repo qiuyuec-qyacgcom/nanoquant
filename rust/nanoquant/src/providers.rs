@@ -49,6 +49,7 @@ pub struct BookTop {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AccountSnapshot {
     pub equity: f64,
+    pub wallet: f64,
     pub available_balance: f64,
 }
 
@@ -163,6 +164,7 @@ impl SnapshotProvider for DemoProvider {
                 }],
                 account: AccountSnapshot {
                     equity: 10_000.0,
+                    wallet: 10_000.0,
                     available_balance: 10_000.0,
                 },
                 positions: Vec::new(),
@@ -361,6 +363,7 @@ impl BinanceProvider {
         Ok((
             AccountSnapshot {
                 equity,
+                wallet: equity,
                 available_balance: (equity - margin_used).max(0.0),
             },
             positions,
@@ -404,6 +407,15 @@ impl BinanceProvider {
         let params = vec![("symbol".to_string(), symbol.to_string())];
         let value = self
             .get_json("/fapi/v1/premiumIndex", &params, true)
+            .await?;
+        number(&value, "markPrice")
+    }
+
+    /// 公开标记价：不依赖 API 凭证，供账户面板的高频刷新使用。
+    pub async fn public_mark_price(&self, symbol: &str) -> Result<f64, ProviderError> {
+        let params = vec![("symbol".to_string(), symbol.to_string())];
+        let value = self
+            .get_json("/fapi/v1/premiumIndex", &params, false)
             .await?;
         number(&value, "markPrice")
     }
@@ -614,6 +626,7 @@ impl SnapshotProvider for BinanceProvider {
             let account = self.get_json("/fapi/v3/account", &[], true).await?;
             let equity = number(&account, "totalMarginBalance")?;
             let available_balance = number(&account, "availableBalance")?;
+            let wallet = number(&account, "totalWalletBalance").unwrap_or(equity);
             let positions_value = self.get_json("/fapi/v3/positionRisk", &[], true).await?;
             let rows = positions_value
                 .as_array()
@@ -635,6 +648,7 @@ impl SnapshotProvider for BinanceProvider {
                 markets,
                 account: AccountSnapshot {
                     equity,
+                    wallet,
                     available_balance,
                 },
                 positions,
@@ -1253,6 +1267,7 @@ mod tests {
             snapshot.account,
             AccountSnapshot {
                 equity: 125.0,
+                wallet: 125.0,
                 available_balance: 75.0
             }
         );

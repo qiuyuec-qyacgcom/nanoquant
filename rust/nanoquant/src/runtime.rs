@@ -5178,6 +5178,97 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
+/// 账户面板专用：独立于策略周期，每 3 秒刷新持仓标记价和浮盈，
+/// 让 /engine/status 的权益/浮动盈亏跟行情同步（只读公开标记价）。
+pub(crate) async fn run_position_mark_task(
+    db: crate::db::Db,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        if let Err(error) = refresh_position_marks(&db).await {
+            tracing::debug!(%error, "持仓标记价刷新失败");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
+async fn refresh_position_marks(db: &crate::db::Db) -> Result<(), String> {
+    let rows: Vec<(i64, String, String, f64, f64)> = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|_| "数据库锁不可用".to_string())?;
+        let mode: String = conn
+            .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|_| "demo".to_string());
+        if mode != "live" {
+            return Ok(());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,symbol,side,qty,entry_price FROM positions \
+                 WHERE mode='live' AND status='open'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
+        .map_err(|error| format!("{error:?}"))?;
+    let mut updates = Vec::new();
+    for (id, symbol, side, qty, entry) in rows {
+        if let Ok(mark) = provider.public_mark_price(&symbol).await {
+            if mark.is_finite() && mark > 0.0 {
+                let direction = if side == "long" { 1.0 } else { -1.0 };
+                updates.push((id, mark, (mark - entry) * qty * direction));
+            }
+        }
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| "数据库锁不可用".to_string())?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let now = crate::now();
+    for (id, mark, unrealized) in updates {
+        tx.execute(
+            "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
+             WHERE id=?4 AND status='open'",
+            (mark, unrealized, now, id),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

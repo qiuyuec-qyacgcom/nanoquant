@@ -1336,6 +1336,9 @@ fn account_view(conn: &rusqlite::Connection, mode: &str) -> Value {
     let snapshot_equity = snapshot
         .as_ref()
         .and_then(|value| value["account"]["equity"].as_f64());
+    let snapshot_wallet = snapshot
+        .as_ref()
+        .and_then(|value| value["account"]["wallet"].as_f64());
     let snapshot_available = snapshot
         .as_ref()
         .and_then(|value| value["account"]["available_balance"].as_f64());
@@ -1358,7 +1361,7 @@ fn account_view(conn: &rusqlite::Connection, mode: &str) -> Value {
         .unwrap_or(1000.0);
     let (wallet, available, source) = match (snapshot_equity, point) {
         (Some(equity), _) => (
-            (equity - unrealized).max(0.0),
+            snapshot_wallet.unwrap_or_else(|| (equity - unrealized).max(0.0)),
             snapshot_available.unwrap_or(0.0),
             "snapshot",
         ),

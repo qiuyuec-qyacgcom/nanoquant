@@ -308,7 +308,12 @@ async fn main() {
     let (stop_tx, stop_rx) = runtime::stop_channel();
     // 自动换池独立任务：与交易引擎解耦，进程退出时随 stop_tx 一起收敛。
     if let Some(db) = database.clone() {
-        tokio::spawn(crate::symbol_scan::run_loop(db, stop_tx.subscribe()));
+        tokio::spawn(crate::symbol_scan::run_loop(db.clone(), stop_tx.subscribe()));
+        // 账户面板的标记价刷新独立于策略周期，避免权益/浮盈要等 10 分钟一轮才变。
+        tokio::spawn(crate::runtime::run_position_mark_task(
+            db,
+            stop_tx.subscribe(),
+        ));
     }
     // AI 复核器必须注入引擎：漏了这一步，每个候选都会以「AI 复核不可用」被拒，
     // 信号审计里全是同一句话，真正的复核原因根本落不了库。

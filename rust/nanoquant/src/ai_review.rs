@@ -528,6 +528,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
                 }],
                 account: crate::providers::AccountSnapshot {
                     equity: 1000.0,
+                    wallet: 1000.0,
                     available_balance: 900.0,
                 },
                 positions: Vec::new(),

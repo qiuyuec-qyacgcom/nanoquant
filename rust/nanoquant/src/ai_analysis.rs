@@ -886,6 +886,7 @@ mod tests {
                 }],
                 account: AccountSnapshot {
                     equity: 1000.0,
+                    wallet: 1000.0,
                     available_balance: 900.0,
                 },
                 positions: Vec::new(),
