@@ -1003,6 +1003,7 @@ pub struct Decision {
     pub action: String,
     pub confidence: f64,
     pub leverage: f64,
+    pub margin_pct: Option<f64>,
     pub sl_pct: f64,
     pub tp_pct: f64,
     pub reason: String,
@@ -1026,6 +1027,10 @@ impl Decision {
         };
         self.confidence = self.confidence.clamp(0.0, 1.0);
         self.leverage = self.leverage.clamp(0.0, 125.0);
+        self.margin_pct = self
+            .margin_pct
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value.clamp(0.0, 100.0));
         self.sl_pct = self.sl_pct.clamp(0.0, 50.0);
         self.tp_pct = self.tp_pct.clamp(0.0, 100.0);
         self.reason = self.reason.chars().take(800).collect();
@@ -1116,10 +1121,19 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let margin_pct = localized
+        .get("margin_pct")
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+        .filter(|value| value.is_finite() && *value > 0.0);
     Ok(Decision {
         action: text_of("action"),
         confidence: float("confidence"),
         leverage: float("leverage"),
+        margin_pct,
         sl_pct: float("sl_pct"),
         tp_pct: float("tp_pct"),
         reason: text_of("reason"),
@@ -1208,6 +1222,7 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
     out.insert("action".to_string(), json!(action));
     out.insert("confidence".to_string(), json!(number("c")));
     out.insert("leverage".to_string(), json!(number("l")));
+    out.insert("margin_pct".to_string(), json!(number("m")));
     out.insert("sl_pct".to_string(), json!(number("s")));
     out.insert("tp_pct".to_string(), json!(number("t")));
     out.insert(

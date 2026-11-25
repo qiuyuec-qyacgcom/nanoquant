@@ -11,6 +11,8 @@ pub(crate) struct ReviewDecision {
     pub action: ReviewAction,
     pub side: Option<String>,
     pub leverage: Option<f64>,
+    /// AI 按波动率给出的单仓保证金比例；None 表示使用宿主回退。
+    pub margin_pct: Option<f64>,
     pub stop_price: Option<f64>,
     pub take_profit: Option<f64>,
     pub reason: String,
@@ -28,6 +30,11 @@ pub(crate) struct EntryProposal {
     pub leverage: f64,
     /// 全局杠杆上限（已并入交易所/单标的限制）。
     pub max_leverage: f64,
+    /// 全局建议保证金比例（AI 的参考中枢）。
+    pub margin_pct: f64,
+    /// AI 可调整的保证金下限/上限（默认 中枢±5%）。
+    pub margin_min_pct: f64,
+    pub margin_max_pct: f64,
     pub stop_price: f64,
     pub take_profit: f64,
     pub mark_price: f64,
@@ -37,6 +44,8 @@ pub(crate) struct EntryProposal {
 pub(crate) struct ReviewedEntry {
     pub side: String,
     pub leverage: f64,
+    /// AI 给出的保证金比例；None 时由 runtime 走原有 ATR 缩放。
+    pub margin_pct: Option<f64>,
     pub stop_price: f64,
     pub take_profit: f64,
     pub reason: String,
@@ -105,6 +114,7 @@ pub(crate) fn apply_review(
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
             leverage: proposal.leverage,
+            margin_pct: None,
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
@@ -129,6 +139,12 @@ fn clamp_leverage(proposal: &EntryProposal, requested: Option<f64>) -> Result<f6
         Some(value) if !value.is_finite() || value <= 0.0 => Err("AI 返回的杠杆无效".to_string()),
         Some(value) => Ok(value.clamp(proposal.leverage, upper)),
     }
+}
+
+fn clamp_margin(proposal: &EntryProposal, requested: Option<f64>) -> Option<f64> {
+    requested
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(proposal.margin_min_pct, proposal.margin_max_pct))
 }
 
 fn apply_decision(
@@ -172,6 +188,7 @@ fn apply_decision(
                 decision.leverage.filter(|v| v.is_finite() && *v > 0.0),
             )
             .map_err(|error| ReviewError::new(error, "reject"))?,
+            margin_pct: clamp_margin(proposal, decision.margin_pct),
             stop_price,
             take_profit,
             reason: decision.reason,
@@ -202,6 +219,7 @@ fn apply_decision(
             Ok(ReviewedEntry {
                 side: side.clone(),
                 leverage,
+                margin_pct: clamp_margin(proposal, decision.margin_pct),
                 stop_price,
                 take_profit,
                 reason: decision.reason,
@@ -232,6 +250,9 @@ mod tests {
             quant_score: Some(0.8),
             leverage: 10.0,
             max_leverage: 20.0,
+            margin_pct: 20.0,
+            margin_min_pct: 15.0,
+            margin_max_pct: 25.0,
             stop_price: 95.0,
             take_profit: 110.0,
             mark_price: 100.0,
@@ -243,6 +264,7 @@ mod tests {
             action,
             side: None,
             leverage: None,
+            margin_pct: None,
             stop_price: None,
             take_profit: None,
             reason: String::new(),
@@ -259,11 +281,29 @@ mod tests {
     }
 
     #[test]
+    fn ai_margin_is_clamped_to_the_configured_center_band() {
+        let mut low = decision(ReviewAction::Agree);
+        low.margin_pct = Some(12.0);
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(low))), true).unwrap();
+        assert_eq!(reviewed.margin_pct, Some(15.0), "低于中枢-5% 必须抬回 15%");
+
+        let mut high = decision(ReviewAction::Agree);
+        high.margin_pct = Some(28.0);
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(high))), true).unwrap();
+        assert_eq!(reviewed.margin_pct, Some(25.0), "高于中枢+5% 必须压回 25%");
+
+        let missing = decision(ReviewAction::Agree);
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(missing))), true).unwrap();
+        assert_eq!(reviewed.margin_pct, None, "未给 margin 时交给 runtime 走 ATR 回退");
+    }
+
+    #[test]
     fn leverage_is_clamped_into_the_global_bounds_but_can_rise() {
         let too_high = FakeReviewer(Ok(ReviewDecision {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(50.0),
+            margin_pct: None,
             stop_price: Some(90.0),
             take_profit: None,
             reason: "tighten".to_string(),
@@ -277,6 +317,7 @@ mod tests {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(18.0),
+            margin_pct: None,
             stop_price: Some(97.0),
             take_profit: None,
             reason: "raise within bounds".to_string(),
@@ -289,6 +330,7 @@ mod tests {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(5.0),
+            margin_pct: None,
             stop_price: Some(97.0),
             take_profit: None,
             reason: "tighten".to_string(),
@@ -313,6 +355,7 @@ mod tests {
             action: ReviewAction::Reject,
             side: None,
             leverage: None,
+            margin_pct: None,
             stop_price: None,
             take_profit: None,
             reason: "行情不匹配".to_string(),
@@ -331,6 +374,7 @@ mod tests {
             action: ReviewAction::Hold,
             side: None,
             leverage: None,
+            margin_pct: None,
             stop_price: None,
             take_profit: None,
             reason: "观望".to_string(),
@@ -348,6 +392,7 @@ mod tests {
             action: ReviewAction::Tighten,
             side: None,
             leverage: Some(f64::NAN),
+            margin_pct: None,
             stop_price: Some(0.0),
             take_profit: None,
             reason: "bad".to_string(),

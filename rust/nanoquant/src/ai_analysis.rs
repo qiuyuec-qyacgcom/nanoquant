@@ -305,7 +305,7 @@ pub(crate) fn decision_messages_with_personas(
             "system",
             &[
                 "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
-             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"s\":5..50,\"t\":5..100,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
+             {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"m\":0..100,\"s\":5..50,\"t\":5..100,\"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"Chinese conclusion and reason <=60 chars\"} \
              a: L=long S=short H=hold C=close; c=conf; l=lev; s=stop% of position margin (not price); t=tp% of position margin (not price). \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
@@ -321,6 +321,7 @@ pub(crate) fn decision_messages_with_personas(
              0.50 ≤ c < 0.70：取区间中段（建议 min + 30%~70% 区间宽度）；\
              c < 0.50：观望（H），不得开仓。\
              禁止无条件取 min_leverage；min_leverage 只是硬下限，不是建议值；proposal.leverage 只是参考，禁止直接照抄。\
+             m=可选单仓保证金占权益百分比；以 constraints.margin_pct 为中枢，只能在 constraints.margin_min_pct ~ constraints.margin_max_pct 内按波动率调整：高波动取低、低波动取高；省略则由宿主按 ATR 缩放回退。\
              只有在极高波动/极窄止损的例外下才允许取区间下限，且必须在 f 字段说明理由。\
              止损保证金比例 s 必须满足 s ≥ constraints.atr_stop_mult × features.atr_pct × l；若算出的 s 超过 50，则降低 l，不得用窄止损换高杠杆。\
              禁止「大止损 × 大保证金 × 高杠杆」；止损偏宽时优先压缩保证金或降低杠杆。\
@@ -573,6 +574,9 @@ async fn decision_preview(
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
             "atr_stop_mult": risk.get("atr_stop_mult").and_then(Value::as_f64).unwrap_or(1.3),
+            "margin_pct": risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0),
+            "margin_min_pct": (risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0) - 5.0).max(0.0),
+            "margin_max_pct": (risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0) + 5.0).min(100.0),
             "min_confidence": cfg.min_confidence,
         },
 

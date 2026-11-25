@@ -129,6 +129,12 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "mark_price": proposal.mark_price,
         })
     });
+    let margin_base = risk
+        .get("margin_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(20.0);
+    let margin_min = (margin_base - 5.0).max(0.0);
+    let margin_max = (margin_base + 5.0).min(100.0);
     let mut context = json!({
         "analysis_order": [
             "global_strategy",
@@ -170,6 +176,9 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
             "atr_stop_mult": risk.get("atr_stop_mult").and_then(Value::as_f64).unwrap_or(1.3),
+            "margin_pct": margin_base,
+            "margin_min_pct": margin_min,
+            "margin_max_pct": margin_max,
             "min_confidence": cfg.min_confidence,
         },
         "news": news,
@@ -214,6 +223,7 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         action: ReviewAction::Reject,
         side: None,
         leverage: None,
+        margin_pct: None,
         stop_price: None,
         take_profit: None,
         reason: reason.into(),
@@ -246,6 +256,7 @@ fn decision_to_review(
                 action: ReviewAction::Hold,
                 side: None,
                 leverage: None,
+                margin_pct: None,
                 stop_price: None,
                 take_profit: None,
                 reason: if decision.reason.is_empty() {
@@ -339,6 +350,7 @@ fn decision_to_review(
         },
         side: Some(side.to_string()),
         leverage,
+        margin_pct: decision.margin_pct,
         stop_price: Some(stop_price),
         take_profit: Some(take_profit),
         reason: decision.reason.clone(),
@@ -358,6 +370,9 @@ mod tests {
             quant_score: Some(0.8),
             leverage: 2.0,
             max_leverage: 20.0,
+            margin_pct: 20.0,
+            margin_min_pct: 15.0,
+            margin_max_pct: 25.0,
             stop_price: if side == "long" { 95.0 } else { 105.0 },
             take_profit: if side == "long" { 110.0 } else { 90.0 },
             mark_price: 100.0,
@@ -369,6 +384,7 @@ mod tests {
             action: action.to_string(),
             confidence,
             leverage: 0.0,
+            margin_pct: None,
             sl_pct: 0.0,
             tp_pct: 0.0,
             reason: "test".to_string(),
@@ -700,6 +716,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_long".to_string(),
             confidence: 0.9,
             leverage: 4.0,
+            margin_pct: None,
             sl_pct: 8.0,
             tp_pct: 0.0,
             reason: "tighten".to_string(),
@@ -722,6 +739,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_short".to_string(),
             confidence: 0.9,
             leverage: 3.0,
+            margin_pct: None,
             sl_pct: 6.0,
             tp_pct: 0.0,
             reason: "tighten".to_string(),
@@ -746,6 +764,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_long".to_string(),
             confidence: 0.9,
             leverage: 12.0,
+            margin_pct: None,
             sl_pct: 0.0,
             tp_pct: 0.0,
             reason: "波动收敛，区间内加杠杆".to_string(),
@@ -780,6 +799,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             action: "open_long".to_string(),
             confidence: 0.9,
             leverage: 0.0,
+            margin_pct: None,
             sl_pct: 20.0,
             tp_pct: 0.0,
             reason: "wider".to_string(),

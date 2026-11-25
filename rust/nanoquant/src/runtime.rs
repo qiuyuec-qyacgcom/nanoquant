@@ -139,6 +139,10 @@ struct EntryDraft {
     leverage: f64,
     /// 全局杠杆上限，已并入交易所与单标的限制。
     max_leverage: f64,
+    /// AI 的保证金比例参考中枢，以及允许的 ±5% 区间。
+    margin_pct: f64,
+    margin_min_pct: f64,
+    margin_max_pct: f64,
     stop_price: f64,
     take_profit: f64,
     score: f64,
@@ -171,6 +175,9 @@ impl EntryDraft {
             quant_score: self.quant_score,
             leverage: self.leverage,
             max_leverage: self.max_leverage,
+            margin_pct: self.margin_pct,
+            margin_min_pct: self.margin_min_pct,
+            margin_max_pct: self.margin_max_pct,
             stop_price: self.stop_price,
             take_profit: self.take_profit,
             mark_price: self.mark_price,
@@ -2820,6 +2827,10 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
             // 杠杆由 AI 在 [lower, upper] 内决定；这里只给出回退值（下限）。
             let leverage = lower as f64;
+            // 保证金以参数值为中枢，AI 可按波动率上下调整 5 个百分点。
+            let margin_base = cfg["margin_pct"].as_f64().unwrap_or(20.0);
+            let margin_min = (margin_base - 5.0).max(0.0);
+            let margin_max = (margin_base + 5.0).min(100.0);
             // 仓位止盈止损率是用户的心理预期（保证金收益率）：
             // 作为 AI 未给出止损/止盈价时的默认价，价格距离 = 保证金% ÷ 杠杆。
             let direction = if side == "long" { 1.0 } else { -1.0 };
@@ -2880,6 +2891,9 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 quant_passed,
                 leverage,
                 max_leverage: upper as f64,
+                margin_pct: margin_base,
+                margin_min_pct: margin_min,
+                margin_max_pct: margin_max,
                 stop_price,
                 take_profit,
                 score,
@@ -2959,6 +2973,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     serde_json::json!({
                         "reason": ai_reason,
                         "leverage": reviewed.leverage,
+                        "margin_pct": reviewed.margin_pct,
                         "stop_price": reviewed.stop_price,
                     }),
                 );
@@ -2977,15 +2992,19 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             };
             let leverage = reviewed.leverage;
             let stop_price = reviewed.stop_price;
+            // AI 给了保证金比例就按 AI 值（已在复核层夹到中枢±5%）；
+            // 没给时才回退到原有 ATR 缩放，避免双重放大。
+            let margin_pct = reviewed.margin_pct.unwrap_or_else(|| {
+                (cfg["margin_pct"].as_f64().unwrap_or(50.0)
+                    * draft.scale.clamp(0.25, 2.0))
+                .clamp(0.0, 100.0)
+            });
             let (qty, _) = crate::risk::estimate_qty(
                 snapshot.account.equity,
                 draft.mark_price,
                 leverage,
                 &crate::risk::SizeParams {
-                    // 波动率目标仍作用于保证金比例：ATR 高于目标时缩仓，低于时放大（0.25–2x）。
-                    margin_pct: (cfg["margin_pct"].as_f64().unwrap_or(50.0)
-                        * draft.scale.clamp(0.25, 2.0))
-                    .clamp(0.0, 100.0),
+                    margin_pct,
                     min_notional_buffer: cfg["min_notional_buffer"].as_f64().unwrap_or(1.05),
                 },
                 &draft.filter,
@@ -5526,6 +5545,7 @@ mod tests {
                     action: crate::review::ReviewAction::Reject,
                     side: None,
                     leverage: None,
+                    margin_pct: None,
                     stop_price: None,
                     take_profit: None,
                     reason: "flat 候选不自动开仓".to_string(),
@@ -5536,6 +5556,7 @@ mod tests {
                 action: crate::review::ReviewAction::Agree,
                 side: Some(side),
                 leverage: None,
+                margin_pct: None,
                 stop_price: None,
                 take_profit: Some(proposal.take_profit),
                 reason: "test approve".to_string(),
@@ -5895,6 +5916,7 @@ mod tests {
                 action: crate::review::ReviewAction::Hold,
                 side: None,
                 leverage: None,
+                margin_pct: None,
                 stop_price: None,
                 take_profit: None,
                 reason: "测试观望".to_string(),
@@ -6537,6 +6559,7 @@ mod tests {
                 action: crate::review::ReviewAction::Reject,
                 side: None,
                 leverage: None,
+                margin_pct: None,
                 stop_price: None,
                 take_profit: None,
                 reason: "test reject".to_string(),
