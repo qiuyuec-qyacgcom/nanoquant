@@ -603,20 +603,9 @@ function syncJsonText() {
 
 // ---------------------------------------------------- 交易模式（双向逐仓）
 const tradeMode = ref<any>(null)
-const tradeModeBusy = ref(false)
-const tradeModeResults = ref<any[]>([])
 const tradeModeError = ref('')
 const isolatedOnly = computed(() => app.settings.engine?.isolated === true)
 const isolatedBusy = ref(false)
-
-const tradeModeLabel = computed(() => {
-  if (tradeModeBusy.value) return '切换中…'
-  const m = tradeMode.value
-  if (!m) return '读取中…'
-  if (m.hedge_mode && !m.need_isolated?.length) return '已是双向逐仓'
-  if (!m.hedge_mode && !m.need_isolated?.length) return '一键开启双向持仓'
-  return '一键切换为双向逐仓'
-})
 
 async function loadTradeMode() {
   try {
@@ -628,36 +617,9 @@ async function loadTradeMode() {
   }
 }
 
-async function fixTradeMode() {
-  const m = tradeMode.value
-  if (!m) return
-  // 只发送真正需要变更的项：网络差时避免把 8 个标的的逐仓请求也一起打出去
-  const payload = {
-    hedge: !m.hedge_mode,
-    isolated: Boolean(m.need_isolated?.length),
-  }
-  if (!payload.hedge && !payload.isolated) return
-  if (!confirm('将账户切换为「双向持仓 + 逐仓」？有持仓或挂单时交易所会拒绝，需要先全部平仓。')) return
-  tradeModeBusy.value = true
-  try {
-    const res = await http.post('/engine/trade-mode', payload, 15000)
-    tradeModeResults.value = res.results || []
-    const firstFail = (res.results || []).find((r: any) => !r.ok)
-    app.notify(
-      res.ok ? '切换完成' : firstFail?.detail || '切换未完成，请查看下方原因',
-      res.ok ? 'ok' : 'error',
-    )
-    await loadTradeMode() // 不再顺带刷新全量状态，避免二次 REST 卡顿
-  } catch (err: any) {
-    app.notify(err.message, 'error')
-  } finally {
-    tradeModeBusy.value = false
-  }
-}
-
-async function toggleIsolated(event: Event) {
-  const input = event.target as HTMLInputElement
-  const enabled = input.checked
+async function toggleIsolated() {
+  if (isolatedBusy.value) return
+  const enabled = !isolatedOnly.value
   isolatedBusy.value = true
   try {
     await app.saveGroup('engine', { isolated: enabled })
@@ -667,7 +629,6 @@ async function toggleIsolated(event: Event) {
         { hedge: Boolean(tradeMode.value?.hedge_mode), isolated: true },
         15000,
       )
-      tradeModeResults.value = res.results || []
       const firstFail = (res.results || []).find((item: any) => !item.ok)
       app.notify(
         res.ok ? '已开启全局逐仓并完成切换' : firstFail?.detail || '逐仓开关已保存，部分标的切换失败',
@@ -680,7 +641,6 @@ async function toggleIsolated(event: Event) {
       app.notify('已关闭全局逐仓开单', 'ok')
     }
   } catch (err: any) {
-    input.checked = isolatedOnly.value
     app.notify(err.message, 'error')
   } finally {
     isolatedBusy.value = false
@@ -1175,21 +1135,26 @@ onUnmounted(() => {
             <div v-if="current === 'engine'" class="section">
               <div class="section-hd">
                 <span class="section-title">交易模式</span>
-                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；全局逐仓开关控制开仓前自动切换，手动全局切换需无持仓/挂单</span>
+                <span class="section-hint">系统按「双向持仓 + 逐仓」设计；开关只控制新开仓自动逐仓；开启时若无持仓/挂单会立即切换当前标的池</span>
               </div>
               <div v-if="tradeMode" class="trade-mode">
                 <div class="tm-row">
                   <span class="tm-label">全局逐仓开单</span>
-                  <label class="row" style="gap: 6px; font-size: 12px; cursor: pointer">
-                    <input
-                      type="checkbox"
-                      :checked="isolatedOnly"
-                      :disabled="isolatedBusy"
-                      @change="toggleIsolated"
-                    />
-                    <span>{{ isolatedOnly ? '开启' : '关闭' }}</span>
-                  </label>
-                  <span class="muted tm-note">开启后新开仓前自动确保逐仓；已有全仓仓位需先平仓</span>
+                  <div
+                    class="switch"
+                    :class="{ on: isolatedOnly, disabled: isolatedBusy }"
+                    role="switch"
+                    :aria-checked="isolatedOnly"
+                    aria-label="全局逐仓开单"
+                    :title="isolatedOnly ? '关闭全局逐仓开单' : '开启全局逐仓开单'"
+                    tabindex="0"
+                    @click="toggleIsolated"
+                    @keydown.enter.prevent="toggleIsolated"
+                    @keydown.space.prevent="toggleIsolated"
+                  />
+                  <span class="muted tm-note">
+                    {{ isolatedOnly ? '开启' : '关闭' }} · 只控制新开仓；已有全仓仓位需先平仓
+                  </span>
                 </div>
                 <div class="tm-row">
                   <span class="tm-label">持仓模式</span>
@@ -1207,8 +1172,8 @@ onUnmounted(() => {
                       tradeMode.need_isolated?.length
                         ? `${tradeMode.need_isolated.length} 个标的为全仓`
                         : tradeMode.margin_known
-                          ? '全部逐仓'
-                          : '开仓时自动逐仓'
+                          ? '当前池全部逐仓'
+                          : '逐仓状态未知'
                     }}
                   </span>
                   <span class="muted tm-note">
@@ -1219,33 +1184,8 @@ onUnmounted(() => {
                     }}
                   </span>
                 </div>
-                <div class="tm-hint">{{ tradeMode.hint }}</div>
-                <div class="row" style="gap: 8px; flex-wrap: wrap">
-                  <button
-                    class="btn btn-sm btn-primary"
-                    :disabled="tradeModeBusy || (tradeMode.hedge_mode && !tradeMode.need_isolated?.length)"
-                    @click="fixTradeMode"
-                  >
-                    {{ tradeModeLabel }}
-                  </button>
-                  <button class="btn btn-sm" :disabled="tradeModeBusy" @click="loadTradeMode">刷新</button>
-                  <span v-if="!tradeMode.can_switch" class="tag tag-warn">有持仓，切换前需先平仓</span>
-                </div>
-                <div v-if="tradeModeResults.length" class="stack" style="gap: 6px; margin-top: 8px">
-                  <div v-for="r in tradeModeResults" :key="r.target" class="stack" style="gap: 2px">
-                    <div class="row" style="font-size: 11.5px">
-                      <span class="tag" :class="r.ok ? 'tag-long' : 'tag-short'">{{ r.ok ? '成功' : '部分失败' }}</span>
-                      <span class="muted">{{ r.target === 'hedge' ? '双向持仓' : '逐仓' }} · {{ r.detail }}</span>
-                    </div>
-                    <div
-                      v-for="f in r.failed || []"
-                      :key="f.symbol"
-                      class="muted"
-                      style="font-size: 10.5px; padding-left: 4px"
-                    >
-                      {{ f.symbol }} · {{ f.detail }}
-                    </div>
-                  </div>
+                <div v-if="!tradeMode.can_switch" class="tag tag-warn">
+                  有持仓：开关只影响新开仓；立即切换需先平仓
                 </div>
               </div>
               <div v-else class="empty" style="padding: 14px">
@@ -1800,10 +1740,16 @@ onUnmounted(() => {
   font-size: 11px;
   line-height: 1.5;
 }
-.tm-hint {
-  font-size: 11.5px;
-  color: var(--muted);
-  line-height: 1.6;
+.trade-mode .switch {
+  flex: 0 0 38px;
+}
+.switch.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ------------------------------------------------ 阶梯止盈档位编辑器 */
