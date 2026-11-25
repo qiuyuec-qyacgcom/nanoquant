@@ -4287,6 +4287,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                  AND o.side = CASE p.side WHEN 'long' THEN 'SELL' ELSE 'BUY' END \
                  AND o.purpose IN ('stop_loss','take_profit') \
                  AND o.status IN ('SUBMITTING','ACCEPTED','NEW','UNKNOWN') \
+                 AND o.ts >= p.opened_at \
                  AND (o.status != 'ACCEPTED' OR o.exchange_order_id != ''))"
         );
         let conn = self
