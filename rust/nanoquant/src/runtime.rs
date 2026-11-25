@@ -664,17 +664,19 @@ impl EngineControl {
             ("side".to_string(), close_side.to_string()),
             ("type".to_string(), "MARKET".to_string()),
             ("quantity".to_string(), filter.format_qty(qty)),
-            ("reduceOnly".to_string(), "true".to_string()),
             (
                 "newClientOrderId".to_string(),
                 crate::live::client_order_id("nx", "close", position_id as usize),
             ),
         ];
         if dual {
+            // 双向持仓模式只认 positionSide；同时带 reduceOnly 会被交易所拒绝。
             params.push((
                 "positionSide".to_string(),
                 if side == "long" { "LONG" } else { "SHORT" }.to_string(),
             ));
+        } else {
+            params.push(("reduceOnly".to_string(), "true".to_string()));
         }
         params.push(("recvWindow".to_string(), creds.recv_window_ms.to_string()));
         let (status, body) = self
@@ -3744,9 +3746,9 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     (if status.is_empty() { "NEW" } else { status.as_str() }, order_id, client_order_id),
                 )
                 .map_err(|error| error.to_string())?;
-                // 只做 Maker 的开仓单挂上之后就进入等待状态：不是失败，也不建仓，
-                // 由下一轮对账确认成交或超时撤销。
-                if plan.purpose == "entry" && plan.order_type.is_post_only() {
+                // 开仓单（含只做 Maker 和市价回执 NEW）受理后就是等待状态：不是失败，也不建仓，
+                // 由下一轮对账确认成交、超时撤销或转 FILLED。
+                if plan.purpose == "entry" {
                     None
                 } else {
                     Some(format!(
