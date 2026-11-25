@@ -543,6 +543,10 @@ fn review_messages(stats: &Value, trades: &[Value], existing: &[String]) -> Vec<
              \"verdict\":\"...\",\"score\":0,\"diagnosis\":[\"...\"],\
              \"lessons\":[{\"title\":\"...\",\"rule\":\"...\",\"category\":\"entry|exit|risk|timing|position|market\",\
              \"confidence\":0.0,\"evidence\":\"...\",\"replaces\":\"\"}]}。\
+             示例格式：{\"change_status\":\"CHANGE\",\"verdict\":\"...\",\"score\":60,\"diagnosis\":[\"...\"],\
+             \"lessons\":[{\"title\":\"硬止损执行\",\"rule\":\"当空头仓位 ROE 低于 -12% 时必须立即市价平仓\",\
+             \"category\":\"risk\",\"confidence\":0.7,\"evidence\":\"3 笔止损记录\"}]}。\
+             lessons.rule 必须是字符串；禁止输出数组、空字符串或 title=null；每条规则必须含当/若/如果/一旦。\
              规则必须含触发条件（当/若/如果/一旦）。没有明确逐笔证据或规则无法验证时必须返回 NO_CHANGE 且 lessons 为空；\
              不要仅因样本少于 10 笔就拒绝证据充分的单条规则，但不得把单笔极值或小样本分组统计外推为长期规律。\
              不得给出杠杆建议。",
