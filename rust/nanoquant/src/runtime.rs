@@ -3746,17 +3746,14 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     (if status.is_empty() { "NEW" } else { status.as_str() }, order_id, client_order_id),
                 )
                 .map_err(|error| error.to_string())?;
-                // 开仓单（含只做 Maker 和市价回执 NEW）受理后就是等待状态：不是失败，也不建仓，
-                // 由下一轮对账确认成交、超时撤销或转 FILLED。
-                if plan.purpose == "entry" {
-                    None
-                } else {
-                    Some(format!(
-                        "{} 下单已受理但未成交（{}）",
-                        plan.symbol,
-                        reply.status_text()
-                    ))
-                }
+                // 交易所受理（NEW/PARTIALLY_FILLED）不是失败：开仓和平仓都等待下一轮对账，
+                // 只有明确拒绝或结果未知才上报，避免把正常回执写成错误事件。
+                tracing::debug!(
+                    symbol = %plan.symbol,
+                    status = %reply.status_text(),
+                    "订单已受理，等待对账"
+                );
+                None
             }
             Reply::Rejected { code, message } => {
                 tx.execute(
