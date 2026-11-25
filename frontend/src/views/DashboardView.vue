@@ -59,12 +59,17 @@ const positions = computed(() => {
   })
 })
 
-/** 账户浮盈用实时持仓汇总，权益 = 钱包 + 浮盈。 */
+/** 顶部账户概览与右上角同源：统一使用 /engine/status 的 account 快照，避免用实时持仓二次重算。 */
 const account = computed(() => {
   const base: any = status.value?.account || {}
-  if (!positions.value.length) return base
-  const unrealized = positions.value.reduce((sum, p) => sum + Number(p.unrealized || 0), 0)
-  return { ...base, unrealized, equity: Number(base.wallet || 0) + unrealized }
+  return {
+    ...base,
+    wallet: Number(base.wallet || 0),
+    available: Number(base.available || 0),
+    equity: Number(base.equity || 0),
+    unrealized: Number(base.unrealized || 0),
+    margin_used: Number(base.margin_used || 0),
+  }
 })
 
 /** 当前持仓止盈止损：取交易所 STOP_MARKET / TAKE_PROFIT_MARKET 触发价。 */
@@ -184,7 +189,7 @@ const equityOption = computed(() => {
 })
 
 async function load() {
-  await app.loadStatus()
+
   const [eq, tr, sg, us, ev, ex, pr, od] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
@@ -232,6 +237,7 @@ async function closePosition(id: number) {
 
 
 onMounted(async () => {
+  await app.loadStatus()
   await refreshQuotes()
   await load()
 })

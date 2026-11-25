@@ -87,7 +87,7 @@ async function refresh() {
   await app.loadStatus()
 }
 
-useSilentRefresh(refresh, 5000)
+useSilentRefresh(refresh, 3000)
 
 async function toggleEngine() {
   if (!status.value) return
