@@ -383,7 +383,7 @@ fn insert_lesson(
     conn.execute(
         "INSERT INTO mantras(title, rule, tags, category, source, confidence, health, hits, wins, \
          losses, enabled, visible, version, superseded_by, evidence, created_at, updated_at, expires_at) \
-         VALUES(?1,'[]',?2,?3,?4,?5,0,0,0,0,1,1,?6,0,?7,?8,?8,?9)",
+         VALUES(?1,?2,'[]',?3,?4,?5,0,0,0,0,1,1,?6,0,?7,?8,?8,?9)",
         (
             title,
             rule,
@@ -772,7 +772,20 @@ struct BatchQuery {
     force: bool,
 }
 
+fn repair_rule_from_tags(conn: &rusqlite::Connection) -> usize {
+    // 历史版本把 rule 参数写进了 tags，rule 列固定成 '[]'；这里迁回真实规则。
+    conn.execute(
+        "UPDATE mantras SET rule = tags, tags = '[]', updated_at = ?1 \
+         WHERE (rule IS NULL OR trim(rule) IN ('', '[]')) \
+           AND tags IS NOT NULL AND trim(tags) NOT IN ('', '[]') \
+           AND (tags LIKE '%当%' OR tags LIKE '%若%' OR tags LIKE '%如果%' OR tags LIKE '%一旦%')",
+        [crate::now()],
+    )
+    .unwrap_or(0)
+}
+
 fn cleanup_invalid_mantras(conn: &rusqlite::Connection) -> usize {
+    repair_rule_from_tags(conn);
     conn.execute(
         "UPDATE mantras SET enabled = 0, visible = 0, updated_at = ?1 \
          WHERE enabled = 1 AND (rule IS NULL OR trim(rule) = '' OR trim(rule) = '[]')",
@@ -1438,6 +1451,42 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[test]
+    fn inserted_lesson_keeps_rule_in_rule_column() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nq-evo-rule-{stamp}.db"));
+        let db = fixture(&path, false);
+        let conn = db.conn.lock().unwrap();
+        let cfg = write_cfg(&conn);
+        let result = insert_lesson(
+            &conn,
+            &cfg,
+            "测试规则",
+            "当价格突破前高时入场",
+            "entry",
+            0.7,
+            "manual",
+            &json!({}),
+            None,
+            1,
+        );
+        let id = result["mantra"]["id"].as_i64().unwrap();
+        let (rule, tags): (String, String) = conn
+            .query_row(
+                "SELECT rule, tags FROM mantras WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rule, "当价格突破前高时入场");
+        assert_eq!(tags, "[]");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
