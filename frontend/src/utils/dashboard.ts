@@ -32,3 +32,16 @@ export function distancePct(mark: number, trigger: number): number | null {
   if (!(mark > 0) || !(trigger > 0)) return null
   return Math.abs((trigger - mark) / mark) * 100
 }
+export function protectionForPosition(
+  position: { symbol?: string; side?: string },
+  protections: { symbol?: string; side?: string; type?: string; trigger_price?: number }[],
+): { stop?: { trigger_price?: number }; takeProfit?: { trigger_price?: number } } {
+  const closeSide = position.side === 'long' ? 'SELL' : 'BUY'
+  const rows = protections.filter(
+    (order) => order.symbol === position.symbol && (!order.side || order.side === closeSide),
+  )
+  return {
+    stop: rows.find((order) => order.type === 'STOP_MARKET'),
+    takeProfit: rows.find((order) => order.type === 'TAKE_PROFIT_MARKET'),
+  }
+}

@@ -288,10 +288,14 @@ pub(crate) fn classify_reply(method: &str, status: u16, body: &str) -> Reply {
         return Reply::Unknown;
     };
     if (200..300).contains(&status) {
-        let order_id = parsed["orderId"]
-            .as_i64()
-            .map(|id| id.to_string())
-            .or_else(|| parsed["orderId"].as_str().map(str::to_string))
+        let order_id = ["orderId", "algoId"]
+            .iter()
+            .find_map(|key| {
+                parsed[*key]
+                    .as_i64()
+                    .map(|id| id.to_string())
+                    .or_else(|| parsed[*key].as_str().map(str::to_string))
+            })
             .unwrap_or_default();
         let status_text = parsed["status"]
             .as_str()
@@ -511,13 +515,15 @@ pub(crate) fn protection_legs_mode(
 pub(crate) struct LegOutcome {
     pub failure: Option<String>,
     pub unknown: bool,
+    pub exchange_order_id: String,
 }
 
 impl LegOutcome {
-    fn ok() -> Self {
+    fn ok(order_id: String) -> Self {
         Self {
             failure: None,
             unknown: false,
+            exchange_order_id: order_id,
         }
     }
 
@@ -525,6 +531,7 @@ impl LegOutcome {
         Self {
             failure: Some(reason),
             unknown: true,
+            exchange_order_id: String::new(),
         }
     }
 
@@ -532,6 +539,7 @@ impl LegOutcome {
         Self {
             failure: Some(reason),
             unknown: false,
+            exchange_order_id: String::new(),
         }
     }
 }
@@ -573,7 +581,9 @@ pub(crate) async fn place_protection_leg(
         gate.observe(message, crate::now_millis());
     }
     match reply {
-        Reply::Filled { .. } | Reply::Accepted { .. } => LegOutcome::ok(),
+        Reply::Filled { order_id, .. } | Reply::Accepted { order_id, .. } => {
+            LegOutcome::ok(order_id)
+        }
         Reply::Rejected { code, .. } => {
             // 只有明确拒绝才回落；未知结果回落等于挂第二套保护单。
             if !crate::submit::protection_plan("POST", raw.status, &raw.body).fallback {
@@ -594,7 +604,9 @@ pub(crate) async fn place_protection_leg(
                 Err(error) => return LegOutcome::failed(format!("{}: {error}", leg.kind)),
             };
             match submit(gateway, &legacy).await {
-                Reply::Filled { .. } | Reply::Accepted { .. } => LegOutcome::ok(),
+                Reply::Filled { order_id, .. } | Reply::Accepted { order_id, .. } => {
+                    LegOutcome::ok(order_id)
+                }
                 Reply::Rejected { code, message } => {
                     LegOutcome::failed(format!("{}: 回落失败 {code} {message}", leg.kind))
                 }
@@ -1085,6 +1097,7 @@ mod tests {
             failure.failure.is_none(),
             "明确拒绝可以回落，回落成功就算挂上"
         );
+        assert_eq!(failure.exchange_order_id, "11");
         let sent = gateway.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
         assert!(sent[0].contains(ALGO_PATH));

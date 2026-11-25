@@ -4250,7 +4250,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
              AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.mode=p.mode AND o.symbol=p.symbol \
                  AND o.side = CASE p.side WHEN 'long' THEN 'SELL' ELSE 'BUY' END \
                  AND o.purpose IN ('stop_loss','take_profit') \
-                 AND o.status IN ('SUBMITTING','ACCEPTED','NEW','UNKNOWN'))"
+                 AND o.status IN ('SUBMITTING','ACCEPTED','NEW','UNKNOWN') \
+                 AND (o.status != 'ACCEPTED' OR o.exchange_order_id != ''))"
         );
         let conn = self
             .db
@@ -4321,12 +4322,17 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 )
                 .await;
                 match outcome.failure {
-                    None => self.record_protection_order(symbol, purpose, &leg, "ACCEPTED")?,
+                    None => self.record_protection_order(
+                        symbol,
+                        purpose,
+                        &leg,
+                        "ACCEPTED",
+                        &outcome.exchange_order_id,
+                    )?,
                     Some(failure) => {
-                        if outcome.unknown {
-                            // 结果未知的腿先留痕，否则下一轮会再挂一套。
-                            self.record_protection_order(symbol, purpose, &leg, "UNKNOWN")?;
-                        }
+                        // 明确拒绝也留痕，但不阻塞下一轮重试；结果未知的腿必须阻塞，避免重复挂单。
+                        let status = if outcome.unknown { "UNKNOWN" } else { "REJECTED" };
+                        self.record_protection_order(symbol, purpose, &leg, status, "")?;
                         failures.push(format!("{symbol} 保护单 {failure}"));
                     }
                 }
@@ -4342,6 +4348,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         purpose: &str,
         leg: &crate::live::ProtectionLeg,
         status: &str,
+        exchange_order_id: &str,
     ) -> Result<(), String> {
         let param = |name: &str| {
             leg.algo_params
@@ -4358,7 +4365,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         conn.execute(
             "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
              client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
-             VALUES(?1,?2,?3,?4,0,0,?5,?6,?7,'',1,'live',0)",
+             VALUES(?1,?2,?3,?4,0,0,?5,?6,?7,?8,1,'live',0)",
             (
                 crate::now(),
                 symbol,
@@ -4367,6 +4374,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 status,
                 purpose,
                 param("clientAlgoId"),
+                exchange_order_id,
             ),
         )
         .map(|_| ())
@@ -7292,7 +7300,15 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             )
             .unwrap();
         assert_eq!(stop, 1, "挂上的那条腿要留痕");
-        assert_eq!(take, 0, "失败的腿不能记成已挂");
+        assert_eq!(take, 1, "失败的腿要留痕");
+        let take_status: String = conn
+            .query_row(
+                "SELECT status FROM orders WHERE purpose='take_profit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(take_status, "REJECTED", "失败的腿不能记成已挂");
     }
 
     #[tokio::test]

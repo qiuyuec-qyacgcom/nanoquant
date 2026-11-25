@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeOrders, distancePct, isActiveOrder, isMakerOrder, orderPurposeLabel } from './dashboard'
+import { activeOrders, distancePct, isActiveOrder, isMakerOrder, orderPurposeLabel, protectionForPosition } from './dashboard'
 
 describe('dashboard helpers', () => {
   it('filters final order statuses out of active orders', () => {
@@ -53,5 +53,19 @@ describe('dashboard helpers', () => {
     expect(distancePct(100, 98)).toBeCloseTo(2)
     expect(distancePct(0, 102)).toBeNull()
     expect(distancePct(100, 0)).toBeNull()
+  })
+
+  it('matches exchange protection orders by symbol and close side', () => {
+    const protections = [
+      { symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', trigger_price: 95 },
+      { symbol: 'BTCUSDT', side: 'SELL', type: 'TAKE_PROFIT_MARKET', trigger_price: 110 },
+      { symbol: 'BTCUSDT', side: 'BUY', type: 'STOP_MARKET', trigger_price: 105 },
+    ]
+    const long = protectionForPosition({ symbol: 'BTCUSDT', side: 'long' }, protections)
+    expect(long.stop?.trigger_price).toBe(95)
+    expect(long.takeProfit?.trigger_price).toBe(110)
+    const missing = protectionForPosition({ symbol: 'ETHUSDT', side: 'short' }, protections)
+    expect(missing.stop).toBeUndefined()
+    expect(missing.takeProfit).toBeUndefined()
   })
 })

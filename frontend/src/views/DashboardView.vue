@@ -8,7 +8,7 @@ import EventFeed from '../components/EventFeed.vue'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
 import { visibleEvents } from '../utils/events'
-import { activeOrders, distancePct, isMakerOrder, orderPurposeLabel } from '../utils/dashboard'
+import { activeOrders, distancePct, isMakerOrder, orderPurposeLabel, protectionForPosition } from '../utils/dashboard'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
 import { displayDirection, displayScore } from '../utils/signalAudit'
 
@@ -21,6 +21,7 @@ const trades = ref<any[]>([])
 const signals = ref<any[]>([])
 const usage = ref<any>(null)
 const stages = ref<any>(null)
+const protection = ref<any[]>([])
 const orders = ref<any[]>([])
 const busy = ref(false)
 const showPosHelp = ref(false)
@@ -66,14 +67,20 @@ const account = computed(() => {
   return { ...base, unrealized, equity: Number(base.wallet || 0) + unrealized }
 })
 
-/** 当前持仓止盈止损：本地计划价，按实时标记价计算触发距离。 */
-const positionRiskRows = computed(() =>
+/** 当前持仓止盈止损：取交易所 STOP_MARKET / TAKE_PROFIT_MARKET 触发价。 */
+const positionProtectionRows = computed(() =>
   positions.value.map((p) => {
     const mark = Number(p.mark_price || 0)
+    const { stop, takeProfit } = protectionForPosition(p, protection.value)
+    const sl = Number(stop?.trigger_price || 0)
+    const tp = Number(takeProfit?.trigger_price || 0)
     return {
       ...p,
-      sl_distance_pct: distancePct(mark, Number(p.sl_price || 0)),
-      tp_distance_pct: distancePct(mark, Number(p.tp_price || 0)),
+      exchange_sl_price: sl,
+      exchange_tp_price: tp,
+      sl_distance_pct: distancePct(mark, sl),
+      tp_distance_pct: distancePct(mark, tp),
+      protection_status: stop && takeProfit ? '已挂' : stop || takeProfit ? '部分' : '未挂',
     }
   }),
 )
@@ -178,13 +185,14 @@ const equityOption = computed(() => {
 
 async function load() {
   await app.loadStatus()
-  const [eq, tr, sg, us, ev, ex, od] = await Promise.allSettled([
+  const [eq, tr, sg, us, ev, ex, pr, od] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),
     http.get('/ai/usage'),
     app.loadEvents(40),
     http.get('/engine/execution'),
+    http.get('/engine/protection'),
     http.get('/engine/orders?limit=30'),
   ])
   if (eq.status === 'fulfilled') equity.value = eq.value.items
@@ -192,6 +200,7 @@ async function load() {
   if (sg.status === 'fulfilled') signals.value = sg.value.items
   if (us.status === 'fulfilled') usage.value = us.value
   if (ex.status === 'fulfilled') stages.value = ex.value
+  if (pr.status === 'fulfilled') protection.value = pr.value.items || []
   if (od.status === 'fulfilled') orders.value = od.value.items || []
 }
 
@@ -517,31 +526,32 @@ useSilentRefresh(refreshQuotes, 3000)
       <div class="panel-hd">
         <span class="panel-title">当前持仓止盈止损</span>
         <div class="right">
-          <span class="tag tag-dim">{{ positionRiskRows.length }} 仓</span>
-          <span class="muted" style="font-size: 10.5px">本地计划价；实际触发以交易所保护单或引擎轮询为准</span>
+          <span class="tag tag-dim">{{ positionProtectionRows.length }} 仓</span>
+          <span class="muted" style="font-size: 10.5px">交易所 STOP_MARKET / TAKE_PROFIT_MARKET 触发价；未挂显示 --</span>
         </div>
       </div>
       <div class="panel-body flush table-scroll">
         <table class="table">
           <thead>
             <tr>
-              <th>标的</th><th>方向</th><th>杠杆</th><th>数量</th><th>标记价</th><th>止损价</th><th>止盈价</th><th title="标记价到止损价还差多少；按价格百分比显示">距止损</th><th title="标记价到止盈价还差多少；按价格百分比显示">距止盈</th>
+              <th>标的</th><th>方向</th><th>杠杆</th><th>数量</th><th>标记价</th><th>交易所止损</th><th>交易所止盈</th><th title="标记价到交易所止损触发价还差多少">距止损</th><th title="标记价到交易所止盈触发价还差多少">距止盈</th><th>保护</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in positionRiskRows" :key="p.id">
+            <tr v-for="p in positionProtectionRows" :key="p.id">
               <td><b>{{ p.symbol }}</b></td>
               <td><span class="tag" :class="p.side === 'long' ? 'tag-long' : 'tag-short'">{{ p.side === 'long' ? '做多' : '做空' }}</span></td>
               <td class="mono">{{ p.leverage }}x</td>
               <td class="mono">{{ p.qty }}</td>
               <td class="mono">{{ px(p.mark_price) }}</td>
-              <td class="mono">{{ p.sl_price > 0 ? px(p.sl_price) : '--' }}</td>
-              <td class="mono">{{ p.tp_price > 0 ? px(p.tp_price) : '--' }}</td>
+              <td class="mono">{{ p.exchange_sl_price > 0 ? px(p.exchange_sl_price) : '--' }}</td>
+              <td class="mono">{{ p.exchange_tp_price > 0 ? px(p.exchange_tp_price) : '--' }}</td>
               <td class="mono muted">{{ p.sl_distance_pct != null ? `${p.sl_distance_pct.toFixed(2)}%` : '--' }}</td>
               <td class="mono muted">{{ p.tp_distance_pct != null ? `${p.tp_distance_pct.toFixed(2)}%` : '--' }}</td>
+              <td><span class="tag" :class="p.protection_status === '已挂' ? 'tag-long' : p.protection_status === '部分' ? 'tag-warn' : 'tag-dim'">{{ p.protection_status }}</span></td>
             </tr>
-            <tr v-if="!positionRiskRows.length">
-              <td colspan="9" class="empty">当前没有持仓 · 开仓后这里显示每仓的止损/止盈计划价</td>
+            <tr v-if="!positionProtectionRows.length">
+              <td colspan="10" class="empty">当前没有持仓 · 交易所保护单挂出后这里显示触发价</td>
             </tr>
           </tbody>
         </table>
