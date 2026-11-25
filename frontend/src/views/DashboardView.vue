@@ -8,7 +8,7 @@ import EventFeed from '../components/EventFeed.vue'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
 import { visibleEvents } from '../utils/events'
-import { activeOrders, distancePct, orderPurposeLabel } from '../utils/dashboard'
+import { activeOrders, distancePct, isMakerOrder, orderPurposeLabel } from '../utils/dashboard'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
 import { displayDirection, displayScore } from '../utils/signalAudit'
 
@@ -78,7 +78,7 @@ const positionRiskRows = computed(() =>
   }),
 )
 
-const activeOrderRows = computed(() => activeOrders(orders.value))
+const activeOrderRows = computed(() => activeOrders(orders.value).filter(isMakerOrder))
 
 const cooldowns = computed(() => Object.entries(stats.value?.cooldowns || {}))
 const dlq = computed(() => stats.value?.dead_letters || { pending: 0, stuck: 0, last_ts: 0 })
@@ -550,10 +550,10 @@ useSilentRefresh(refreshQuotes, 3000)
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">当前挂单</span>
+        <span class="panel-title">当前 Maker 挂单</span>
         <div class="right">
           <span class="tag tag-dim">{{ activeOrderRows.length }} 条</span>
-          <span class="muted" style="font-size: 10.5px">未完成委托；成交或撤销后自动移出</span>
+          <span class="muted" style="font-size: 10.5px">只显示 LIMIT/post-only 未完成委托；市价与保护单不在此列</span>
         </div>
       </div>
       <div class="panel-body flush table-scroll" style="max-height: 260px">
@@ -573,7 +573,7 @@ useSilentRefresh(refreshQuotes, 3000)
               <td><span class="tag tag-dim">{{ o.status || '--' }}</span></td>
             </tr>
             <tr v-if="!activeOrderRows.length">
-              <td colspan="8" class="empty">当前没有未完成委托 · 开仓/保护单成交或撤销后自动移出</td>
+              <td colspan="8" class="empty">当前没有只做 Maker 的未完成挂单 · 市价单和保护单不在此列</td>
             </tr>
           </tbody>
         </table>

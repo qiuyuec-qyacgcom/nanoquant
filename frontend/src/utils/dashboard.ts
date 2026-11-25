@@ -18,6 +18,12 @@ export function isActiveOrder(order: { status?: string }): boolean {
   return !FINAL_ORDER_STATUSES.has(String(order.status || '').toUpperCase())
 }
 
+const MAKER_ORDER_TYPES = new Set(['LIMIT', 'LIMIT_POST_ONLY', 'POST_ONLY'])
+
+export function isMakerOrder(order: { order_type?: string }): boolean {
+  return MAKER_ORDER_TYPES.has(String(order.order_type || '').toUpperCase())
+}
+
 export function activeOrders<T extends { status?: string }>(orders: T[]): T[] {
   return orders.filter(isActiveOrder)
 }
