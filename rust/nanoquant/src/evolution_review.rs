@@ -181,7 +181,7 @@ fn batch_stats(rows: &[TradeRow]) -> Value {
         "by_reason": Value::Object(by_reason),
         "min_structural_sample": MIN_STRUCTURAL_SAMPLE,
         "do_not_assert": [
-            format!("样本 < {MIN_STRUCTURAL_SAMPLE} 笔的分组结论"),
+            format!("样本 < {MIN_STRUCTURAL_SAMPLE} 笔时的分组统计只能作为线索，不得直接写成长期规则"),
             "PRICE_ONLY / NONE 快照的因子因果归因",
             "单笔极值外推为长期规律",
         ],
@@ -533,8 +533,9 @@ fn review_messages(stats: &Value, trades: &[Value], existing: &[String]) -> Vec<
              \"verdict\":\"...\",\"score\":0,\"diagnosis\":[\"...\"],\
              \"lessons\":[{\"title\":\"...\",\"rule\":\"...\",\"category\":\"entry|exit|risk|timing|position|market\",\
              \"confidence\":0.0,\"evidence\":\"...\",\"replaces\":\"\"}]}。\
-             规则必须含触发条件（当/若/如果/一旦）。样本不足或证据不足时必须返回 NO_CHANGE 且 lessons 为空。\
-             不得给出杠杆建议，不得把单笔极值外推为规律。",
+             规则必须含触发条件（当/若/如果/一旦）。没有明确逐笔证据或规则无法验证时必须返回 NO_CHANGE 且 lessons 为空；\
+             不要仅因样本少于 10 笔就拒绝证据充分的单条规则，但不得把单笔极值或小样本分组统计外推为长期规律。\
+             不得给出杠杆建议。",
         ),
         ChatMessage::new(
             "user",
@@ -556,7 +557,8 @@ fn global_messages(stats: &Value, trades: &[Value], existing: &[Value]) -> Vec<C
              \"diagnosis\":[\"...\"],\"lessons\":[{\"title\":\"...\",\"rule\":\"...\",\
              \"category\":\"entry|exit|risk|timing|position|market\",\"confidence\":0.0,\
              \"evidence\":\"...\",\"replaces\":\"\"}],\"retire\":[{\"title\":\"...\",\"reason\":\"...\"}]}。\
-             规则必须含触发条件；证据不足返回 NO_CHANGE。",
+             规则必须含触发条件；没有明确逐笔证据或规则无法验证时返回 NO_CHANGE；\
+             不要仅因分组样本少于 10 笔就拒绝证据充分的单条规则，但不得把单笔极值或小样本分组统计外推为长期规律。",
         ),
         ChatMessage::new(
             "user",
@@ -821,9 +823,8 @@ async fn run_batch(
             .collect();
         (existing, write_cfg(&conn))
     };
-    let _ = existing;
     let (ai_data, ai_error) =
-        match call_ai(&state, &review_messages(&stats, &payloads, &[]), "review").await {
+        match call_ai(&state, &review_messages(&stats, &payloads, &existing), "review").await {
             Ok(data) => (data, String::new()),
             Err(error) => (None, error),
         };
