@@ -258,7 +258,17 @@ fn upsert_lesson(
     run_evidence: &Value,
 ) -> Value {
     let title = sanitize(item.get("title").and_then(Value::as_str).unwrap_or(""));
-    let rule = sanitize(item.get("rule").and_then(Value::as_str).unwrap_or(""));
+    let rule = match item.get("rule") {
+        Some(Value::String(text)) => sanitize(text),
+        Some(Value::Array(items)) => sanitize(
+            &items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("；"),
+        ),
+        _ => String::new(),
+    };
     let category = item
         .get("category")
         .and_then(Value::as_str)
@@ -673,7 +683,7 @@ pub(crate) async fn review_trade_inner(
             .ok();
         }
     }
-    let Json(value) = run_batch(state.clone(), force, None)
+    let Json(value) = run_batch(state.clone(), force, None, Some(trade_id))
         .await
         .map_err(|(status, body)| (status, body.0))?;
     Ok(value)
@@ -758,17 +768,27 @@ struct BatchQuery {
     force: bool,
 }
 
+fn cleanup_invalid_mantras(conn: &rusqlite::Connection) -> usize {
+    conn.execute(
+        "UPDATE mantras SET enabled = 0, visible = 0, updated_at = ?1 \
+         WHERE enabled = 1 AND (rule IS NULL OR trim(rule) = '' OR trim(rule) = '[]')",
+        [crate::now()],
+    )
+    .unwrap_or(0)
+}
+
 async fn review_batch(
     State(state): State<AiState>,
     Query(query): Query<BatchQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    run_batch(state, query.force, Some(query.limit)).await
+    run_batch(state, query.force, Some(query.limit), None).await
 }
 
 async fn run_batch(
     state: AiState,
-    force: bool,
+    _force: bool,
     limit: Option<i64>,
+    focus: Option<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (cfg, rows) = {
         let conn = state.db.conn.lock().expect("db");
@@ -789,19 +809,41 @@ async fn run_batch(
                 json!({"detail": "自进化已关闭"}).into(),
             ));
         }
+        cleanup_invalid_mantras(&conn);
         let size = cfg.min_lesson_sample.max(
             limit
                 .filter(|value| *value > 0)
                 .unwrap_or(cfg.batch_review_size),
         );
-        (cfg, load_trades(&conn, size, !force, ""))
+        // 复盘的样本必须是待复盘的交易；force 只是绕过样本门槛，不能把已复盘交易重新拉进来。
+        let mut rows = load_trades(&conn, size, true, "");
+        if let Some(id) = focus {
+            if !rows.iter().any(|trade| trade.id == id) {
+                if let Some(trade) = load_trades(&conn, 5000, true, "")
+                    .into_iter()
+                    .find(|trade| trade.id == id)
+                {
+                    rows.push(trade);
+                }
+            }
+        }
+        (cfg, rows)
     };
     if (rows.len() as i64) < cfg.min_lesson_sample {
+        let note = format!("样本不足（{}/{}），已标记复盘但未形成规则", rows.len(), cfg.min_lesson_sample);
+        if let Ok(conn) = state.db.conn.lock() {
+            for trade in &rows {
+                let _ = conn.execute(
+                    "UPDATE trades SET reviewed = 1, review_note = ?2 WHERE id = ?1",
+                    (trade.id, note.chars().take(900).collect::<String>()),
+                );
+            }
+        }
         return Ok(json!({
             "ok": true,
             "skipped": true,
             "change_status": "NO_CHANGE",
-            "reason": format!("样本不足（{}/{}），NO_CHANGE", rows.len(), cfg.min_lesson_sample),
+            "reason": note,
             "pending": rows.len(),
             "sample_size": rows.len(),
             "applied": [],
