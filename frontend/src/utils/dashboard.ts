@@ -1,0 +1,28 @@
+export const ORDER_PURPOSE_LABELS: Record<string, string> = {
+  entry: '开仓',
+  stop_loss: '止损',
+  take_profit: '止盈',
+  close: '平仓',
+  partial_take_profit: '部分止盈',
+  adjust: '调整',
+}
+
+export function orderPurposeLabel(purpose?: string): string {
+  if (!purpose) return '--'
+  return ORDER_PURPOSE_LABELS[purpose] || purpose
+}
+
+const FINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'])
+
+export function isActiveOrder(order: { status?: string }): boolean {
+  return !FINAL_ORDER_STATUSES.has(String(order.status || '').toUpperCase())
+}
+
+export function activeOrders<T extends { status?: string }>(orders: T[]): T[] {
+  return orders.filter(isActiveOrder)
+}
+
+export function distancePct(mark: number, trigger: number): number | null {
+  if (!(mark > 0) || !(trigger > 0)) return null
+  return Math.abs((trigger - mark) / mark) * 100
+}

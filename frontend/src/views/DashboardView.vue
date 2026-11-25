@@ -8,6 +8,7 @@ import EventFeed from '../components/EventFeed.vue'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import { useAppStore } from '../stores/app'
 import { visibleEvents } from '../utils/events'
+import { activeOrders, distancePct, orderPurposeLabel } from '../utils/dashboard'
 import { duration, EXIT_LABELS, fmt, numClass, px, timeStr, usdt } from '../utils/format'
 import { displayDirection, displayScore } from '../utils/signalAudit'
 
@@ -20,9 +21,7 @@ const trades = ref<any[]>([])
 const signals = ref<any[]>([])
 const usage = ref<any>(null)
 const stages = ref<any>(null)
-const protection = ref<any[]>([])
 const orders = ref<any[]>([])
-const cancelingId = ref('')
 const busy = ref(false)
 const showPosHelp = ref(false)
 
@@ -67,19 +66,19 @@ const account = computed(() => {
   return { ...base, unrealized, equity: Number(base.wallet || 0) + unrealized }
 })
 
-/** 保护单用同一份实时价补标记价与距离：交易所 Algo 接口不返回 markPrice。 */
-const protectionRows = computed(() =>
-  protection.value.map((o) => {
-    const live = Number(tickers.value[o.symbol]?.last || 0)
-    const trigger = Number(o.trigger_price || 0)
-    if (!(live > 0)) return o
+/** 当前持仓止盈止损：本地计划价，按实时标记价计算触发距离。 */
+const positionRiskRows = computed(() =>
+  positions.value.map((p) => {
+    const mark = Number(p.mark_price || 0)
     return {
-      ...o,
-      mark_price: live,
-      distance_pct: trigger > 0 ? ((trigger - live) / live) * 100 : 0,
+      ...p,
+      sl_distance_pct: distancePct(mark, Number(p.sl_price || 0)),
+      tp_distance_pct: distancePct(mark, Number(p.tp_price || 0)),
     }
   }),
 )
+
+const activeOrderRows = computed(() => activeOrders(orders.value))
 
 const cooldowns = computed(() => Object.entries(stats.value?.cooldowns || {}))
 const dlq = computed(() => stats.value?.dead_letters || { pending: 0, stuck: 0, last_ts: 0 })
@@ -179,22 +178,20 @@ const equityOption = computed(() => {
 
 async function load() {
   await app.loadStatus()
-  const [eq, tr, sg, us, ev, ex, pr, od] = await Promise.allSettled([
+  const [eq, tr, sg, us, ev, ex, od] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),
     http.get('/ai/usage'),
     app.loadEvents(40),
     http.get('/engine/execution'),
-    http.get('/engine/protection'),
-    http.get('/engine/orders?limit=15'),
+    http.get('/engine/orders?limit=30'),
   ])
   if (eq.status === 'fulfilled') equity.value = eq.value.items
   if (tr.status === 'fulfilled') trades.value = tr.value.items
   if (sg.status === 'fulfilled') signals.value = sg.value.items
   if (us.status === 'fulfilled') usage.value = us.value
   if (ex.status === 'fulfilled') stages.value = ex.value
-  if (pr.status === 'fulfilled') protection.value = pr.value.items || []
   if (od.status === 'fulfilled') orders.value = od.value.items || []
 }
 
@@ -211,19 +208,7 @@ async function cycleNow() {
   }
 }
 
-async function cancelProtection(algoId: string) {
-  if (!confirm('确认撤销这条保护单？撤销后该仓位将失去自动止损/止盈。')) return
-  cancelingId.value = algoId
-  try {
-    await http.del(`/engine/protection/${algoId}`)
-    app.notify('保护单已撤销', 'ok')
-    await load()
-  } catch (err: any) {
-    app.notify(err.message, 'error')
-  } finally {
-    cancelingId.value = ''
-  }
-}
+
 
 async function closePosition(id: number) {
   if (!confirm('确认平掉该仓位?')) return
@@ -530,42 +515,65 @@ useSilentRefresh(refreshQuotes, 3000)
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">交易所保护单</span>
+        <span class="panel-title">当前持仓止盈止损</span>
         <div class="right">
-          <span class="tag tag-dim">{{ protectionRows.length }} 条</span>
-          <span class="muted" style="font-size: 10.5px">挂在币安侧的 Algo 条件单，本地账本看不到</span>
+          <span class="tag tag-dim">{{ positionRiskRows.length }} 仓</span>
+          <span class="muted" style="font-size: 10.5px">本地计划价；实际触发以交易所保护单或引擎轮询为准</span>
         </div>
       </div>
       <div class="panel-body flush table-scroll">
         <table class="table">
           <thead>
             <tr>
-              <th>标的</th><th>方向</th><th>类型</th><th>触发价</th><th>标记价</th><th>距离</th><th>状态</th><th></th>
+              <th>标的</th><th>方向</th><th>杠杆</th><th>数量</th><th>标记价</th><th>止损价</th><th>止盈价</th><th title="标记价到止损价还差多少；按价格百分比显示">距止损</th><th title="标记价到止盈价还差多少；按价格百分比显示">距止盈</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="o in protectionRows" :key="o.algo_id">
-              <td class="mono">{{ o.symbol }}</td>
-              <td>{{ o.side === 'SELL' ? '卖出' : '买入' }}</td>
-              <td>{{ o.type === 'STOP_MARKET' ? '止损' : o.type === 'TAKE_PROFIT_MARKET' ? '止盈' : o.type }}</td>
-              <td class="mono">{{ px(o.trigger_price) }}</td>
-              <td class="mono muted">{{ px(o.mark_price) }}</td>
-              <td class="mono" :class="o.distance_pct >= 0 ? 'down' : 'flat'">{{ Number(o.distance_pct || 0).toFixed(2) }}%</td>
-              <td class="mono muted">{{ o.status }}</td>
-              <td class="right">
-                <button class="btn btn-xs btn-danger" :disabled="cancelingId === o.algo_id" @click="cancelProtection(o.algo_id)">
-                  撤单
-                </button>
-              </td>
+            <tr v-for="p in positionRiskRows" :key="p.id">
+              <td><b>{{ p.symbol }}</b></td>
+              <td><span class="tag" :class="p.side === 'long' ? 'tag-long' : 'tag-short'">{{ p.side === 'long' ? '做多' : '做空' }}</span></td>
+              <td class="mono">{{ p.leverage }}x</td>
+              <td class="mono">{{ p.qty }}</td>
+              <td class="mono">{{ px(p.mark_price) }}</td>
+              <td class="mono">{{ p.sl_price > 0 ? px(p.sl_price) : '--' }}</td>
+              <td class="mono">{{ p.tp_price > 0 ? px(p.tp_price) : '--' }}</td>
+              <td class="mono muted">{{ p.sl_distance_pct != null ? `${p.sl_distance_pct.toFixed(2)}%` : '--' }}</td>
+              <td class="mono muted">{{ p.tp_distance_pct != null ? `${p.tp_distance_pct.toFixed(2)}%` : '--' }}</td>
             </tr>
-            <tr v-if="!protectionRows.length">
-              <td colspan="8" class="empty">
-                {{ status?.rate_limit?.banned
-                  ? ((status.rate_limit.declared_remaining ?? 0) > 0
-                      ? `交易所封禁至 ${status.rate_limit.declared_label}，保护单列表暂不可用；解封后自动恢复`
-                      : `交易所限频冷却中（剩余 ${status.rate_limit.ban_remaining}s），保护单列表暂不可用；冷却结束后自动恢复`)
-                  : '当前没有挂着保护单 · 开仓成功后会自动挂止损与止盈' }}
-              </td>
+            <tr v-if="!positionRiskRows.length">
+              <td colspan="9" class="empty">当前没有持仓 · 开仓后这里显示每仓的止损/止盈计划价</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">当前挂单</span>
+        <div class="right">
+          <span class="tag tag-dim">{{ activeOrderRows.length }} 条</span>
+          <span class="muted" style="font-size: 10.5px">未完成委托；成交或撤销后自动移出</span>
+        </div>
+      </div>
+      <div class="panel-body flush table-scroll" style="max-height: 260px">
+        <table class="table">
+          <thead>
+            <tr><th>时间</th><th>标的</th><th>方向</th><th>用途</th><th>类型</th><th>数量</th><th>价格</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="o in activeOrderRows" :key="o.id">
+              <td class="mono muted">{{ timeStr(o.ts, false) }}</td>
+              <td><b>{{ o.symbol }}</b></td>
+              <td><span class="tag" :class="o.side === 'BUY' ? 'tag-long' : 'tag-short'">{{ o.side === 'BUY' ? '买' : '卖' }}</span></td>
+              <td class="muted">{{ orderPurposeLabel(o.purpose) }}</td>
+              <td class="muted">{{ o.order_type }}</td>
+              <td class="mono">{{ o.qty || '--' }}</td>
+              <td class="mono">{{ o.price ? px(o.price) : '--' }}</td>
+              <td><span class="tag tag-dim">{{ o.status || '--' }}</span></td>
+            </tr>
+            <tr v-if="!activeOrderRows.length">
+              <td colspan="8" class="empty">当前没有未完成委托 · 开仓/保护单成交或撤销后自动移出</td>
             </tr>
           </tbody>
         </table>
