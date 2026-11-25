@@ -623,6 +623,12 @@ async function toggleIsolated() {
   isolatedBusy.value = true
   try {
     await app.saveGroup('engine', { isolated: enabled })
+    if (current.value === 'engine') {
+      // 开关是独立保存的；必须同步表单草稿，否则随后「保存并生效」会用旧值覆盖。
+      draft.value = { ...draft.value, isolated: enabled }
+      baseline.value = { ...baseline.value, isolated: enabled }
+      syncJsonText()
+    }
     if (enabled && tradeMode.value?.can_switch) {
       const res = await http.post(
         '/engine/trade-mode',
