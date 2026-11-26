@@ -114,10 +114,14 @@ impl AuditSignal {
 
     /// 在原有 features 基础上并入 AI 复核扩展字段，供审计与前端查询。
     /// 未取到的字段不写入，避免用空值覆盖已有读数。
+    /// 旧 AI 字段一律先清除，保证 features 里的自评字段只反映最新一轮。
     pub fn features_with_meta(&self) -> Value {
         let mut features = self.features.clone();
         // 仅对象形状的 features 会并入 AI 字段；非对象入参原样返回。
         if let Some(object) = features.as_object_mut() {
+            for key in AI_META_KEYS {
+                object.remove(key);
+            }
             if let Some(v) = self.data_quality {
                 object.insert("ai_dq".into(), json!(v));
             }
@@ -169,18 +173,29 @@ fn stored_key(features: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 写入 signals.features 的 AI 自评字段键。
-const AI_META_KEYS: [&str; 7] = [
-    "ai_dq",
-    "ai_rr",
-    "ai_vb",
-    "ai_ip",
-    "ai_ep",
-    "ai_inv",
-    "ai_risk",
-];
+/// 数值型 AI 自评字段：合并时新行缺失则沿用旧值，避免数据丢失。
+const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
 
-/// 合并时把新行缺失的 AI 自评字段用旧值补齐，避免模型本轮没给就被清空。
+/// 文本型 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧文本。
+const AI_TEXT_META_KEYS: [&str; 2] = ["ai_inv", "ai_risk"];
+
+/// 写入 signals.features 的 AI 自评字段键（数值 + 文本）。
+const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_TEXT_META_KEYS.len()] = {
+    let mut keys = [""; AI_NUMERIC_META_KEYS.len() + AI_TEXT_META_KEYS.len()];
+    let mut index = 0;
+    while index < AI_NUMERIC_META_KEYS.len() {
+        keys[index] = AI_NUMERIC_META_KEYS[index];
+        index += 1;
+    }
+    let mut offset = 0;
+    while offset < AI_TEXT_META_KEYS.len() {
+        keys[index + offset] = AI_TEXT_META_KEYS[offset];
+        offset += 1;
+    }
+    keys
+};
+
+/// 合并时用旧值补齐数值字段；文本字段以最新一轮为准，缺失时删除旧键。
 fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
     let previous: Value = match serde_json::from_str(previous_text) {
         Ok(value) => value,
@@ -192,11 +207,18 @@ fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
     let Some(object) = features.as_object_mut() else {
         return;
     };
-    for key in AI_META_KEYS {
+    // 数值字段：新行缺失时沿用旧值。
+    for key in AI_NUMERIC_META_KEYS {
         if !object.contains_key(key) {
             if let Some(value) = previous_object.get(key) {
                 object.insert(key.to_string(), value.clone());
             }
+        }
+    }
+    // 文本字段：新一轮没给就删掉旧键，不得跨轮残留。
+    for key in AI_TEXT_META_KEYS {
+        if !object.contains_key(key) {
+            object.remove(key);
         }
     }
 }
@@ -528,6 +550,39 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_str(&features).unwrap();
         assert_eq!(value["ai_dq"], 0.8, "新行缺 ai_dq 时要沿用旧值");
+    }
+
+    #[test]
+    fn merged_signal_drops_stale_ai_text_when_new_round_missing() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        let mut first = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        first.data_quality = Some(0.8);
+        first.invalidation_text = Some("跌破 EMA".to_string());
+        first.risk_text = Some("上方套牢".to_string());
+        record(&tx, "demo", 1000, &[first]).unwrap();
+        // 第二轮同键但没有文本：数值沿用旧值，文本必须以最新一轮为准消失。
+        let second = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        record(&tx, "demo", 1015, &[second]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count(&conn), 1, "同类信号应合并成一行");
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["ai_dq"], 0.8, "数值字段新行缺失时仍沿用旧值");
+        assert!(
+            value.get("ai_inv").is_none(),
+            "新行没给失效文本时不得残留旧值: {value}"
+        );
+        assert!(
+            value.get("ai_risk").is_none(),
+            "新行没给风险文本时不得残留旧值: {value}"
+        );
     }
 
     #[test]

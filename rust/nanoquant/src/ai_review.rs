@@ -267,16 +267,33 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
     }
 }
 
+/// AI 文本字段规范化：去首尾空白，空内容不落库。
+fn text_fields(decision: &ai_client::Decision) -> (Option<String>, Option<String>) {
+    let invalidation = decision.invalidation.trim();
+    let risk = decision
+        .risk_flags
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("；");
+    (
+        (!invalidation.is_empty()).then(|| invalidation.to_string()),
+        (!risk.is_empty()).then_some(risk),
+    )
+}
+
 /// 拒单时必须把 AI 自评字段一并带出，否则审计层拿不到 dq/rr。
 fn reject_with(reason: impl Into<String>, decision: &ai_client::Decision) -> ReviewDecision {
+    let (invalidation_text, risk_text) = text_fields(decision);
     ReviewDecision {
         invalidation_price: decision.invalidation_price,
         valid_bars: decision.valid_bars,
         data_quality: decision.data_quality,
         rr_target: decision.rr_target,
         entry_price: decision.entry_price,
-        invalidation_text: (!decision.invalidation.is_empty()).then(|| decision.invalidation.clone()),
-        risk_text: (!decision.risk_flags.is_empty()).then(|| decision.risk_flags.join("；")),
+        invalidation_text,
+        risk_text,
         ..reject(reason)
     }
 }
@@ -306,6 +323,7 @@ fn decision_to_review(
         "open_long" => "long",
         "open_short" => "short",
         _ => {
+            let (invalidation_text, risk_text) = text_fields(decision);
             return Ok(ReviewDecision {
                 action: ReviewAction::Hold,
                 side: None,
@@ -324,10 +342,8 @@ fn decision_to_review(
                 data_quality: decision.data_quality,
                 rr_target: decision.rr_target,
                 entry_price: decision.entry_price,
-                invalidation_text: (!decision.invalidation.is_empty())
-                    .then(|| decision.invalidation.clone()),
-                risk_text: (!decision.risk_flags.is_empty())
-                    .then(|| decision.risk_flags.join("；")),
+                invalidation_text,
+                risk_text,
             })
         }
     };
@@ -426,6 +442,7 @@ fn decision_to_review(
         _ => false,
     };
     let changed = side != proposal.side || leverage_changed || stop_tightened;
+    let (invalidation_text, risk_text) = text_fields(decision);
     Ok(ReviewDecision {
         action: if changed {
             ReviewAction::Tighten
@@ -444,8 +461,8 @@ fn decision_to_review(
         data_quality: decision.data_quality,
         rr_target: decision.rr_target,
         entry_price: decision.entry_price,
-        invalidation_text: (!decision.invalidation.is_empty()).then(|| decision.invalidation.clone()),
-        risk_text: (!decision.risk_flags.is_empty()).then(|| decision.risk_flags.join("；")),
+        invalidation_text,
+        risk_text,
     })
 }
 
@@ -488,6 +505,70 @@ mod tests {
             rr_target: None,
             entry_price: None,
         }
+    }
+
+    #[test]
+    fn blank_invalidation_and_risk_are_ignored() {
+        let mut item = decision("hold", 0.9);
+        item.invalidation = "   ".to_string();
+        item.risk_flags = vec!["  ".to_string()];
+        let hold = decision_to_review(
+            &proposal("long"),
+            "any",
+            &item,
+            0.45,
+            true,
+            false,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(hold.action, ReviewAction::Hold);
+        assert_eq!(hold.invalidation_text, None, "空白失效文本不应落库");
+        assert_eq!(hold.risk_text, None, "空白风险文本不应落库");
+
+        let mut rejected = decision("open_long", 0.2);
+        rejected.invalidation = "\t ".to_string();
+        rejected.risk_flags = vec![" ".to_string(), String::new()];
+        let rejected = decision_to_review(
+            &proposal("long"),
+            "any",
+            &rejected,
+            0.45,
+            true,
+            false,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(rejected.action, ReviewAction::Reject);
+        assert_eq!(
+            rejected.invalidation_text, None,
+            "拒单路径的空白失效文本不应落库"
+        );
+        assert_eq!(rejected.risk_text, None, "拒单路径的空白风险文本不应落库");
+
+        let mut mixed = decision("hold", 0.9);
+        mixed.invalidation = " 跌破 EMA ".to_string();
+        mixed.risk_flags = vec![" ".to_string(), " 上方套牢 ".to_string(), String::new()];
+        let mixed = decision_to_review(
+            &proposal("long"),
+            "any",
+            &mixed,
+            0.45,
+            true,
+            false,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed.invalidation_text.as_deref(),
+            Some("跌破 EMA"),
+            "有效文本应去掉首尾空白"
+        );
+        assert_eq!(
+            mixed.risk_text.as_deref(),
+            Some("上方套牢"),
+            "风险项应过滤空白后拼接"
+        );
     }
 
     #[test]
