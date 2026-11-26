@@ -135,6 +135,16 @@ const BASE_META: Record<string, FieldMeta> = {
     unit: '个',
     hint: '0=不限制；与「最大持仓」同时生效，取更小值；币种高度相关，小资金建议设 1',
   },
+  correlation_limit: {
+    label: '高相关同向上限',
+    unit: '个',
+    hint: '同向高相关币种最多几个；BTC/ETH/SOL 视为同一簇，其余按基础资产归组；1–5',
+  },
+  direction_exposure_limit_pct: {
+    label: '同向敞口上限',
+    unit: '%',
+    hint: '同一方向持仓名义额（含本次）/ 权益；与总敞口上限同时生效，取更小值',
+  },
   vol_target_atr_pct: {
     label: '波动率目标',
     unit: '%',

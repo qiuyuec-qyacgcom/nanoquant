@@ -22,6 +22,8 @@
     "margin_pct": 50.0,
     "max_exposure_pct": 2000.0,
     "max_same_direction": 0,
+    "correlation_limit": 2,
+    "direction_exposure_limit_pct": 200.0,
     "category_exposure_limit_pct": 500.0,
     "vol_target_atr_pct": 0.0,
     "daily_loss_limit_pct": 25.0,

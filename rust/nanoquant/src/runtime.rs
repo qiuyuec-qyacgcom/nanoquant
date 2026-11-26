@@ -3394,7 +3394,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 ))
             })
             .map_err(|e| e.to_string())?;
-        let (mut count, mut same, mut total, mut group) = (0, 0, notional, notional);
+        let (mut count, mut same, mut correlated, mut same_notional) = (0, 0, 0, notional);
+        let (mut total, mut group) = (notional, notional);
         for row in rows {
             let (held, direction, qty, fallback) = row.map_err(|e| e.to_string())?;
             if held == symbol {
@@ -3410,13 +3411,20 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 return Ok(Some(format!("{held} 仓位价值异常")));
             }
             count += 1;
-            same += i64::from(direction == side);
             total += value;
+            if direction == side {
+                same += 1;
+                same_notional += value;
+                if correlated_symbols(&held, symbol) {
+                    correlated += 1;
+                }
+            }
             if category(&held) == category(symbol) {
                 group += value;
             }
         }
         let side_cap = cfg["max_same_direction"].as_i64().unwrap_or(0);
+        let correlation_cap = cfg["correlation_limit"].as_i64().unwrap_or(2);
         let category_cap = cfg["category_exposure_limit_pct"].as_f64().unwrap_or(500.0);
         let max_positions = engine["max_positions"].as_i64().unwrap_or(2);
         let equity = snapshot.account.equity;
@@ -3429,11 +3437,25 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         if side_cap > 0 && same >= side_cap {
             return Ok(Some(format!("同向持仓 {same} 达到上限 {side_cap}")));
         }
+        if correlation_cap > 0 && correlated >= correlation_cap {
+            return Ok(Some(format!(
+                "高相关同向持仓 {correlated} 达到上限 {correlation_cap}"
+            )));
+        }
         let exposure_pct = total / equity * 100.0;
         let max_exposure_pct = cfg["max_exposure_pct"].as_f64().unwrap_or(2000.0);
         if exposure_pct > max_exposure_pct {
             return Ok(Some(format!(
                 "总敞口 {exposure_pct:.1}% 超过上限 {max_exposure_pct:.1}%"
+            )));
+        }
+        let direction_pct = same_notional / equity * 100.0;
+        let direction_cap = cfg["direction_exposure_limit_pct"]
+            .as_f64()
+            .unwrap_or(200.0);
+        if direction_cap > 0.0 && direction_pct > direction_cap {
+            return Ok(Some(format!(
+                "同向敞口 {direction_pct:.1}% 超过上限 {direction_cap:.1}%"
             )));
         }
         let group_pct = group / equity * 100.0;
@@ -5740,6 +5762,20 @@ async fn refresh_account_balance(
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// 同向持仓的相关性判定：三大主流视为同一风险簇，
+/// 其余标的按去掉 USDT 后的基础资产归组。
+fn correlated_symbols(a: &str, b: &str) -> bool {
+    fn major(s: &str) -> bool {
+        s.starts_with("BTC") || s.starts_with("ETH") || s.starts_with("SOL")
+    }
+    if major(a) && major(b) {
+        return true;
+    }
+    let base = |s: &str| s.strip_suffix("USDT").unwrap_or(s).to_string();
+    let (a, b) = (base(a), base(b));
+    !a.is_empty() && a == b
 }
 
 #[cfg(test)]
@@ -9234,6 +9270,127 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             )
             .unwrap();
         assert_eq!(paused, 1);
+    }
+
+    fn combo_db(positions: &[(&str, &str, f64, f64)]) -> Db {
+        let db = test_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            for (symbol, side, qty, mark) in positions {
+                conn.execute(
+                    "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,status,mode) VALUES(?1,?2,?3,?4,?4,'open','demo')",
+                    (symbol, side, qty, mark),
+                )
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    fn combo_snapshot() -> crate::providers::TradingSnapshot {
+        crate::providers::TradingSnapshot {
+            markets: Vec::new(),
+            account: crate::providers::AccountSnapshot {
+                equity: 10_000.0,
+                wallet: 10_000.0,
+                available_balance: 10_000.0,
+            },
+            positions: Vec::new(),
+            open_orders: Vec::new(),
+        }
+    }
+
+    fn combo_check(
+        db: &Db,
+        cfg: serde_json::Value,
+        symbol: &str,
+        side: &str,
+        notional: f64,
+    ) -> Result<Option<String>, String> {
+        let mut conn = db.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        EngineRuntime::entry_allowed(
+            &tx,
+            "demo",
+            &serde_json::json!({"max_positions": 10}),
+            &cfg,
+            &combo_snapshot(),
+            symbol,
+            side,
+            notional,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn same_direction_limit_rejects_third_long() {
+        let db = combo_db(&[
+            ("ETHUSDT", "long", 1.0, 1_000.0),
+            ("XRPUSDT", "long", 1.0, 100.0),
+        ]);
+        let cfg = serde_json::json!({
+            "max_same_direction": 2,
+            "correlation_limit": 5,
+            "direction_exposure_limit_pct": 1000.0,
+            "max_exposure_pct": 10000.0,
+            "category_exposure_limit_pct": 0.0,
+        });
+        let reason = combo_check(&db, cfg, "BTCUSDT", "long", 100.0).unwrap();
+        assert!(
+            reason.as_deref().unwrap_or("").contains("同向持仓"),
+            "第三个多单必须被同向上限挡下: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn correlation_limit_rejects_second_major() {
+        let db = combo_db(&[("ETHUSDT", "long", 1.0, 1_000.0)]);
+        let cfg = serde_json::json!({
+            "max_same_direction": 0,
+            "correlation_limit": 1,
+            "direction_exposure_limit_pct": 1000.0,
+            "max_exposure_pct": 10000.0,
+            "category_exposure_limit_pct": 0.0,
+        });
+        let reason = combo_check(&db, cfg, "BTCUSDT", "long", 100.0).unwrap();
+        assert!(
+            reason.as_deref().unwrap_or("").contains("高相关"),
+            "同向第二个主流币必须被相关性上限挡下: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn reverse_side_not_affected() {
+        let db = combo_db(&[
+            ("ETHUSDT", "long", 1.0, 1_000.0),
+            ("BTCUSDT", "long", 1.0, 1_000.0),
+        ]);
+        let cfg = serde_json::json!({
+            "max_same_direction": 2,
+            "correlation_limit": 1,
+            "direction_exposure_limit_pct": 100.0,
+            "max_exposure_pct": 10000.0,
+            "category_exposure_limit_pct": 0.0,
+        });
+        let reason = combo_check(&db, cfg, "SOLUSDT", "short", 100.0).unwrap();
+        assert_eq!(reason, None, "反向开仓不受同向与相关性限制: {reason:?}");
+    }
+
+    #[test]
+    fn direction_exposure_limit_rejects_oversized_side() {
+        let db = combo_db(&[("BTCUSDT", "long", 100.0, 100.0)]);
+        let cfg = serde_json::json!({
+            "max_same_direction": 0,
+            "correlation_limit": 5,
+            "direction_exposure_limit_pct": 200.0,
+            "max_exposure_pct": 10000.0,
+            "category_exposure_limit_pct": 0.0,
+        });
+        let reason = combo_check(&db, cfg, "ETHUSDT", "long", 10_001.0).unwrap();
+        assert!(
+            reason.as_deref().unwrap_or("").contains("同向敞口"),
+            "同向名义额超过权益 200% 必须被挡下: {reason:?}"
+        );
     }
 
     fn test_db() -> Db {
