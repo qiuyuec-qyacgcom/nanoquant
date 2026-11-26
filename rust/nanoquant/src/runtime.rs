@@ -21,8 +21,8 @@ const GLOBAL_COOLDOWN_SYMBOL: &str = "__global__";
 /// LIMIT 开仓挂单的最短超时。周期更长时按 `cycle_interval_sec * 2` 放宽。
 const LIMIT_ORDER_TIMEOUT_SEC: i64 = 120;
 
-/// AI 建议入场价与现价的最大偏离。与 `ai_client::EP_TOLERANCE` 同源：
-/// 解析层先按该容差剔一次，执行层再用同一口径复核，避免跨层漂移。
+/// AI 建议入场价与现价的最大偏离。数值与 `ai_client::EP_TOLERANCE` 保持一致（当前各自维护）：
+/// 解析层先按该容差剔除一次，执行层再用同一口径复核，避免跨层漂移。
 const PREFERRED_ENTRY_TOLERANCE: f64 = 0.005;
 
 /// 引擎判活阈值（秒）。
@@ -1926,7 +1926,6 @@ fn live_entry_inflight(
     )
     .map_err(|error| error.to_string())
 }
-
 
 /// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
 fn live_plans(
@@ -5675,7 +5674,6 @@ async fn refresh_account_balance(
     .map_err(|error| error.to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6008,6 +6006,44 @@ mod tests {
             EngineRuntime::preferred_limit_price("BUY", 100.0, 99.8, 0.0),
             Some(99.8)
         );
+        // 非有限或非正的 AI 建议价必须拒绝。
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, f64::INFINITY, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 0.0, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, -0.0, 0.01),
+            None
+        );
+        // 非有限或非正的现价无法判定偏离，也必须拒绝。
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 0.0, 99.8, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", f64::INFINITY, 99.8, 0.01),
+            None
+        );
+        // 恰好 0.5% 的偏离不算超限；方向正确时放行，方向错误仍拒绝。
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.5, 0.01),
+            Some(99.5),
+            "恰好 0.5% 且方向正确的买单放行"
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("SELL", 100.0, 100.5, 0.01),
+            Some(100.5),
+            "恰好 0.5% 且方向正确的卖单放行"
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 100.5, 0.01),
+            None,
+            "恰好 0.5% 但方向错误的买单仍拒绝"
+        );
     }
 
     #[test]
@@ -6050,13 +6086,8 @@ mod tests {
         .with_reviewer(Arc::new(TestApproveReviewer::default()))
     }
 
+    #[derive(Default)]
     struct TestApproveReviewer(Option<f64>);
-
-    impl Default for TestApproveReviewer {
-        fn default() -> Self {
-            Self(None)
-        }
-    }
 
     impl crate::review::AiReviewer for TestApproveReviewer {
         fn review(
