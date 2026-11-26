@@ -278,6 +278,11 @@ impl BinanceProvider {
         let equity = number(&value, "totalMarginBalance")?;
         let wallet = number(&value, "totalWalletBalance").unwrap_or(equity);
         let available_balance = number(&value, "availableBalance")?;
+        let available_balance = if available_balance.is_finite() && available_balance > 0.0 {
+            available_balance
+        } else {
+            equity.max(0.0)
+        };
         Ok(AccountSnapshot {
             equity,
             wallet,
@@ -682,6 +687,8 @@ impl SnapshotProvider for BinanceProvider {
                 .iter()
                 .map(parse_open_order)
                 .collect::<Result<Vec<_>, _>>()?;
+            let has_positions = !positions.is_empty() || !open_orders.is_empty();
+            let available_balance = sane_available(equity, available_balance, has_positions);
             Ok(TradingSnapshot {
                 markets,
                 account: AccountSnapshot {
@@ -694,6 +701,18 @@ impl SnapshotProvider for BinanceProvider {
             })
         })
     }
+}
+
+/// 可用余额异常回退：无持仓且可用余额低于权益 10% 时，视为快照异常，按权益回退。
+fn sane_available(equity: f64, available: f64, has_positions: bool) -> f64 {
+    if !available.is_finite() || available <= 0.0 {
+        return equity.max(0.0);
+    }
+    if !has_positions && equity > 0.0 && available < equity * 0.1 {
+        tracing::warn!(equity, available, "可用余额显著低于权益且无持仓，按快照异常回退到权益");
+        return equity;
+    }
+    available
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -1027,6 +1046,15 @@ mod tests {
         let provider = DemoProvider::with_mark_price(f64::NAN);
         let error = provider.snapshot().await.unwrap_err();
         assert!(matches!(error, ProviderError::InvalidData(_)));
+    }
+
+    #[test]
+    fn sane_available_falls_back_for_outlier_without_positions() {
+        assert_eq!(sane_available(113.86, 2.03, false), 113.86);
+        assert_eq!(sane_available(113.86, 2.03, true), 2.03);
+        assert_eq!(sane_available(113.86, 0.0, false), 113.86);
+        assert_eq!(sane_available(113.86, 50.0, false), 50.0);
+        assert_eq!(sane_available(113.86, f64::NAN, false), 113.86);
     }
 
     #[test]
