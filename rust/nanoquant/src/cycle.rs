@@ -159,6 +159,7 @@ mod tests {
             volume_ratio_min: 0.8,
             min_24h_quote_volume: 3e6,
             spread_bps_max: 8.0,
+            funding_veto_bps: 0.0,
             entry_threshold: 0.5,
         }
     }
@@ -230,6 +231,7 @@ mod tests {
             vol_ratio: 1.0,
             quote_volume: 1e8,
             spread_bps: 2.0,
+            funding_rate: 0.0,
             strength: 0.9,
             preview_side: None,
         }];
@@ -269,6 +271,7 @@ mod tests {
             vol_ratio: 1.0,
             quote_volume: 1e8,
             spread_bps: 2.0,
+            funding_rate: 0.0,
             strength: 0.9,
             preview_side: None,
         }];

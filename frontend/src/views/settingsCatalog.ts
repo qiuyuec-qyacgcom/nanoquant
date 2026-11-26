@@ -35,7 +35,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     {
       title: '入场过滤',
       hint: '任一项不达标都不开仓',
-      fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume', 'min_entry_rr'],
+      fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume', 'min_entry_rr', 'funding_veto_bps'],
     },
     {
       title: '出场与保护',

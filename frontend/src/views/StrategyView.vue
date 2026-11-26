@@ -184,6 +184,7 @@ const BASE_META: Record<string, FieldMeta> = {
   partial_tp_at_r: { label: '部分止盈触发', unit: 'R', hint: '浮盈达到该 R 倍数先平一部分；0=关闭' },
   partial_tp_ratio: { label: '部分止盈比例', unit: '比例', hint: '0.5 = 平一半，剩余交给移动止损' },
   max_spread_bps: { label: '盘口点差上限', unit: 'bps', hint: '买一卖一价差超过该值就放弃开仓；0=关闭。短线建议 5–12bps' },
+  funding_veto_bps: { label: '资金费率否决', unit: 'bps', hint: '资金费率超过该值时，禁止开同向仓（正费率禁多、负费率禁空）', min: 0, max: 50, step: 0.5 },
   roi_table: {
     label: '时间阶梯止盈',
     widget: 'roi',

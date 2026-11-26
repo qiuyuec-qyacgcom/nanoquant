@@ -15,6 +15,8 @@ pub struct Candidate {
     pub quote_volume: f64,
     /// 盘口点差（bp）。
     pub spread_bps: f64,
+    /// 当期资金费率（小数，0.001 = 10bps）。
+    pub funding_rate: f64,
     /// 方向分的绝对值。均值回归模式下改传 |z|。
     pub strength: f64,
     /// 融合策略的预览方向，仅用于审计与排序，不参与下单决策。
@@ -29,6 +31,8 @@ pub struct ScanGates {
     pub min_24h_quote_volume: f64,
     /// 盘口点差上限（bp）。
     pub spread_bps_max: f64,
+    /// 资金费率否决阈值（bp）。费率绝对值超过它且方向不利时拒绝开仓；0 表示关闭。
+    pub funding_veto_bps: f64,
     /// 触发阈值。强度按它归一化：越接近 1 越值得优先看。
     pub entry_threshold: f64,
 }
@@ -46,6 +50,16 @@ pub fn risk_gate(c: &Candidate, g: &ScanGates) -> String {
     }
     if c.vol_ratio < g.volume_ratio_min {
         return format!("量能不足 {:.2} < {}", c.vol_ratio, g.volume_ratio_min);
+    }
+    if g.funding_veto_bps > 0.0 && c.funding_rate.abs() * 10000.0 > g.funding_veto_bps {
+        let adverse = match c.preview_side {
+            Some("long") => c.funding_rate > 0.0,
+            Some("short") => c.funding_rate < 0.0,
+            _ => false,
+        };
+        if adverse {
+            return format!("资金费率不利 {:.2}bps", c.funding_rate * 10000.0);
+        }
     }
     if c.quote_volume < g.min_24h_quote_volume {
         return "24h 成交额偏低".to_string();
@@ -86,6 +100,7 @@ mod tests {
             volume_ratio_min: 0.8,
             min_24h_quote_volume: 3e6,
             spread_bps_max: 8.0,
+            funding_veto_bps: 5.0,
             entry_threshold: 0.5,
         }
     }
@@ -98,6 +113,7 @@ mod tests {
             vol_ratio: vol,
             quote_volume: quote,
             spread_bps: 2.0,
+            funding_rate: 0.0,
             strength,
             preview_side: None,
         }
@@ -140,6 +156,50 @@ mod tests {
             ["BBBUSDT", "DDDUSDT"],
             "额度应给离触发最近的，而不是扫描顺序靠前的"
         );
+    }
+
+    #[test]
+    fn funding_rate_veto_blocks_expensive_long() {
+        let mut c = candidate("BTCUSDT", 1.0, 1.0, 1e8, 0.9);
+        c.preview_side = Some("long");
+        c.funding_rate = 0.001;
+        assert!(
+            risk_gate(&c, &gates()).contains("资金费率不利"),
+            "正费率 10bps 超过 5bps 阈值，禁止开多"
+        );
+    }
+
+    #[test]
+    fn funding_rate_veto_blocks_expensive_short() {
+        let mut c = candidate("BTCUSDT", 1.0, 1.0, 1e8, 0.9);
+        c.preview_side = Some("short");
+        c.funding_rate = -0.001;
+        assert!(
+            risk_gate(&c, &gates()).contains("资金费率不利"),
+            "负费率 -10bps 超过 5bps 阈值，禁止开空"
+        );
+    }
+
+    #[test]
+    fn funding_rate_veto_ignores_reverse_side() {
+        let mut c = candidate("BTCUSDT", 1.0, 1.0, 1e8, 0.9);
+        c.preview_side = Some("long");
+        c.funding_rate = -0.001;
+        assert_eq!(
+            risk_gate(&c, &gates()),
+            "",
+            "负费率对空头不利、对多头有利，不能拦做多"
+        );
+    }
+
+    #[test]
+    fn funding_veto_zero_disables_filter() {
+        let mut g = gates();
+        g.funding_veto_bps = 0.0;
+        let mut c = candidate("BTCUSDT", 1.0, 1.0, 1e8, 0.9);
+        c.preview_side = Some("long");
+        c.funding_rate = 0.01;
+        assert_eq!(risk_gate(&c, &g), "", "阈值 0 表示关闭资金费率否决");
     }
 
     #[test]

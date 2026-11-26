@@ -1999,6 +1999,7 @@ fn scan_gates_of(strategy: &Value) -> crate::scan::ScanGates {
             .as_f64()
             .unwrap_or(3_000_000.0),
         spread_bps_max,
+        funding_veto_bps: strategy["funding_veto_bps"].as_f64().unwrap_or(5.0),
         entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
     }
 }
@@ -2566,6 +2567,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 vol_ratio: metric.vol_ratio,
                 quote_volume: market.quote_volume,
                 spread_bps: market.spread_bps,
+                funding_rate: market.funding_rate,
                 strength,
                 preview_side,
             }
@@ -5929,6 +5931,7 @@ mod tests {
                 vol_ratio: 1.0,
                 quote_volume: 1e8,
                 spread_bps: 2.0,
+                funding_rate: 0.0,
                 strength: index as f64 / 40.0,
                 preview_side: None,
             })
@@ -6110,6 +6113,7 @@ mod tests {
             vol_ratio: gates.volume_ratio_min + 0.1,
             quote_volume: gates.min_24h_quote_volume + 1.0,
             spread_bps: 3.0,
+            funding_rate: 0.0,
             strength: 0.5,
             preview_side: None,
         };

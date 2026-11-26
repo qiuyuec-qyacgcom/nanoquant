@@ -69,6 +69,8 @@ fn as_candidate(row: &ScannedSymbol) -> Candidate {
         vol_ratio: row.vol_ratio,
         quote_volume: row.quote_volume,
         spread_bps: row.spread_bps,
+        // 换池只判断「能不能做」，不带方向；资金费率否决依赖 preview_side，这里恒为空。
+        funding_rate: 0.0,
         strength: row.vol_ratio,
         preview_side: None,
     }
@@ -258,6 +260,7 @@ impl Clone for ScanGates {
             volume_ratio_min: self.volume_ratio_min,
             min_24h_quote_volume: self.min_24h_quote_volume,
             spread_bps_max: self.spread_bps_max,
+            funding_veto_bps: self.funding_veto_bps,
             entry_threshold: self.entry_threshold,
         }
     }
@@ -271,6 +274,7 @@ impl std::fmt::Debug for ScanGates {
             .field("volume_ratio_min", &self.volume_ratio_min)
             .field("min_24h_quote_volume", &self.min_24h_quote_volume)
             .field("spread_bps_max", &self.spread_bps_max)
+            .field("funding_veto_bps", &self.funding_veto_bps)
             .field("entry_threshold", &self.entry_threshold)
             .finish()
     }
@@ -307,6 +311,7 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
             .as_f64()
             .unwrap_or(3_000_000.0),
         spread_bps_max,
+        funding_veto_bps: strategy["funding_veto_bps"].as_f64().unwrap_or(5.0),
         entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
     };
     let (endpoint, fallback) = if mode == "live" {
@@ -1384,6 +1389,7 @@ mod tests {
             volume_ratio_min: 0.8,
             min_24h_quote_volume: 3_000_000.0,
             spread_bps_max: 8.0,
+            funding_veto_bps: 0.0,
             entry_threshold: 0.3,
         }
     }

@@ -79,6 +79,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
+    ("strategy", "funding_veto_bps", 0.0, 50.0, 0.5),
     // v2 开仓盈亏比门槛：默认 0.8，低于此值的信号不开仓；1 步 = 0.1 R。
     ("strategy", "min_entry_rr", 0.0, 10.0, 0.1),
     // v2 信号有效期：AI 未给出有效期时使用的 K 线根数，默认 6；整数语义。
@@ -174,6 +175,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "partial_tp_at_r",
             "partial_tp_ratio",
             "max_spread_bps",
+            "funding_veto_bps",
             "roi_table",
         ],
     ),
