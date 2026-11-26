@@ -79,11 +79,8 @@ test('风控分组：日亏基准区块与重置入口存在', async ({ page }) 
   await expect(page.getByRole('button', { name: /重置基准/ })).toBeVisible()
 })
 
-test('信号跟单与总览：关键面板可渲染', async ({ page }) => {
+test('总览：关键面板可渲染', async ({ page }) => {
   await login(page)
-
-  await page.goto('/#/admin/signal-follow')
-  await expect(page.locator('body')).toContainText(/跟仓|跳过|演练/)
 
   await page.goto('/#/admin/dashboard')
   await expect(page.locator('body')).toContainText('引擎控制')

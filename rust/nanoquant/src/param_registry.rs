@@ -26,7 +26,7 @@ const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("engine", "mode"),
     ("engine", "enabled"),
     ("engine", "close_on_halt"),
-    ("signal_follow", "enabled"),
+
     ("backup", "encrypt"),
     ("strategy", "min_entry_rr"),
     ("strategy", "valid_bars"),
@@ -162,12 +162,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("system", "alert_cooldown_sec", 0.0, 86400.0, 1.0),
     ("system", "alert_digest_minutes", 1.0, 1440.0, 1.0),
     ("system", "api_rate_limit_per_min", 0.0, 100000.0, 1.0),
-    ("signal_follow", "poll_sec", 1.0, 3600.0, 1.0),
-    ("signal_follow", "leverage_bonus", 0.0, 100.0, 1.0),
-    ("signal_follow", "max_age_sec", 1.0, 86400.0, 1.0),
-    ("signal_follow", "max_per_hour", 1.0, 1000.0, 1.0),
-    ("signal_follow", "default_sl_pct", 0.0, 100.0, 0.1),
-    ("signal_follow", "margin_pct_override", 0.0, 100.0, 0.1),
+
     ("journal", "min_record_confidence", 0.0, 1.0, 0.01),
     ("journal", "label_after_sec", 1.0, 2592000.0, 3600.0),
     ("journal", "correct_threshold_pct", 0.0, 100.0, 0.01),
@@ -568,7 +563,7 @@ mod tests {
         assert!(is_sensitive("system", "alert_telegram_chat_id"));
         assert!(find("system", "alert_webhook_url").is_none());
         assert!(!find("engine", "enabled").unwrap().ai_writable);
-        assert!(!find("signal_follow", "enabled").unwrap().ai_writable);
+
         assert!(!find("backup", "encrypt").unwrap().ai_writable);
         assert!(!find("risk", "max_leverage").unwrap().ai_writable);
     }

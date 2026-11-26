@@ -74,7 +74,7 @@ mod secret;
 mod settings_api;
 mod sign;
 mod signal_audit;
-mod signal_follow;
+
 
 mod strategies;
 mod submit;
@@ -516,7 +516,7 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         system::spawn_alert_task(system_state.clone());
         api = api.merge(system::routes().with_state(system_state));
         api = api.merge(settings_api::routes().with_state(database.clone()));
-        api = api.merge(signal_follow::routes().with_state(state.clone()));
+
     }
 
     let mut app = Router::new()

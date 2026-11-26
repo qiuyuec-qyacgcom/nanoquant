@@ -15,8 +15,8 @@
     ],
     "schema_version": null
   },
-  "table_count": 23,
-  "model_table_count": 23,
+  "table_count": 22,
+  "model_table_count": 22,
   "missing_in_db": [],
   "extra_in_db": [],
   "model_tables": [
@@ -37,7 +37,6 @@
     "orders",
     "positions",
     "settings_audit",
-    "signal_follows",
     "signals",
     "strategy_profiles",
     "trades",
@@ -2348,206 +2347,6 @@
               "seqno": 0,
               "cid": 3,
               "name": "group_name"
-            }
-          ]
-        }
-      ],
-      "foreign_keys": []
-    },
-    {
-      "name": "signal_follows",
-      "sql": "CREATE TABLE signal_follows (\n\tid INTEGER NOT NULL, \n\tsignal_id VARCHAR(64) NOT NULL, \n\tsymbol VARCHAR(32) NOT NULL, \n\tside VARCHAR(8) NOT NULL, \n\tchannel VARCHAR(64) NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\treason VARCHAR(240) NOT NULL, \n\tleverage INTEGER NOT NULL, \n\tqty FLOAT NOT NULL, \n\tprice FLOAT NOT NULL, \n\tmargin FLOAT NOT NULL, \n\tmode VARCHAR(8) NOT NULL, \n\tpayload JSON, \n\tcreated_at INTEGER NOT NULL, \n\tPRIMARY KEY (id)\n)",
-      "row_count": 0,
-      "columns": [
-        {
-          "cid": 0,
-          "name": "id",
-          "type": "INTEGER",
-          "notnull": true,
-          "default": null,
-          "pk": true
-        },
-        {
-          "cid": 1,
-          "name": "signal_id",
-          "type": "VARCHAR(64)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 2,
-          "name": "symbol",
-          "type": "VARCHAR(32)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 3,
-          "name": "side",
-          "type": "VARCHAR(8)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 4,
-          "name": "channel",
-          "type": "VARCHAR(64)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 5,
-          "name": "status",
-          "type": "VARCHAR(16)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 6,
-          "name": "reason",
-          "type": "VARCHAR(240)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 7,
-          "name": "leverage",
-          "type": "INTEGER",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 8,
-          "name": "qty",
-          "type": "FLOAT",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 9,
-          "name": "price",
-          "type": "FLOAT",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 10,
-          "name": "margin",
-          "type": "FLOAT",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 11,
-          "name": "mode",
-          "type": "VARCHAR(8)",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 12,
-          "name": "payload",
-          "type": "JSON",
-          "notnull": false,
-          "default": null,
-          "pk": false
-        },
-        {
-          "cid": 13,
-          "name": "created_at",
-          "type": "INTEGER",
-          "notnull": true,
-          "default": null,
-          "pk": false
-        }
-      ],
-      "indexes": [
-        {
-          "name": "ix_signal_follows_channel",
-          "unique": false,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 4,
-              "name": "channel"
-            }
-          ]
-        },
-        {
-          "name": "ix_signal_follows_created_at",
-          "unique": false,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 13,
-              "name": "created_at"
-            }
-          ]
-        },
-        {
-          "name": "ix_signal_follows_symbol",
-          "unique": false,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 2,
-              "name": "symbol"
-            }
-          ]
-        },
-        {
-          "name": "ix_signal_follows_status",
-          "unique": false,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 5,
-              "name": "status"
-            }
-          ]
-        },
-        {
-          "name": "ix_signal_follows_signal_id",
-          "unique": true,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 1,
-              "name": "signal_id"
-            }
-          ]
-        },
-        {
-          "name": "ix_signal_follows_mode",
-          "unique": false,
-          "origin": "c",
-          "partial": false,
-          "columns": [
-            {
-              "seqno": 0,
-              "cid": 11,
-              "name": "mode"
             }
           ]
         }

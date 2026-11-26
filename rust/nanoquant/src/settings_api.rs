@@ -31,7 +31,7 @@ pub fn routes() -> Router<Db> {
         .route("/system/system-settings", get(system_settings))
 }
 
-pub(crate) const GROUPS: [&str; 16] = [
+pub(crate) const GROUPS: [&str; 15] = [
     "engine",
     "risk",
     "strategy",
@@ -46,7 +46,7 @@ pub(crate) const GROUPS: [&str; 16] = [
     "security",
     "system",
     "public",
-    "signal_follow",
+
     "journal",
 ];
 

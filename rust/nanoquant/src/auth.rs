@@ -199,8 +199,7 @@ const PASSWORD_GATE_ALLOWED: &[&str] = &["/api/v1/auth/me"];
 /// WebSocket 升级不走 HTTP 中间件（legacy 内核（已退役） 侧同理），但 Rust 的中间件对
 /// 全量请求生效，所以这里要显式放行：WS 自带首帧鉴权。
 const WS_PATHS: &[&str] = &["/api/v1/ws", "/api/v1/ws/klines"];
-/// 机器直推使用 `X-Signal-Token`，鉴权在 handler 内完成，HTTP 中间件先放行。
-const SIGNAL_INGEST_PATH: &str = "/api/v1/signal-follow/ingest";
+
 
 #[derive(serde::Deserialize)]
 pub struct LoginIn {
@@ -365,7 +364,7 @@ pub async fn require_token(State(state): State<AuthState>, req: Request, next: N
         || PASSWORD_CHANGE_ALLOWED.contains(&path)
         || path.starts_with("/api/v1/public/")
         || matches!(path, "/api/v1/ws" | "/api/v1/ws/klines")
-        || path == SIGNAL_INGEST_PATH
+
     {
         return next.run(req).await;
     }
@@ -396,7 +395,7 @@ pub async fn force_password_change(
         || PASSWORD_GATE_ALLOWED.contains(&path)
         || WS_PATHS.contains(&path)
         || path.starts_with("/api/v1/public/")
-        || path == SIGNAL_INGEST_PATH
+
     {
         return next.run(req).await;
     }

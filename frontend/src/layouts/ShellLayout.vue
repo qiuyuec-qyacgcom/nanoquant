@@ -22,7 +22,7 @@ const nav = [
   { group: '交易', items: [
     { path: '/admin/onboarding', label: '开仓检查', ico: '⇥' },
     { path: '/admin/signals', label: '信号审计', ico: '▥' },
-    { path: '/admin/signal-follow', label: '信号跟单', ico: '⇄' },
+
     { path: '/admin/strategies', label: '全局策略', ico: '⚑' },
     { path: '/admin/symbols', label: '标的池', ico: '☰' },
   ]},

@@ -287,21 +287,7 @@
     "show_mantras": true,
     "show_performance": false
   },
-  "signal_follow": {
-    "enabled": false,
-    "jsonl_path": "",
-    "poll_sec": 1,
-    "ingest_token": "",
-    "leverage_bonus": 10,
-    "max_age_sec": 180,
-    "max_per_hour": 6,
-    "auto_add_symbol": true,
-    "strict_events": false,
-    "default_sl_pct": 10.0,
-    "sizing_mode": "margin_pct",
-    "margin_pct_override": 0.0,
-    "dry_run": true
-  },
+
   "journal": {
     "enabled": true,
     "min_record_confidence": 0.45,
