@@ -310,9 +310,9 @@ pub(crate) fn decision_messages_with_personas(
              \"ip\":0,\"vb\":0,\"dq\":0..1,\"rr\":0..10,\"ep\":0,\
              \"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"中文补充<=200字\"} \
              a: L=long S=short H=hold C=close; c=conf; l=lev; m=margin% of equity; s=stop% of position margin (not price); t=tp% of position margin (not price). \
-             why/risk/inv: free Chinese text; ip: invalidation price (0 = not given); vb: valid bars 1..24 (0 = not given); \
-             dq: data quality 0..1; rr: expected reward/risk 0..10; ep: preferred entry price (0 = not given, only for post-only). \
-             Four Chinese text fields (why+risk+inv+f) must not exceed 2000 chars in total. \
+             why/risk/inv: free Chinese text; ip: invalidation price (0 = not given, within 10% of current price); vb: valid bars 1..24 (0 = not given); \
+             dq: data quality 0..1; rr: expected reward/risk 0..10; ep: preferred entry price (0 = not given, within 0.5% of current price, only for post-only). \
+             Four Chinese text fields (why+risk+inv+f) must not exceed 2000 chars in total (including indicator/supplement prefixes). \
              r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
              11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
              20volhigh 21liqnear 22resist 23lowvol 24mantra. \
@@ -611,6 +611,7 @@ async fn decision_preview(
         ));
     }
     let mut call = ChatCall::new(&messages, "preview");
+    call.max_tokens = Some(16000);
     call.temperature = Some(cfg.temperature);
     let outcome =
         ai_client::chat_with_fallback(state.transport.as_ref(), &state.db, &chain, call, &cfg)
@@ -799,6 +800,9 @@ mod tests {
         let system = &messages[0].content;
         for key in ["why", "risk", "inv", "ip", "vb", "dq", "rr", "ep"] {
             assert!(system.contains(key), "prompt 缺少字段 {key}");
+        }
+        for key in ["2000", "1..24", "post-only", "10%", "0.5%", "\"ip\":0"] {
+            assert!(system.contains(key), "prompt 缺少口径 {key}");
         }
     }
 

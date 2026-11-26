@@ -486,6 +486,11 @@ fn truncate(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+/// 请求预算按 provider 上限取大：显式预算只作为下限，避免推理模型被小预算截断。
+fn effective_max_tokens(call_max: Option<i64>, provider_max: i64) -> i64 {
+    call_max.map_or(provider_max, |v| v.max(provider_max)).max(1)
+}
+
 /// 一次真实调用。成功与失败都写 `ai_call_logs`；失败不伪造空成功。
 pub async fn chat(
     transport: &dyn AiTransport,
@@ -507,7 +512,7 @@ pub async fn chat(
     };
     let json_mode = call.json_mode.unwrap_or(provider.json_mode);
     let temperature = call.temperature.unwrap_or(provider.temperature);
-    let max_tokens = call.max_tokens.unwrap_or(provider.max_tokens).max(1);
+    let max_tokens = effective_max_tokens(call.max_tokens, provider.max_tokens);
     let mut payload = build_payload(provider, call.messages, json_mode, temperature, max_tokens);
     let effort = call
         .reasoning_effort
@@ -1197,6 +1202,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
         params,
         invalidation_price: opt_float("invalidation_price").filter(|v| within(*v, IP_TOLERANCE)),
         valid_bars: opt_float("valid_bars")
+            .filter(|v| *v > 0.0)
             .map(|v| v.round() as i64)
             .map(|v| v.clamp(VB_MIN, VB_MAX)),
         data_quality: opt_float("data_quality").map(|v| v.clamp(0.0, DQ_MAX)),
@@ -2025,7 +2031,7 @@ mod tests {
     fn extended_numbers_are_clamped() {
         let ctx = json!({"price": 100.0});
         let low =
-            parse_decision(r#"{"a":"L","c":0.7,"dq":-1,"rr":-1,"vb":0}"#, Some(&ctx)).unwrap();
+            parse_decision(r#"{"a":"L","c":0.7,"dq":-1,"rr":-1,"vb":0.4}"#, Some(&ctx)).unwrap();
         assert_eq!(low.data_quality, Some(0.0));
         assert_eq!(low.rr_target, Some(0.0));
         assert_eq!(low.valid_bars, Some(VB_MIN));
@@ -2069,6 +2075,20 @@ mod tests {
         let ctx = json!({"price": 100.0});
         let d = parse_decision(r#"{"a":"L","c":0.7,"vb":6.0}"#, Some(&ctx)).unwrap();
         assert_eq!(d.valid_bars, Some(6));
+    }
+
+    #[test]
+    fn vb_zero_means_not_given() {
+        let ctx = json!({"price": 100.0});
+        let d = parse_decision(r#"{"a":"L","c":0.7,"vb":0}"#, Some(&ctx)).unwrap();
+        assert_eq!(d.valid_bars, None);
+    }
+
+    #[test]
+    fn effective_max_tokens_respects_provider_ceiling() {
+        assert_eq!(effective_max_tokens(Some(16000), 32000), 32000);
+        assert_eq!(effective_max_tokens(Some(16000), 3000), 16000);
+        assert_eq!(effective_max_tokens(None, 3000), 3000);
     }
 
     #[test]
