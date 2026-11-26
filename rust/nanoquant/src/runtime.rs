@@ -21,6 +21,10 @@ const GLOBAL_COOLDOWN_SYMBOL: &str = "__global__";
 /// LIMIT 开仓挂单的最短超时。周期更长时按 `cycle_interval_sec * 2` 放宽。
 const LIMIT_ORDER_TIMEOUT_SEC: i64 = 120;
 
+/// AI 建议入场价与现价的最大偏离。与 `ai_client::EP_TOLERANCE` 同源：
+/// 解析层先按该容差剔一次，执行层再用同一口径复核，避免跨层漂移。
+const PREFERRED_ENTRY_TOLERANCE: f64 = 0.005;
+
 /// 引擎判活阈值（秒）。
 ///
 /// 必须跟着扫描周期走：周期 10 分钟时，两轮之间天然有近 10 分钟没有新的扫描心跳，
@@ -1857,6 +1861,47 @@ fn limit_entry_price(side: &str, bid: f64, ask: f64, mark: f64) -> f64 {
     }
 }
 
+/// AI 建议限价只在「方向正确且贴近现价」时采用，否则回退宿主挂单价。
+/// 先按交易所 tick 归整：买单向下、卖单向上，归整后再复核一次，
+/// 避免归整把价格推出容差或推成反向。tick 不可信（<=0/非有限）时保留原值，
+/// 依赖下游 `SymbolFilter::format_price` 按小数位归整（后续项：归整下沉到下单出口）。
+fn preferred_limit_price(side: &str, mark: f64, ai_entry_price: f64, tick: f64) -> Option<f64> {
+    if !mark.is_finite() || mark <= 0.0 {
+        return None;
+    }
+    if !ai_entry_price.is_finite() || ai_entry_price <= 0.0 {
+        return None;
+    }
+    if side != "BUY" && side != "SELL" {
+        return None;
+    }
+    if (ai_entry_price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
+        return None;
+    }
+    if (side == "BUY" && ai_entry_price > mark) || (side == "SELL" && ai_entry_price < mark) {
+        return None;
+    }
+    let price = if tick.is_finite() && tick > 0.0 {
+        if side == "BUY" {
+            crate::live::floor_to_step(ai_entry_price, tick)
+        } else {
+            crate::live::ceil_to_step(ai_entry_price, tick)
+        }
+    } else {
+        ai_entry_price
+    };
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    if (price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
+        return None;
+    }
+    if (side == "BUY" && price > mark) || (side == "SELL" && price < mark) {
+        return None;
+    }
+    Some(price)
+}
+
 /// 开仓成交费率：只做 Maker 的限价开仓用 maker 费率，其余（市价开仓、
 /// 平仓、保护单）一律 taker，保证 positions/trades 的手续费口径一致。
 fn plan_fee_rate(plan: &LivePlan, taker_rate: f64, maker_rate: f64) -> f64 {
@@ -3087,10 +3132,17 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                             .map(|market| (market.bid, market.ask))
                             .unwrap_or((draft.mark_price, draft.mark_price));
                         let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
-                        // AI 建议价只在方向正确且贴近现价时采用，否则回退宿主挂单价。
+                        // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
                         let price = reviewed
                             .entry_price
-                            .and_then(|ep| preferred_limit_price(side, draft.mark_price, ep))
+                            .and_then(|ai_entry_price| {
+                                Self::preferred_limit_price(
+                                    side,
+                                    draft.mark_price,
+                                    ai_entry_price,
+                                    draft.filter.price_tick,
+                                )
+                            })
                             .unwrap_or(fallback);
                         Some(price)
                     }
@@ -5623,19 +5675,6 @@ async fn refresh_account_balance(
     .map_err(|error| error.to_string())
 }
 
-/// AI 建议限价只在「方向正确且偏离现价 ≤0.5%」时采用，否则回退宿主挂单价。
-fn preferred_limit_price(side: &str, mark: f64, preferred: f64) -> Option<f64> {
-    if !preferred.is_finite() || preferred <= 0.0 || mark <= 0.0 {
-        return None;
-    }
-    if (preferred - mark).abs() / mark > 0.005 {
-        return None;
-    }
-    if (side == "BUY" && preferred > mark) || (side == "SELL" && preferred < mark) {
-        return None;
-    }
-    Some(preferred)
-}
 
 #[cfg(test)]
 mod tests {
@@ -5916,13 +5955,59 @@ mod tests {
     fn preferred_entry_price_used_only_when_valid() {
         // 只做 Maker 时，AI 建议价必须方向正确且贴近现价才采用；
         // 越界、反向、偏离超 0.5% 或非有限值一律回退宿主挂单价。
-        assert_eq!(preferred_limit_price("BUY", 100.0, 99.8), Some(99.8));
-        assert_eq!(preferred_limit_price("BUY", 100.0, 100.5), None);
-        assert_eq!(preferred_limit_price("SELL", 100.0, 100.2), Some(100.2));
-        assert_eq!(preferred_limit_price("SELL", 100.0, 99.8), None);
-        assert_eq!(preferred_limit_price("BUY", 100.0, 99.0), None);
-        assert_eq!(preferred_limit_price("BUY", 100.0, f64::NAN), None);
-
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.8, 0.01),
+            Some(99.8)
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 100.5, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("SELL", 100.0, 100.2, 0.01),
+            Some(100.2)
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("SELL", 100.0, 99.8, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.0, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, f64::NAN, 0.01),
+            None
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", f64::NAN, 99.8, 0.01),
+            None,
+            "非有限的现价无法判定偏离，必须回退"
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("HOLD", 100.0, 99.9, 0.01),
+            None,
+            "未知方向不能采用 AI 建议价"
+        );
+        // 买单向下归整、卖单向上归整，保证挂单价不越过 AI 意图且符合 tick。
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.984, 0.01),
+            Some(99.98)
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("SELL", 100.0, 100.016, 0.01),
+            Some(100.02)
+        );
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.8, 1.0),
+            None,
+            "归整后偏离超过 0.5% 必须回退"
+        );
+        // tick 不可信时保留原值，依赖下游 format_price 按小数位归整。
+        assert_eq!(
+            EngineRuntime::preferred_limit_price("BUY", 100.0, 99.8, 0.0),
+            Some(99.8)
+        );
     }
 
     #[test]
@@ -5962,10 +6047,16 @@ mod tests {
             b"MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=".to_vec(),
             crate::events::EventBus::new(None),
         )
-        .with_reviewer(Arc::new(TestApproveReviewer))
+        .with_reviewer(Arc::new(TestApproveReviewer::default()))
     }
 
-    struct TestApproveReviewer;
+    struct TestApproveReviewer(Option<f64>);
+
+    impl Default for TestApproveReviewer {
+        fn default() -> Self {
+            Self(None)
+        }
+    }
 
     impl crate::review::AiReviewer for TestApproveReviewer {
         fn review(
@@ -6002,7 +6093,7 @@ mod tests {
                 valid_bars: None,
                 data_quality: None,
                 rr_target: None,
-                entry_price: None,
+                entry_price: self.0,
             })
         }
     }
@@ -6622,6 +6713,40 @@ mod tests {
         assert!(replanned.is_empty(), "挂单未完成时不能重复发单");
     }
 
+    /// 用指定 AI 建议价跑一轮只做 Maker 的开仓规划，返回计划价与买一。
+    async fn limit_post_only_plan_with_ai_price(ai_entry_price: Option<f64>) -> (LivePlan, f64) {
+        let (db, snapshot) = entry_fixture().await;
+        set_engine_settings(
+            &db,
+            r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
+        );
+        let runtime =
+            test_runtime(&db).with_reviewer(Arc::new(TestApproveReviewer(ai_entry_price)));
+        let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
+        assert_eq!(plans.len(), 1, "必须产出一张限价开仓计划");
+        let bid = snapshot.markets[0].bid;
+        (plans[0].clone(), bid)
+    }
+
+    #[tokio::test]
+    async fn live_limit_post_only_entry_uses_ai_entry_price_only_when_valid() {
+        // 合法 AI 建议价要替代宿主买一挂单价，直接进入计划。
+        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.95)).await;
+        assert_eq!(plan.order_type, LiveOrderType::LimitPostOnly);
+        assert_eq!(plan.side, "BUY");
+        assert_eq!(plan.price, Some(99.95), "合法 AI 建议价必须进入计划价");
+
+        // 不在 tick 上的建议价按买单向下归整，归整后的价格进入计划。
+        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.984)).await;
+        assert_eq!(plan.price, Some(99.98), "AI 建议价要按 tick 向下归整");
+
+        // 高于现价（方向错误）与偏离超 0.5% 的建议价必须回退买一。
+        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(100.5)).await;
+        assert_eq!(plan.price, Some(bid), "反向建议价必须回退买一");
+        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(99.0)).await;
+        assert_eq!(plan.price, Some(bid), "偏离超限必须回退买一");
+    }
+
     #[tokio::test]
     async fn live_order_type_limit_entry_rejection_is_not_resent() {
         let (db, snapshot) = entry_fixture().await;
@@ -7093,7 +7218,7 @@ mod tests {
             b"MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=".to_vec(),
             crate::events::EventBus::new(Some(db.clone())),
         )
-        .with_reviewer(Arc::new(TestApproveReviewer))
+        .with_reviewer(Arc::new(TestApproveReviewer::default()))
     }
 
     /// 一笔已开仓的 demo 夹具：由标记价决定触发止损（亏损）还是止盈（盈利）。
