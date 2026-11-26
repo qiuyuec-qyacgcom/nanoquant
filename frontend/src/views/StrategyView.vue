@@ -213,6 +213,12 @@ const BASE_META: Record<string, FieldMeta> = {
   partial_tp_ratio: { label: '部分止盈比例', unit: '比例', hint: '0.5 = 平一半，剩余交给移动止损' },
   max_spread_bps: { label: '盘口点差上限', unit: 'bps', hint: '买一卖一价差超过该值就放弃开仓；0=关闭。短线建议 5–12bps' },
   funding_veto_bps: { label: '资金费率否决', unit: 'bps', hint: '资金费率超过该值时，禁止开同向仓（正费率禁多、负费率禁空）', min: 0, max: 50, step: 0.5 },
+  mr_enabled: { label: '均值回归', hint: '只在震荡市（regime=range）启用；关闭后震荡市继续走趋势信号' },
+  mr_rsi_high: { label: 'RSI 超买线', hint: 'RSI 高于该值且收盘突破布林上轨时做空', min: 50, max: 90, step: 1 },
+  mr_rsi_low: { label: 'RSI 超卖线', hint: 'RSI 低于该值且收盘跌破布林下轨时做多', min: 10, max: 50, step: 1 },
+  mr_band_k: { label: '布林带倍数', unit: 'σ', hint: '20 日均线 ± N 倍标准差构成上下轨；倍数越大越难触发', min: 1, max: 4, step: 0.1 },
+  mr_sl_pct: { label: '均值回归止损率', unit: '%', hint: '保证金口径；价格距离 = 该值 ÷ 杠杆，不继承全局止损率', min: 5, max: 50, step: 1 },
+  mr_tp_pct: { label: '均值回归止盈率', unit: '%', hint: '保证金口径；价格距离 = 该值 ÷ 杠杆，不继承全局止盈率', min: 5, max: 100, step: 1 },
   roi_table: {
     label: '时间阶梯止盈',
     widget: 'roi',

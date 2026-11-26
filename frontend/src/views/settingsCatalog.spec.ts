@@ -56,6 +56,19 @@ describe('参数配置目录', () => {
     expect(model?.fields).toEqual([])
   })
 
+  it('策略分组展示均值回归参数', () => {
+    const section = SETTINGS_SECTIONS.strategy.find((s) => s.title === '均值回归 · 震荡市')
+    expect(section, '震荡市均值回归参数必须可配置').toBeTruthy()
+    expect(section?.fields).toEqual([
+      'mr_enabled',
+      'mr_rsi_high',
+      'mr_rsi_low',
+      'mr_band_k',
+      'mr_sl_pct',
+      'mr_tp_pct',
+    ])
+  })
+
   it('保留实盘常用参数', () => {
     const required = [
       'cycle_interval_sec',

@@ -367,6 +367,7 @@ pub(crate) fn build_config(
         max_bars_hold: None,
         policy,
         manage,
+        mr: params.clone(),
     })
 }
 

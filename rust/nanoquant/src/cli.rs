@@ -925,6 +925,7 @@ fn verify_partial_tp(options: &Options) -> Result<(i32, Value), (i32, String)> {
         partial_taken: false,
         score: 0.0,
         held_minutes: 0.0,
+        margin_stop_take: None,
     };
     let expected_qty = {
         let raw = base.qty * cfg.partial_tp_ratio;

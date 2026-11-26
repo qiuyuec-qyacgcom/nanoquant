@@ -30,6 +30,8 @@ const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("backup", "encrypt"),
     ("strategy", "min_entry_rr"),
     ("strategy", "valid_bars"),
+    // 均值回归开关是人工断路器，AI 调参不得自行关闭。
+    ("strategy", "mr_enabled"),
 ];
 
 pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
@@ -85,6 +87,11 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
     ("strategy", "funding_veto_bps", 0.0, 50.0, 0.5),
+    ("strategy", "mr_rsi_high", 50.0, 90.0, 1.0),
+    ("strategy", "mr_rsi_low", 10.0, 50.0, 1.0),
+    ("strategy", "mr_band_k", 1.0, 4.0, 0.1),
+    ("strategy", "mr_sl_pct", 5.0, 50.0, 1.0),
+    ("strategy", "mr_tp_pct", 5.0, 100.0, 1.0),
     // v2 开仓盈亏比门槛：默认 0.8，低于此值的信号不开仓；1 步 = 0.1 R。
     ("strategy", "min_entry_rr", 0.0, 10.0, 0.1),
     // v2 信号有效期：AI 未给出有效期时使用的 K 线根数，默认 6；整数语义。
@@ -190,6 +197,12 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "partial_tp_ratio",
             "max_spread_bps",
             "funding_veto_bps",
+            "mr_enabled",
+            "mr_rsi_high",
+            "mr_rsi_low",
+            "mr_band_k",
+            "mr_sl_pct",
+            "mr_tp_pct",
             "roi_table",
         ],
     ),

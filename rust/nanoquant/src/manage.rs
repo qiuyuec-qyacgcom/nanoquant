@@ -44,6 +44,8 @@ pub struct ManagedPosition {
     pub score: f64,
     /// 持仓时长（分钟），用于时间阶梯止盈。
     pub held_minutes: f64,
+    /// 均值回归仓的独立保证金止损/止盈率，覆盖全局阈值。
+    pub margin_stop_take: Option<(f64, f64)>,
 }
 
 /// 管仓参数。
@@ -81,13 +83,17 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
         0.0
     };
     // 全局止盈止损按保证金收益率判断：价格变动 × 杠杆。
+    // 均值回归仓使用开仓时快照的独立阈值，不继承趋势仓的全局阈值。
+    let (stop_loss_pct, take_profit_pct) = pos
+        .margin_stop_take
+        .unwrap_or((cfg.global_stop_loss_pct, cfg.global_take_profit_pct));
     let margin_pct = price_pct * pos.leverage.max(1.0);
-    if cfg.global_stop_loss_pct > 0.0 && margin_pct <= -cfg.global_stop_loss_pct {
+    if stop_loss_pct > 0.0 && margin_pct <= -stop_loss_pct {
         return ManageAction::Close {
             reason: "global_stop_loss".to_string(),
         };
     }
-    if cfg.global_take_profit_pct > 0.0 && margin_pct >= cfg.global_take_profit_pct {
+    if take_profit_pct > 0.0 && margin_pct >= take_profit_pct {
         return ManageAction::Close {
             reason: "global_take_profit".to_string(),
         };
@@ -244,6 +250,7 @@ mod tests {
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,
+            margin_stop_take: None,
         }
     }
 
@@ -388,6 +395,45 @@ mod tests {
             manage(&pos, &config),
             ManageAction::Close {
                 reason: "global_stop_loss".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mean_reversion_position_uses_independent_margin_limits() {
+        let mut pos = long_pos();
+        pos.sl_price = 0.0;
+        pos.tp_price = 0.0;
+        pos.margin_stop_take = Some((20.0, 30.0));
+        let mut config = cfg();
+        config.global_stop_loss_pct = 10.0;
+        config.global_take_profit_pct = 20.0;
+        config.partial_tp_at_r = 0.0;
+        config.trailing_pct = 0.0;
+        config.breakeven_at_r = 0.0;
+        config.roi_min_r = 0.0;
+        config.roi_table.clear();
+        config.exit_threshold = 10.0;
+
+        // 保证金 -15%：全局 10% 会提前平仓，独立 20% 应继续持有。
+        pos.mark_price = 98.5;
+        assert_eq!(manage(&pos, &config), ManageAction::Hold);
+        // 保证金 -20%：独立止损生效。
+        pos.mark_price = 98.0;
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "global_stop_loss".to_string()
+            }
+        );
+        // 保证金 +25%：全局 20% 会提前止盈，独立 30% 应继续持有。
+        pos.mark_price = 102.5;
+        assert_eq!(manage(&pos, &config), ManageAction::Hold);
+        pos.mark_price = 103.0;
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "global_take_profit".to_string()
             }
         );
     }

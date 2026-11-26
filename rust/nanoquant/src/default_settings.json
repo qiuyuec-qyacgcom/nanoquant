@@ -71,6 +71,12 @@
     "partial_tp_ratio": 0.5,
     "max_spread_bps": 8.0,
     "funding_veto_bps": 5,
+    "mr_enabled": true,
+    "mr_rsi_high": 70,
+    "mr_rsi_low": 30,
+    "mr_band_k": 2.0,
+    "mr_sl_pct": 20,
+    "mr_tp_pct": 30,
     "roi_table": [
       [
         0,

@@ -54,6 +54,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       ],
     },
     {
+      title: '均值回归 · 震荡市',
+      hint: '只在 regime=range 启用：RSI 超买/超卖与布林带越界同向共振，且量能收敛才开仓；止损止盈使用独立的保证金阈值，不继承趋势仓全局值。',
+      fields: ['mr_enabled', 'mr_rsi_high', 'mr_rsi_low', 'mr_band_k', 'mr_sl_pct', 'mr_tp_pct'],
+    },
+    {
       title: '信号模型 · NQ-Fusion',
       hint: '当前唯一信号模型（fusion）。按趋势/震荡/高波动状态加权相对强弱、波动突破、资金费率与 OI/订单流；至少两个因子同向且置信度达标才开仓。',
       fields: [],

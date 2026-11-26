@@ -457,6 +457,7 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
         max_bars_hold: None,
         policy,
         manage,
+        mr: prepared.strategy.clone(),
     }
 }
 

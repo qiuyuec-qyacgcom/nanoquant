@@ -40,6 +40,9 @@ pub struct EngineConfig {
     pub max_bars_hold: Option<usize>,
     pub policy: TradePolicy,
     pub manage: ManageConfig,
+    /// 策略参数快照：range 市均值回归的开关、阈值与独立止损止盈。
+    /// 缺省 `Value::Null` 时均值回归关闭，保持既有回测语义。
+    pub mr: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +106,8 @@ struct OpenPosition {
     entry_index: usize,
     peak: f64,
     liq_price: f64,
+    /// 该仓来自均值回归信号：退出阈值使用独立保证金止损止盈。
+    mean_reversion: bool,
 }
 
 struct Sim<'a> {
@@ -265,6 +270,18 @@ impl<'a> Sim<'a> {
                 let held_bars = index - position.entry_index;
                 let peak = position.peak;
                 let partial = position.partial;
+                let mean_reversion = position.mean_reversion;
+                let (global_stop, global_tp) = if mean_reversion {
+                    (
+                        self.config.mr["mr_sl_pct"].as_f64().unwrap_or(20.0),
+                        self.config.mr["mr_tp_pct"].as_f64().unwrap_or(30.0),
+                    )
+                } else {
+                    (
+                        self.config.manage.global_stop_loss_pct,
+                        self.config.manage.global_take_profit_pct,
+                    )
+                };
 
                 let previous_ts = self.bars[index - 1].open_time;
                 let crossings = funding_crossings(previous_ts, bar.open_time);
@@ -299,15 +316,11 @@ impl<'a> Sim<'a> {
                 } else {
                     0.0
                 };
-                if self.config.manage.global_stop_loss_pct > 0.0
-                    && bar_margin_pct <= -self.config.manage.global_stop_loss_pct
-                {
+                if global_stop > 0.0 && bar_margin_pct <= -global_stop {
                     self.close_position(bar.close, index, "global_stop_loss");
                     continue;
                 }
-                if self.config.manage.global_take_profit_pct > 0.0
-                    && bar_margin_pct >= self.config.manage.global_take_profit_pct
-                {
+                if global_tp > 0.0 && bar_margin_pct >= global_tp {
                     self.close_position(bar.close, index, "global_take_profit");
                     continue;
                 }
@@ -423,25 +436,51 @@ impl<'a> Sim<'a> {
             } else {
                 0.0
             };
-            let Some(signal) = trade_policy::evaluate(
-                slice,
-                bar.close,
-                metrics.atr,
-                self.config.policy,
-                MarketFeatures {
-                    funding_rate: self.config.funding_bps_8h / 10_000.0,
-                    open_interest_change_pct: f64::NAN,
-                    relative_strength,
-                    relative_strength_available: true,
-                },
-            ) else {
-                continue;
+            let features = MarketFeatures {
+                funding_rate: self.config.funding_bps_8h / 10_000.0,
+                open_interest_change_pct: f64::NAN,
+                relative_strength,
+                relative_strength_available: true,
             };
-            let direction = direction_of(signal.side);
+            // 与实盘同路由：range 且启用均值回归时，趋势信号不参与开仓。
+            let regime = trade_policy::regime_for(slice, bar.close, metrics.atr, features);
+            let mean_reversion = crate::mean_reversion::mean_reversion_active(
+                regime.map(|regime| regime.as_str()),
+                &self.config.mr,
+            );
+            let (side, score) = if mean_reversion {
+                let Some(signal) =
+                    crate::mean_reversion::mean_reversion_signal(slice, &self.config.mr)
+                else {
+                    continue;
+                };
+                (signal.side, signal.score)
+            } else {
+                let Some(signal) = trade_policy::evaluate(
+                    slice,
+                    bar.close,
+                    metrics.atr,
+                    self.config.policy,
+                    features,
+                ) else {
+                    continue;
+                };
+                (signal.side, signal.score)
+            };
+            let direction = direction_of(side);
             let next = self.bars[index + 1];
             let entry = fill_price(next.open, self.slip_bps(), direction, true);
-            let sl_pct = self.config.manage.global_stop_loss_pct / leverage;
-            let tp_pct = self.config.manage.global_take_profit_pct / leverage;
+            let (sl_pct, tp_pct) = if mean_reversion {
+                (
+                    self.config.mr["mr_sl_pct"].as_f64().unwrap_or(20.0) / leverage,
+                    self.config.mr["mr_tp_pct"].as_f64().unwrap_or(30.0) / leverage,
+                )
+            } else {
+                (
+                    self.config.manage.global_stop_loss_pct / leverage,
+                    self.config.manage.global_take_profit_pct / leverage,
+                )
+            };
             if sl_pct <= 0.0 || tp_pct <= 0.0 || entry <= 0.0 {
                 continue;
             }
@@ -454,7 +493,7 @@ impl<'a> Sim<'a> {
             let entry_fee = entry * qty * self.fee_rate();
             self.fee_total += entry_fee;
             self.position = Some(OpenPosition {
-                side: signal.side.to_string(),
+                side: side.to_string(),
                 entry_ts: next.open_time,
                 entry: round(entry, 8),
                 qty,
@@ -467,10 +506,11 @@ impl<'a> Sim<'a> {
                 realized: 0.0,
                 funding: 0.0,
                 partial: false,
-                score: signal.score,
+                score,
                 entry_index: index + 1,
                 peak: next.open,
                 liq_price: entry * (1.0 - direction * (1.0 / leverage - mmr)),
+                mean_reversion,
             });
         }
 
@@ -1424,6 +1464,7 @@ mod tests {
                 roi_min_r: 0.0,
                 roi_table: Vec::new(),
             },
+            mr: Value::Null,
         }
     }
 
@@ -1485,6 +1526,7 @@ mod tests {
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,
+            margin_stop_take: None,
         };
         let action = crate::manage::manage(
             &position,
@@ -1666,6 +1708,73 @@ let bars = trending_bars(1200);
                 (format!("SYM{}USDT", symbol + 1), bars)
             })
             .collect()
+    }
+
+    /// 合成震荡市：每 20 根在末端来一次缩量急涨，随后回落。
+    /// 急涨单根把 RSI/布林带推到超买，但 ADX 窗口里多数是小幅交替，regime 仍是 range。
+    fn mean_reversion_range_bars(count: usize) -> Vec<HistoryBar> {
+        let mut price = 100.0;
+        let mut bars = Vec::with_capacity(count);
+        for index in 0..count {
+            let phase = index % 20;
+            let open = price;
+            let close = match phase {
+                18 => open + 2.0,
+                19 => 100.8,
+                0 => 100.0,
+                _ if phase % 2 == 1 => 100.05,
+                _ => 99.95,
+            };
+            let volume = if phase == 18 { 300.0 } else { 1000.0 };
+            let open_time = index as i64 * 900_000;
+            bars.push(HistoryBar {
+                open_time,
+                close_time: open_time + 899_999,
+                open,
+                high: open.max(close) + 0.1,
+                low: open.min(close) - 0.1,
+                close,
+                volume,
+            });
+            price = close;
+        }
+        bars
+    }
+
+    #[test]
+    fn mean_reversion_trades_in_range_with_independent_stops() {
+        let bars = mean_reversion_range_bars(320);
+        let mut config = config();
+        config.policy.volume_ratio_min = 0.0;
+        config.mr = json!({
+            "mr_enabled": true,
+            "mr_rsi_high": 70,
+            "mr_rsi_low": 30,
+            "mr_band_k": 2.0,
+            "mr_sl_pct": 20,
+            "mr_tp_pct": 30,
+        });
+        let result = run(&bars, &config).unwrap();
+        let mut trades: Vec<_> = result
+            .trades
+            .iter()
+            .filter(|trade| trade.side == "short")
+            .collect();
+        trades.sort_by_key(|trade| trade.entry_ts);
+        let trade = trades
+            .first()
+            .unwrap_or_else(|| panic!("range 内的缩量急涨应产生空单: {:?}", result.summary));
+        assert!(
+            (trade.sl_pct - 1.0).abs() < 1e-9,
+            "MR 止损率 20% / 20x 应换算成 1% 价格距离，实际 {}",
+            trade.sl_pct
+        );
+        assert!(
+            (trade.tp_pct - 1.5).abs() < 1e-9,
+            "MR 止盈率 30% / 20x 应换算成 1.5% 价格距离，实际 {}",
+            trade.tp_pct
+        );
+        assert!(trade.pnl_pct > 0.0, "急涨回落应让空单盈利");
     }
 
     fn tagged_regimes_cover_target(basket: &[(String, Vec<HistoryBar>)], target: &str) -> usize {

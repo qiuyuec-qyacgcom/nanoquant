@@ -176,6 +176,8 @@ struct EntryDraft {
     margin_max_pct: f64,
     stop_price: f64,
     take_profit: f64,
+    /// 该草稿来自 range 市的均值回归信号；止损止盈走独立阈值。
+    mean_reversion: bool,
     score: f64,
     mark_price: f64,
     filter: crate::live::SymbolFilter,
@@ -243,6 +245,7 @@ impl EntryDraft {
                 self.quant_score.map(Value::from).unwrap_or(Value::Null),
             );
             object.insert("mark_price".to_string(), json!(self.mark_price));
+            object.insert("mean_reversion".to_string(), json!(self.mean_reversion));
         }
         let mut row = crate::signal_audit::AuditSignal::new(&self.symbol)
             .with_direction(direction)
@@ -1335,6 +1338,29 @@ impl EngineControl {
     }
 }
 
+/// 当前生效的 regime：优先用状态机确认后的 `regime.current`，
+/// 首轮尚未推进时回退到本轮投票写入的 `market_regime`。
+fn current_regime(
+    tx: &rusqlite::Transaction<'_>,
+    mode: &str,
+) -> Result<Option<String>, String> {
+    for key in [
+        format!("regime.current.{mode}"),
+        format!("market_regime.{mode}"),
+    ] {
+        let value: Option<String> = tx
+            .query_row("SELECT value FROM engine_state WHERE key=?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 impl EngineRuntime {
     pub(crate) fn manage_config(strategy: &Value, risk: &Value) -> crate::manage::ManageConfig {
         crate::manage::ManageConfig {
@@ -2199,7 +2225,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             let mut stmt = tx
                 .prepare(
                     "SELECT id,symbol,side,qty,entry_price,sl_price,tp_price,peak_price,\
-                     initial_sl_price,signal_score,partial_taken_at,opened_at,leverage FROM positions \
+                     initial_sl_price,signal_score,partial_taken_at,opened_at,leverage,features FROM positions \
                      WHERE mode=?1 AND status='open' ORDER BY opened_at,id",
                 )
                 .map_err(|error| error.to_string())?;
@@ -2219,6 +2245,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, Option<i64>>(11)?.unwrap_or(0),
                         row.get::<_, Option<f64>>(12)?.unwrap_or(1.0),
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 })
                 .map_err(|error| error.to_string())?;
@@ -2241,6 +2268,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             partial,
             opened_at,
             leverage,
+            features,
         ) in rows
         {
             if blocked.contains(symbol.as_str()) {
@@ -2281,23 +2309,29 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             )
             .map_err(|error| error.to_string())?;
             // 信号反转要看当轮方向分：开仓时的分数不会随行情翻转。
-            let score = metrics
-                .get(market.symbol.as_str())
-                .and_then(|metric| {
-                    crate::trade_policy::evaluate(
-                        &market.candles,
-                        mark,
-                        metric.atr,
-                        policy,
-                        crate::trade_policy::MarketFeatures {
-                            funding_rate: market.funding_rate,
-                            open_interest_change_pct: market.open_interest_change_pct,
-                            relative_strength: 0.0,
-                            relative_strength_available: false,
-                        },
-                    )
-                })
-                .map_or(signal_score, |signal| signal.score);
+            // 均值回归仓的评分无方向符号，且出场由独立阈值接管，这里给 0 避免误触发反转平仓。
+            let margin_stop_take = crate::mean_reversion::position_margin_limits(features.as_deref());
+            let score = if margin_stop_take.is_some() {
+                0.0
+            } else {
+                metrics
+                    .get(market.symbol.as_str())
+                    .and_then(|metric| {
+                        crate::trade_policy::evaluate(
+                            &market.candles,
+                            mark,
+                            metric.atr,
+                            policy,
+                            crate::trade_policy::MarketFeatures {
+                                funding_rate: market.funding_rate,
+                                open_interest_change_pct: market.open_interest_change_pct,
+                                relative_strength: 0.0,
+                                relative_strength_available: false,
+                            },
+                        )
+                    })
+                    .map_or(signal_score, |signal| signal.score)
+            };
             let held_minutes = (crate::now() - opened_at).max(0) as f64 / 60.0;
             symbols.push(symbol);
             positions.push(crate::manage::ManagedPosition {
@@ -2313,6 +2347,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 partial_taken: partial.is_some(),
                 score,
                 held_minutes,
+                margin_stop_take,
             });
         }
         Ok((symbols, positions))
@@ -2669,6 +2704,11 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 .collect()
         };
         let concurrency = Self::scan_concurrency_of(&engine);
+        // range 市若启用均值回归，候选排序与方向也要跟着 MR 信号走，
+        // 否则趋势预览分低的正宗 MR 机会会在扫描阶段被 budget 截掉。
+        let regime = current_regime(tx, mode)?;
+        let mean_reversion_active =
+            crate::mean_reversion::mean_reversion_active(regime.as_deref(), strategy);
         let candidates: Vec<_> = Self::map_bounded(&snapshot.markets, concurrency, |market| {
             let metric = &metrics[market.symbol.as_str()];
             let recent = &market.candles[market.candles.len() - 20..];
@@ -2696,9 +2736,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     relative_strength_available: relative_strength.contains_key(&market.symbol),
                 },
             );
-            let (strength, preview_side) = match preview {
-                Some(preview) => (preview.score.abs(), Some(preview.side)),
-                None => (0.0, None),
+            let (strength, preview_side) = if mean_reversion_active {
+                match crate::mean_reversion::mean_reversion_signal(&market.candles, strategy) {
+                    Some(signal) => (signal.score.abs(), Some(signal.side)),
+                    None => (0.0, None),
+                }
+            } else {
+                match preview {
+                    Some(preview) => (preview.score.abs(), Some(preview.side)),
+                    None => (0.0, None),
+                }
             };
             crate::scan::Candidate {
                 symbol: market.symbol.clone(),
@@ -2885,6 +2932,9 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         }
         let cfg = Self::risk_settings(tx)?;
         let policy = Self::trade_policy(strategy);
+        let regime = current_regime(tx, mode)?;
+        let mean_reversion_active =
+            crate::mean_reversion::mean_reversion_active(regime.as_deref(), strategy);
         let filters = crate::live::load_filters(tx, scanned);
         let mut returns = Vec::new();
         for symbol in scanned {
@@ -2964,13 +3014,18 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
                 relative_strength_available: relative_strength.contains_key(symbol),
             };
-            let signal = crate::trade_policy::evaluate(
-                &market.candles,
-                price,
-                metric.atr,
-                policy,
-                features,
-            );
+            // range 市启用均值回归后，趋势信号不再作为开仓来源：
+            // 有 MR 信号就用它，没有就只留审计草稿，避免震荡市被趋势假突破带偏。
+            let mr_signal = if mean_reversion_active {
+                crate::mean_reversion::mean_reversion_signal(&market.candles, strategy)
+            } else {
+                None
+            };
+            let trend_signal = if mean_reversion_active {
+                None
+            } else {
+                crate::trade_policy::evaluate(&market.candles, price, metric.atr, policy, features)
+            };
             let (
                 side,
                 score,
@@ -2979,8 +3034,10 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 preview_side,
                 preview_score,
                 quant_passed,
-            ) = match signal {
-                Some(signal) => (
+                mean_reversion,
+                signal_reason,
+            ) = if let Some(signal) = mr_signal {
+                (
                     signal.side.to_string(),
                     signal.score,
                     Some(signal.side.to_string()),
@@ -2988,27 +3045,67 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     Some(signal.side.to_string()),
                     Some(signal.score),
                     true,
-                ),
-                None => {
-                    let preview = crate::trade_policy::preview(
-                        &market.candles,
-                        price,
-                        metric.atr,
-                        features,
-                    );
-                    let preview_side = preview
-                        .filter(|item| item.side != "flat")
-                        .map(|item| item.side.to_string());
-                    let preview_score = preview.map(|item| item.score);
-                    (
-                        "long".to_string(),
-                        0.0,
-                        None,
-                        None,
-                        preview_side,
-                        preview_score,
+                    true,
+                    Some(signal.reason),
+                )
+            } else if mean_reversion_active {
+                let preview = crate::trade_policy::preview(
+                    &market.candles,
+                    price,
+                    metric.atr,
+                    features,
+                );
+                let preview_side = preview
+                    .filter(|item| item.side != "flat")
+                    .map(|item| item.side.to_string());
+                let preview_score = preview.map(|item| item.score);
+                (
+                    "long".to_string(),
+                    0.0,
+                    None,
+                    None,
+                    preview_side,
+                    preview_score,
+                    false,
+                    true,
+                    None,
+                )
+            } else {
+                match trend_signal {
+                    Some(signal) => (
+                        signal.side.to_string(),
+                        signal.score,
+                        Some(signal.side.to_string()),
+                        Some(signal.score),
+                        Some(signal.side.to_string()),
+                        Some(signal.score),
+                        true,
                         false,
-                    )
+                        Some(signal.reason),
+                    ),
+                    None => {
+                        let preview = crate::trade_policy::preview(
+                            &market.candles,
+                            price,
+                            metric.atr,
+                            features,
+                        );
+                        let preview_side = preview
+                            .filter(|item| item.side != "flat")
+                            .map(|item| item.side.to_string());
+                        let preview_score = preview.map(|item| item.score);
+                        (
+                            "long".to_string(),
+                            0.0,
+                            None,
+                            None,
+                            preview_side,
+                            preview_score,
+                            false,
+                            false,
+                            None,
+                        )
+                    }
                 }
             };
             let Some(exchange_max): Option<Option<i64>> = tx
@@ -3047,15 +3144,21 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             let direction = if side == "long" { 1.0 } else { -1.0 };
             let global_stop = cfg["global_stop_loss_pct"].as_f64().unwrap_or(10.0);
             let global_take_profit = cfg["global_take_profit_pct"].as_f64().unwrap_or(20.0);
-            let stop_price = if global_stop > 0.0 {
-                price * (1.0 - direction * global_stop / leverage / 100.0)
+            // 均值回归仓使用独立的保证金止损止盈率，不继承趋势仓的全局阈值。
+            let (stop_price, take_profit) = if mean_reversion {
+                crate::mean_reversion::mean_reversion_stops(&side, price, leverage, strategy)
             } else {
-                0.0
-            };
-            let take_profit = if global_take_profit > 0.0 {
-                price * (1.0 + direction * global_take_profit / leverage / 100.0)
-            } else {
-                0.0
+                let stop_price = if global_stop > 0.0 {
+                    price * (1.0 - direction * global_stop / leverage / 100.0)
+                } else {
+                    0.0
+                };
+                let take_profit = if global_take_profit > 0.0 {
+                    price * (1.0 + direction * global_take_profit / leverage / 100.0)
+                } else {
+                    0.0
+                };
+                (stop_price, take_profit)
             };
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
@@ -3086,6 +3189,10 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 "preview_side": preview_side,
                 "preview_score": preview_score,
                 "quant_passed": quant_passed,
+                "mean_reversion": mean_reversion,
+                "mr_sl_pct": if mean_reversion { strategy["mr_sl_pct"].as_f64().unwrap_or(20.0) } else { 0.0 },
+                "mr_tp_pct": if mean_reversion { strategy["mr_tp_pct"].as_f64().unwrap_or(30.0) } else { 0.0 },
+                "signal_reason": signal_reason,
             }))
             .unwrap_or_else(|_| "{}".to_string());
             let client_id = format!(
@@ -3107,6 +3214,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 margin_max_pct: margin_max,
                 stop_price,
                 take_profit,
+                mean_reversion,
                 score,
                 mark_price: price,
                 filter: *filter,
@@ -6004,7 +6112,7 @@ async fn fast_risk_cycle(
         let global_tp = risk["global_take_profit_pct"].as_f64().unwrap_or(15.0);
         let mut stmt = conn
             .prepare(
-                "SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty,invalidation_price \
+"SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty,invalidation_price,features \
                  FROM positions WHERE mode='live' AND status='open' AND qty > 0",
             )
             .map_err(|error| error.to_string())?;
@@ -6020,6 +6128,7 @@ async fn fast_risk_cycle(
                     row.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
                     row.get::<_, f64>(7)?,
                     row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -6032,7 +6141,7 @@ async fn fast_risk_cycle(
     }
     let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
         .map_err(|error| format!("{error:?}"))?;
-    for (id, symbol, side, entry, sl, tp, leverage, qty, invalidation_price) in rows {
+    for (id, symbol, side, entry, sl, tp, leverage, qty, invalidation_price, features) in rows {
         if closing.contains(&id) {
             continue;
         }
@@ -6051,6 +6160,7 @@ async fn fast_risk_cycle(
                 (mark, (mark - entry) * qty * direction, crate::now(), id),
             );
         }
+        let limits = crate::mean_reversion::position_margin_limits(features.as_deref());
         let reason = fast_risk_reason(&FastRiskInput {
             side: &side,
             entry,
@@ -6059,8 +6169,8 @@ async fn fast_risk_cycle(
             tp,
             leverage,
             invalidation_price: gate_ai_value(invalidation_price, ai_cfg.use_invalidation_price),
-            global_stop_pct: global_stop,
-            global_tp_pct: global_tp,
+            global_stop_pct: limits.map_or(global_stop, |limits| limits.0),
+            global_tp_pct: limits.map_or(global_tp, |limits| limits.1),
         });
         let Some(reason) = reason else {
             continue;
@@ -8323,6 +8433,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             margin_max_pct: 15.0,
             stop_price: 95.0,
             take_profit: 110.0,
+            mean_reversion: false,
             score,
             mark_price: 100.0,
             filter: crate::live::SymbolFilter::default(),

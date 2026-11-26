@@ -223,6 +223,7 @@ mod tests {
             partial_taken: false,
             score: 0.0,
             held_minutes: 0.0,
+            margin_stop_take: None,
         };
         let candidates = vec![Candidate {
             symbol: "BTCUSDT".to_string(),

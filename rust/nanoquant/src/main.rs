@@ -51,6 +51,7 @@ mod journal_api;
 mod kline_stream;
 mod live;
 mod manage;
+mod mean_reversion;
 mod news;
 mod oi_regime;
 mod ops_tools;
