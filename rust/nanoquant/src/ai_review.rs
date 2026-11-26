@@ -209,6 +209,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .and_then(|filters| filters.get("side"))
         .and_then(Value::as_str)
         .unwrap_or("any");
+    // 开仓盈亏比门槛来自策略配置，未配置时回退默认值 0.8。
+    let min_rr = strategy_cfg
+        .get("min_entry_rr")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.8);
     decision_to_review(
         &proposal,
         side_lock,
@@ -216,6 +221,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.min_confidence,
         cfg.require_agreement,
         cfg.allow_ai_override,
+        min_rr,
     )
 }
 
@@ -239,7 +245,19 @@ fn decision_to_review(
     min_confidence: f64,
     require_agreement: bool,
     allow_ai_override: bool,
+    min_rr_target: f64,
 ) -> Result<ReviewDecision, String> {
+    // 复核前置拒单：AI 自评的数据质量与预期盈亏比低于门槛时直接拒单。
+    if let Some(dq) = decision.data_quality {
+        if dq < min_confidence {
+            return Ok(reject(format!("AI 数据质量分 {dq:.2} 低于 {min_confidence:.2}")));
+        }
+    }
+    if let Some(rr) = decision.rr_target {
+        if rr < min_rr_target {
+            return Ok(reject(format!("AI 盈亏比 {rr:.2} 低于 {min_rr_target:.2}")));
+        }
+    }
     if decision.confidence < min_confidence {
         let mut rejected = reject(format!(
             "AI 置信度 {:.2} 低于 {:.2}",
@@ -409,6 +427,7 @@ mod tests {
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -424,6 +443,7 @@ mod tests {
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -440,6 +460,7 @@ mod tests {
                 0.45,
                 true,
                 false,
+                0.8,
             )
             .unwrap();
         assert_eq!(result.action, ReviewAction::Agree);
@@ -454,6 +475,7 @@ mod tests {
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(low.action, ReviewAction::Reject);
@@ -466,11 +488,30 @@ mod tests {
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(hold.action, ReviewAction::Hold);
         assert!((hold.confidence - 0.9).abs() < 1e-9);
         assert_eq!(hold.reason, "test");
+    }
+
+    #[test]
+    fn low_data_quality_is_rejected() {
+        let mut decision = decision("open_long", 0.9);
+        decision.data_quality = Some(0.2);
+        let result = decision_to_review(&proposal("long"), "long", &decision, 0.45, true, true, 0.8).unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("数据质量"));
+    }
+
+    #[test]
+    fn low_rr_target_is_rejected() {
+        let mut decision = decision("open_long", 0.9);
+        decision.rr_target = Some(0.4);
+        let result = decision_to_review(&proposal("long"), "long", &decision, 0.45, true, true, 0.8).unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("盈亏比"));
     }
 
     const MASTER_KEY: &str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
@@ -736,7 +777,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             entry_price: None,
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &long, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("long"), "any", &long, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Tighten);
         assert_eq!(reviewed.leverage, Some(4.0));
         let long_stop = reviewed.stop_price.expect("多单应收紧止损");
@@ -764,7 +805,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             entry_price: None,
         };
         let reviewed =
-            decision_to_review(&proposal("short"), "any", &short, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("short"), "any", &short, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.leverage, Some(3.0));
         let short_stop = reviewed.stop_price.expect("空单应收紧止损");
         assert!(
@@ -794,7 +835,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             entry_price: None,
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &raised, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("long"), "any", &raised, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.leverage, Some(12.0), "区间内允许上调杠杆");
 
         let too_high = ai_client::Decision {
@@ -802,7 +843,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             ..raised.clone()
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.leverage, Some(20.0), "超过上限压回上限");
 
         let too_low = ai_client::Decision {
@@ -810,7 +851,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             ..raised
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &too_low, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("long"), "any", &too_low, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.leverage, Some(2.0), "低于下限抬回下限");
     }
 
@@ -834,7 +875,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             entry_price: None,
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &wider, 0.45, true, false).unwrap();
+            decision_to_review(&proposal("long"), "any", &wider, 0.45, true, false, 0.8).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
         assert_eq!(reviewed.leverage, None);
         assert_eq!(reviewed.stop_price, Some(90.0));
@@ -863,6 +904,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(blocked.action, ReviewAction::Reject, "默认必须与量化方向一致");
@@ -874,6 +916,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             false,
             true,
+            0.8,
         )
         .unwrap();
         assert_eq!(conflict.action, ReviewAction::Tighten);
@@ -896,6 +939,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             true,
             true,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -908,6 +952,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(agree.action, ReviewAction::Agree);
@@ -922,6 +967,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             false,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -937,6 +983,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             false,
             true,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Tighten);
@@ -952,6 +999,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -964,6 +1012,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             false,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(ai_first.action, ReviewAction::Agree, "无量化方向时 AI 仍是第一决策者");
@@ -979,6 +1028,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
                 0.45,
                 require_agreement,
                 allow_ai_override,
+                0.8,
             )
             .unwrap();
             assert_eq!(result.action, ReviewAction::Hold);
@@ -995,6 +1045,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.45,
             true,
             false,
+            0.8,
         )
         .unwrap();
         assert_eq!(
