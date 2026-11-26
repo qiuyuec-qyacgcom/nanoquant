@@ -248,6 +248,8 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "review_concurrency",
             "review_timeout_sec",
             "provider_order_mode",
+            // 提示词档位：string 参数，可选 full / slim；非法值读取侧回退 full。
+            "prompt_profile",
             "circuit_breaker_failures",
             "circuit_breaker_sec",
         ],
@@ -781,5 +783,13 @@ mod tests {
         assert_eq!(find("ai", "circuit_breaker_sec").unwrap().min, Some(10.0));
         assert_eq!(find("ai", "circuit_breaker_sec").unwrap().max, Some(600.0));
         assert!(!is_ai_writable("ai", "provider_order_mode"));
+    }
+
+    #[test]
+    fn prompt_profile_param_is_registered() {
+        assert_eq!(defaults()["ai"]["prompt_profile"], json!("full"));
+        assert!(is_visible("ai", "prompt_profile"), "档位应在 AI 参数页可见");
+        assert_eq!(find("ai", "prompt_profile").unwrap().kind, "string");
+        assert!(!is_ai_writable("ai", "prompt_profile"));
     }
 }

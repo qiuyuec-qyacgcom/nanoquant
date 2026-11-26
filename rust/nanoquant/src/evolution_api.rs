@@ -706,6 +706,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
     json!({ "mantras": mantra_stats(&conn, &cfg), "trades": trade_stats(&conn, &mode) }).into()
 }
 
+#[derive(Clone)]
 pub(crate) struct EvolutionCfg {
     pub(crate) ttl_days: f64,
     pub(crate) max_injected: i64,

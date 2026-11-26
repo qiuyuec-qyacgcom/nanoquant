@@ -204,6 +204,7 @@ describe('参数配置目录', () => {
       'fail_open_scale',
       'high_score_threshold',
       'low_score_threshold',
+      'prompt_profile',
       'provider_order_mode',
       'review_cache_ttl_sec',
       'review_concurrency',

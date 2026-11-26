@@ -842,6 +842,8 @@ pub struct AiConfig {
     pub fail_open_scale: f64,
     /// 供应商排序模式："config" 按配置顺序，"fastest" 按最近 24h P95 延迟升序。
     pub provider_order_mode: String,
+    /// 提示词上下文档位："full" 注入完整上下文，"slim" 精简 K 线/资讯/经验/心法。
+    pub prompt_profile: String,
     /// 连续失败达到该次数后熔断；0=关闭熔断。
     pub circuit_breaker_failures: i64,
     /// 熔断后跳过该供应商的秒数。
@@ -873,6 +875,7 @@ impl Default for AiConfig {
             scale_on_confidence: true,
             fail_open_scale: 0.5,
             provider_order_mode: "fastest".to_string(),
+            prompt_profile: "full".to_string(),
             circuit_breaker_failures: 3,
             circuit_breaker_sec: 60,
             use_invalidation_price: false,
@@ -965,6 +968,12 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
         cfg.provider_order_mode = match item {
             "config" => "config".to_string(),
             _ => "fastest".to_string(),
+        };
+    }
+    if let Some(item) = value.get("prompt_profile").and_then(Value::as_str) {
+        cfg.prompt_profile = match item {
+            "slim" => "slim".to_string(),
+            _ => "full".to_string(),
         };
     }
     if let Some(item) = value

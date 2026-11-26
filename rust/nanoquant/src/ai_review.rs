@@ -150,6 +150,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     if chain.is_empty() {
         return Err("未配置可用的 AI 模型".to_string());
     }
+    // 瘦身档位只压缩注入上下文，不改 prompt 文本与输出上限。
+    let slim = cfg.prompt_profile == "slim";
     let st = profile
         .as_ref()
         .map(crate::strategies::compact)
@@ -160,7 +162,10 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             .conn
             .lock()
             .map_err(|_| "数据库锁不可用".to_string())?;
-        let evolution = crate::evolution_api::evolution_cfg(&conn);
+        let mut evolution = crate::evolution_api::evolution_cfg(&conn);
+        if slim {
+            evolution.max_injected = evolution.max_injected.min(3);
+        }
         let (mantra_text, mantra_ids) = if cfg.inject_mantras {
             crate::evolution_api::injection_payload(&conn, &evolution)
         } else {
@@ -172,16 +177,19 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "oi_change_pct": features["oi_change_pct"],
             "oi_regime": features["oi_regime"],
         });
-        let experiences = crate::journal::inject_lessons(
+        let mut experiences = crate::journal::inject_lessons(
             &conn,
             &proposal.symbol,
             &journal_snapshot,
             &proposal.side,
         );
+        if slim {
+            experiences.truncate(3);
+        }
         (mantra_text, mantra_ids, experiences)
     };
     let news = if cfg.inject_news {
-        crate::ai_analysis::news_digest(&state, 8)
+        crate::ai_analysis::news_digest(&state, if slim { 4 } else { 8 })
     } else {
         Vec::new()
     };
@@ -228,7 +236,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
             "regime": features["oi_regime"],
         },
         "oi_regime_hint": "价涨+OI增=上升趋势确认；价涨+OI减=反弹不牢；价跌+OI增=下降趋势确认；价跌+OI减=趋势可能尾声",
-        "klines": crate::ai_analysis::recent_bars(&market.candles, 14),
+        "klines": crate::ai_analysis::recent_bars(&market.candles, if slim { 8 } else { 14 }),
         "funding": market.funding_rate,
         "change_24h": features["change_24h"],
         "quote_volume": market.quote_volume,
@@ -301,6 +309,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         parse_ms: Some(parse_ms),
         wall_ms: None,
     };
+    reviewed.prompt_profile = Some(cfg.prompt_profile.clone());
     Ok(fill_default_valid_bars(reviewed, &strategy_cfg))
 }
 
@@ -337,6 +346,7 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         risk_text: None,
         scale: None,
         latency: AiLatency::default(),
+        prompt_profile: None,
     }
 }
 
@@ -450,6 +460,7 @@ fn decision_to_review_mode(
                 risk_text,
                 scale: None,
                 latency: AiLatency::default(),
+                prompt_profile: None,
             });
         }
     };
@@ -509,8 +520,9 @@ fn decision_to_review_mode(
             entry_price: decision.entry_price,
             invalidation_text,
             risk_text,
-            scale,
+scale,
             latency: AiLatency::default(),
+            prompt_profile: None,
         });
     }
     if let Some(quant_side) = proposal.quant_side.as_deref() {
@@ -607,6 +619,7 @@ fn decision_to_review_mode(
         risk_text,
         scale,
         latency: AiLatency::default(),
+        prompt_profile: None,
     })
 }
 
@@ -901,10 +914,24 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
                CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT,
                  outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER,
                  enabled INTEGER, created_at INTEGER, updated_at INTEGER);
+               CREATE TABLE news_items(id INTEGER PRIMARY KEY, title TEXT, source TEXT, sentiment REAL, ts INTEGER);
                INSERT INTO app_settings VALUES('ai','{"enabled":true,"mode":"single","provider_id":1,"fallback_provider_ids":[],"min_confidence":0.45,"max_calls_per_hour":30,"monthly_budget_usd":3,"temperature":0.2,"timeout_sec":5,"decision_schema_version":2}',0);
                INSERT INTO app_settings VALUES('risk','{"max_leverage":20}',0);
                INSERT INTO app_settings VALUES('strategy','{"timeframe":"15m"}',0);
                INSERT INTO strategy_profiles VALUES(1,'突破追多','','放量突破后等回踩再进',1,10,'{"symbols":["BTCUSDT"],"side":"long"}',1,1);
+               INSERT INTO news_items(title, source, sentiment, ts) VALUES
+                 ('a','s',0.1,1),('b','s',0.1,2),('c','s',0.1,3),('d','s',0.1,4),
+                 ('e','s',0.1,5),('f','s',0.1,6),('g','s',0.1,7),('h','s',0.1,8);
+               INSERT INTO experiences(symbol,tags,scenario,lesson,outcome,source,hits,wins,losses,enabled,created_at,updated_at) VALUES
+                 ('BTCUSDT','["trend","dir:long"]','{"rsi":55,"adx":30,"atr_pct":1.2}','exp1','correct','review',1,1,0,1,1,1),
+                 ('BTCUSDT','["trend","dir:long"]','{"rsi":55,"adx":30,"atr_pct":1.2}','exp2','correct','review',1,1,0,1,2,2),
+                 ('BTCUSDT','["trend","dir:long"]','{"rsi":55,"adx":30,"atr_pct":1.2}','exp3','correct','review',1,1,0,1,3,3),
+                 ('BTCUSDT','["trend","dir:long"]','{"rsi":55,"adx":30,"atr_pct":1.2}','exp4','correct','review',1,1,0,1,4,4);
+               INSERT INTO mantras(id,title,rule,tags,category,source,confidence,health,hits,wins,losses,enabled,visible,version,superseded_by,evidence,created_at,updated_at,expires_at) VALUES
+                 (1,'m1','r1','[]','c','review',0.9,0.9,0,0,0,1,1,1,0,'{}',1,1,0),
+                 (2,'m2','r2','[]','c','review',0.9,0.9,0,0,0,1,1,1,0,'{}',2,2,0),
+                 (3,'m3','r3','[]','c','review',0.9,0.9,0,0,0,1,1,1,0,'{}',3,3,0),
+                 (4,'m4','r4','[]','c','review',0.9,0.9,0,0,0,1,1,1,0,'{}',4,4,0);
                INSERT INTO ai_providers VALUES(1,'alpha','openai_chat','https://api.example.com/v1','','deepseek-v4',0.2,1024,'auto',5,1,1,10,'primary','{}',1,1);"#,
         )
         .unwrap();
@@ -1542,9 +1569,17 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     async fn review_context_with(inject: bool, tag: &str) -> Value {
+        review_with_profile(inject, None, tag).await.1
+    }
+
+    async fn review_with_profile(
+        inject: bool,
+        profile: Option<&str>,
+        tag: &str,
+    ) -> (ReviewDecision, Value) {
         let path = std::env::temp_dir().join(format!("nq-ai-review-inject-{tag}.db"));
         let db = fixture(&path);
-        let ai_value = json!({
+        let mut ai_value = json!({
             "enabled": true,
             "mode": "single",
             "provider_id": 1,
@@ -1558,6 +1593,9 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             "inject_news": inject,
             "inject_mantras": inject,
         });
+        if let Some(profile) = profile {
+            ai_value["prompt_profile"] = json!(profile);
+        }
         db.lock()
             .execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai'",
@@ -1583,7 +1621,61 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             .as_array()
             .and_then(|items| items.iter().find(|item| item["role"] == "user"))
             .expect("复核请求缺少 user 消息");
-        serde_json::from_str(user["content"].as_str().expect("user content 不是字符串")).unwrap()
+        let context =
+            serde_json::from_str(user["content"].as_str().expect("user content 不是字符串"))
+                .unwrap();
+        (reviewed, context)
+    }
+
+    fn mantra_lines(context: &Value) -> usize {
+        context["mantras"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                line.chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_digit())
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slim_profile_limits_klines_news_experiences() {
+        let (reviewed, context) = review_with_profile(true, Some("slim"), "slim").await;
+        assert_eq!(reviewed.prompt_profile.as_deref(), Some("slim"));
+        assert_eq!(context["klines"].as_array().unwrap().len(), 8, "瘦身 K 线 8 根");
+        assert_eq!(context["news"].as_array().unwrap().len(), 4, "瘦身资讯 4 条");
+        assert_eq!(
+            context["experiences"].as_array().unwrap().len(),
+            3,
+            "瘦身经验只取前 3 条"
+        );
+        assert_eq!(mantra_lines(&context), 3, "瘦身心法夹到 3 条");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_profile_keeps_default_context_sizes() {
+        let (reviewed, context) = review_with_profile(true, Some("full"), "full").await;
+        assert_eq!(reviewed.prompt_profile.as_deref(), Some("full"));
+        assert_eq!(context["klines"].as_array().unwrap().len(), 14, "完整 K 线 14 根");
+        assert_eq!(context["news"].as_array().unwrap().len(), 8, "完整资讯 8 条");
+        assert_eq!(
+            context["experiences"].as_array().unwrap().len(),
+            4,
+            "完整经验全量注入"
+        );
+        assert_eq!(mantra_lines(&context), 4, "完整心法全量注入");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_profile_is_recorded_in_audit() {
+        let (reviewed, _) = review_with_profile(true, Some("weird"), "fallback").await;
+        assert_eq!(
+            reviewed.prompt_profile.as_deref(),
+            Some("full"),
+            "非法档位回退 full 并写入审计"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

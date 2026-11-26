@@ -326,6 +326,12 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       options: [['fastest', '按延迟 P95 升序（最近 24h）'], ['config', '按配置顺序']],
       hint: '样本不足 5 次时保持配置顺序；熔断中的供应商会被自动跳过',
     },
+    prompt_profile: {
+      label: '提示词档位',
+      widget: 'select',
+      options: [['full', '完整上下文'], ['slim', '瘦身（8 根 K 线 / 4 条资讯 / 3 条经验与心法）']],
+      hint: '瘦身只压缩注入上下文，不改 prompt 文本与输出上限；用于对比延迟与效果',
+    },
     circuit_breaker_failures: {
       label: '连续失败熔断阈值', unit: '次', min: 0, max: 10, step: 1,
       hint: '连续失败达到该次数后暂停调用该供应商；0=关闭熔断',

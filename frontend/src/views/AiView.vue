@@ -36,6 +36,7 @@ const aiCfg = reactive<any>({
   scale_on_confidence: true,
   fail_open_scale: 0.5,
   provider_order_mode: 'fastest',
+  prompt_profile: 'full',
   circuit_breaker_failures: 3,
   circuit_breaker_sec: 60,
   max_calls_per_hour: 30,
@@ -384,6 +385,13 @@ onMounted(loadAll)
             <select v-model.number="aiCfg.decision_schema_version" class="select">
               <option :value="2">v2 紧凑英文 · 后台转中文（省 token）</option>
               <option :value="1">v1 中文详细 JSON（兼容旧模型）</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="label">提示词档位</span>
+            <select v-model="aiCfg.prompt_profile" class="select">
+              <option value="full">完整上下文</option>
+              <option value="slim">瘦身（8 根 K 线 / 4 条资讯 / 3 条经验与心法）</option>
             </select>
           </div>
           <div class="field">

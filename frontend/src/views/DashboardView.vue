@@ -190,6 +190,8 @@ const halfAi = computed(() => {
     scaleNone: Number(h.scale_none || 0),
     failOpen: Number(h.ai_fail_open || 0),
     highSkip: Number(h.high_score_skip || 0),
+    promptFull: Number(h.ai_prompt_full || 0),
+    promptSlim: Number(h.ai_prompt_slim || 0),
     topGate,
     p50: Number(h.ai_latency_p50_ms || 0),
     p95: Number(h.ai_latency_p95_ms || 0),
@@ -543,6 +545,10 @@ useSilentRefresh(refreshQuotes, 3000)
           <div class="metric"><span>scale 0.75</span><span class="mono">{{ halfAi.scale075 }}</span></div>
           <div class="metric"><span>scale 0.9~1</span><span class="mono">{{ halfAi.scale09 }}</span></div>
           <div class="metric"><span>scale 无</span><span class="mono muted">{{ halfAi.scaleNone }}</span></div>
+        </div>
+        <div class="grid g2" style="gap: 10px">
+          <div class="metric"><span>提示词 完整</span><span class="mono">{{ halfAi.promptFull }}</span></div>
+          <div class="metric"><span>提示词 瘦身</span><span class="mono">{{ halfAi.promptSlim }}</span></div>
         </div>
         <div class="grid g4" style="gap: 10px">
           <div class="metric">

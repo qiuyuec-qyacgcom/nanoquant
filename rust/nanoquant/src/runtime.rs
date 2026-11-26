@@ -265,6 +265,7 @@ impl EntryDraft {
             row.provider_ms = meta.latency.provider_ms;
             row.queue_ms = meta.latency.queue_ms();
             row.wall_ms = meta.latency.wall_ms;
+            row.prompt_profile = meta.prompt_profile.clone();
         }
         if !self.quant_passed
             && self.preview_side.as_deref() == Some(direction)
@@ -3394,6 +3395,7 @@ impl EngineRuntime {
                         risk_text: None,
                         scale: None,
                         latency: crate::review::AiLatency::default(),
+                        prompt_profile: None,
                     }),
                 });
             } else {
@@ -6473,6 +6475,7 @@ mod tests {
                     risk_text: None,
                     scale: None,
                     latency: Default::default(),
+                    prompt_profile: None,
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -6493,6 +6496,7 @@ mod tests {
                 risk_text: None,
                 scale: None,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }
@@ -6849,6 +6853,7 @@ mod tests {
                 risk_text: None,
                 scale: None,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }
@@ -7556,6 +7561,7 @@ mod tests {
                 risk_text: Some("高位放量；资金费率抬升".to_string()),
                 scale: None,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }
@@ -8069,6 +8075,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 risk_text: None,
                 scale: None,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }
@@ -8196,6 +8203,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 risk_text: None,
                 scale: None,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }
@@ -8381,6 +8389,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 risk_text: None,
                 scale: self.scale,
                 latency: Default::default(),
+                prompt_profile: None,
             })
         }
     }

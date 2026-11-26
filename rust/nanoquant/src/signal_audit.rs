@@ -52,6 +52,8 @@ pub struct AuditSignal {
     pub queue_ms: Option<i64>,
     /// 整次复核总耗时（毫秒）。
     pub wall_ms: Option<i64>,
+    /// 本次复核使用的提示词档位：full / slim。
+    pub prompt_profile: Option<String>,
 }
 
 impl AuditSignal {
@@ -78,6 +80,7 @@ impl AuditSignal {
             provider_ms: None,
             queue_ms: None,
             wall_ms: None,
+            prompt_profile: None,
         }
     }
 
@@ -170,6 +173,9 @@ impl AuditSignal {
                     }),
                 );
             }
+            if let Some(profile) = self.prompt_profile.as_ref() {
+                object.insert("ai_prompt_profile".into(), json!(profile));
+            }
             // 统一决策追踪：一层一行就能看清走到哪、被谁拦、AI 想做什么。
             let mut trace = json!({
                 "stage": self.stage,
@@ -249,7 +255,13 @@ const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai
 /// 按轮次生效的 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧值。
 /// ai_scale 只代表当前轮的下单缩放，跨轮沿用会与 filter_trace.scale 口径不一致；
 /// ai_latency 同理，跨轮沿用会让延迟样本被旧值污染。
-const AI_ROUND_META_KEYS: [&str; 4] = ["ai_inv", "ai_risk", "ai_scale", "ai_latency"];
+const AI_ROUND_META_KEYS: [&str; 5] = [
+        "ai_inv",
+        "ai_risk",
+        "ai_scale",
+        "ai_latency",
+        "ai_prompt_profile",
+    ];
 
 /// 写入 signals.features 的 AI 自评字段键（数值 + 按轮次）。
 const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_ROUND_META_KEYS.len()] = {
@@ -441,6 +453,8 @@ struct SignalMetricRow {
     wall_ms: Option<f64>,
     /// 复核排队耗时（毫秒），来自 features.ai_latency.queue_ms。
     queue_ms: Option<f64>,
+    /// 提示词档位，来自 features.ai_prompt_profile。
+    prompt_profile: Option<String>,
 }
 
 fn round2(value: f64) -> f64 {
@@ -464,6 +478,8 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
     let mut ai_veto = 0_i64;
     let mut ai_fail_open = 0_i64;
     let mut high_score_skip = 0_i64;
+    let mut ai_prompt_full = 0_i64;
+    let mut ai_prompt_slim = 0_i64;
     // [0.5, 0.75, 0.9~1.0, none]
     let mut scales = [0_i64; 4];
     let mut gates: BTreeMap<&'static str, i64> =
@@ -498,6 +514,11 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         }
         if row.skip {
             high_score_skip += 1;
+        }
+        match row.prompt_profile.as_deref() {
+            Some("full") => ai_prompt_full += 1,
+            Some("slim") => ai_prompt_slim += 1,
+            _ => {}
         }
         let action = row.ai_action.trim();
         // AI 实际复核过的信号：有动作且不是 none/error，作为否决率分母。
@@ -567,6 +588,8 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "scale_none": scales[3],
         "ai_fail_open": ai_fail_open,
         "high_score_skip": high_score_skip,
+        "ai_prompt_full": ai_prompt_full,
+        "ai_prompt_slim": ai_prompt_slim,
         "gates": gates,
         "ai_latency_samples": latencies.len(),
         "ai_latency_p50_ms": percentile(&latencies, 0.50),
@@ -637,7 +660,8 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
              json_extract(features, '$.filter_trace.skip'), \
              json_extract(features, '$.ai_scale'), \
              json_extract(features, '$.ai_latency.wall_ms'), \
-             json_extract(features, '$.ai_latency.queue_ms') \
+             json_extract(features, '$.ai_latency.queue_ms'), \
+             json_extract(features, '$.ai_prompt_profile') \
              FROM signals WHERE ts >= ?1 AND mode = ?2",
         )
         .ok()?;
@@ -654,6 +678,7 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
                 scale: r.get(4)?,
                 wall_ms: r.get(5)?,
                 queue_ms: r.get(6)?,
+                prompt_profile: r.get(7)?,
             })
         })
         .ok()?;
@@ -691,6 +716,7 @@ fn features_rows(conn: &Connection, mode: &str, since: i64) -> Vec<SignalMetricR
                 scale: value["ai_scale"].as_f64(),
                 wall_ms: value["ai_latency"]["wall_ms"].as_f64(),
                 queue_ms: value["ai_latency"]["queue_ms"].as_f64(),
+                prompt_profile: value["ai_prompt_profile"].as_str().map(str::to_string),
             }
         })
         .collect()
@@ -825,6 +851,37 @@ mod tests {
         assert_eq!(value["ai_latency_p99_ms"], 0.0);
         assert_eq!(value["ai_latency_max_ms"], 0.0);
         assert_eq!(value["ai_latency_by_provider"], json!({}));
+    }
+
+    #[test]
+    fn half_ai_stats_counts_prompt_profiles() {
+        let conn = table();
+        let now = 300_000;
+        insert_signal(
+            &conn,
+            now - 10,
+            "opened",
+            "open_long",
+            r#"{"ai_prompt_profile":"full","filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 20,
+            "opened",
+            "open_long",
+            r#"{"ai_prompt_profile":"slim","filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 30,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"ai_dq"}}"#,
+        );
+
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["ai_prompt_full"], 1, "完整档位计数");
+        assert_eq!(value["ai_prompt_slim"], 1, "瘦身档位计数");
     }
 
     #[test]

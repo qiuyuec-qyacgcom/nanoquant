@@ -54,6 +54,8 @@ pub(crate) struct ReviewDecision {
     pub scale: Option<f64>,
     /// 复核分段耗时；wall_ms 由 runtime 补齐。
     pub latency: AiLatency,
+    /// 本次复核使用的提示词档位：full / slim；未知时为空。
+    pub prompt_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +108,8 @@ pub(crate) struct ReviewedEntry {
     pub scale: Option<f64>,
     /// 复核分段耗时；wall_ms 由 runtime 补齐。
     pub latency: AiLatency,
+    /// 本次复核使用的提示词档位。
+    pub prompt_profile: Option<String>,
 }
 
 /// AI 自评字段的载体：拒单/观望也要把 dq、rr 等落进审计。
@@ -122,6 +126,8 @@ pub(crate) struct AiMeta {
     pub scale: Option<f64>,
     /// 复核分段耗时；wall_ms 由 runtime 补齐。
     pub latency: AiLatency,
+    /// 本次复核使用的提示词档位。
+    pub prompt_profile: Option<String>,
 }
 
 impl From<&ReviewedEntry> for AiMeta {
@@ -136,6 +142,7 @@ impl From<&ReviewedEntry> for AiMeta {
             risk_text: value.risk_text.clone(),
             scale: value.scale,
             latency: value.latency,
+            prompt_profile: value.prompt_profile.clone(),
         }
     }
 }
@@ -152,6 +159,7 @@ impl From<&ReviewDecision> for AiMeta {
             risk_text: value.risk_text.clone(),
             scale: value.scale,
             latency: value.latency,
+            prompt_profile: value.prompt_profile.clone(),
         }
     }
 }
@@ -168,6 +176,7 @@ impl From<&ReviewError> for AiMeta {
             risk_text: value.risk_text.clone(),
             scale: value.scale,
             latency: value.latency,
+            prompt_profile: value.prompt_profile.clone(),
         }
     }
 }
@@ -193,6 +202,8 @@ pub(crate) struct ReviewError {
     pub scale: Option<f64>,
     /// 复核分段耗时；wall_ms 由 runtime 补齐。
     pub latency: AiLatency,
+    /// 本次复核使用的提示词档位。
+    pub prompt_profile: Option<String>,
 }
 
 impl ReviewError {
@@ -210,6 +221,7 @@ impl ReviewError {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }
     }
 
@@ -228,6 +240,7 @@ impl ReviewError {
             .filter(|value| value.is_finite() && *value > 0.0)
             .map(|value| value.clamp(0.0, 1.0));
         self.latency = decision.latency;
+        self.prompt_profile = meta.prompt_profile;
         self
     }
 }
@@ -286,6 +299,7 @@ pub(crate) fn apply_review(
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
@@ -355,6 +369,7 @@ fn apply_decision(
                     confidence,
                     scale,
                     latency,
+                    prompt_profile: meta.prompt_profile.clone(),
                 });
             }
             ReviewAction::Hold => {
@@ -375,6 +390,7 @@ fn apply_decision(
                     risk_text: meta.risk_text,
                     scale,
                     latency,
+                    prompt_profile: meta.prompt_profile.clone(),
                 })
             }
             ReviewAction::Reject => {
@@ -395,6 +411,7 @@ fn apply_decision(
                     risk_text: meta.risk_text,
                     scale,
                     latency,
+                    prompt_profile: meta.prompt_profile.clone(),
                 })
             }
         }
@@ -452,6 +469,7 @@ fn apply_decision(
             confidence,
             scale,
             latency,
+            prompt_profile: meta.prompt_profile.clone(),
         }),
         ReviewAction::Hold => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -470,6 +488,7 @@ fn apply_decision(
             risk_text: meta.risk_text,
             scale,
             latency,
+            prompt_profile: meta.prompt_profile.clone(),
         }),
         ReviewAction::Reject => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -488,6 +507,7 @@ fn apply_decision(
             risk_text: meta.risk_text,
             scale,
             latency,
+            prompt_profile: meta.prompt_profile.clone(),
         }),
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
@@ -510,6 +530,7 @@ fn apply_decision(
                 confidence,
                 scale,
                 latency,
+                prompt_profile: meta.prompt_profile.clone(),
             })
         }
     }
@@ -563,6 +584,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }
     }
 
@@ -594,6 +616,7 @@ mod tests {
             risk_text: None,
             scale: Some(0.7),
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&reviewer), true, true).unwrap();
         assert_eq!(reviewed.side, "long", "否决模式必须保留量化方向");
@@ -654,6 +677,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true, false).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
@@ -677,6 +701,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&raised), true, false).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
@@ -699,6 +724,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_low), true, false).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
@@ -733,6 +759,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         assert!(apply_review(&proposal(), Some(&reject), false, false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
@@ -761,6 +788,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         let error = apply_review(&proposal(), Some(&hold), true, false).unwrap_err();
         assert_eq!(error.action, "hold");
@@ -788,6 +816,7 @@ mod tests {
             risk_text: None,
             scale: None,
             latency: AiLatency::default(),
+            prompt_profile: None,
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true, false).is_err());
     }
