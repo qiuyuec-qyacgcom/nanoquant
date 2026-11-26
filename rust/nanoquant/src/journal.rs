@@ -16,14 +16,24 @@ pub fn routes() -> Router<Db> {
         .route("/journal/retrieve", get(retrieve_preview))
 }
 
-/// 手动触发 24h 回访打标。价格取当前交易环境快照，另一环境的 pending 保持原状。
-async fn label_pending_handler(State(db): State<Db>) -> Json<Value> {
+#[derive(Deserialize)]
+struct LabelQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// 手动触发回访打标。默认只标到期项；`?force=true` 立即打标当前环境全部 pending。
+/// 价格取当前交易环境快照，另一环境的 pending 保持原状。
+async fn label_pending_handler(
+    State(db): State<Db>,
+    Query(query): Query<LabelQuery>,
+) -> Json<Value> {
     let (mode, prices) = {
         let conn = db.conn.lock().expect("db");
         let mode = current_mode(&conn);
         (mode.clone(), prices_from_state(&conn, &mode))
     };
-    let result = label_due(&db, &prices, &mode, crate::now());
+    let result = label_due(&db, &prices, &mode, crate::now(), query.force);
     record_label_event(&db, &result);
     result.into()
 }
@@ -113,12 +123,14 @@ pub(crate) fn outcome_of(signed_pct: f64, threshold: f64) -> &'static str {
     }
 }
 
-/// 回访所有到期的 pending 方向性决策。只标当前环境，价格缺失的保持 pending。
+/// 回访 pending 方向性决策。默认只标到期项；`force` 时忽略回访窗口，立即标当前环境全部
+/// pending（仅 long/short）。价格缺失的保持 pending。
 pub(crate) fn label_due(
     db: &Db,
     prices: &std::collections::BTreeMap<String, f64>,
     mode: &str,
     now: i64,
+    force: bool,
 ) -> Value {
     let conn = db.conn.lock().expect("db");
     let (enabled, after, threshold) = label_config(&conn);
@@ -126,25 +138,38 @@ pub(crate) fn label_due(
         return json!({"ok": false, "error": "决策日志已关闭", "labeled": 0});
     }
     let cutoff = now - after;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, symbol, direction, entry_price, mode FROM decision_journal \
-             WHERE status = 'pending' AND direction IN ('long','short') AND ts <= ?1",
-        )
-        .expect("prepare label");
-    let rows: Vec<(i64, String, String, f64, String)> = stmt
-        .query_map([cutoff], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-            ))
-        })
-        .expect("query label")
-        .collect::<Result<_, _>>()
-        .expect("label rows");
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, String, String, f64, String)> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        ))
+    };
+    let rows: Vec<(i64, String, String, f64, String)> = if force {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, symbol, direction, entry_price, mode FROM decision_journal \
+                 WHERE status = 'pending' AND direction IN ('long','short')",
+            )
+            .expect("prepare label");
+        stmt.query_map([], map)
+            .expect("query label")
+            .collect::<Result<_, _>>()
+            .expect("label rows")
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, symbol, direction, entry_price, mode FROM decision_journal \
+                 WHERE status = 'pending' AND direction IN ('long','short') AND ts <= ?1",
+            )
+            .expect("prepare label");
+        stmt.query_map([cutoff], map)
+            .expect("query label")
+            .collect::<Result<_, _>>()
+            .expect("label rows")
+    };
     let due = rows
         .iter()
         .filter(|(_, _, _, _, row_mode)| row_mode == mode)
@@ -182,6 +207,7 @@ pub(crate) fn label_due(
         "missing_price": missing,
         "threshold_pct": threshold,
         "mode": mode,
+        "force": force,
     })
 }
 
@@ -924,7 +950,7 @@ mod tests {
         }
         let mut prices = std::collections::BTreeMap::new();
         prices.insert("BTCUSDT".to_string(), 100.5);
-        let result = label_due(&db, &prices, "demo", now);
+        let result = label_due(&db, &prices, "demo", now, false);
         assert_eq!(result["labeled"], 1, "{result}");
         assert_eq!(result["deferred"], 1, "live 快照不得被 demo 价格打标");
         assert_eq!(result["missing_price"], 1, "无行情的保持 pending");
@@ -955,6 +981,7 @@ mod tests {
             .nest("/api/v1", routes())
             .with_state(db.clone());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -970,6 +997,92 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["labeled"], 0, "已打标/缺价的行不会被重复计数: {body}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/journal/label?force=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["labeled"], 1,
+            "force 端点应立刻打标最近的 pending: {body}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn manual_force_labels_recent_pending() {
+        let path = std::env::temp_dir().join("nq-journal-label-force.db");
+        let db = label_db(&path);
+        let now = crate::now();
+        {
+            let conn = db.conn.lock().unwrap();
+            insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 100);
+            insert_pending(&conn, 2, "BTCUSDT", 100.0, "live", now - 100);
+        }
+        let mut prices = std::collections::BTreeMap::new();
+        prices.insert("BTCUSDT".to_string(), 101.0);
+        let auto = label_due(&db, &prices, "demo", now, false);
+        assert_eq!(auto["labeled"], 0, "未到期不得自动打标: {auto}");
+        let forced = label_due(&db, &prices, "demo", now, true);
+        assert_eq!(forced["labeled"], 1, "force 立即打标当前环境: {forced}");
+        assert_eq!(forced["deferred"], 1, "另一环境的 pending 不受影响");
+        {
+            let conn = db.conn.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM decision_journal WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "labeled");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM decision_journal WHERE id=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "pending");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn auto_label_respects_horizon() {
+        let path = std::env::temp_dir().join("nq-journal-label-horizon.db");
+        let db = label_db(&path);
+        let now = crate::now();
+        {
+            let conn = db.conn.lock().unwrap();
+            insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 90_000);
+            insert_pending(&conn, 2, "BTCUSDT", 100.0, "demo", now - 600);
+        }
+        let mut prices = std::collections::BTreeMap::new();
+        prices.insert("BTCUSDT".to_string(), 100.5);
+        let result = label_due(&db, &prices, "demo", now, false);
+        assert_eq!(result["labeled"], 1, "只标到期项: {result}");
+        {
+            let conn = db.conn.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM decision_journal WHERE id=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "pending", "回访窗口内的最近决策保持 pending");
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -984,7 +1097,7 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 90_000);
         }
-        let first = label_due(&db, &prices, "demo", now);
+        let first = label_due(&db, &prices, "demo", now, false);
         assert_eq!(first["labeled"], 1);
         {
             let conn = db.conn.lock().unwrap();
@@ -996,7 +1109,7 @@ mod tests {
             .unwrap();
             insert_pending(&conn, 2, "BTCUSDT", 100.0, "demo", now - 90_000);
         }
-        let second = label_due(&db, &prices, "demo", now);
+        let second = label_due(&db, &prices, "demo", now, false);
         assert_eq!(second["labeled"], 1);
         {
             let conn = db.conn.lock().unwrap();

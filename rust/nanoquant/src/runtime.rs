@@ -1526,7 +1526,7 @@ impl EngineRuntime {
         if prices.is_empty() {
             return;
         }
-        let result = crate::journal::label_due(&self.db, &prices, mode, now);
+        let result = crate::journal::label_due(&self.db, &prices, mode, now, false);
         let labeled = result["labeled"].as_i64().unwrap_or(0);
         if labeled > 0 {
             tracing::info!(mode, labeled, "决策回访打标完成");

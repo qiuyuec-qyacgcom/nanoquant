@@ -291,7 +291,7 @@
   "journal": {
     "enabled": true,
     "min_record_confidence": 0.45,
-    "label_after_sec": 86400,
+    "label_after_sec": 3600,
     "correct_threshold_pct": 0.15,
     "retrieve_top_k": 5,
     "inject_experiences": true,

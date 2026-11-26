@@ -786,12 +786,56 @@ fn repair_rule_from_tags(conn: &rusqlite::Connection) -> usize {
 
 fn cleanup_invalid_mantras(conn: &rusqlite::Connection) -> usize {
     repair_rule_from_tags(conn);
-    conn.execute(
+    let mut changed = conn
+        .execute(
+            "UPDATE mantras SET enabled = 0, visible = 0, updated_at = ?1 \
+             WHERE enabled = 1 AND (rule IS NULL OR trim(rule) = '' OR trim(rule) = '[]')",
+            [crate::now()],
+        )
+        .unwrap_or(0);
+    changed += disable_low_sample_mantras(conn);
+    changed
+}
+
+/// 批量复盘产出的心法必须过 10 笔证据门；历史低样本条目统一禁用。
+fn disable_low_sample_mantras(conn: &rusqlite::Connection) -> usize {
+    let now = crate::now();
+    if let Ok(rows) = conn.execute(
         "UPDATE mantras SET enabled = 0, visible = 0, updated_at = ?1 \
-         WHERE enabled = 1 AND (rule IS NULL OR trim(rule) = '' OR trim(rule) = '[]')",
-        [crate::now()],
-    )
-    .unwrap_or(0)
+         WHERE enabled = 1 AND source = 'batch_review' \
+           AND CAST(json_extract(evidence, '$.sample_size') AS INTEGER) < ?2",
+        (now, MIN_STRUCTURAL_SAMPLE),
+    ) {
+        return rows;
+    }
+    // 未编译 JSON1 或 evidence 非法 JSON 时退回 Rust 侧解析。
+    let mut changed = 0;
+    let mut ids: Vec<i64> = Vec::new();
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT id, evidence FROM mantras WHERE enabled = 1 AND source = 'batch_review'")
+    {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        }) {
+            for (id, evidence) in rows.flatten() {
+                let sample = evidence
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|value| value.get("sample_size").and_then(Value::as_i64));
+                if sample.unwrap_or(0) < MIN_STRUCTURAL_SAMPLE {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    for id in ids {
+        changed += conn
+            .execute(
+                "UPDATE mantras SET enabled = 0, visible = 0, updated_at = ?2 WHERE id = ?1",
+                (id, now),
+            )
+            .unwrap_or(0);
+    }
+    changed
 }
 
 async fn review_batch(
@@ -827,11 +871,14 @@ async fn run_batch(
             ));
         }
         cleanup_invalid_mantras(&conn);
-        let size = cfg.min_lesson_sample.max(
-            limit
-                .filter(|value| *value > 0)
-                .unwrap_or(cfg.batch_review_size),
-        );
+        let size = cfg
+            .min_lesson_sample
+            .max(
+                limit
+                    .filter(|value| *value > 0)
+                    .unwrap_or(cfg.batch_review_size),
+            )
+            .max(MIN_STRUCTURAL_SAMPLE);
         // 复盘的样本必须是待复盘的交易；force 只是绕过样本门槛，不能把已复盘交易重新拉进来。
         let mut rows = load_trades(&conn, size, true, "");
         if let Some(id) = focus {
@@ -847,7 +894,11 @@ async fn run_batch(
         (cfg, rows)
     };
     if (rows.len() as i64) < cfg.min_lesson_sample {
-        let note = format!("样本不足（{}/{}），已标记复盘但未形成规则", rows.len(), cfg.min_lesson_sample);
+        let note = format!(
+            "样本不足（{}/{}），已标记复盘但未形成规则",
+            rows.len(),
+            cfg.min_lesson_sample
+        );
         if let Ok(conn) = state.db.conn.lock() {
             for trade in &rows {
                 let _ = conn.execute(
@@ -859,6 +910,34 @@ async fn run_batch(
         return Ok(json!({
             "ok": true,
             "skipped": true,
+            "change_status": "NO_CHANGE",
+            "reason": note,
+            "pending": rows.len(),
+            "sample_size": rows.len(),
+            "applied": [],
+            "insights": [],
+        })
+        .into());
+    }
+    // 心法属于结构性结论：不足 10 笔一律不调 AI、不写心法，只标记已复盘。
+    if (rows.len() as i64) < MIN_STRUCTURAL_SAMPLE {
+        let note = format!(
+            "样本不足（{}/{}），已标记复盘但未形成心法",
+            rows.len(),
+            MIN_STRUCTURAL_SAMPLE
+        );
+        if let Ok(conn) = state.db.conn.lock() {
+            for trade in &rows {
+                let _ = conn.execute(
+                    "UPDATE trades SET reviewed = 1, review_note = ?2 WHERE id = ?1",
+                    (trade.id, note.chars().take(900).collect::<String>()),
+                );
+            }
+        }
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "used_ai": false,
             "change_status": "NO_CHANGE",
             "reason": note,
             "pending": rows.len(),
@@ -882,11 +961,16 @@ async fn run_batch(
             .collect();
         (existing, write_cfg(&conn))
     };
-    let (ai_data, ai_error) =
-        match call_ai(&state, &review_messages(&stats, &payloads, &existing), "review").await {
-            Ok(data) => (data, String::new()),
-            Err(error) => (None, error),
-        };
+    let (ai_data, ai_error) = match call_ai(
+        &state,
+        &review_messages(&stats, &payloads, &existing),
+        "review",
+    )
+    .await
+    {
+        Ok(data) => (data, String::new()),
+        Err(error) => (None, error),
+    };
     let mut lessons: Vec<Value> = Vec::new();
     let mut diagnosis: Vec<String> = Vec::new();
     let mut verdict = String::new();
@@ -1428,6 +1512,27 @@ mod tests {
         Db::open(path.to_str().unwrap()).unwrap()
     }
 
+    /// 追加 `count` 笔待复盘闭环交易，用于跨过 10 笔结构性证据门。
+    fn seed_pending_trades(db: &Db, count: i64) {
+        let conn = db.conn.lock().unwrap();
+        for offset in 0..count {
+            let id = 10 + offset;
+            conn.execute(
+                "INSERT INTO trades VALUES(?1,'BTCUSDT','long',0.1,100,105,5,0,5,5,25,0.1,600,700,100,'tp',0.7,'ok',0.7,0,'demo',0,'','{}','[]')",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn ai_lesson_reply() -> HttpReply {
+        let inner = r#"{"change_status":"CHANGE","verdict":"样本显示止盈有效","score":70,"diagnosis":["tp 组表现更好"],"lessons":[{"title":"止盈优先","rule":"当浮盈达到 2R 时先落袋一半","category":"exit","confidence":0.7,"evidence":"10 笔样本"}]}"#;
+        HttpReply {
+            status: 200,
+            body: json!({"choices":[{"message":{"content":inner},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}).to_string(),
+        }
+    }
+
     fn app(db: Db, transport: Arc<dyn AiTransport>) -> Router {
         Router::new().nest("/api/v1", routes()).with_state(
             AiState::with_transport(db, MASTER_KEY.as_bytes().to_vec(), transport)
@@ -1556,12 +1661,10 @@ mod tests {
             request(router, "POST", "/api/v1/evolution/review-batch?force=true").await;
         assert_eq!(status, StatusCode::OK, "{}", body);
         assert_eq!(body["used_ai"], false);
+        assert_eq!(body["skipped"], true, "不足 10 笔必须跳过: {body}");
         assert_eq!(body["change_status"], "NO_CHANGE");
-        assert!(!body["insights"].as_array().unwrap().is_empty());
-        assert!(body["insights"][0]
-            .as_str()
-            .unwrap()
-            .contains(DETERMINISTIC_PREFIX));
+        assert!(body["reason"].as_str().unwrap().contains("3/10"));
+        assert!(body["insights"].as_array().unwrap().is_empty());
         let conn = db.conn.lock().unwrap();
         let pending: i64 = conn
             .query_row(
@@ -1578,7 +1681,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(runs, 1);
+        assert_eq!(runs, 0, "低样本跳过不生成复盘记录");
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
@@ -1588,6 +1691,7 @@ mod tests {
     async fn review_with_ai_creates_lesson_and_missing_trade_is_400() {
         let path = std::env::temp_dir().join("nq-evo-ai.db");
         let db = fixture(&path, true);
+        seed_pending_trades(&db, 7);
         let transport = Arc::new(FakeTransport {
             replies: Mutex::new(vec![HttpReply {
                 status: 200,
@@ -1618,6 +1722,106 @@ mod tests {
 
         let (status, _) = request(router, "POST", "/api/v1/evolution/review/999?force=true").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn batch_with_two_samples_does_not_create_mantra() {
+        let path = std::env::temp_dir().join("nq-evo-low-sample.db");
+        let db = fixture(&path, true);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE trades SET reviewed = 1 WHERE id = 3", [])
+            .unwrap();
+        let router = app(
+            db.clone(),
+            Arc::new(FakeTransport {
+                replies: Mutex::new(vec![ai_lesson_reply()]),
+            }),
+        );
+        let (status, body) =
+            request(router, "POST", "/api/v1/evolution/review-batch?force=true").await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert_eq!(body["used_ai"], false, "2 笔样本不得调用 AI: {body}");
+        assert_eq!(body["skipped"], true);
+        assert_eq!(body["change_status"], "NO_CHANGE");
+        assert!(body["reason"].as_str().unwrap().contains("2/10"));
+        let conn = db.conn.lock().unwrap();
+        let mantras: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mantras WHERE source = 'batch_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mantras, 0, "低样本不得写入心法");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn batch_with_ten_samples_can_create_mantra() {
+        let path = std::env::temp_dir().join("nq-evo-ten-sample.db");
+        let db = fixture(&path, true);
+        seed_pending_trades(&db, 7);
+        let router = app(
+            db.clone(),
+            Arc::new(FakeTransport {
+                replies: Mutex::new(vec![ai_lesson_reply()]),
+            }),
+        );
+        let (status, body) =
+            request(router, "POST", "/api/v1/evolution/review-batch?force=true").await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert_eq!(body["used_ai"], true);
+        assert_eq!(body["change_status"], "CHANGE");
+        assert_eq!(body["sample_size"], 10);
+        assert_eq!(body["applied"].as_array().unwrap().len(), 1);
+        let conn = db.conn.lock().unwrap();
+        let (sample, enabled, visible): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT CAST(json_extract(evidence, '$.sample_size') AS INTEGER), enabled, visible \
+                 FROM mantras WHERE source = 'batch_review' AND superseded_by = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sample, 10, "心法证据记录 10 笔样本");
+        assert_eq!((enabled, visible), (1, 1), "满 10 笔样本的心法保持启用");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cleanup_disables_low_sample_mantras() {
+        let path = std::env::temp_dir().join("nq-evo-cleanup-low-sample.db");
+        let db = fixture(&path, false);
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO mantras VALUES(20,'低样本','当量比放大时追多','[]','entry','batch_review',0.7,0.6,0,0,0,1,1,1,0, \
+             '{\"sample_size\":2}',200,200,0); \
+             INSERT INTO mantras VALUES(21,'足量','当回踩不破时开多','[]','entry','batch_review',0.7,0.6,0,0,0,1,1,1,0, \
+             '{\"sample_size\":12}',200,200,0);",
+        )
+        .unwrap();
+        let changed = cleanup_invalid_mantras(&conn);
+        assert_eq!(changed, 1, "只禁用低样本条目");
+        let (low_enabled, low_visible): (i64, i64) = conn
+            .query_row(
+                "SELECT enabled, visible FROM mantras WHERE id=20",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((low_enabled, low_visible), (0, 0));
+        let high_enabled: i64 = conn
+            .query_row("SELECT enabled FROM mantras WHERE id=21", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(high_enabled, 1, "10 笔以上样本的心法保留");
+        drop(conn);
         let _ = std::fs::remove_file(&path);
     }
 

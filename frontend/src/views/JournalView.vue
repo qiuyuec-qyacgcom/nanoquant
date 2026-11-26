@@ -71,8 +71,8 @@ function onFilter() {
 async function labelNow() {
   busy.value = true
   try {
-    const res = await http.post('/journal/label')
-    app.notify(`回访打标完成: ${res.labeled ?? 0} 条（到期 ${res.due ?? 0}）`, 'ok')
+    const res = await http.post('/journal/label?force=true')
+    app.notify(`即时打标完成: ${res.labeled ?? 0} 条（缺价待回访 ${res.missing_price ?? 0}）`, 'ok')
     await load()
   } catch (err: any) {
     app.notify(err.message, 'error')
