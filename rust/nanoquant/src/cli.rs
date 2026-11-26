@@ -728,10 +728,11 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
         })
         .unwrap_or_default();
     // 默认按实盘周期回测；`--interval` 允许在部署周期未对齐时做离线诊断。
-    let timeframe = options
-        .interval
-        .clone()
-        .unwrap_or_else(|| live_timeframe.clone());
+    let timeframe = crate::ga_tune::resolve_timeframe(
+        &live_timeframe,
+        &gate_timeframes,
+        options.interval.as_deref(),
+    );
     let evidence_gate_compatible = timeframe == live_timeframe
         && gate_timeframes.iter().any(|frame| frame == &timeframe);
     let interval_ms = crate::history::interval_ms(&timeframe)

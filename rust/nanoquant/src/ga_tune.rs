@@ -204,6 +204,31 @@ pub(crate) fn params_with_genome(base: &Value, genome: &Genome) -> Value {
     params
 }
 
+/// 默认回测周期对齐证据门白名单：`strategy.timeframe` 不在白名单时回退白名单首个，
+/// 白名单为空则回退证据门默认周期（1h）。显式 `--interval` 始终优先。
+pub(crate) fn resolve_timeframe(
+    live_timeframe: &str,
+    gate_timeframes: &[String],
+    requested: Option<&str>,
+) -> String {
+    if let Some(frame) = requested.map(str::trim).filter(|frame| !frame.is_empty()) {
+        return frame.to_string();
+    }
+    let evidence = gate_timeframes
+        .iter()
+        .map(|frame| frame.trim())
+        .find(|frame| !frame.is_empty())
+        .unwrap_or(crate::evidence_task::DEFAULT_TIMEFRAME);
+    if live_timeframe.trim() != evidence {
+        tracing::warn!(
+            live = %live_timeframe,
+            gate = %evidence,
+            "strategy.timeframe 不在证据门白名单，GA 默认回退证据门周期"
+        );
+    }
+    evidence.to_string()
+}
+
 /// 适应度：样本外平均收益 - 0.5 × 最大回撤 - 0.01 × 交易次数。
 pub(crate) fn score_metrics(metrics: &BasketMetrics) -> f64 {
     metrics.oos_avg_return_pct
@@ -348,6 +373,31 @@ mod tests {
             );
             assert!(value.is_finite(), "{} 必须有限", gene.key);
         }
+    }
+
+    #[test]
+    fn ga_default_interval_matches_evidence_gate() {
+        let gate = vec!["1h".to_string()];
+        assert_eq!(
+            resolve_timeframe("1h", &gate, None),
+            "1h",
+            "与证据门一致时保持实盘周期"
+        );
+        assert_eq!(
+            resolve_timeframe("4h", &gate, None),
+            "1h",
+            "strategy.timeframe=4h 不在白名单时必须回退证据门 1h"
+        );
+        assert_eq!(
+            resolve_timeframe("4h", &gate, Some("4h")),
+            "4h",
+            "--interval 显式覆盖优先"
+        );
+        assert_eq!(
+            resolve_timeframe("4h", &[], None),
+            crate::evidence_task::DEFAULT_TIMEFRAME,
+            "空白名单回退证据门默认周期"
+        );
     }
 
     #[test]
