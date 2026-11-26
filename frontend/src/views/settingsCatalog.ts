@@ -60,7 +60,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
   ],
   ai: [
-    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核（当前版本尚未生效，待后续任务启用）', fields: ['use_invalidation_price', 'use_entry_price'] },
+    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核', fields: ['use_invalidation_price', 'use_entry_price'] },
   ],
   ai_tuning: [
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },

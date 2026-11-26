@@ -366,6 +366,22 @@ mod tests {
     
 
     #[test]
+    fn migrate_adds_invalidation_price_to_positions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT);")
+            .unwrap();
+        migrate(&conn).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info('positions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"invalidation_price".to_string()));
+    }
+
+    #[test]
     fn normalize_ai_tuning_interval_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();

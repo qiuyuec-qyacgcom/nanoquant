@@ -471,21 +471,4 @@ mod tests {
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
     }
 
-    /// 迁移测试放在本模块，避免改动 schema.rs；断言 positions 已补失效价列。
-    #[test]
-    fn migrate_adds_invalidation_price_to_positions() {
-        use rusqlite::Connection;
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT);")
-            .unwrap();
-        crate::schema::migrate(&conn).unwrap();
-        let columns: Vec<String> = conn
-            .prepare("PRAGMA table_info('positions')")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(columns.contains(&"invalidation_price".to_string()));
-    }
 }
