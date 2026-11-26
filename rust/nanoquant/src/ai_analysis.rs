@@ -612,6 +612,7 @@ async fn decision_preview(
     }
     let mut call = ChatCall::new(&messages, "preview");
     call.max_tokens = Some(16000);
+    call.min_max_tokens = true;
     call.temperature = Some(cfg.temperature);
     let outcome =
         ai_client::chat_with_fallback(state.transport.as_ref(), &state.db, &chain, call, &cfg)

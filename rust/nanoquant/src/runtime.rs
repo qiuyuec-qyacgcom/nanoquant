@@ -2995,6 +2995,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         executed: &mut Vec<Value>,
     ) -> Result<Vec<LivePlan>, String> {
         let cfg = Self::risk_settings(tx)?;
+        let ai_cfg = crate::ai_client::read_ai_config_conn(tx);
         let entry_order_type = LiveOrderType::from_setting(engine["order_type"].as_str());
         let mut plans = Vec::new();
         let mut available = snapshot.account.available_balance;
@@ -3132,8 +3133,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                             .unwrap_or((draft.mark_price, draft.mark_price));
                         let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
                         // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
-                        let price = reviewed
-                            .entry_price
+                        let price = gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
                             .and_then(|ai_entry_price| {
                                 Self::preferred_limit_price(
                                     side,
@@ -5459,6 +5459,15 @@ pub(crate) async fn run_fast_risk_task(
     }
 }
 
+/// 开关只在消费点生效：关闭时一律回退旧行为，不采用 AI 值。
+fn gate_ai_value<T>(value: Option<T>, enabled: bool) -> Option<T> {
+    if enabled {
+        value
+    } else {
+        None
+    }
+}
+
 /// 快速风控判定输入：9 个量具名化，避免调用点位置参数错位。
 struct FastRiskInput<'a> {
     side: &'a str,
@@ -5521,11 +5530,12 @@ async fn fast_risk_cycle(
     control: &EngineControl,
     closing: &mut std::collections::HashSet<i64>,
 ) -> Result<(), String> {
-    let (rows, global_stop, global_tp) = {
+    let (rows, global_stop, global_tp, ai_cfg) = {
         let conn = db
             .conn
             .lock()
             .map_err(|_| "数据库锁不可用".to_string())?;
+        let ai_cfg = crate::ai_client::read_ai_config_conn(&conn);
         let mode: String = conn
             .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
                 row.get(0)
@@ -5568,7 +5578,7 @@ async fn fast_risk_cycle(
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        (rows, global_stop, global_tp)
+        (rows, global_stop, global_tp, ai_cfg)
     };
     if rows.is_empty() {
         return Ok(());
@@ -5601,7 +5611,7 @@ async fn fast_risk_cycle(
             sl,
             tp,
             leverage,
-            invalidation_price,
+            invalidation_price: gate_ai_value(invalidation_price, ai_cfg.use_invalidation_price),
             global_stop_pct: global_stop,
             global_tp_pct: global_tp,
         });
@@ -5722,6 +5732,47 @@ mod tests {
             fast_risk_reason(&risk_input("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
             None
         );
+    }
+
+    #[test]
+    fn fast_risk_ignores_invalidation_when_switch_off() {
+        // 开关关闭时消费点把 invalidation_price 置空，失效价不再触发平仓。
+        assert_eq!(
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                96.0,
+                95.0,
+                110.0,
+                5.0,
+                gate_ai_value(Some(97.0), false),
+                30.0,
+                15.0,
+            )),
+            None
+        );
+        // 开关打开时与旧行为一致。
+        assert_eq!(
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                96.0,
+                95.0,
+                110.0,
+                5.0,
+                gate_ai_value(Some(97.0), true),
+                30.0,
+                15.0,
+            )),
+            Some("invalidation")
+        );
+    }
+
+    #[test]
+    fn limit_entry_ignores_ai_price_when_switch_off() {
+        // 限价委托在开关关闭时不采用 AI 入场价，直接回退买一/卖一。
+        assert_eq!(gate_ai_value(Some(101.0), false), None);
+        assert_eq!(gate_ai_value(Some(101.0), true), Some(101.0));
     }
 
     #[test]
@@ -6745,12 +6796,26 @@ mod tests {
     }
 
     /// 用指定 AI 建议价跑一轮只做 Maker 的开仓规划，返回计划价与买一。
-    async fn limit_post_only_plan_with_ai_price(ai_entry_price: Option<f64>) -> (LivePlan, f64) {
+    async fn limit_post_only_plan_with_ai_price(
+        ai_entry_price: Option<f64>,
+        use_entry_price: bool,
+    ) -> (LivePlan, f64) {
         let (db, snapshot) = entry_fixture().await;
         set_engine_settings(
             &db,
             r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
         );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('ai',?1,0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [format!(
+                    r#"{{"use_entry_price":{use_entry_price},"use_invalidation_price":false}}"#
+                )],
+            )
+            .unwrap();
         let runtime =
             test_runtime(&db).with_reviewer(Arc::new(TestApproveReviewer(ai_entry_price)));
         let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
@@ -6762,20 +6827,27 @@ mod tests {
     #[tokio::test]
     async fn live_limit_post_only_entry_uses_ai_entry_price_only_when_valid() {
         // 合法 AI 建议价要替代宿主买一挂单价，直接进入计划。
-        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.95)).await;
+        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.95), true).await;
         assert_eq!(plan.order_type, LiveOrderType::LimitPostOnly);
         assert_eq!(plan.side, "BUY");
         assert_eq!(plan.price, Some(99.95), "合法 AI 建议价必须进入计划价");
 
         // 不在 tick 上的建议价按买单向下归整，归整后的价格进入计划。
-        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.984)).await;
+        let (plan, _) = limit_post_only_plan_with_ai_price(Some(99.984), true).await;
         assert_eq!(plan.price, Some(99.98), "AI 建议价要按 tick 向下归整");
 
         // 高于现价（方向错误）与偏离超 0.5% 的建议价必须回退买一。
-        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(100.5)).await;
+        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(100.5), true).await;
         assert_eq!(plan.price, Some(bid), "反向建议价必须回退买一");
-        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(99.0)).await;
+        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(99.0), true).await;
         assert_eq!(plan.price, Some(bid), "偏离超限必须回退买一");
+    }
+
+    #[tokio::test]
+    async fn live_limit_post_only_ignores_ai_entry_price_when_switch_off() {
+        // 开关关闭时即使 AI 建议价合法，也必须回退买一，保持旧行为。
+        let (plan, bid) = limit_post_only_plan_with_ai_price(Some(99.95), false).await;
+        assert_eq!(plan.price, Some(bid), "开关关闭必须回退买一");
     }
 
     #[tokio::test]

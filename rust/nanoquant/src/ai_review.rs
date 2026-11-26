@@ -195,6 +195,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     let messages = crate::ai_analysis::decision_messages_with_personas(&context, &cfg.personas);
     let mut call = ChatCall::new(&messages, "engine_review");
     call.max_tokens = Some(16000);
+    call.min_max_tokens = true;
     call.temperature = Some(cfg.temperature);
     let outcome =
         ai_client::chat_with_fallback(state.transport.as_ref(), &state.db, &chain, call, &cfg)
@@ -215,7 +216,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .get("min_entry_rr")
         .and_then(Value::as_f64)
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
-    // 由开关决定是否把 AI 新协议字段透传给下游：关闭时保持旧行为。
+    // AI 新协议字段照常落在审计里；`use_invalidation_price` / `use_entry_price`
+    // 只在消费点（快速风控、限价开仓）决定是否采用，复核出口不得清空。
     let reviewed = decision_to_review(
         &proposal,
         side_lock,
@@ -225,16 +227,20 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.allow_ai_override,
         min_entry_rr,
     )?;
-    Ok(apply_ai_switches(reviewed, &cfg))
+    Ok(fill_default_valid_bars(reviewed, &strategy_cfg))
 }
 
-/// 复核出口统一应用 AI 新协议开关：关闭时清空对应字段，保持旧行为。
-fn apply_ai_switches(mut reviewed: ReviewDecision, cfg: &ai_client::AiConfig) -> ReviewDecision {
-    if !cfg.use_invalidation_price {
-        reviewed.invalidation_price = None;
-    }
-    if !cfg.use_entry_price {
-        reviewed.entry_price = None;
+/// AI 未给有效期时回退 strategy.valid_bars，未配置则默认 6 根；越界夹到 1..=24。
+fn fill_default_valid_bars(
+    mut reviewed: ReviewDecision,
+    strategy_cfg: &Value,
+) -> ReviewDecision {
+    if reviewed.valid_bars.is_none() {
+        reviewed.valid_bars = strategy_cfg
+            .get("valid_bars")
+            .and_then(Value::as_i64)
+            .map(|v| v.clamp(1, 24))
+            .or(Some(6));
     }
     reviewed
 }
@@ -1293,23 +1299,35 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     #[test]
-    fn switches_off_clear_invalidation_and_entry() {
-        // 两个开关默认关闭时，复核出口必须清空新协议字段，保持旧行为。
-        let cfg = ai_client::AiConfig::default();
-        let reviewed = apply_ai_switches(reviewed_with_new_fields(), &cfg);
-        assert_eq!(reviewed.invalidation_price, None);
-        assert_eq!(reviewed.entry_price, None);
+    fn valid_bars_falls_back_to_strategy_config() {
+        let reviewed = fill_default_valid_bars(reviewed_with_new_fields(), &json!({"valid_bars": 10}));
+        assert_eq!(reviewed.valid_bars, Some(10));
     }
 
     #[test]
-    fn switches_on_keep_invalidation_and_entry() {
-        // 两个开关打开时，复核出口原样保留 AI 给出的失效价与入场价。
-        let cfg = ai_client::AiConfig {
-            use_invalidation_price: true,
-            use_entry_price: true,
-            ..ai_client::AiConfig::default()
-        };
-        let reviewed = apply_ai_switches(reviewed_with_new_fields(), &cfg);
+    fn valid_bars_keeps_ai_value_when_present() {
+        let mut reviewed = reviewed_with_new_fields();
+        reviewed.valid_bars = Some(4);
+        let reviewed = fill_default_valid_bars(reviewed, &json!({"valid_bars": 10}));
+        assert_eq!(reviewed.valid_bars, Some(4));
+    }
+
+    #[test]
+    fn valid_bars_defaults_when_config_missing() {
+        let reviewed = fill_default_valid_bars(reviewed_with_new_fields(), &json!({}));
+        assert_eq!(reviewed.valid_bars, Some(6));
+        // 配置越界值夹到 1..=24。
+        for (input, expected) in [(0, 1), (-3, 1), (99, 24)] {
+            let reviewed =
+                fill_default_valid_bars(reviewed_with_new_fields(), &json!({"valid_bars": input}));
+            assert_eq!(reviewed.valid_bars, Some(expected), "valid_bars={input}");
+        }
+    }
+
+    #[test]
+    fn switches_do_not_clear_audit_meta() {
+        // 开关只在消费点生效，复核出口必须保留 AI 失效价/入场价供审计落库。
+        let reviewed = fill_default_valid_bars(reviewed_with_new_fields(), &json!({}));
         assert_eq!(reviewed.invalidation_price, Some(97.0));
         assert_eq!(reviewed.entry_price, Some(101.0));
     }

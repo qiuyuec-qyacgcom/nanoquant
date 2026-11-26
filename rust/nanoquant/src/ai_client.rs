@@ -174,6 +174,8 @@ pub struct ChatCall<'a> {
     pub json_mode: Option<bool>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// 是否把 provider 上限当作预算下限（复核/预览需要更宽的输出空间）。
+    pub min_max_tokens: bool,
     pub reasoning_effort: Option<&'a str>,
     pub retries: usize,
 }
@@ -186,6 +188,7 @@ impl<'a> ChatCall<'a> {
             json_mode: None,
             temperature: None,
             max_tokens: None,
+            min_max_tokens: false,
             reasoning_effort: None,
             retries: 2,
         }
@@ -491,6 +494,15 @@ fn effective_max_tokens(call_max: Option<i64>, provider_max: i64) -> i64 {
     call_max.map_or(provider_max, |v| v.max(provider_max)).max(1)
 }
 
+/// 通用预算解析：只有显式声明 `min_max_tokens` 的调用才把 provider 上限当下限。
+fn resolve_max_tokens(call_max: Option<i64>, provider_max: i64, min_max_tokens: bool) -> i64 {
+    if min_max_tokens {
+        effective_max_tokens(call_max, provider_max)
+    } else {
+        call_max.unwrap_or(provider_max).max(1)
+    }
+}
+
 /// 一次真实调用。成功与失败都写 `ai_call_logs`；失败不伪造空成功。
 pub async fn chat(
     transport: &dyn AiTransport,
@@ -512,7 +524,11 @@ pub async fn chat(
     };
     let json_mode = call.json_mode.unwrap_or(provider.json_mode);
     let temperature = call.temperature.unwrap_or(provider.temperature);
-    let max_tokens = effective_max_tokens(call.max_tokens, provider.max_tokens);
+    let max_tokens = resolve_max_tokens(
+        call.max_tokens,
+        provider.max_tokens,
+        call.min_max_tokens,
+    );
     let mut payload = build_payload(provider, call.messages, json_mode, temperature, max_tokens);
     let effort = call
         .reasoning_effort
@@ -2100,6 +2116,19 @@ mod tests {
         assert_eq!(effective_max_tokens(Some(16000), 32000), 32000);
         assert_eq!(effective_max_tokens(Some(16000), 3000), 16000);
         assert_eq!(effective_max_tokens(None, 3000), 3000);
+    }
+
+    #[test]
+    fn min_max_tokens_flag_controls_budget_floor() {
+        // 默认语义：显式预算就是上限，不因 provider 上限更高而被抬高。
+        assert_eq!(resolve_max_tokens(Some(8000), 32000, false), 8000);
+        // 只有显式开启下限语义（复核/预览）才把 provider 上限作为下限。
+        assert_eq!(resolve_max_tokens(Some(8000), 32000, true), 32000);
+        assert_eq!(resolve_max_tokens(None, 3000, false), 3000);
+        assert_eq!(resolve_max_tokens(None, 3000, true), 3000);
+        // 任何情况下预算至少为 1。
+        assert_eq!(resolve_max_tokens(Some(0), 0, false), 1);
+        assert_eq!(resolve_max_tokens(Some(0), 0, true), 1);
     }
 
     #[test]
