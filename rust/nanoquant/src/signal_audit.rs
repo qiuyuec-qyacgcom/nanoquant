@@ -223,28 +223,29 @@ fn stored_key(features: &str) -> Option<String> {
 }
 
 /// 数值型 AI 自评字段：合并时新行缺失则沿用旧值，避免数据丢失。
-const AI_NUMERIC_META_KEYS: [&str; 6] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep", "ai_scale"];
+const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
 
-/// 文本型 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧文本。
-const AI_TEXT_META_KEYS: [&str; 2] = ["ai_inv", "ai_risk"];
+/// 按轮次生效的 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧值。
+/// ai_scale 只代表当前轮的下单缩放，跨轮沿用会与 filter_trace.scale 口径不一致。
+const AI_ROUND_META_KEYS: [&str; 3] = ["ai_inv", "ai_risk", "ai_scale"];
 
-/// 写入 signals.features 的 AI 自评字段键（数值 + 文本）。
-const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_TEXT_META_KEYS.len()] = {
-    let mut keys = [""; AI_NUMERIC_META_KEYS.len() + AI_TEXT_META_KEYS.len()];
+/// 写入 signals.features 的 AI 自评字段键（数值 + 按轮次）。
+const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_ROUND_META_KEYS.len()] = {
+    let mut keys = [""; AI_NUMERIC_META_KEYS.len() + AI_ROUND_META_KEYS.len()];
     let mut index = 0;
     while index < AI_NUMERIC_META_KEYS.len() {
         keys[index] = AI_NUMERIC_META_KEYS[index];
         index += 1;
     }
     let mut offset = 0;
-    while offset < AI_TEXT_META_KEYS.len() {
-        keys[index + offset] = AI_TEXT_META_KEYS[offset];
+    while offset < AI_ROUND_META_KEYS.len() {
+        keys[index + offset] = AI_ROUND_META_KEYS[offset];
         offset += 1;
     }
     keys
 };
 
-/// 合并时用旧值补齐数值字段；文本字段以最新一轮为准，缺失时删除旧键。
+/// 合并时用旧值补齐数值字段；按轮次字段以最新一轮为准，缺失时删除旧键。
 fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
     let previous: Value = match serde_json::from_str(previous_text) {
         Ok(value) => value,
@@ -264,8 +265,8 @@ fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
             }
         }
     }
-    // 文本字段：新一轮没给就删掉旧键，不得跨轮残留。
-    for key in AI_TEXT_META_KEYS {
+    // 按轮次字段：新一轮没给就删掉旧键，不得跨轮残留。
+    for key in AI_ROUND_META_KEYS {
         if !object.contains_key(key) {
             object.remove(key);
         }
@@ -757,6 +758,36 @@ mod tests {
         assert_eq!(
             value["filter_trace"]["stage"], "",
             "合并后 filter_trace 必须是最新一轮"
+        );
+    }
+
+    #[test]
+    fn merged_signal_drops_stale_ai_scale() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        let mut first = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        first.scale = Some(0.8);
+        record(&tx, "demo", 1000, &[first]).unwrap();
+        // 第二轮同键但没有 scale：ai_scale 必须按轮次消失，不能沿用旧值。
+        let second = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        record(&tx, "demo", 1015, &[second]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count(&conn), 1, "同类信号应合并成一行");
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert!(
+            value.get("ai_scale").is_none(),
+            "新行没给 scale 时不得残留旧 ai_scale: {value}"
+        );
+        assert!(
+            value["filter_trace"]["scale"].is_null(),
+            "filter_trace.scale 应反映本轮无 scale: {value}"
         );
     }
 
