@@ -998,6 +998,36 @@ pub struct ParamUpdate {
     pub reason: String,
 }
 
+// v2 自由文本与扩展数值字段的解析边界，normalized/localize/parse_decision 共用。
+const TEXT_BUDGET: usize = 2000;
+const WHY_MAX: usize = 800;
+const INV_MAX: usize = 500;
+const RISK_MAX: usize = 500;
+const F_MAX: usize = 200;
+const METRIC_PREFIX: &str = "｜指标：";
+const FREE_PREFIX: &str = "｜补充：";
+const IP_TOLERANCE: f64 = 0.10;
+const EP_TOLERANCE: f64 = 0.005;
+const VB_MIN: i64 = 1;
+const VB_MAX: i64 = 24;
+const DQ_MAX: f64 = 1.0;
+const RR_MAX: f64 = 10.0;
+
+/// 首尾空白（含全角空格 U+3000）裁掉。
+fn trim_display(text: &str) -> &str {
+    text.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{3000}')
+}
+
+/// 自由文本清洗：换行转空格避免粘连，其余控制字符删除，首尾空白裁掉。
+fn normalize_free_text(text: &str) -> String {
+    let replaced: String = text
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .filter(|ch| !ch.is_control())
+        .collect();
+    trim_display(&replaced).to_string()
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Decision {
     pub action: String,
@@ -1010,10 +1040,15 @@ pub struct Decision {
     pub risk_flags: Vec<String>,
     pub invalidation: String,
     pub params: Vec<ParamUpdate>,
+    /// 失效价（>0，相对 mark 偏离 ≤10% 才保留）
     pub invalidation_price: Option<f64>,
+    /// 信号有效期（K 线根数，1–24）
     pub valid_bars: Option<i64>,
+    /// 数据质量分（0–1）
     pub data_quality: Option<f64>,
+    /// 预期盈亏比（0–10）
     pub rr_target: Option<f64>,
+    /// 建议入场价（>0，相对 mark 偏离 ≤0.5% 才保留）
     pub entry_price: Option<f64>,
 }
 
@@ -1038,9 +1073,9 @@ impl Decision {
             .map(|value| value.clamp(0.0, 100.0));
         self.sl_pct = self.sl_pct.clamp(0.0, 50.0);
         self.tp_pct = self.tp_pct.clamp(0.0, 100.0);
-        self.reason = self.reason.chars().take(2000).collect();
+        self.reason = self.reason.chars().take(TEXT_BUDGET).collect();
         self.risk_flags.truncate(6);
-        self.invalidation = self.invalidation.chars().take(500).collect();
+        self.invalidation = self.invalidation.chars().take(INV_MAX).collect();
         self
     }
 }
@@ -1121,7 +1156,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
             items
                 .iter()
                 .filter_map(|item| item.as_str())
-                .map(|item| item.chars().take(500).collect::<String>())
+                .map(|item| item.chars().take(RISK_MAX).collect::<String>())
                 .take(6)
                 .collect::<Vec<_>>()
         })
@@ -1139,8 +1174,16 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
     let within = |v: f64, pct: f64| mark > 0.0 && v > 0.0 && (v - mark).abs() / mark <= pct;
-    let opt_float =
-        |key: &str| localized.get(key).and_then(Value::as_f64).filter(|v| v.is_finite());
+    let opt_float = |key: &str| {
+        localized
+            .get(key)
+            .and_then(|value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+            })
+            .filter(|v| v.is_finite())
+    };
     Ok(Decision {
         action: text_of("action"),
         confidence: float("confidence"),
@@ -1152,14 +1195,13 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
         risk_flags: flags,
         invalidation: text_of("invalidation"),
         params,
-        invalidation_price: opt_float("invalidation_price").filter(|v| within(*v, 0.10)),
-        valid_bars: localized
-            .get("valid_bars")
-            .and_then(Value::as_i64)
-            .map(|v| v.clamp(1, 24)),
-        data_quality: opt_float("data_quality").map(|v| v.clamp(0.0, 1.0)),
-        rr_target: opt_float("rr_target").map(|v| v.clamp(0.0, 10.0)),
-        entry_price: opt_float("entry_price").filter(|v| within(*v, 0.005)),
+        invalidation_price: opt_float("invalidation_price").filter(|v| within(*v, IP_TOLERANCE)),
+        valid_bars: opt_float("valid_bars")
+            .map(|v| v.round() as i64)
+            .map(|v| v.clamp(VB_MIN, VB_MAX)),
+        data_quality: opt_float("data_quality").map(|v| v.clamp(0.0, DQ_MAX)),
+        rr_target: opt_float("rr_target").map(|v| v.clamp(0.0, RR_MAX)),
+        entry_price: opt_float("entry_price").filter(|v| within(*v, EP_TOLERANCE)),
     }
     .normalized())
 }
@@ -1202,50 +1244,52 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
         });
     }
 
-    // 四个自由文本字段共用总预算，按 why → inv → risk → f 顺序占用。
+    // 四个自由文本字段 + 指标块 + 补充块共用总预算，
+    // 按 why → inv → risk → numeric → f 顺序占用。
     fn take_budget(text: &str, max: usize, left: &mut usize) -> String {
         let out: String = text.chars().take(max.min(*left)).collect();
         *left -= out.chars().count();
         out
     }
-    const TEXT_BUDGET: usize = 2000;
     let mut left = TEXT_BUDGET;
     let why = take_budget(
-        data.get("why").and_then(Value::as_str).unwrap_or("").trim(),
-        800,
+        trim_display(data.get("why").and_then(Value::as_str).unwrap_or("")),
+        WHY_MAX,
         &mut left,
     );
     let inv_text = take_budget(
-        data.get("inv").and_then(Value::as_str).unwrap_or("").trim(),
-        500,
+        trim_display(data.get("inv").and_then(Value::as_str).unwrap_or("")),
+        INV_MAX,
         &mut left,
     );
     let risk_text = take_budget(
-        data.get("risk").and_then(Value::as_str).unwrap_or("").trim(),
-        500,
+        trim_display(data.get("risk").and_then(Value::as_str).unwrap_or("")),
+        RISK_MAX,
         &mut left,
     );
-    let free_source: String = data
-        .get("f")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect();
-    let free = take_budget(&free_source, 200, &mut left);
+
+    let numeric = numbers_text(&numbers);
+    let numeric_block = if numeric.is_empty() || left <= METRIC_PREFIX.chars().count() {
+        String::new()
+    } else {
+        take_budget(&format!("{METRIC_PREFIX}{numeric}"), usize::MAX, &mut left)
+    };
+    let free_source = normalize_free_text(data.get("f").and_then(Value::as_str).unwrap_or(""));
+    let free_budget = F_MAX.min(left.saturating_sub(FREE_PREFIX.chars().count()));
+    let free = take_budget(&free_source, free_budget, &mut left);
+    let free_block = if free.is_empty() {
+        String::new()
+    } else {
+        format!("{FREE_PREFIX}{free}")
+    };
 
     let mut reason = if why.is_empty() {
         reasons.join("；")
     } else {
-        why.clone()
+        why
     };
-    let numeric = numbers_text(&numbers);
-    if !numeric.is_empty() {
-        reason.push_str(&format!("｜指标：{numeric}"));
-    }
-    if !free.is_empty() {
-        reason.push_str(&format!("｜补充：{free}"));
-    }
+    reason.push_str(&numeric_block);
+    reason.push_str(&free_block);
 
     let risks = if risk_text.is_empty() {
         codes_text(data.get("k"), &CODE_TEXT, 3)
@@ -1286,12 +1330,17 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
     );
     out.insert("risk_flags".to_string(), json!(risks));
     out.insert("invalidation".to_string(), json!(invalidation));
-    let opt = |key: &str| data.get(key).and_then(Value::as_f64).filter(|v| v.is_finite());
+    let opt = |key: &str| {
+        data.get(key)
+            .and_then(|value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+            })
+            .filter(|v| v.is_finite())
+    };
     out.insert("invalidation_price".to_string(), json!(opt("ip")));
-    out.insert(
-        "valid_bars".to_string(),
-        json!(data.get("vb").and_then(Value::as_i64)),
-    );
+    out.insert("valid_bars".to_string(), json!(opt("vb")));
     out.insert("data_quality".to_string(), json!(opt("dq")));
     out.insert("rr_target".to_string(), json!(opt("rr")));
     out.insert("entry_price".to_string(), json!(opt("ep")));
@@ -1935,7 +1984,13 @@ mod tests {
         assert!(d.reason.contains('很'));
         assert!(d.reason.chars().count() <= 2000);
         assert!(d.invalidation.chars().count() <= 500);
-        assert!(d.risk_flags.iter().map(|s| s.chars().count()).sum::<usize>() <= 500);
+        assert!(
+            d.risk_flags
+                .iter()
+                .map(|s| s.chars().count())
+                .sum::<usize>()
+                <= 500
+        );
     }
 
     #[test]
@@ -1954,5 +2009,103 @@ mod tests {
         let d = parse_decision(text, Some(&ctx)).unwrap();
         assert_eq!(d.action, "hold");
         assert_eq!(d.data_quality, None);
+    }
+
+    #[test]
+    fn free_text_fields_fall_back_to_code_tables() {
+        let ctx = json!({"price": 100.0});
+        let text = r#"{"a":"L","c":0.7,"r":[1],"k":[2],"x":3}"#;
+        let d = parse_decision(text, Some(&ctx)).unwrap();
+        assert!(d.reason.contains("EMA 多头排列"), "{}", d.reason);
+        assert!(d.risk_flags.iter().any(|s| s.contains("短周期动量延续")));
+        assert!(d.invalidation.contains("RSI 回升至 30"));
+    }
+
+    #[test]
+    fn extended_numbers_are_clamped() {
+        let ctx = json!({"price": 100.0});
+        let low =
+            parse_decision(r#"{"a":"L","c":0.7,"dq":-1,"rr":-1,"vb":0}"#, Some(&ctx)).unwrap();
+        assert_eq!(low.data_quality, Some(0.0));
+        assert_eq!(low.rr_target, Some(0.0));
+        assert_eq!(low.valid_bars, Some(VB_MIN));
+
+        let high =
+            parse_decision(r#"{"a":"L","c":0.7,"dq":2,"rr":11,"vb":25}"#, Some(&ctx)).unwrap();
+        assert_eq!(high.data_quality, Some(DQ_MAX));
+        assert_eq!(high.rr_target, Some(RR_MAX));
+        assert_eq!(high.valid_bars, Some(VB_MAX));
+    }
+
+    #[test]
+    fn invalidation_and_entry_price_need_a_positive_mark() {
+        let text = r#"{"a":"L","c":0.7,"ip":95.0,"ep":100.2}"#;
+        let no_ctx = parse_decision(text, None).unwrap();
+        assert_eq!(no_ctx.invalidation_price, None);
+        assert_eq!(no_ctx.entry_price, None);
+
+        let zero = json!({"price": 0.0});
+        let zero_ctx = parse_decision(text, Some(&zero)).unwrap();
+        assert_eq!(zero_ctx.invalidation_price, None);
+        assert_eq!(zero_ctx.entry_price, None);
+    }
+
+    #[test]
+    fn extended_numbers_accept_string_digits() {
+        let ctx = json!({"price": 100.0});
+        let d = parse_decision(
+            r#"{"a":"L","c":0.7,"ip":"95.0","dq":"0.8","rr":"1.5","ep":"100.2"}"#,
+            Some(&ctx),
+        )
+        .unwrap();
+        assert_eq!(d.invalidation_price, Some(95.0));
+        assert_eq!(d.data_quality, Some(0.8));
+        assert_eq!(d.rr_target, Some(1.5));
+        assert_eq!(d.entry_price, Some(100.2));
+    }
+
+    #[test]
+    fn valid_bars_accepts_float_integral_values() {
+        let ctx = json!({"price": 100.0});
+        let d = parse_decision(r#"{"a":"L","c":0.7,"vb":6.0}"#, Some(&ctx)).unwrap();
+        assert_eq!(d.valid_bars, Some(6));
+    }
+
+    #[test]
+    fn blank_free_text_is_not_appended() {
+        let ctx = json!({"price": 100.0});
+        let ascii =
+            parse_decision(r#"{"a":"H","c":0.5,"why":"理由","f":"   "}"#, Some(&ctx)).unwrap();
+        assert!(!ascii.reason.contains(FREE_PREFIX));
+
+        let cjk = parse_decision(
+            "{\"a\":\"H\",\"c\":0.5,\"why\":\"理由\",\"f\":\"\\u3000\\u3000\"}",
+            Some(&ctx),
+        )
+        .unwrap();
+        assert!(!cjk.reason.contains(FREE_PREFIX));
+
+        let newline =
+            parse_decision(r#"{"a":"H","c":0.5,"why":"理由","f":"a\nb"}"#, Some(&ctx)).unwrap();
+        assert!(newline.reason.ends_with("a b"), "{}", newline.reason);
+    }
+
+    #[test]
+    fn reason_budget_includes_numeric_and_free_blocks() {
+        let ctx = json!({"price": 100.0, "features": {"rsi": 70.0, "v": 2.0}});
+        let long = "很".repeat(3000);
+        let text = format!(
+            r#"{{"a":"L","c":0.7,"why":"{}","inv":"{}","risk":"{}","f":"{}"}}"#,
+            long, long, long, long
+        );
+        let d = parse_decision(&text, Some(&ctx)).unwrap();
+        assert!(
+            d.reason.chars().count() <= TEXT_BUDGET,
+            "length {}",
+            d.reason.chars().count()
+        );
+        assert!(d.reason.starts_with(&"很".repeat(WHY_MAX)));
+        assert!(d.reason.contains(METRIC_PREFIX));
+        assert!(d.reason.contains(FREE_PREFIX));
     }
 }
