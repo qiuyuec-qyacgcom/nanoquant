@@ -5406,6 +5406,41 @@ pub(crate) async fn run_fast_risk_task(
     }
 }
 
+/// 快速风控裁决：先看全局止盈止损（保证金收益率），再看单仓价格、
+/// AI 失效价，最后看单仓止盈止损。返回 None 表示继续持仓。
+fn fast_risk_reason(
+    side: &str,
+    entry: f64,
+    mark: f64,
+    sl: f64,
+    tp: f64,
+    leverage: f64,
+    invalidation_price: Option<f64>,
+    global_stop: f64,
+    global_tp: f64,
+) -> Option<&'static str> {
+    let direction = if side == "long" { 1.0 } else { -1.0 };
+    let margin_pct = (mark - entry) * direction / entry * 100.0 * leverage.max(1.0);
+    if global_stop > 0.0 && margin_pct <= -global_stop {
+        return Some("global_stop_loss");
+    }
+    if global_tp > 0.0 && margin_pct >= global_tp {
+        return Some("global_take_profit");
+    }
+    if let Some(ip) = invalidation_price.filter(|v| *v > 0.0 && v.is_finite()) {
+        if (direction > 0.0 && mark <= ip) || (direction < 0.0 && mark >= ip) {
+            return Some("invalidation");
+        }
+    }
+    if sl > 0.0 && ((direction > 0.0 && mark <= sl) || (direction < 0.0 && mark >= sl)) {
+        return Some("stop_loss");
+    }
+    if tp > 0.0 && ((direction > 0.0 && mark >= tp) || (direction < 0.0 && mark <= tp)) {
+        return Some("take_profit");
+    }
+    None
+}
+
 async fn fast_risk_cycle(
     db: &crate::db::Db,
     control: &EngineControl,
@@ -5437,7 +5472,7 @@ async fn fast_risk_cycle(
         let global_tp = risk["global_take_profit_pct"].as_f64().unwrap_or(15.0);
         let mut stmt = conn
             .prepare(
-                "SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty \
+                "SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty,invalidation_price \
                  FROM positions WHERE mode='live' AND status='open' AND qty > 0",
             )
             .map_err(|error| error.to_string())?;
@@ -5452,6 +5487,7 @@ async fn fast_risk_cycle(
                     row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                     row.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
                     row.get::<_, f64>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -5464,7 +5500,7 @@ async fn fast_risk_cycle(
     }
     let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
         .map_err(|error| format!("{error:?}"))?;
-    for (id, symbol, side, entry, sl, tp, leverage, qty) in rows {
+    for (id, symbol, side, entry, sl, tp, leverage, qty, invalidation_price) in rows {
         if closing.contains(&id) {
             continue;
         }
@@ -5475,8 +5511,7 @@ async fn fast_risk_cycle(
             continue;
         }
         let direction = if side == "long" { 1.0 } else { -1.0 };
-        let price_pct = (mark - entry) * direction / entry * 100.0;
-        let margin_pct = price_pct * leverage.max(1.0);
+
         if let Ok(conn) = db.conn.lock() {
             let _ = conn.execute(
                 "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
@@ -5484,17 +5519,9 @@ async fn fast_risk_cycle(
                 (mark, (mark - entry) * qty * direction, crate::now(), id),
             );
         }
-        let reason = if global_stop > 0.0 && margin_pct <= -global_stop {
-            Some("global_stop_loss")
-        } else if global_tp > 0.0 && margin_pct >= global_tp {
-            Some("global_take_profit")
-        } else if sl > 0.0 && ((direction > 0.0 && mark <= sl) || (direction < 0.0 && mark >= sl)) {
-            Some("stop_loss")
-        } else if tp > 0.0 && ((direction > 0.0 && mark >= tp) || (direction < 0.0 && mark <= tp)) {
-            Some("take_profit")
-        } else {
-            None
-        };
+        let reason = fast_risk_reason(
+            &side, entry, mark, sl, tp, leverage, invalidation_price, global_stop, global_tp,
+        );
         let Some(reason) = reason else {
             continue;
         };
@@ -5568,6 +5595,26 @@ async fn refresh_account_balance(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn invalidation_price_triggers_fast_close() {
+        // 快速风控需在 AI 失效价被触及时立即返回 invalidation：
+        // 多单标记价跌到失效价、空单标记价涨到失效价即视为失效。
+        // 全局止损阈值需高于杠杆放大后的浮亏（-4% × 5 = -20%），
+        // 否则会先命中 global_stop_loss，无法验证失效价分支。
+        assert_eq!(
+            fast_risk_reason("long", 100.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0),
+            Some("invalidation")
+        );
+        assert_eq!(
+            fast_risk_reason("short", 100.0, 104.0, 105.0, 90.0, 5.0, Some(103.0), 30.0, 15.0),
+            Some("invalidation")
+        );
+        assert_eq!(
+            fast_risk_reason("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0),
+            None
+        );
+    }
 
     #[test]
     fn entry_position_persists_invalidation_price() {

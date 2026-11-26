@@ -762,6 +762,9 @@ pub struct AiConfig {
     pub inject_mantras: bool,
     pub require_agreement: bool,
     pub allow_ai_override: bool,
+    // AI 新协议字段：是否在复核出口透传失效价与入场价，默认关闭以保持旧行为。
+    pub use_invalidation_price: bool,
+    pub use_entry_price: bool,
     pub personas: Vec<AiPersona>,
 }
 
@@ -782,6 +785,8 @@ impl Default for AiConfig {
             inject_mantras: true,
             require_agreement: true,
             allow_ai_override: false,
+            use_invalidation_price: false,
+            use_entry_price: false,
             personas: Vec::new(),
         }
     }
@@ -848,6 +853,12 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     }
     if let Some(item) = value.get("allow_ai_override").and_then(Value::as_bool) {
         cfg.allow_ai_override = item;
+    }
+    if let Some(item) = value.get("use_invalidation_price").and_then(Value::as_bool) {
+        cfg.use_invalidation_price = item;
+    }
+    if let Some(item) = value.get("use_entry_price").and_then(Value::as_bool) {
+        cfg.use_entry_price = item;
     }
     if let Some(items) = value.get("personas").and_then(Value::as_array) {
         cfg.personas = items

@@ -215,7 +215,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .get("min_entry_rr")
         .and_then(Value::as_f64)
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
-    decision_to_review(
+    // 由开关决定是否把 AI 新协议字段透传给下游：关闭时保持旧行为。
+    let mut reviewed = decision_to_review(
         &proposal,
         side_lock,
         &decision,
@@ -223,7 +224,14 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.require_agreement,
         cfg.allow_ai_override,
         min_entry_rr,
-    )
+    )?;
+    if !cfg.use_invalidation_price {
+        reviewed.invalidation_price = None;
+    }
+    if !cfg.use_entry_price {
+        reviewed.entry_price = None;
+    }
+    Ok(reviewed)
 }
 
 const DEFAULT_MIN_ENTRY_RR: f64 = 0.8;
