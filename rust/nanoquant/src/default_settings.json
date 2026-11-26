@@ -167,6 +167,8 @@
     "kline_ttl_sec": 20,
     "request_timeout_sec": 12,
     "max_pool_size": 20,
+    "book_ws_enabled": true,
+    "book_stale_ms": 3000,
     "demo_api_key_enc": "",
     "demo_api_secret_enc": "",
     "live_api_key_enc": "",

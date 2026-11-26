@@ -115,6 +115,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("data", "kline_ttl_sec", 1.0, 3600.0, 1.0),
     ("data", "request_timeout_sec", 1.0, 300.0, 1.0),
     ("data", "max_pool_size", 1.0, 500.0, 1.0),
+    ("data", "book_stale_ms", 500.0, 30000.0, 500.0),
     ("news", "refresh_minutes", 1.0, 1440.0, 1.0),
     ("news", "keep_days", 1.0, 365.0, 1.0),
     ("news", "sentiment_threshold", -1.0, 1.0, 0.01),
@@ -252,6 +253,8 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "live_base_url",
             "backup_base_urls",
             "proxy",
+            "book_ws_enabled",
+            "book_stale_ms",
         ],
     ),
     (

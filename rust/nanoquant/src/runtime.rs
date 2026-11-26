@@ -4789,6 +4789,19 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             .map_err(|error| error.to_string())?
             .unwrap_or(Value::Null);
         let timeframe = strategy["timeframe"].as_str().unwrap_or("4h");
+        let data = self
+            .db
+            .setting("data")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let book_ws_enabled = data
+            .get("book_ws_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let book_stale_ms = data
+            .get("book_stale_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(3_000);
         let provider = match credentials {
             Some((api_key, secret)) => crate::providers::BinanceProvider::with_symbols(
                 base,
@@ -4804,6 +4817,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             ),
         }
         .and_then(|provider| provider.with_timeframe(timeframe))
+        .map(|provider| provider.with_book_config(book_ws_enabled, book_stale_ms))
         .map_err(|error| format!("无法初始化交易所快照客户端: {error:?}"))?;
         let plans = self.refresh_snapshot(mode, &provider).await?;
         Ok((mode.to_string(), plans))

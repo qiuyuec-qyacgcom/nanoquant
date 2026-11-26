@@ -38,10 +38,7 @@ pub struct ExchangeTicker {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookTop {
     pub symbol: String,
-    // 盘口买一/卖一暂未被扫描读取，仅用于计算/审计点差。
-    #[allow(dead_code)]
     pub bid: f64,
-    #[allow(dead_code)]
     pub ask: f64,
     pub spread_bps: f64,
 }
@@ -185,6 +182,11 @@ pub struct BinanceProvider {
 
     /// demo 无凭证时，账户/持仓/订单从这里读本地账本。
     public_book: Option<crate::db::Db>,
+
+    /// 是否优先读 `book_stream` 的本地盘口；关闭时完全走 REST。
+    book_enabled: bool,
+    /// 本地盘口超过该毫秒数未更新就回退 REST。
+    book_stale_ms: i64,
 }
 
 impl BinanceProvider {
@@ -226,6 +228,9 @@ impl BinanceProvider {
             timeframe: "4h".into(),
 
             public_book: None,
+
+            book_enabled: false,
+            book_stale_ms: 3_000,
         })
     }
 
@@ -244,6 +249,9 @@ impl BinanceProvider {
             secret: String::new(),
             timeframe: "4h".into(),
             public_book: None,
+
+            book_enabled: false,
+            book_stale_ms: 3_000,
         })
     }
 
@@ -269,6 +277,9 @@ impl BinanceProvider {
             secret,
             timeframe: "4h".into(),
             public_book: None,
+
+            book_enabled: false,
+            book_stale_ms: 3_000,
         })
     }
 
@@ -315,6 +326,9 @@ impl BinanceProvider {
             timeframe: "4h".into(),
 
             public_book: Some(db),
+
+            book_enabled: false,
+            book_stale_ms: 3_000,
         })
     }
 
@@ -428,6 +442,14 @@ impl BinanceProvider {
         }
         .into();
         Ok(self)
+    }
+
+    /// 注入本地盘口开关与过期阈值。只有引擎行情快照需要打开，
+    /// 其他只读客户端保持纯 REST，避免测试之间共享全局盘口。
+    pub fn with_book_config(mut self, enabled: bool, stale_ms: i64) -> Self {
+        self.book_enabled = enabled;
+        self.book_stale_ms = stale_ms.clamp(500, 30_000);
+        self
     }
 
     /// 只拉交易所持仓，不拉行情/K 线。用于手动平仓后的快速对账。
@@ -606,8 +628,14 @@ impl SnapshotProvider for BinanceProvider {
                         "{symbol} 盘口买一/卖一无效"
                     )));
                 }
-                let mid = (bid + ask) / 2.0;
-                let spread_bps = ((ask - bid) / mid * 10_000.0).max(0.0);
+                let (bid, ask, spread_bps) = crate::book_stream::resolve_for_symbol(
+                    self.book_enabled,
+                    self.book_stale_ms,
+                    symbol,
+                    bid,
+                    ask,
+                    crate::now_millis(),
+                );
                 let (open_interest, open_interest_change_pct) = match self
                     .get_json(
                         "/futures/data/openInterestHist",

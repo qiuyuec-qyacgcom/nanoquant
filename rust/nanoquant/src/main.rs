@@ -27,6 +27,7 @@ mod auth;
 mod backtest;
 mod backtest_engine;
 mod backup;
+mod book_stream;
 mod bootstrap;
 mod cli;
 mod config;
@@ -309,6 +310,11 @@ async fn main() {
     // 自动换池独立任务：与交易引擎解耦，进程退出时随 stop_tx 一起收敛。
     if let Some(db) = database.clone() {
         tokio::spawn(crate::symbol_scan::run_loop(db.clone(), stop_tx.subscribe()));
+        // 本地盘口：bookTicker 合并流只在开关打开且 live/demo 时启动；
+        // 未启动或断线时 snapshot 会自动回退 REST。
+        if crate::book_stream::startup_enabled(&db) {
+            tokio::spawn(crate::book_stream::run_task(db.clone(), stop_tx.subscribe()));
+        }
         // 账户面板的标记价刷新独立于策略周期，避免权益/浮盈要等 10 分钟一轮才变。
         tokio::spawn(crate::runtime::run_position_mark_task(
             db.clone(),

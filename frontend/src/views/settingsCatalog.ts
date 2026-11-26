@@ -131,6 +131,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       hint: '只影响引擎内部取价与 API 权重，不改变对外行情接口',
       fields: ['kline_limit', 'ticker_ttl_sec', 'kline_ttl_sec', 'request_timeout_sec', 'max_pool_size'],
     },
+    {
+      title: '本地盘口',
+      hint: 'WebSocket bookTicker 优先，关闭或过期时回退 REST',
+      fields: ['book_ws_enabled', 'book_stale_ms'],
+    },
   ],
   news: [
     { title: '抓取', fields: ['enabled', 'refresh_minutes', 'keep_days', 'sources', 'max_items_per_source', 'rsshub_base'] },

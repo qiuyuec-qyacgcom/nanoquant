@@ -231,6 +231,8 @@ const BASE_META: Record<string, FieldMeta> = {
   kline_limit: { label: 'K 线长度', unit: '根', hint: '引擎内部取价使用，不作为对外行情接口' },
   ticker_ttl_sec: { label: '行情缓存', unit: '秒', hint: '引擎内部 ticker 缓存，减少 API 权重' },
   kline_ttl_sec: { label: 'K 线缓存', unit: '秒' },
+  book_ws_enabled: { label: '本地盘口', hint: '开启后用 bookTicker WebSocket 维护买一/卖一；关闭则完全走 REST' },
+  book_stale_ms: { label: '盘口过期', unit: '毫秒', hint: '本地盘口超过该时长未更新就回退 REST' },
   request_timeout_sec: { label: '请求超时', unit: '秒' },
   max_pool_size: { label: '标的池上限', unit: '个', hint: '与 astra 规则一致，超限拒绝添加' },
 
