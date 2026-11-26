@@ -4,6 +4,7 @@
 //! 有效提案时只输出「本地台账推导」的事实，恒 `NO_CHANGE`，绝不回填规则心法。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -24,6 +25,18 @@ const DETERMINISTIC_PREFIX: &str = "[本地台账推导]";
 const MIN_STRUCTURAL_SAMPLE: i64 = 10;
 const REPLACE_SIM: f64 = 0.62;
 const MERGE_WINDOW_SEC: i64 = 6 * 3600;
+const GLOBAL_REVIEW_LAST_KEY: &str = "evolution.global_review_last";
+
+static GLOBAL_REVIEWING: AtomicBool = AtomicBool::new(false);
+
+/// 无论正常返回还是 panic，都在作用域结束时释放并发闸门。
+struct GlobalReviewGuard;
+
+impl Drop for GlobalReviewGuard {
+    fn drop(&mut self) {
+        GLOBAL_REVIEWING.store(false, Ordering::SeqCst);
+    }
+}
 
 pub fn routes() -> Router<AiState> {
     Router::new()
@@ -480,7 +493,11 @@ fn refresh_health(conn: &rusqlite::Connection, cfg: &EvolutionCfg) -> Value {
         )
         .ok();
         updated += 1;
-        if hits >= cfg.min_health_sample && health < 0.45 && row.enabled {
+        if cfg.auto_disable_negative
+            && hits >= cfg.min_health_sample
+            && health < cfg.archive_health_threshold
+            && row.enabled
+        {
             conn.execute(
                 "UPDATE mantras SET enabled = 0, updated_at = ?2 WHERE id = ?1",
                 (row.id, now),
@@ -506,6 +523,77 @@ fn refresh_health(conn: &rusqlite::Connection, cfg: &EvolutionCfg) -> Value {
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// 按配置间隔决定是否自动全局复盘：`every <= 0` 视为关闭。
+fn should_run_global_review(total_trades: i64, last: i64, every: i64) -> bool {
+    every > 0 && total_trades - last >= every
+}
+
+fn read_engine_i64(conn: &rusqlite::Connection, key: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT value FROM engine_state WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| raw.trim().parse::<i64>().ok())
+}
+
+fn write_engine_i64(conn: &rusqlite::Connection, key: &str, value: i64) {
+    conn.execute(
+        "INSERT OR REPLACE INTO engine_state(key, value, updated_at) VALUES(?1, ?2, ?3)",
+        (key, value.to_string(), crate::now()),
+    )
+    .ok();
+}
+
+/// 自动全局复盘：失败只告警，不阻断平仓复盘链路；并发时直接跳过。
+async fn maybe_run_global_review(state: &AiState) {
+    let (cfg, total, last) = {
+        let conn = state.db.lock();
+        let cfg = evolution_cfg(&conn);
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trades WHERE closed_at > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let last = read_engine_i64(&conn, GLOBAL_REVIEW_LAST_KEY).unwrap_or(0);
+        (cfg, total, last)
+    };
+    if !should_run_global_review(total, last, cfg.global_review_every_trades) {
+        return;
+    }
+    if GLOBAL_REVIEWING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _guard = GlobalReviewGuard;
+    {
+        let conn = state.db.lock();
+        write_engine_i64(&conn, GLOBAL_REVIEW_LAST_KEY, total);
+    }
+    if let Err((status, body)) = global_review_inner(state, &cfg).await {
+        let detail = body["detail"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("未知错误");
+        if let Ok(conn) = state.db.conn.lock() {
+            let _ = conn.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) \
+                 VALUES(?1,'warn','evolution',?2,?3)",
+                (
+                    crate::now(),
+                    format!("自动全局复盘失败({}): {detail}", status.as_u16())
+                        .chars()
+                        .take(400)
+                        .collect::<String>(),
+                    serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()),
+                ),
+            );
+        }
+    }
 }
 
 fn insert_run(
@@ -720,6 +808,7 @@ pub(crate) async fn review_trade_and_record(
         return;
     }
     let result = review_trade_inner(&state, trade_id, false).await;
+    let mut batch_reviewed = false;
     let (level, message, payload) = match result {
         Ok(value) if value["skipped"].as_bool().unwrap_or(false) => (
             "warn",
@@ -729,15 +818,18 @@ pub(crate) async fn review_trade_and_record(
             ),
             json!({"trade_id": trade_id, "skipped": true, "result": value}),
         ),
-        Ok(value) => (
-            "info",
-            format!(
-                "交易 #{trade_id} 复盘完成: {} 笔样本, change_status={}",
-                value["sample_size"].as_i64().unwrap_or(0),
-                value["change_status"].as_str().unwrap_or("NO_CHANGE")
-            ),
-            json!({"trade_id": trade_id, "result": value}),
-        ),
+        Ok(value) => {
+            batch_reviewed = true;
+            (
+                "info",
+                format!(
+                    "交易 #{trade_id} 复盘完成: {} 笔样本, change_status={}",
+                    value["sample_size"].as_i64().unwrap_or(0),
+                    value["change_status"].as_str().unwrap_or("NO_CHANGE")
+                ),
+                json!({"trade_id": trade_id, "result": value}),
+            )
+        }
         Err((_, body)) => (
             "warn",
             format!(
@@ -762,6 +854,9 @@ pub(crate) async fn review_trade_and_record(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&trade_id);
+    if batch_reviewed {
+        maybe_run_global_review(&state).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -1135,9 +1230,22 @@ async fn health_refresh(State(state): State<AiState>) -> Json<Value> {
 async fn global_review(
     State(state): State<AiState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (cfg, stats, rows, existing) = {
+    let cfg = {
         let conn = state.db.lock();
-        let cfg = evolution_cfg(&conn);
+        evolution_cfg(&conn)
+    };
+    global_review_inner(&state, &cfg)
+        .await
+        .map(Json)
+        .map_err(|(status, body)| (status, Json(body)))
+}
+
+async fn global_review_inner(
+    state: &AiState,
+    cfg: &EvolutionCfg,
+) -> Result<Value, (StatusCode, Value)> {
+    let (stats, rows, existing) = {
+        let conn = state.db.lock();
         let rows = load_trades(&conn, 60, false, "");
         let stats = batch_stats(&rows);
         let existing: Vec<Value> = load_mantras(&conn)
@@ -1147,13 +1255,12 @@ async fn global_review(
             .take(40)
             .map(|row| json!({"title": row.title, "health": row.health}))
             .collect();
-        (cfg, stats, rows, existing)
+        (stats, rows, existing)
     };
     if (rows.len() as i64) < cfg.min_lesson_sample {
         return Err((
             StatusCode::BAD_REQUEST,
-            json!({"detail": format!("样本不足 (至少 {} 笔闭环交易)", cfg.min_lesson_sample)})
-                .into(),
+            json!({"detail": format!("样本不足 (至少 {} 笔闭环交易)", cfg.min_lesson_sample)}),
         ));
     }
     let payloads: Vec<Value> = rows
@@ -1161,7 +1268,7 @@ async fn global_review(
         .map(|trade| trade_payload(trade, true))
         .collect();
     let (ai_data, ai_error) = match call_ai(
-        &state,
+        state,
         &global_messages(&stats, &payloads, &existing),
         "global_review",
     )
@@ -1266,7 +1373,7 @@ async fn global_review(
     {
         let conn = state.db.lock();
         let archived = purge_superseded(&conn);
-        let health = refresh_health(&conn, &cfg);
+        let health = refresh_health(&conn, cfg);
         let produced = applied
             .iter()
             .filter(|item| matches!(item["action"].as_str(), Some("created") | Some("replaced")))
@@ -1309,8 +1416,7 @@ async fn global_review(
         "applied": applied,
         "retired": retired,
         "stats": stats,
-    })
-    .into())
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1935,6 +2041,171 @@ mod tests {
             })
             .unwrap();
         assert_eq!(superseded, old_id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn evolution_cfg_reads_archive_and_global_review_keys() {
+        let path = std::env::temp_dir().join("nq-evo-cfg-wire.db");
+        let db = fixture(&path, false);
+        let conn = db.lock();
+        let defaults = evolution_cfg(&conn);
+        assert_eq!(defaults.archive_health_threshold, 0.45, "缺省归档阈值 0.45");
+        assert!(defaults.auto_disable_negative, "缺省自动禁用负向心法");
+        assert_eq!(
+            defaults.global_review_every_trades, 10,
+            "缺省每 10 笔全局复盘"
+        );
+        conn.execute(
+            "UPDATE app_settings SET value = ?1 WHERE key = 'evolution'",
+            [r#"{"archive_health_threshold":0.2,"auto_disable_negative":false,"global_review_every_trades":3}"#],
+        )
+        .unwrap();
+        let cfg = evolution_cfg(&conn);
+        assert_eq!(cfg.archive_health_threshold, 0.2);
+        assert!(!cfg.auto_disable_negative);
+        assert_eq!(cfg.global_review_every_trades, 3);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refresh_health_uses_configured_threshold() {
+        let path = std::env::temp_dir().join("nq-evo-health-threshold.db");
+        let db = fixture(&path, false);
+        let conn = db.lock();
+        conn.execute(
+            "UPDATE app_settings SET value = ?1 WHERE key = 'evolution'",
+            [r#"{"min_health_sample":1,"archive_health_threshold":0.6}"#],
+        )
+        .unwrap();
+        let cfg = evolution_cfg(&conn);
+        let report = refresh_health(&conn, &cfg);
+        assert_eq!(
+            report["archived"], 1,
+            "健康分 0.5 低于 0.6 阈值应归档: {report}"
+        );
+        let enabled: i64 = conn
+            .query_row("SELECT enabled FROM mantras WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(enabled, 0);
+
+        conn.execute("UPDATE mantras SET enabled = 1 WHERE id = 1", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE app_settings SET value = ?1 WHERE key = 'evolution'",
+            [r#"{"min_health_sample":1,"archive_health_threshold":0.4}"#],
+        )
+        .unwrap();
+        let cfg = evolution_cfg(&conn);
+        let report = refresh_health(&conn, &cfg);
+        assert_eq!(report["archived"], 0, "阈值 0.4 时健康分 0.5 不归档");
+        let enabled: i64 = conn
+            .query_row("SELECT enabled FROM mantras WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(enabled, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_disable_negative_false_keeps_mantra_enabled() {
+        let path = std::env::temp_dir().join("nq-evo-auto-disable-off.db");
+        let db = fixture(&path, false);
+        let conn = db.lock();
+        conn.execute(
+            "UPDATE app_settings SET value = ?1 WHERE key = 'evolution'",
+            [r#"{"min_health_sample":1,"archive_health_threshold":1.0,"auto_disable_negative":false}"#],
+        )
+        .unwrap();
+        let cfg = evolution_cfg(&conn);
+        let report = refresh_health(&conn, &cfg);
+        assert_eq!(report["archived"], 0, "关闭自动禁用时只更新健康分");
+        let enabled: i64 = conn
+            .query_row("SELECT enabled FROM mantras WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(enabled, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn should_run_global_review_respects_interval_and_zero() {
+        assert!(!should_run_global_review(100, 0, 0), "间隔 0 等于关闭");
+        assert!(!should_run_global_review(100, 0, -5), "负间隔等于关闭");
+        assert!(!should_run_global_review(100, 95, 10), "不足间隔不触发");
+        assert!(should_run_global_review(100, 90, 10), "恰好达到间隔触发");
+        assert!(should_run_global_review(100, 0, 10), "首次累计达到间隔触发");
+    }
+
+    #[tokio::test]
+    async fn global_review_inner_rejects_insufficient_samples() {
+        let path = std::env::temp_dir().join("nq-evo-global-inner-empty.db");
+        let db = fixture(&path, false);
+        db.lock().execute("DELETE FROM trades", []).unwrap();
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            Arc::new(FakeTransport {
+                replies: Mutex::new(Vec::new()),
+            }),
+        );
+        let cfg = {
+            let conn = db.lock();
+            evolution_cfg(&conn)
+        };
+        let error = global_review_inner(&state, &cfg).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1["detail"].as_str().unwrap().contains("样本不足"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn auto_global_review_runs_after_batch_review_at_interval() {
+        let path = std::env::temp_dir().join("nq-evo-global-auto.db");
+        let db = fixture(&path, false);
+        seed_pending_trades(&db, 7);
+        db.lock()
+            .execute(
+                "UPDATE app_settings SET value = ?1 WHERE key = 'evolution'",
+                [r#"{"enabled":true,"min_lesson_sample":2,"batch_review_size":5,"min_health_sample":10,"min_confidence":0.5,"global_review_every_trades":5}"#],
+            )
+            .unwrap();
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            Arc::new(FakeTransport {
+                replies: Mutex::new(Vec::new()),
+            }),
+        );
+        let reviewing = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        review_trade_and_record(state, reviewing, 1).await;
+        let conn = db.lock();
+        let last: i64 = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key = 'evolution.global_review_last'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(last, 10, "自动触发后记录已复盘的交易总数");
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evolution_runs WHERE kind = 'global_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "达到间隔应自动全局复盘");
+        drop(conn);
         let _ = std::fs::remove_file(&path);
     }
 

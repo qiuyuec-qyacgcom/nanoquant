@@ -217,7 +217,7 @@ export const BASE_META: Record<string, FieldMeta> = {
   max_injected: { label: '最多注入心法', unit: '条', hint: '每次决策最多注入几条心法' },
   ttl_days: { label: '心法有效期', unit: '天', hint: '过期自动退出注入' },
   min_confidence: { label: '心法最低置信度', hint: '低于该置信度的复盘结论不进入心法库' },
-  global_review_every_trades: { label: '全局复盘间隔', unit: '笔', hint: '每多少笔交易做一次全局复盘' },
+  global_review_every_trades: { label: '全局复盘间隔', unit: '笔', hint: '闭环交易累计每多少笔做一次全局复盘；0=关闭自动触发' },
   guard_strict: { label: '严格防污染', hint: '拦截放宽风控类结论' },
   auto_disable_negative: { label: '负向心法自动降权' },
   max_rule_chars: { label: '心法最大字数', unit: '字' },

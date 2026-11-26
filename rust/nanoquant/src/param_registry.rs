@@ -145,7 +145,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("evolution", "max_injected", 0.0, 100.0, 1.0),
     ("evolution", "ttl_days", 1.0, 365.0, 1.0),
     ("evolution", "min_confidence", 0.0, 1.0, 0.01),
-    ("evolution", "global_review_every_trades", 1.0, 1000.0, 1.0),
+    ("evolution", "global_review_every_trades", 0.0, 1000.0, 1.0),
     ("evolution", "max_rule_chars", 10.0, 10000.0, 10.0),
     ("evolution", "min_lesson_sample", 1.0, 1000.0, 1.0),
     ("evolution", "batch_review_size", 1.0, 100.0, 1.0),

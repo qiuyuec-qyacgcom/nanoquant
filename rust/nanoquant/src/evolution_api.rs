@@ -715,6 +715,9 @@ pub(crate) struct EvolutionCfg {
     pub(crate) min_health_sample: i64,
     pub(crate) enabled: bool,
     pub(crate) review_on_close: bool,
+    pub(crate) archive_health_threshold: f64,
+    pub(crate) auto_disable_negative: bool,
+    pub(crate) global_review_every_trades: i64,
 }
 
 pub(crate) fn evolution_cfg(conn: &rusqlite::Connection) -> EvolutionCfg {
@@ -741,6 +744,12 @@ pub(crate) fn evolution_cfg(conn: &rusqlite::Connection) -> EvolutionCfg {
             .get("review_on_close")
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
+        archive_health_threshold: num("archive_health_threshold", 0.45).clamp(0.0, 1.0),
+        auto_disable_negative: raw
+            .get("auto_disable_negative")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        global_review_every_trades: int("global_review_every_trades", 10),
     }
 }
 
