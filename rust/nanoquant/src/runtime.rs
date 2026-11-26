@@ -325,15 +325,14 @@ impl crate::review::AiReviewer for CachedReviewer<'_> {
     }
 }
 
-/// 缓存键：symbol + 方向 + 0.05 粒度评分桶。
-fn review_cache_key(draft: &EntryDraft) -> String {
-    let bucket = (draft.signal_score() * 20.0).round() as i64;
-    format!(
-        "{}:{}:{}",
-        draft.symbol,
-        draft.signal_side().unwrap_or("flat"),
-        bucket
-    )
+/// 低分分流拒绝的原因前缀。事件文案按这个前缀区分「分流拒绝」与「AI 不可用」。
+const SCORE_SPLIT_LOW_PREFIX: &str = "评分低于 AI 分流下限";
+
+/// 缓存键：mode + symbol + 方向 + 0.05 粒度评分桶。
+/// mode 必须参与，避免 demo 与 live 同标的同桶复用 AI 结论。
+fn review_cache_key(mode: &str, symbol: &str, side: &str, score: f64) -> String {
+    let bucket = (score * 20.0).round() as i64;
+    format!("{mode}:{symbol}:{side}:{bucket}")
 }
 
 #[derive(Clone)]
@@ -1798,6 +1797,7 @@ impl EngineRuntime {
         let reviewed = Self::review_drafts(
             reviewer,
             drafts,
+            mode,
             ai_required,
             ai_cfg.veto_only,
             ai_cfg.fail_open_scale,
@@ -3182,6 +3182,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
     fn review_drafts(
         reviewer: Option<&dyn crate::review::AiReviewer>,
         drafts: Vec<EntryDraft>,
+        mode: &str,
         required: bool,
         veto_only: bool,
         fail_open_scale: f64,
@@ -3213,7 +3214,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     // 低分直接拒绝，不花 AI 调用；评分保留在 confidence 里供审计。
                     Err(crate::review::ReviewError {
                         reason: format!(
-                            "评分低于 AI 分流下限 {score:.3} < {low_score_threshold:.3}"
+                            "{SCORE_SPLIT_LOW_PREFIX} {score:.3} < {low_score_threshold:.3}"
                         ),
                         action: "reject".to_string(),
                         confidence: score.clamp(0.0, 1.0),
@@ -3230,7 +3231,12 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         (true, Some(cache), Some(inner)) => Some(CachedReviewer {
                             inner,
                             cache,
-                            key: review_cache_key(&draft),
+                            key: review_cache_key(
+                                mode,
+                                &draft.symbol,
+                                draft.signal_side().unwrap_or("flat"),
+                                score,
+                            ),
                             ttl_sec: cache_ttl_sec,
                             now,
                         }),
@@ -3269,6 +3275,15 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             .collect()
     }
 
+    /// 复核失败的引擎事件文案：低分分流拒绝与 AI 不可用要分开，便于排查。
+    fn review_event_message(reason: &str) -> &'static str {
+        if reason.starts_with(SCORE_SPLIT_LOW_PREFIX) {
+            "评分分流拒绝（低评分）"
+        } else {
+            "AI 复核跳过开仓"
+        }
+    }
+
     fn apply_entries(
         tx: &rusqlite::Transaction<'_>,
         mode: &str,
@@ -3292,7 +3307,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','ai',?2,?3)",
                         (
                             now,
-                            "AI 复核跳过开仓",
+                            Self::review_event_message(&error.reason),
                             serde_json::json!({"symbol": draft.symbol, "reason": error.reason}).to_string(),
                         ),
                     );
@@ -8233,6 +8248,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         EngineRuntime::review_drafts(
             Some(reviewer),
             drafts,
+            "demo",
             true,
             true,
             0.5,
@@ -8298,6 +8314,34 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let reviewed = split_review(&reviewer, vec![score_draft(0.6)], Some(&cache), 1_061);
         assert!(reviewed[0].result.is_ok());
         assert_eq!(reviewer.calls(), 2, "TTL 过期后必须重新调用 AI");
+    }
+
+    #[test]
+    fn review_cache_key_includes_mode() {
+        assert_eq!(
+            review_cache_key("demo", "BTCUSDT", "long", 0.6),
+            "demo:BTCUSDT:long:12",
+            "评分按 0.05 粒度分桶"
+        );
+        assert_ne!(
+            review_cache_key("demo", "BTCUSDT", "long", 0.6),
+            review_cache_key("live", "BTCUSDT", "long", 0.6),
+            "demo 与 live 不得共用缓存结论"
+        );
+    }
+
+    #[test]
+    fn low_score_rejection_uses_split_event_message() {
+        assert_eq!(
+            EngineRuntime::review_event_message(&format!("{SCORE_SPLIT_LOW_PREFIX} 0.200 < 0.450")),
+            "评分分流拒绝（低评分）",
+            "低分分流拒绝要与非 AI 可用区分"
+        );
+        assert_eq!(
+            EngineRuntime::review_event_message("AI 复核失败，按 fail-open 降仓: timeout"),
+            "AI 复核跳过开仓",
+            "其他复核失败保持原文案"
+        );
     }
 
     struct ScaleReviewer {
