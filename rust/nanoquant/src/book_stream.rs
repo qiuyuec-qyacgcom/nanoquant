@@ -14,6 +14,7 @@
 //! 测试不碰真实网络：消息解析与新鲜度判定都是纯函数，直接喂 JSON 断言。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
@@ -64,6 +65,63 @@ pub fn store(ticker: &BookTicker) {
     if let Ok(mut books) = book_map().write() {
         books.insert(ticker.symbol.clone(), ticker.state.clone());
     }
+}
+
+/// 本地盘口读取结果，用于统计 stale / 回退 REST 的比例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteSource {
+    /// 本地盘口新鲜，直接采用。
+    Local,
+    /// 本地盘口存在但过期或非法，回退 REST。
+    Stale,
+    /// 未启用本地盘口，直接走 REST。
+    Rest,
+}
+
+/// 盘口读取累计计数；进程内单调递增，重启归零。
+#[derive(Debug, Default)]
+pub struct BookCounters {
+    pub queries: AtomicU64,
+    pub stale: AtomicU64,
+    pub fallback_rest: AtomicU64,
+}
+
+impl BookCounters {
+    pub fn record(&self, source: QuoteSource) {
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        match source {
+            QuoteSource::Local => {}
+            QuoteSource::Stale => {
+                self.stale.fetch_add(1, Ordering::Relaxed);
+                self.fallback_rest.fetch_add(1, Ordering::Relaxed);
+            }
+            QuoteSource::Rest => {
+                self.fallback_rest.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let queries = self.queries.load(Ordering::Relaxed);
+        let stale = self.stale.load(Ordering::Relaxed);
+        let stale_pct = if queries == 0 {
+            0.0
+        } else {
+            (stale as f64 / queries as f64 * 10_000.0).round() / 100.0
+        };
+        serde_json::json!({
+            "queries": queries,
+            "stale": stale,
+            "fallback_rest": self.fallback_rest.load(Ordering::Relaxed),
+            "stale_pct": stale_pct,
+        })
+    }
+}
+
+/// 全局计数器的快照，供 `/engine/stats` 读取。
+pub fn stats() -> Value {
+    static COUNTERS: OnceLock<BookCounters> = OnceLock::new();
+    COUNTERS.get_or_init(BookCounters::default).snapshot()
 }
 
 pub fn quote(symbol: &str) -> Option<BookState> {
@@ -141,8 +199,9 @@ pub fn parse_book_ticker(raw: &str) -> Option<BookTicker> {
     })
 }
 
-/// 新鲜度判定：本地盘口在 `stale_ms` 内且价格合法时优先，否则回退 REST。
-/// 返回 `(bid, ask, spread_bps)`。
+/// 本地盘口在 `stale_ms` 内且价格合法时优先，否则回退 REST。
+/// 返回 `(bid, ask, spread_bps)`。生产路径走 `resolve_quote_source`，此函数仅供测试与旧调用。
+#[cfg(test)]
 pub fn resolve_quote(
     enabled: bool,
     book: Option<&BookState>,
@@ -151,19 +210,46 @@ pub fn resolve_quote(
     now_ms: i64,
     stale_ms: i64,
 ) -> (f64, f64, f64) {
-    if let Some(book) = book.filter(|_| enabled) {
+    resolve_quote_source(enabled, book, rest_bid, rest_ask, now_ms, stale_ms).0
+}
+
+/// 同 `resolve_quote`，但额外返回本次读数来源，便于盘口健康度计数。
+pub fn resolve_quote_source(
+    enabled: bool,
+    book: Option<&BookState>,
+    rest_bid: f64,
+    rest_ask: f64,
+    now_ms: i64,
+    stale_ms: i64,
+) -> ((f64, f64, f64), QuoteSource) {
+    let usable = book.filter(|_| enabled).filter(|book| {
         let age = now_ms.saturating_sub(book.ts);
         let fresh = stale_ms > 0 && book.ts > 0 && age <= stale_ms;
         let valid =
             book.bid.is_finite() && book.ask.is_finite() && book.bid > 0.0 && book.ask >= book.bid;
-        if fresh && valid {
-            return (book.bid, book.ask, spread_bps(book.bid, book.ask));
+        fresh && valid
+    });
+    match usable {
+        Some(book) => (
+            (book.bid, book.ask, spread_bps(book.bid, book.ask)),
+            QuoteSource::Local,
+        ),
+        None => {
+            // 本地盘口存在却没用上，说明它过期/非法，记一次 stale。
+            let source = if book.is_some() && enabled {
+                QuoteSource::Stale
+            } else {
+                QuoteSource::Rest
+            };
+            (
+                (rest_bid, rest_ask, spread_bps(rest_bid, rest_ask)),
+                source,
+            )
         }
     }
-    (rest_bid, rest_ask, spread_bps(rest_bid, rest_ask))
 }
 
-/// `snapshot()` 用入口：读取全局盘口后判定新鲜度。
+/// `snapshot()` 用入口：读取全局盘口后判定新鲜度，并累加盘口健康度计数。
 pub fn resolve_for_symbol(
     enabled: bool,
     stale_ms: i64,
@@ -173,7 +259,11 @@ pub fn resolve_for_symbol(
     now_ms: i64,
 ) -> (f64, f64, f64) {
     let book = quote(symbol);
-    resolve_quote(enabled, book.as_ref(), rest_bid, rest_ask, now_ms, stale_ms)
+    let (quote, source) =
+        resolve_quote_source(enabled, book.as_ref(), rest_bid, rest_ask, now_ms, stale_ms);
+    static COUNTERS: OnceLock<BookCounters> = OnceLock::new();
+    COUNTERS.get_or_init(BookCounters::default).record(source);
+    quote
 }
 
 fn spread_bps(bid: f64, ask: f64) -> f64 {
@@ -423,6 +513,33 @@ mod tests {
         let (bid, ask, _) = resolve_quote(false, Some(&state), 90.0, 110.0, 1_100, 3_000);
         assert_eq!(bid, 90.0, "开关关闭时禁止读本地盘口");
         assert_eq!(ask, 110.0);
+    }
+
+    #[test]
+    fn book_counters_track_stale_and_fallback() {
+        let counters = BookCounters::default();
+        let state = book(1_000);
+        let (_, fresh) =
+            resolve_quote_source(true, Some(&state), 90.0, 110.0, 2_500, 3_000);
+        counters.record(fresh);
+        let (_, stale) = resolve_quote_source(true, Some(&state), 90.0, 110.0, 10_000, 3_000);
+        counters.record(stale);
+        let (_, rest) = resolve_quote_source(false, Some(&state), 90.0, 110.0, 1_100, 3_000);
+        counters.record(rest);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot["queries"], 3, "每次读数都要计一次查询");
+        assert_eq!(snapshot["stale"], 1, "仅过期盘口算 stale");
+        assert_eq!(snapshot["fallback_rest"], 2, "过期与未启用都回退 REST");
+        assert!(
+            (snapshot["stale_pct"].as_f64().unwrap() - 33.33).abs() < 1e-6,
+            "stale 占比 = stale / queries: {snapshot}"
+        );
+        assert_eq!(
+            BookCounters::default().snapshot()["queries"],
+            0,
+            "无数据时计数保持 0"
+        );
     }
 
     #[test]

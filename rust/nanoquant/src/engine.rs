@@ -719,6 +719,10 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         .into_iter()
         .map(|(reason, (n, pnl))| (reason, json!({"n": n, "pnl": round2(pnl)})))
         .collect::<serde_json::Map<String, Value>>();
+    let half_ai = {
+        let conn = db.conn.lock().expect("db");
+        crate::signal_audit::half_ai_stats(&conn, crate::now(), 86_400)
+    };
     Json(json!({
         "trades": rows.len(),
         "wins": wins,
@@ -731,6 +735,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         "by_reason": reasons,
         "engine": read_status(&db),
         "execution": execution_view(&segments),
+        "half_ai": half_ai,
     }))
 }
 

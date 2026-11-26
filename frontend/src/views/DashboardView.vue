@@ -21,6 +21,7 @@ const trades = ref<any[]>([])
 const signals = ref<any[]>([])
 const usage = ref<any>(null)
 const stages = ref<any>(null)
+const halfAiRaw = ref<any>(null)
 const protection = ref<any[]>([])
 const orders = ref<any[]>([])
 const busy = ref(false)
@@ -142,6 +143,50 @@ const scalp = computed(() => {
   }
 })
 
+/** 半 AI 运行指标（/engine/stats 最近 24h）：AI 否决、scale 分布、fail-open、闸门、延迟、盘口健康度 */
+const HALF_AI_GATE_LABELS: Record<string, string> = {
+  funding_veto: '资金费率',
+  news_veto: '负面新闻',
+  direction_limit: '同向持仓上限',
+  correlation_limit: '相关性上限',
+  score_split_low: '低分分流',
+  ai_fail_open: 'AI 失败放行',
+  ai_dq: 'AI 数据质量',
+  ai_rr: 'AI 盈亏比',
+  ai_confidence: 'AI 置信度',
+  ai_direction: 'AI 方向',
+  other: '其他',
+  none: '无闸门',
+}
+
+const halfAi = computed(() => {
+  const h: any = halfAiRaw.value?.half_ai || {}
+  const gates: Record<string, number> = h.gates || {}
+  const ranked = Object.entries(gates)
+    .filter(([key]) => key !== 'none')
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+  const topGate = ranked.length && Number(ranked[0][1]) > 0
+    ? `${HALF_AI_GATE_LABELS[ranked[0][0]] || ranked[0][0]} ${ranked[0][1]}`
+    : '--'
+  return {
+    total: Number(h.signals_total || 0),
+    opened: Number(h.opened || 0),
+    rejected: Number(h.rejected || 0),
+    vetoRate: Number(h.ai_veto_rate_pct || 0),
+    scale05: Number(h.scale_0_5 || 0),
+    scale075: Number(h.scale_0_75 || 0),
+    scale09: Number(h.scale_0_9_1 || 0),
+    scaleNone: Number(h.scale_none || 0),
+    failOpen: Number(h.ai_fail_open || 0),
+    highSkip: Number(h.high_score_skip || 0),
+    topGate,
+    p50: Number(h.ai_latency_p50_ms || 0),
+    p95: Number(h.ai_latency_p95_ms || 0),
+    bookStale: Number(h.book_stale_pct || 0),
+    bookQueries: Number(h.book?.queries || 0),
+  }
+})
+
 const equityOption = computed(() => {
   const points = equity.value
   return {
@@ -190,7 +235,7 @@ const equityOption = computed(() => {
 
 async function load() {
 
-  const [eq, tr, sg, us, ev, ex, pr, od] = await Promise.allSettled([
+  const [eq, tr, sg, us, ev, ex, pr, od, hs] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),
@@ -199,6 +244,7 @@ async function load() {
     http.get('/engine/execution'),
     http.get('/engine/protection'),
     http.get('/engine/orders?limit=30'),
+    http.get('/engine/stats'),
   ])
   if (eq.status === 'fulfilled') equity.value = eq.value.items
   if (tr.status === 'fulfilled') trades.value = tr.value.items
@@ -207,6 +253,7 @@ async function load() {
   if (ex.status === 'fulfilled') stages.value = ex.value
   if (pr.status === 'fulfilled') protection.value = pr.value.items || []
   if (od.status === 'fulfilled') orders.value = od.value.items || []
+  if (hs.status === 'fulfilled') halfAiRaw.value = hs.value
 }
 
 async function cycleNow() {
@@ -438,6 +485,64 @@ useSilentRefresh(refreshQuotes, 3000)
         <div class="hint">
           点差闸门在开仓前用买一/卖一价校验；下单延迟与入场滑点来自最近成交的订单/交易，
           止损熔断在窗口内多次止损后全局暂停开仓。
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <span class="panel-title">半 AI 运行 · 24H</span>
+        <div class="right">
+          <span class="tag tag-dim">{{ halfAi.total }} 条信号</span>
+          <span class="tag tag-dim">开 {{ halfAi.opened }} · 拒 {{ halfAi.rejected }}</span>
+        </div>
+      </div>
+      <div class="panel-body stack" style="gap: 12px">
+        <div class="grid g4" style="gap: 10px">
+          <div class="metric">
+            <span>AI 否决率</span>
+            <span class="mono" :class="halfAi.vetoRate > 0 ? 'down' : 'flat'">{{ halfAi.vetoRate.toFixed(1) }}%</span>
+          </div>
+          <div class="metric">
+            <span>fail-open</span>
+            <span class="mono" :class="halfAi.failOpen ? 'down' : 'up'">{{ halfAi.failOpen }} 次</span>
+          </div>
+          <div class="metric">
+            <span>高分区跳过</span>
+            <span class="mono">{{ halfAi.highSkip }} 次</span>
+          </div>
+          <div class="metric">
+            <span>Top 闸门</span>
+            <span class="mono">{{ halfAi.topGate }}</span>
+          </div>
+        </div>
+        <div class="grid g4" style="gap: 10px">
+          <div class="metric"><span>scale 0.5</span><span class="mono">{{ halfAi.scale05 }}</span></div>
+          <div class="metric"><span>scale 0.75</span><span class="mono">{{ halfAi.scale075 }}</span></div>
+          <div class="metric"><span>scale 0.9~1</span><span class="mono">{{ halfAi.scale09 }}</span></div>
+          <div class="metric"><span>scale 无</span><span class="mono muted">{{ halfAi.scaleNone }}</span></div>
+        </div>
+        <div class="grid g4" style="gap: 10px">
+          <div class="metric">
+            <span>AI 延迟 P50</span>
+            <span class="mono">{{ halfAi.p50 ? halfAi.p50 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span>AI 延迟 P95</span>
+            <span class="mono" :class="halfAi.p95 > 3000 ? 'down' : 'flat'">{{ halfAi.p95 ? halfAi.p95 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span>盘口 stale</span>
+            <span class="mono" :class="halfAi.bookStale > 0 ? 'down' : 'up'">{{ halfAi.bookStale.toFixed(1) }}%</span>
+          </div>
+          <div class="metric">
+            <span>盘口读取</span>
+            <span class="mono muted">{{ halfAi.bookQueries }} 次</span>
+          </div>
+        </div>
+        <div class="hint">
+          最近 24 小时口径：AI 否决率只统计 AI 主动收紧/否决（数据质量、盈亏比、置信度、方向）；
+          fail-open 为 AI 复核失败后放行；盘口 stale 为本地 WebSocket 盘口过期并回退 REST 的比例。
         </div>
       </div>
     </div>

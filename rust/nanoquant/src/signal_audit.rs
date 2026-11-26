@@ -5,7 +5,9 @@
 //! 所以相同信号合并成一行，用 repeats 记真实扫描次数——
 //! 「扫描密度」看的是 repeats 累加，不是行数。
 
-use rusqlite::Transaction;
+use std::collections::BTreeMap;
+
+use rusqlite::{Connection, Transaction};
 use serde_json::{json, Value};
 
 /// 相同信号的合并窗口（秒）。窗口内同一标的同一结论只留一行。
@@ -389,6 +391,217 @@ fn find_mergeable(
     Ok(None)
 }
 
+/// 半 AI 运行指标的闸门白名单：顺序与前端展示一致。
+const GATE_KEYS: [&str; 12] = [
+    "funding_veto",
+    "news_veto",
+    "direction_limit",
+    "correlation_limit",
+    "score_split_low",
+    "ai_fail_open",
+    "ai_dq",
+    "ai_rr",
+    "ai_confidence",
+    "ai_direction",
+    "other",
+    "none",
+];
+
+/// AI 主动收紧/否决的闸门：命中即计入 AI 否决率。
+const AI_VETO_GATES: [&str; 4] = ["ai_dq", "ai_rr", "ai_confidence", "ai_direction"];
+
+/// 最近窗口内一条信号在聚合时需要的字段。
+struct SignalMetricRow {
+    decision: String,
+    ai_action: String,
+    gate: Option<String>,
+    skip: bool,
+    scale: Option<f64>,
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// 最近 `window_sec` 的半 AI 运行指标：信号/决议、scale 分布、fail-open、
+/// 闸门分层、AI 延迟与盘口健康度。只读聚合，不改交易行为。
+///
+/// `features` 优先用 SQLite `json_extract` 展平；老库缺少 JSON1 或存了坏 JSON 时，
+/// 回退到 Rust 侧逐行解析，保证接口不因数据脏而失败。
+pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
+    let since = now.saturating_sub(window_sec.max(0));
+    let mut signals_total = 0_i64;
+    let mut opened = 0_i64;
+    let mut rejected = 0_i64;
+    let mut ai_veto = 0_i64;
+    let mut ai_fail_open = 0_i64;
+    let mut high_score_skip = 0_i64;
+    // [0.5, 0.75, 0.9~1.0, none]
+    let mut scales = [0_i64; 4];
+    let mut gates: BTreeMap<&'static str, i64> =
+        GATE_KEYS.iter().map(|key| (*key, 0_i64)).collect();
+
+    for row in signal_metric_rows(conn, since) {
+        signals_total += 1;
+        match row.decision.as_str() {
+            "opened" => opened += 1,
+            "rejected" => rejected += 1,
+            _ => {}
+        }
+        let gate = row.gate.as_deref().unwrap_or("none");
+        let gate_key = if gates.contains_key(gate) { gate } else { "other" };
+        if let Some(slot) = gates.get_mut(gate_key) {
+            *slot += 1;
+        }
+        if gate_key == "ai_fail_open" {
+            ai_fail_open += 1;
+        }
+        if row.skip {
+            high_score_skip += 1;
+        }
+        if row.decision == "rejected"
+            && (row.ai_action == "reject" || AI_VETO_GATES.contains(&gate_key))
+        {
+            ai_veto += 1;
+        }
+        scales[scale_bucket(row.scale)] += 1;
+    }
+
+    let ai_veto_rate = if signals_total == 0 {
+        0.0
+    } else {
+        ai_veto as f64 / signals_total as f64 * 100.0
+    };
+
+    let mut latencies: Vec<f64> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT latency_ms FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0",
+    ) {
+        if let Ok(rows) = stmt.query_map([since], |r| r.get::<_, i64>(0)) {
+            for latency in rows.flatten() {
+                latencies.push(latency as f64);
+            }
+        }
+    }
+    latencies.sort_by(f64::total_cmp);
+
+    let book = crate::book_stream::stats();
+    let book_queries = book["queries"].as_u64().unwrap_or(0);
+    let book_stale = book["stale"].as_u64().unwrap_or(0);
+    let book_stale_pct = if book_queries == 0 {
+        0.0
+    } else {
+        round2(book_stale as f64 / book_queries as f64 * 100.0)
+    };
+
+    json!({
+        "window_sec": window_sec.max(0),
+        "signals_total": signals_total,
+        "opened": opened,
+        "rejected": rejected,
+        "ai_veto_rate_pct": round2(ai_veto_rate),
+        "scale_0_5": scales[0],
+        "scale_0_75": scales[1],
+        "scale_0_9_1": scales[2],
+        "scale_none": scales[3],
+        "ai_fail_open": ai_fail_open,
+        "high_score_skip": high_score_skip,
+        "gates": gates,
+        "ai_latency_p50_ms": percentile(&latencies, 0.50),
+        "ai_latency_p95_ms": percentile(&latencies, 0.95),
+        "book_stale_pct": book_stale_pct,
+        "book": book,
+    })
+}
+
+/// 已排序样本的分位值；空样本返回 0，避免接口出现 null。
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted.len() as f64 * q).floor() as usize).min(sorted.len() - 1);
+    round2(sorted[index])
+}
+
+/// scale 分桶：0.5 / 0.75 / 0.9~1.0，其余（含缺失）归 none。
+fn scale_bucket(scale: Option<f64>) -> usize {
+    let Some(scale) = scale.filter(|value| value.is_finite()) else {
+        return 3;
+    };
+    if (scale - 0.5).abs() < 0.01 {
+        0
+    } else if (scale - 0.75).abs() < 0.01 {
+        1
+    } else if (0.9..=1.0).contains(&scale) {
+        2
+    } else {
+        3
+    }
+}
+
+fn signal_metric_rows(conn: &Connection, since: i64) -> Vec<SignalMetricRow> {
+    json_extract_rows(conn, since).unwrap_or_else(|| features_rows(conn, since))
+}
+
+/// JSON1 可用的主路径：把 features 拆成列，聚合仍在 Rust 侧做。
+fn json_extract_rows(conn: &Connection, since: i64) -> Option<Vec<SignalMetricRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT decision, ai_action, \
+             json_extract(features, '$.filter_trace.gate'), \
+             json_extract(features, '$.filter_trace.skip'), \
+             json_extract(features, '$.ai_scale') \
+             FROM signals WHERE ts >= ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([since], |r| {
+            Ok(SignalMetricRow {
+                decision: r.get(0)?,
+                ai_action: r.get(1)?,
+                gate: r.get(2)?,
+                skip: r.get::<_, Option<i64>>(3)?.map(|flag| flag != 0).unwrap_or(false),
+                scale: r.get(4)?,
+            })
+        })
+        .ok()?;
+    rows.collect::<Result<Vec<_>, _>>().ok()
+}
+
+/// 回退路径：整行读出 features 后按 JSON 结构解析。
+fn features_rows(conn: &Connection, since: i64) -> Vec<SignalMetricRow> {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT decision, ai_action, features FROM signals WHERE ts >= ?1")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([since], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .map(|(decision, ai_action, features)| {
+            let value: Value = features
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(Value::Null);
+            let trace = &value["filter_trace"];
+            SignalMetricRow {
+                decision,
+                ai_action,
+                gate: trace["gate"].as_str().map(str::to_string),
+                skip: trace["skip"].as_bool().unwrap_or(false),
+                scale: value["ai_scale"].as_f64(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +626,107 @@ mod tests {
     fn repeats(conn: &Connection) -> i64 {
         conn.query_row("SELECT repeats FROM signals LIMIT 1", [], |r| r.get(0))
             .unwrap()
+    }
+
+    fn insert_signal(
+        conn: &Connection,
+        ts: i64,
+        decision: &str,
+        ai_action: &str,
+        features: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO signals(ts,symbol,direction,score,features,ai_action,ai_confidence,\
+             ai_reason,decision,reject_reason,mode,repeats) \
+             VALUES(?1,'BTCUSDT','long',0.8,?2,?3,0.7,'',?4,'','demo',1)",
+            rusqlite::params![ts, features, ai_action, decision],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn half_ai_stats_counts_gates_and_scales() {
+        let conn = table();
+        let now = 100_000;
+        insert_signal(
+            &conn,
+            now - 10,
+            "opened",
+            "open_long",
+            r#"{"ai_scale":1.0,"filter_trace":{"gate":"none","decision":"opened"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 20,
+            "rejected",
+            "open_long",
+            r#"{"filter_trace":{"gate":"ai_fail_open"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 30,
+            "rejected",
+            "reject",
+            r#"{"ai_scale":0.5,"filter_trace":{"gate":"ai_dq"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 40,
+            "rejected",
+            "open_long",
+            r#"{"ai_scale":0.75,"filter_trace":{"gate":"funding_veto"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 50,
+            "flat",
+            "open_long",
+            r#"{"filter_trace":{"gate":"none","skip":true}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 90_000,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"news_veto"}}"#,
+        );
+
+        let value = half_ai_stats(&conn, now, 86_400);
+        assert_eq!(value["signals_total"], 5, "窗口外的信号不计入");
+        assert_eq!(value["opened"], 1);
+        assert_eq!(value["rejected"], 3);
+        assert_eq!(value["ai_fail_open"], 1);
+        assert_eq!(value["high_score_skip"], 1);
+        assert_eq!(value["scale_0_5"], 1);
+        assert_eq!(value["scale_0_75"], 1);
+        assert_eq!(value["scale_0_9_1"], 1);
+        assert_eq!(value["scale_none"], 2);
+        assert_eq!(value["gates"]["funding_veto"], 1);
+        assert_eq!(value["gates"]["ai_dq"], 1);
+        assert_eq!(value["gates"]["ai_fail_open"], 1);
+        assert_eq!(value["gates"]["none"], 2);
+        assert_eq!(value["gates"]["news_veto"], 0, "窗口外的闸门不应计数");
+        assert_eq!(
+            value["ai_veto_rate_pct"], 20.0,
+            "仅 AI 主动否决计入: ai_dq / 5"
+        );
+    }
+
+    #[test]
+    fn half_ai_stats_handles_empty_window() {
+        let conn = table();
+        let value = half_ai_stats(&conn, 424_242, 86_400);
+        assert_eq!(value["signals_total"], 0);
+        assert_eq!(value["opened"], 0);
+        assert_eq!(value["rejected"], 0);
+        assert_eq!(value["ai_veto_rate_pct"], 0.0);
+        assert_eq!(value["scale_none"], 0);
+        assert_eq!(value["ai_fail_open"], 0);
+        assert_eq!(value["high_score_skip"], 0);
+        assert_eq!(value["ai_latency_p50_ms"], 0.0);
+        assert_eq!(value["ai_latency_p95_ms"], 0.0);
+        assert_eq!(value["gates"]["none"], 0);
+        assert_eq!(value["gates"]["ai_dq"], 0);
     }
 
     #[test]
