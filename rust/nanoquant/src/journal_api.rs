@@ -40,7 +40,9 @@ fn default_journal_limit() -> i64 {
 
 async fn list_journal(State(db): State<Db>, Query(q): Query<JournalQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 1000);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "error": "数据库不可用"}).into();
+    };
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, symbol, direction, confidence, entry_price, target_pct, reason, snapshot, \
@@ -88,7 +90,19 @@ fn serialize_journal(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 }
 
 async fn journal_stats(State(db): State<Db>, Query(q): Query<JournalQuery>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({
+            "total": 0,
+            "pending": 0,
+            "labeled": 0,
+            "correct": 0,
+            "wrong": 0,
+            "partial": 0,
+            "accuracy": 0.0,
+            "error": "数据库不可用",
+        })
+        .into();
+    };
     let mut stmt = conn
         .prepare("SELECT status, outcome FROM decision_journal WHERE ?1 = '' OR mode = ?1")
         .expect("prepare journal stats");
@@ -130,7 +144,9 @@ fn default_experience_limit() -> i64 {
 
 async fn list_experiences(State(db): State<Db>, Query(q): Query<ExperienceQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 500);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "error": "数据库不可用"}).into();
+    };
     let cfg = journal_cfg(&conn);
     let mut rows = load_experiences(&conn);
     rows.retain(|r| {
@@ -162,7 +178,17 @@ async fn list_experiences(State(db): State<Db>, Query(q): Query<ExperienceQuery>
 }
 
 async fn experience_stats(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({
+            "total": 0,
+            "by_outcome": {},
+            "by_symbol": {},
+            "avg_hit_rate": 0.0,
+            "judged": 0,
+            "error": "数据库不可用",
+        })
+        .into();
+    };
     let rows = load_experiences(&conn);
     let mut by_outcome = serde_json::Map::new();
     let mut by_symbol = serde_json::Map::new();
@@ -198,7 +224,9 @@ fn default_search_limit() -> i64 {
 }
 
 async fn search_experiences(State(db): State<Db>, Query(q): Query<SearchQuery>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "error": "数据库不可用"}).into();
+    };
     let cfg = journal_cfg(&conn);
     let limit = q.limit.clamp(1, 20).min(cfg.retrieve_top_k.max(1));
     if !cfg.inject_experiences || q.q.trim().is_empty() {

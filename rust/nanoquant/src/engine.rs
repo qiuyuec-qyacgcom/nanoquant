@@ -39,7 +39,9 @@ fn default_trades_limit() -> i64 {
 async fn trades(State(db): State<Db>, Query(q): Query<TradesQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 500);
     let mode = current_mode(&db);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "stats": {}, "error": "数据库不可用"}).into();
+    };
     let mut stmt = conn
         .prepare(
             "SELECT id, symbol, side, qty, entry_price, exit_price, leverage, notional, pnl, pnl_pct, roi_pct, \
@@ -178,7 +180,9 @@ fn default_signals_limit() -> i64 {
 async fn signals(State(db): State<Db>, Query(q): Query<SignalsQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 1000);
     let mode = current_mode(&db);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "summary": {}, "limit": limit, "error": "数据库不可用"}).into();
+    };
     let mut where_sql = "WHERE mode = ?1".to_string();
     let mut args: Vec<String> = vec![mode];
     if !q.symbol.is_empty() {
@@ -330,7 +334,9 @@ async fn equity(State(db): State<Db>, Query(q): Query<EquityQuery>) -> Json<Valu
     let hours = q.hours.clamp(1, 720);
     let since = crate::now() - hours * 3600;
     let mode = current_mode(&db);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "hours": hours, "error": "数据库不可用"}).into();
+    };
     let mut stmt = conn
         .prepare(
             "SELECT ts, wallet, available, unrealized, margin_used, positions, mode \
@@ -368,7 +374,9 @@ fn default_orders_limit() -> i64 {
 async fn orders(State(db): State<Db>, Query(q): Query<OrdersQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 500);
     let mode = current_mode(&db);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "source": "local", "error": "数据库不可用"}).into();
+    };
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, symbol, side, order_type, qty, price, status, purpose, client_order_id, \
@@ -419,7 +427,9 @@ fn default_positions_limit() -> i64 {
 async fn positions(State(db): State<Db>, Query(q): Query<PositionsQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 500);
     let mode = current_mode(&db);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "error": "数据库不可用"}).into();
+    };
     let status_filter = if q.include_closed {
         String::new()
     } else {
@@ -654,20 +664,40 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
             .unwrap_or(Value::Null),
         None => Value::Null,
     };
-    let rows: Vec<(String, f64, i64, String)> = {
-        let conn = db.conn.lock().expect("db");
+    let (rows, half_ai): (Vec<(String, f64, i64, String)>, Value) = {
+        let Ok(conn) = db.read() else {
+            return json!({
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "pnl": 0.0,
+                "avg_hold_seconds": 0.0,
+                "profit_factor": Value::Null,
+                "by_symbol": {},
+                "by_reason": {},
+                "engine": read_status(&db),
+                "execution": execution_view(&segments),
+                "half_ai": {},
+                "error": "数据库不可用",
+            })
+            .into();
+        };
         let mut stmt = conn
             .prepare(
                 "SELECT symbol, pnl, hold_seconds, exit_reason FROM trades \
                  WHERE mode=?1 ORDER BY closed_at DESC LIMIT 50",
             )
             .expect("prepare stats");
-        stmt.query_map([&mode], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .expect("query stats")
-        .flatten()
-        .collect()
+        let rows = stmt
+            .query_map([&mode], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query stats")
+            .flatten()
+            .collect();
+        let half_ai = crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400);
+        (rows, half_ai)
     };
     let mut wins = 0_i64;
     let mut losses = 0_i64;
@@ -719,10 +749,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         .into_iter()
         .map(|(reason, (n, pnl))| (reason, json!({"n": n, "pnl": round2(pnl)})))
         .collect::<serde_json::Map<String, Value>>();
-    let half_ai = {
-        let conn = db.conn.lock().expect("db");
-        crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400)
-    };
+
     Json(json!({
         "trades": rows.len(),
         "wins": wins,
@@ -798,7 +825,9 @@ fn write_state(db: &Db, key: &str, value: &str) {
 }
 
 fn current_mode(db: &Db) -> String {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return "demo".to_string();
+    };
     conn.query_row(
         "SELECT value FROM engine_state WHERE key = 'mode'",
         [],
@@ -814,7 +843,23 @@ async fn admission(State(db): State<Db>) -> Json<Value> {
 }
 
 fn evaluate_admission(db: &Db) -> Value {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({
+            "ok": false,
+            "can_open": false,
+            "score": 0.0,
+            "mode": "demo",
+            "steps": [],
+            "blocking": [],
+            "warnings": [],
+            "account": {},
+            "params": {},
+            "symbols": [],
+            "tradeable_count": 0,
+            "evaluated_at": crate::now(),
+            "error": "数据库不可用",
+        });
+    };
     let group = |name: &str| -> Value {
         let raw: Option<String> = conn
             .query_row(
@@ -1233,7 +1278,28 @@ fn step(
 /// 引擎运行态。前端总览、引擎控制都读这一份，
 /// 账户权益、持仓、统计必须在这里齐活——少一个字段页面就显示 0。
 fn read_status(db: &Db) -> Value {
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({
+            "enabled": false,
+            "mode": "demo",
+            "env": "demo",
+            "env_label": "模拟盘 · 币安测试网",
+            "running": false,
+            "heartbeat_age": -1,
+            "cycle_interval_sec": 0,
+            "liveness_threshold_sec": 0,
+            "runtime_task": "",
+            "uptime": 0,
+            "last_cycle_ts": 0,
+            "last_cycle_ms": 0,
+            "last_error": "",
+            "halted": "",
+            "account": {},
+            "positions": [],
+            "stats": {},
+            "error": "数据库不可用",
+        });
+    };
     let mut stmt = conn
         .prepare("SELECT key, value FROM engine_state")
         .expect("prepare state");

@@ -1,6 +1,23 @@
 //! SQLite 访问。只打开现有主库，绝不建表，避免把历史数据旁路成一个空库。
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
+
+/// 只读查询连接：文件库走独立连接，内存库或打开失败时回退主连接锁。
+pub enum DbRead<'a> {
+    Shared(std::sync::MutexGuard<'a, Connection>),
+    Owned(Connection),
+}
+
+impl std::ops::Deref for DbRead<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            DbRead::Shared(guard) => guard,
+            DbRead::Owned(conn) => conn,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -59,6 +76,48 @@ impl Db {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("db")
+    }
+
+    /// 只读查询入口。文件库新开一个 `query_only` 连接，避免和写事务抢主连接锁；
+    /// 内存库、文件不存在、打开失败或 schema 不匹配时回退主连接，绝不 panic。
+    pub fn read(&self) -> Result<DbRead<'_>, String> {
+        if self.path.is_empty()
+            || self.path == ":memory:"
+            || !std::path::Path::new(&self.path).is_file()
+        {
+            return self.shared();
+        }
+        let Ok(conn) = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return self.shared();
+        };
+        if conn
+            .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
+            .is_err()
+        {
+            return self.shared();
+        }
+        let has_settings = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_settings'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        if !has_settings {
+            return self.shared();
+        }
+        Ok(DbRead::Owned(conn))
+    }
+
+    fn shared(&self) -> Result<DbRead<'_>, String> {
+        self.conn
+            .lock()
+            .map(DbRead::Shared)
+            .map_err(|_| "数据库锁不可用".to_string())
     }
 
     /// 用库里的 security 组构造鉴权状态；缺字段时回退到安全默认值。
@@ -198,6 +257,84 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .starts_with("pbkdf2_sha256$"));
+    }
+
+    fn seeded_file_db(name: &str) -> (std::path::PathBuf, Db) {
+        let path = std::env::temp_dir().join(format!("nq-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             CREATE TABLE probe(id INTEGER PRIMARY KEY, label TEXT); \
+             INSERT INTO app_settings VALUES('engine','{}',0); \
+             INSERT INTO probe VALUES(1,'alpha');",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        (path, db)
+    }
+
+    #[test]
+    fn read_uses_separate_connection_for_file_db() {
+        let (path, db) = seeded_file_db("read-separate");
+        let read = db.read().expect("文件库应能开独立只读连接");
+        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        let label: String = read
+            .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "alpha");
+        drop(read);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_falls_back_for_memory_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe(id INTEGER PRIMARY KEY, label TEXT); \
+             INSERT INTO probe VALUES(1,'mem');",
+        )
+        .unwrap();
+        let db = Db {
+            path: String::new(),
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        };
+        let read = db.read().expect("内存库应回退主连接");
+        assert!(matches!(&read, DbRead::Shared(_)), "内存库应回退主连接");
+        let label: String = read
+            .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "mem");
+    }
+
+    #[test]
+    fn read_connection_is_query_only() {
+        let (path, db) = seeded_file_db("read-query-only");
+        let read = db.read().expect("文件库应能开独立只读连接");
+        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        assert!(
+            read.execute("INSERT INTO probe(id, label) VALUES(2, 'nope')", [])
+                .is_err(),
+            "只读连接必须拒绝写入"
+        );
+        drop(read);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_does_not_block_on_main_connection() {
+        let (path, db) = seeded_file_db("read-not-block");
+        let guard = db.conn.lock().unwrap();
+        let read = db.read().expect("主连接持锁时仍应取出独立连接");
+        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        let label: String = read
+            .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "alpha", "主连接持锁不应阻塞只读查询");
+        drop(read);
+        drop(guard);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

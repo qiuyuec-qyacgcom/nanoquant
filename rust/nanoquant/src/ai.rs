@@ -31,7 +31,9 @@ fn default_limit() -> i64 {
 
 async fn logs(State(db): State<Db>, Query(q): Query<LogsQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 500);
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "error": "数据库不可用"}).into();
+    };
     let (sql, args): (String, Vec<String>) = if q.purpose.is_empty() {
         ("SELECT id, ts, provider, model, purpose, ok, latency_ms, prompt_tokens, completion_tokens, cost_usd, error, raw_text \
           FROM ai_call_logs ORDER BY ts DESC LIMIT ?1".to_string(), vec![limit.to_string()])
@@ -67,7 +69,16 @@ async fn usage(State(db): State<Db>) -> Json<Value> {
     let now = crate::now();
     let since_30d = now - 30 * 86400;
     let since_24h = now - 86400;
-    let conn = db.conn.lock().expect("db");
+    let Ok(conn) = db.read() else {
+        return json!({
+            "by_day": [],
+            "by_provider": [],
+            "total_30d": {"calls": 0, "cost_usd": 0.0, "calls_24h": 0},
+            "budget": {"monthly_usd": 0.0, "used_usd": 0.0, "max_calls_per_hour": 0},
+            "error": "数据库不可用",
+        })
+        .into();
+    };
     let mut stmt = conn
         .prepare("SELECT ts, provider, ok, prompt_tokens, completion_tokens, cost_usd FROM ai_call_logs WHERE ts >= ?1")
         .expect("prepare usage");

@@ -309,7 +309,9 @@ async fn dead_letters(
     Query(query): Query<DeadLettersQuery>,
 ) -> Json<Value> {
     let limit = query.limit.clamp(1, 500);
-    let conn = state.db.conn.lock().expect("db");
+    let Ok(conn) = state.db.read() else {
+        return Json(json!({"items": [], "summary": {}, "error": "数据库不可用"}));
+    };
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, kind, payload, error, attempts, auto_attempts, resolved \
@@ -1835,7 +1837,9 @@ async fn metrics(State(state): State<SystemState>, headers: HeaderMap) -> impl I
         .auth
         .as_ref()
         .is_some_and(|auth| auth::bearer_is_valid(auth, &headers));
-    let conn = state.db.conn.lock().expect("db");
+    let Ok(conn) = state.db.read() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "数据库不可用").into_response();
+    };
     if !metrics_enabled(&conn) {
         return (StatusCode::NOT_FOUND, "metrics 已关闭").into_response();
     }
@@ -2030,7 +2034,13 @@ async fn logs(
 }
 
 async fn info(State(state): State<SystemState>) -> impl IntoResponse {
-    let conn = state.db.conn.lock().expect("db");
+    let Ok(conn) = state.db.read() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail": "数据库不可用"})),
+        )
+            .into_response();
+    };
     let engine = conn
         .query_row(
             "SELECT value FROM app_settings WHERE key='engine'",
@@ -2072,6 +2082,7 @@ async fn info(State(state): State<SystemState>) -> impl IntoResponse {
     Json(
         json!({"version": env!("CARGO_PKG_VERSION"), "uptime_sec": crate::now().saturating_sub(state.started_at).max(0), "kernel": "rust", "engine": engine, "settings_groups": settings_groups}),
     )
+    .into_response()
 }
 
 fn diag_check(name: &str, ok: bool, detail: String, started: std::time::Instant) -> Value {
@@ -2085,7 +2096,13 @@ fn diag_check(name: &str, ok: bool, detail: String, started: std::time::Instant)
 }
 
 async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
-    let conn = state.db.conn.lock().expect("db");
+    let Ok(conn) = state.db.read() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail": "数据库不可用"})),
+        )
+            .into_response();
+    };
     let mut checks = Vec::new();
 
     let started = std::time::Instant::now();
@@ -2303,6 +2320,7 @@ async fn diagnostics(State(state): State<SystemState>) -> impl IntoResponse {
         "checks": checks,
         "free_bytes": (state.free_bytes)(&state.archives_dir)
     }))
+    .into_response()
 }
 
 fn round(value: f64, digits: u32) -> f64 {
