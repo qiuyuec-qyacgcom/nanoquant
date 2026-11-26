@@ -74,6 +74,52 @@ pub(crate) struct ReviewedEntry {
     pub entry_price: Option<f64>,
 }
 
+/// AI 自评字段的载体：拒单/观望也要把 dq、rr 等落进审计。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct AiMeta {
+    pub invalidation_price: Option<f64>,
+    pub valid_bars: Option<i64>,
+    pub data_quality: Option<f64>,
+    pub rr_target: Option<f64>,
+    pub entry_price: Option<f64>,
+}
+
+impl From<&ReviewedEntry> for AiMeta {
+    fn from(value: &ReviewedEntry) -> Self {
+        Self {
+            invalidation_price: value.invalidation_price,
+            valid_bars: value.valid_bars,
+            data_quality: value.data_quality,
+            rr_target: value.rr_target,
+            entry_price: value.entry_price,
+        }
+    }
+}
+
+impl From<&ReviewDecision> for AiMeta {
+    fn from(value: &ReviewDecision) -> Self {
+        Self {
+            invalidation_price: value.invalidation_price,
+            valid_bars: value.valid_bars,
+            data_quality: value.data_quality,
+            rr_target: value.rr_target,
+            entry_price: value.entry_price,
+        }
+    }
+}
+
+impl From<&ReviewError> for AiMeta {
+    fn from(value: &ReviewError) -> Self {
+        Self {
+            invalidation_price: value.invalidation_price,
+            valid_bars: value.valid_bars,
+            data_quality: value.data_quality,
+            rr_target: value.rr_target,
+            entry_price: value.entry_price,
+        }
+    }
+}
+
 /// AI 复核没给出可执行结论：原因、动作、置信度都要留痕，
 /// 信号审计要能回答「为什么这一刀没开」。
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +128,11 @@ pub(crate) struct ReviewError {
     /// none / reject / error。
     pub action: String,
     pub confidence: f64,
+    pub invalidation_price: Option<f64>,
+    pub valid_bars: Option<i64>,
+    pub data_quality: Option<f64>,
+    pub rr_target: Option<f64>,
+    pub entry_price: Option<f64>,
 }
 
 impl ReviewError {
@@ -90,7 +141,23 @@ impl ReviewError {
             reason: reason.into(),
             action: action.to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }
+    }
+
+    /// 把原始 ReviewDecision 的 AI 自评字段带进错误，避免拒单审计丢失 dq/rr。
+    fn with_meta(mut self, decision: &ReviewDecision) -> Self {
+        let meta = AiMeta::from(decision);
+        self.invalidation_price = meta.invalidation_price;
+        self.valid_bars = meta.valid_bars;
+        self.data_quality = meta.data_quality;
+        self.rr_target = meta.rr_target;
+        self.entry_price = meta.entry_price;
+        self
     }
 }
 
@@ -107,6 +174,7 @@ pub(crate) trait AiReviewer: Send + Sync {
     fn review(&self, proposal: &EntryProposal) -> Result<ReviewDecision, String>;
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) fn apply_review(
     proposal: &EntryProposal,
     reviewer: Option<&dyn AiReviewer>,
@@ -172,6 +240,7 @@ fn clamp_margin(proposal: &EntryProposal, requested: Option<f64>) -> Option<f64>
         .map(|value| value.clamp(proposal.margin_min_pct, proposal.margin_max_pct))
 }
 
+#[allow(clippy::result_large_err)]
 fn apply_decision(
     proposal: &EntryProposal,
     decision: ReviewDecision,
@@ -182,12 +251,12 @@ fn apply_decision(
         .unwrap_or_else(|| proposal.side.clone());
     let take_profit = decision.take_profit.unwrap_or(proposal.take_profit);
     if !take_profit.is_finite() || take_profit <= 0.0 {
-        return Err(ReviewError::new("AI 返回的止盈价无效", "reject"));
+        return Err(ReviewError::new("AI 返回的止盈价无效", "reject").with_meta(&decision));
     }
     // AI 可以给出任意有效的止损价；没有给时才回退到仓位止盈止损率计算出的默认价。
     let stop_price = match decision.stop_price {
         Some(stop) if !stop.is_finite() || stop <= 0.0 => {
-            return Err(ReviewError::new("AI 返回的止损价无效", "reject"))
+            return Err(ReviewError::new("AI 返回的止损价无效", "reject").with_meta(&decision))
         }
         Some(stop) => stop,
         None if side == proposal.side && proposal.stop_price > 0.0 => proposal.stop_price,
@@ -199,12 +268,17 @@ fn apply_decision(
                 proposal.mark_price + distance
             }
         }
-        None => return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject")),
+        None => {
+            return Err(
+                ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision)
+            )
+        }
     };
     if !stop_price.is_finite() || stop_price <= 0.0 {
-        return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject"));
+        return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision));
     }
     let confidence = decision.confidence;
+    let meta = AiMeta::from(&decision);
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
             side: side.clone(),
@@ -233,6 +307,11 @@ fn apply_decision(
             },
             action: "hold".to_string(),
             confidence,
+            invalidation_price: meta.invalidation_price,
+            valid_bars: meta.valid_bars,
+            data_quality: meta.data_quality,
+            rr_target: meta.rr_target,
+            entry_price: meta.entry_price,
         }),
         ReviewAction::Reject => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -242,6 +321,11 @@ fn apply_decision(
             },
             action: "reject".to_string(),
             confidence,
+            invalidation_price: meta.invalidation_price,
+            valid_bars: meta.valid_bars,
+            data_quality: meta.data_quality,
+            rr_target: meta.rr_target,
+            entry_price: meta.entry_price,
         }),
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
@@ -469,6 +553,50 @@ mod tests {
             entry_price: None,
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
+    }
+
+    #[test]
+    fn rejected_review_carries_ai_meta() {
+        let mut rejected = decision(ReviewAction::Reject);
+        rejected.confidence = 0.9;
+        rejected.data_quality = Some(0.3);
+        rejected.rr_target = Some(0.5);
+        rejected.invalidation_price = Some(97.5);
+        rejected.valid_bars = Some(6);
+        rejected.entry_price = Some(99.8);
+        let error = apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true)
+            .expect_err("Reject 必须转成错误");
+        assert_eq!(error.action, "reject");
+        assert_eq!(error.data_quality, Some(0.3));
+        assert_eq!(error.rr_target, Some(0.5));
+        assert_eq!(error.invalidation_price, Some(97.5));
+        assert_eq!(error.valid_bars, Some(6));
+        assert_eq!(error.entry_price, Some(99.8));
+        let meta = AiMeta::from(&error);
+        assert_eq!(meta.data_quality, Some(0.3));
+        assert_eq!(meta.rr_target, Some(0.5));
+        assert_eq!(meta.invalidation_price, Some(97.5));
+        assert_eq!(meta.valid_bars, Some(6));
+        assert_eq!(meta.entry_price, Some(99.8));
+    }
+
+    #[test]
+    fn rejected_signal_persists_ai_meta_in_features() {
+        let mut rejected = decision(ReviewAction::Reject);
+        rejected.data_quality = Some(0.3);
+        rejected.rr_target = Some(0.5);
+        let error =
+            apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true).unwrap_err();
+        let mut row = crate::signal_audit::AuditSignal::new("BTCUSDT");
+        let meta = AiMeta::from(&error);
+        row.data_quality = meta.data_quality;
+        row.rr_target = meta.rr_target;
+        row.valid_bars = meta.valid_bars;
+        row.invalidation_price = meta.invalidation_price;
+        row.entry_price = meta.entry_price;
+        let features = row.features_with_meta();
+        assert_eq!(features["ai_dq"], 0.3);
+        assert_eq!(features["ai_rr"], 0.5);
     }
 
 }

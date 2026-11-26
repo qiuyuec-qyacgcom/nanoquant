@@ -265,6 +265,18 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
     }
 }
 
+/// 拒单时必须把 AI 自评字段一并带出，否则审计层拿不到 dq/rr。
+fn reject_with(reason: impl Into<String>, decision: &ai_client::Decision) -> ReviewDecision {
+    ReviewDecision {
+        invalidation_price: decision.invalidation_price,
+        valid_bars: decision.valid_bars,
+        data_quality: decision.data_quality,
+        rr_target: decision.rr_target,
+        entry_price: decision.entry_price,
+        ..reject(reason)
+    }
+}
+
 fn decision_to_review(
     proposal: &EntryProposal,
     side_lock: &str,
@@ -275,10 +287,13 @@ fn decision_to_review(
     min_entry_rr: f64,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
-        let mut rejected = reject(format!(
-            "AI 置信度 {:.2} 低于 {:.2}",
-            decision.confidence, min_confidence
-        ));
+        let mut rejected = reject_with(
+            format!(
+                "AI 置信度 {:.2} 低于 {:.2}",
+                decision.confidence, min_confidence
+            ),
+            decision,
+        );
         rejected.confidence = decision.confidence;
         return Ok(rejected);
     }
@@ -300,46 +315,52 @@ fn decision_to_review(
                     decision.reason.clone()
                 },
                 confidence: decision.confidence,
-                invalidation_price: None,
-                valid_bars: None,
-                data_quality: None,
-                rr_target: None,
-                entry_price: None,
+                invalidation_price: decision.invalidation_price,
+                valid_bars: decision.valid_bars,
+                data_quality: decision.data_quality,
+                rr_target: decision.rr_target,
+                entry_price: decision.entry_price,
             })
         }
     };
     // 复核前置拒单：仅对开仓决策生效，hold/close 不因门槛被改写为 Reject。
     if let Some(dq) = decision.data_quality {
         if dq.is_finite() && dq < min_confidence {
-            let mut rejected = reject(format!("AI 数据质量分 {dq:.2} 低于 {min_confidence:.2}"));
+            let mut rejected = reject_with(
+                format!("AI 数据质量分 {dq:.2} 低于 {min_confidence:.2}"),
+                decision,
+            );
             rejected.confidence = decision.confidence;
             return Ok(rejected);
         }
     }
     if let Some(rr) = decision.rr_target {
         if rr.is_finite() && rr < min_entry_rr {
-            let mut rejected = reject(format!("AI 盈亏比 {rr:.2} 低于 {min_entry_rr:.2}"));
+            let mut rejected = reject_with(
+                format!("AI 盈亏比 {rr:.2} 低于 {min_entry_rr:.2}"),
+                decision,
+            );
             rejected.confidence = decision.confidence;
             return Ok(rejected);
         }
     }
     if side_lock == "long" && side == "short" {
-        return Ok(reject("策略只允许做多，AI 方向相反"));
+        return Ok(reject_with("策略只允许做多，AI 方向相反", decision));
     }
     if side_lock == "short" && side == "long" {
-        return Ok(reject("策略只允许做空，AI 方向相反"));
+        return Ok(reject_with("策略只允许做空，AI 方向相反", decision));
     }
     if let Some(quant_side) = proposal.quant_side.as_deref() {
         if quant_side != side {
             if require_agreement {
-                return Ok(reject("AI 与量化方向不一致"));
+                return Ok(reject_with("AI 与量化方向不一致", decision));
             }
             if !allow_ai_override {
-                return Ok(reject("AI 与量化方向不一致，且未允许 AI 覆盖"));
+                return Ok(reject_with("AI 与量化方向不一致，且未允许 AI 覆盖", decision));
             }
         }
     } else if require_agreement {
-        return Ok(reject("缺少量化方向，无法与量化方向一致"));
+        return Ok(reject_with("缺少量化方向，无法与量化方向一致", decision));
     }
     let mark = proposal.mark_price;
     // 杠杆由 AI 在全局区间内决定：低于下限抬回下限，高于上限压回上限。
@@ -387,7 +408,7 @@ fn decision_to_review(
         || !take_profit.is_finite()
         || take_profit <= 0.0
     {
-        return Ok(reject("AI 返回的止损/止盈价无效"));
+        return Ok(reject_with("AI 返回的止损/止盈价无效", decision));
     }
     let leverage_changed =
         leverage.is_some_and(|value| (value - proposal.leverage).abs() > f64::EPSILON);
@@ -544,6 +565,11 @@ mod tests {
         let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
+        assert_eq!(
+            result.data_quality,
+            Some(0.2),
+            "门槛拒单必须保留 AI 自评数据质量，供审计落 ai_dq"
+        );
         assert!(
             (result.confidence - 0.9).abs() < 1e-9,
             "门槛拒单必须保留 AI 置信度"
@@ -557,6 +583,11 @@ mod tests {
         let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("盈亏比"));
+        assert_eq!(
+            result.rr_target,
+            Some(0.4),
+            "门槛拒单必须保留 AI 自估盈亏比，供审计落 ai_rr"
+        );
         assert!(
             (result.confidence - 0.9).abs() < 1e-9,
             "门槛拒单必须保留 AI 置信度"

@@ -203,7 +203,7 @@ impl EntryDraft {
         ai_action: &str,
         ai_confidence: f64,
         ai_reason: &str,
-        ai_meta: Option<&crate::review::ReviewedEntry>,
+        ai_meta: Option<&crate::review::AiMeta>,
     ) -> crate::signal_audit::AuditSignal {
         let mut features: Value =
             serde_json::from_str(&self.features_text).unwrap_or_else(|_| serde_json::json!({}));
@@ -3020,7 +3020,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         &error.action,
                         error.confidence,
                         &error.reason,
-                        None,
+                        Some(&crate::review::AiMeta::from(&error)),
                     ));
                     continue;
                 }
@@ -3094,7 +3094,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     &reviewed.action,
                     reviewed.confidence,
                     &reviewed.reason,
-                    Some(&reviewed),
+                    Some(&crate::review::AiMeta::from(&reviewed)),
                 ));
                 continue;
             }
@@ -3117,7 +3117,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         &reviewed.action,
                         reviewed.confidence,
                         &reviewed.reason,
-                        Some(&reviewed),
+                        Some(&crate::review::AiMeta::from(&reviewed)),
                     ));
                     break;
                 }
@@ -3168,7 +3168,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                             &reviewed.action,
                             reviewed.confidence,
                             &reviewed.reason,
-                            Some(&reviewed),
+                            Some(&crate::review::AiMeta::from(&reviewed)),
                         )
                         .with_feature("client_order_id", serde_json::json!(&draft.client_id)),
                 );
@@ -3189,7 +3189,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     &reviewed.action,
                     reviewed.confidence,
                     &reviewed.reason,
-                    Some(&reviewed),
+                    Some(&crate::review::AiMeta::from(&reviewed)),
                 ));
                 continue;
             }
@@ -3238,7 +3238,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 &reviewed.action,
                 reviewed.confidence,
                 &reviewed.reason,
-                Some(&reviewed),
+                Some(&crate::review::AiMeta::from(&reviewed)),
             ));
         }
         // 审计写入失败不能拖垮下单：日志里留痕，下一轮继续。
@@ -7239,11 +7239,11 @@ mod tests {
                 take_profit: None,
                 reason: "test reject".to_string(),
                 confidence: 0.0,
-                invalidation_price: None,
-                valid_bars: None,
-                data_quality: None,
-                rr_target: None,
-                entry_price: None,
+                invalidation_price: Some(97.5),
+                valid_bars: Some(6),
+                data_quality: Some(0.3),
+                rr_target: Some(0.5),
+                entry_price: Some(99.8),
             })
         }
     }
@@ -7291,6 +7291,39 @@ mod tests {
             value["stage"].is_null(),
             "量化已过门槛的行不能标成预评分: {value}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_signal_persists_ai_meta_in_features() {
+        let (db, snapshot) = entry_fixture().await;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
+                 INSERT OR REPLACE INTO ai_providers(id,enabled) VALUES(1,1); \
+                 INSERT INTO app_settings(key,value,updated_at) VALUES('ai','{\"enabled\":true}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;",
+            )
+            .unwrap();
+        let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let features: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT features FROM signals WHERE mode='demo' AND decision='rejected' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["ai_dq"], 0.3, "拒单路径也要落 ai_dq: {value}");
+        assert_eq!(value["ai_rr"], 0.5, "拒单路径也要落 ai_rr: {value}");
+        assert_eq!(value["ai_vb"], 6, "拒单路径也要落 ai_vb: {value}");
+        assert_eq!(value["ai_ip"], 97.5, "拒单路径也要落 ai_ip: {value}");
     }
 
     #[tokio::test]
