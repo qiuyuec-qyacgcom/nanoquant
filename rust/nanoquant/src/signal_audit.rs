@@ -426,13 +426,17 @@ fn round2(value: f64) -> f64 {
 /// 最近 `window_sec` 的半 AI 运行指标：信号/决议、scale 分布、fail-open、
 /// 闸门分层、AI 延迟与盘口健康度。只读聚合，不改交易行为。
 ///
+/// 信号按 `mode` 隔离，与 `/engine/stats` 其他字段一致；`ai_call_logs` 没有
+/// mode 列，AI 延迟只能取全环境样本，返回值用 `ai_latency_scope` 注明。
+///
 /// `features` 优先用 SQLite `json_extract` 展平；老库缺少 JSON1 或存了坏 JSON 时，
 /// 回退到 Rust 侧逐行解析，保证接口不因数据脏而失败。
-pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
+pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -> Value {
     let since = now.saturating_sub(window_sec.max(0));
     let mut signals_total = 0_i64;
     let mut opened = 0_i64;
     let mut rejected = 0_i64;
+    let mut ai_reviewed = 0_i64;
     let mut ai_veto = 0_i64;
     let mut ai_fail_open = 0_i64;
     let mut high_score_skip = 0_i64;
@@ -441,7 +445,7 @@ pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
     let mut gates: BTreeMap<&'static str, i64> =
         GATE_KEYS.iter().map(|key| (*key, 0_i64)).collect();
 
-    for row in signal_metric_rows(conn, since) {
+    for row in signal_metric_rows(conn, mode, since) {
         signals_total += 1;
         match row.decision.as_str() {
             "opened" => opened += 1,
@@ -459,18 +463,21 @@ pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
         if row.skip {
             high_score_skip += 1;
         }
-        if row.decision == "rejected"
-            && (row.ai_action == "reject" || AI_VETO_GATES.contains(&gate_key))
-        {
+        let action = row.ai_action.trim();
+        // AI 实际复核过的信号：有动作且不是 none/error，作为否决率分母。
+        if !action.is_empty() && action != "none" && action != "error" {
+            ai_reviewed += 1;
+        }
+        if AI_VETO_GATES.contains(&gate_key) || action == "reject" || action == "hold" {
             ai_veto += 1;
         }
         scales[scale_bucket(row.scale)] += 1;
     }
 
-    let ai_veto_rate = if signals_total == 0 {
+    let ai_veto_rate = if ai_reviewed == 0 {
         0.0
     } else {
-        ai_veto as f64 / signals_total as f64 * 100.0
+        ai_veto as f64 / ai_reviewed as f64 * 100.0
     };
 
     let mut latencies: Vec<f64> = Vec::new();
@@ -499,6 +506,7 @@ pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
         "signals_total": signals_total,
         "opened": opened,
         "rejected": rejected,
+        "ai_reviewed": ai_reviewed,
         "ai_veto_rate_pct": round2(ai_veto_rate),
         "scale_0_5": scales[0],
         "scale_0_75": scales[1],
@@ -509,6 +517,7 @@ pub fn half_ai_stats(conn: &Connection, now: i64, window_sec: i64) -> Value {
         "gates": gates,
         "ai_latency_p50_ms": percentile(&latencies, 0.50),
         "ai_latency_p95_ms": percentile(&latencies, 0.95),
+        "ai_latency_scope": "all_modes",
         "book_stale_pct": book_stale_pct,
         "book": book,
     })
@@ -539,23 +548,23 @@ fn scale_bucket(scale: Option<f64>) -> usize {
     }
 }
 
-fn signal_metric_rows(conn: &Connection, since: i64) -> Vec<SignalMetricRow> {
-    json_extract_rows(conn, since).unwrap_or_else(|| features_rows(conn, since))
+fn signal_metric_rows(conn: &Connection, mode: &str, since: i64) -> Vec<SignalMetricRow> {
+    json_extract_rows(conn, mode, since).unwrap_or_else(|| features_rows(conn, mode, since))
 }
 
 /// JSON1 可用的主路径：把 features 拆成列，聚合仍在 Rust 侧做。
-fn json_extract_rows(conn: &Connection, since: i64) -> Option<Vec<SignalMetricRow>> {
+fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<SignalMetricRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT decision, ai_action, \
              json_extract(features, '$.filter_trace.gate'), \
              json_extract(features, '$.filter_trace.skip'), \
              json_extract(features, '$.ai_scale') \
-             FROM signals WHERE ts >= ?1",
+             FROM signals WHERE ts >= ?1 AND mode = ?2",
         )
         .ok()?;
     let rows = stmt
-        .query_map([since], |r| {
+        .query_map(rusqlite::params![since, mode], |r| {
             Ok(SignalMetricRow {
                 decision: r.get(0)?,
                 ai_action: r.get(1)?,
@@ -569,13 +578,13 @@ fn json_extract_rows(conn: &Connection, since: i64) -> Option<Vec<SignalMetricRo
 }
 
 /// 回退路径：整行读出 features 后按 JSON 结构解析。
-fn features_rows(conn: &Connection, since: i64) -> Vec<SignalMetricRow> {
-    let Ok(mut stmt) =
-        conn.prepare("SELECT decision, ai_action, features FROM signals WHERE ts >= ?1")
+fn features_rows(conn: &Connection, mode: &str, since: i64) -> Vec<SignalMetricRow> {
+    let Ok(mut stmt) = conn
+        .prepare("SELECT decision, ai_action, features FROM signals WHERE ts >= ?1 AND mode = ?2")
     else {
         return Vec::new();
     };
-    let Ok(rows) = stmt.query_map([since], |r| {
+    let Ok(rows) = stmt.query_map(rusqlite::params![since, mode], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -635,11 +644,22 @@ mod tests {
         ai_action: &str,
         features: &str,
     ) {
+        insert_signal_in(conn, "demo", ts, decision, ai_action, features);
+    }
+
+    fn insert_signal_in(
+        conn: &Connection,
+        mode: &str,
+        ts: i64,
+        decision: &str,
+        ai_action: &str,
+        features: &str,
+    ) {
         conn.execute(
             "INSERT INTO signals(ts,symbol,direction,score,features,ai_action,ai_confidence,\
              ai_reason,decision,reject_reason,mode,repeats) \
-             VALUES(?1,'BTCUSDT','long',0.8,?2,?3,0.7,'',?4,'','demo',1)",
-            rusqlite::params![ts, features, ai_action, decision],
+             VALUES(?1,'BTCUSDT','long',0.8,?2,?3,0.7,'',?4,'',?5,1)",
+            rusqlite::params![ts, features, ai_action, decision, mode],
         )
         .unwrap();
     }
@@ -691,10 +711,11 @@ mod tests {
             r#"{"filter_trace":{"gate":"news_veto"}}"#,
         );
 
-        let value = half_ai_stats(&conn, now, 86_400);
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
         assert_eq!(value["signals_total"], 5, "窗口外的信号不计入");
         assert_eq!(value["opened"], 1);
         assert_eq!(value["rejected"], 3);
+        assert_eq!(value["ai_reviewed"], 5, "AI 有动作的信号都算复核过");
         assert_eq!(value["ai_fail_open"], 1);
         assert_eq!(value["high_score_skip"], 1);
         assert_eq!(value["scale_0_5"], 1);
@@ -708,17 +729,106 @@ mod tests {
         assert_eq!(value["gates"]["news_veto"], 0, "窗口外的闸门不应计数");
         assert_eq!(
             value["ai_veto_rate_pct"], 20.0,
-            "仅 AI 主动否决计入: ai_dq / 5"
+            "仅 AI 主动否决计入: 1 / ai_reviewed 5"
+        );
+    }
+
+    #[test]
+    fn half_ai_stats_filters_by_mode() {
+        let conn = table();
+        let now = 200_000;
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 10,
+            "opened",
+            "open_long",
+            r#"{"ai_scale":1.0,"filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 20,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"ai_dq"}}"#,
+        );
+        insert_signal_in(
+            &conn,
+            "live",
+            now - 15,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"news_veto"}}"#,
+        );
+
+        let demo = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(demo["signals_total"], 2, "只统计当前模式");
+        assert_eq!(demo["opened"], 1);
+        assert_eq!(demo["rejected"], 1);
+        assert_eq!(demo["gates"]["ai_dq"], 1);
+        assert_eq!(demo["gates"]["news_veto"], 0, "live 信号不能混进 demo");
+
+        let live = half_ai_stats(&conn, "live", now, 86_400);
+        assert_eq!(live["signals_total"], 1);
+        assert_eq!(live["gates"]["news_veto"], 1);
+        assert_eq!(live["gates"]["none"], 0);
+    }
+
+    #[test]
+    fn ai_veto_rate_uses_ai_reviewed_denominator() {
+        let conn = table();
+        let now = 300_000;
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 10,
+            "opened",
+            "open_long",
+            r#"{"filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 20,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"other"}}"#,
+        );
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 30,
+            "flat",
+            "none",
+            r#"{"filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal_in(
+            &conn,
+            "demo",
+            now - 40,
+            "flat",
+            "",
+            r#"{"filter_trace":{"gate":"none"}}"#,
+        );
+
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["signals_total"], 4);
+        assert_eq!(value["ai_reviewed"], 2, "none/空动作不算 AI 复核过");
+        assert_eq!(
+            value["ai_veto_rate_pct"], 50.0,
+            "分母取 ai_reviewed，而不是全部信号"
         );
     }
 
     #[test]
     fn half_ai_stats_handles_empty_window() {
         let conn = table();
-        let value = half_ai_stats(&conn, 424_242, 86_400);
+        let value = half_ai_stats(&conn, "demo", 424_242, 86_400);
         assert_eq!(value["signals_total"], 0);
         assert_eq!(value["opened"], 0);
         assert_eq!(value["rejected"], 0);
+        assert_eq!(value["ai_reviewed"], 0);
         assert_eq!(value["ai_veto_rate_pct"], 0.0);
         assert_eq!(value["scale_none"], 0);
         assert_eq!(value["ai_fail_open"], 0);

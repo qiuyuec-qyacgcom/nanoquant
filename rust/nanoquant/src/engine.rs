@@ -721,7 +721,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         .collect::<serde_json::Map<String, Value>>();
     let half_ai = {
         let conn = db.conn.lock().expect("db");
-        crate::signal_audit::half_ai_stats(&conn, crate::now(), 86_400)
+        crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400)
     };
     Json(json!({
         "trades": rows.len(),

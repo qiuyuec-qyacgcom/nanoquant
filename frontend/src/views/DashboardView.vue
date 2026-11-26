@@ -172,6 +172,7 @@ const halfAi = computed(() => {
     total: Number(h.signals_total || 0),
     opened: Number(h.opened || 0),
     rejected: Number(h.rejected || 0),
+    reviewed: Number(h.ai_reviewed || 0),
     vetoRate: Number(h.ai_veto_rate_pct || 0),
     scale05: Number(h.scale_0_5 || 0),
     scale075: Number(h.scale_0_75 || 0),
@@ -501,7 +502,11 @@ useSilentRefresh(refreshQuotes, 3000)
         <div class="grid g4" style="gap: 10px">
           <div class="metric">
             <span>AI 否决率</span>
-            <span class="mono" :class="halfAi.vetoRate > 0 ? 'down' : 'flat'">{{ halfAi.vetoRate.toFixed(1) }}%</span>
+            <span
+              class="mono"
+              :class="halfAi.vetoRate > 0 ? 'down' : 'flat'"
+              :title="`AI 复核信号中否决占比（窗口内 ${halfAi.reviewed} 条 AI 复核）`"
+            >{{ halfAi.vetoRate.toFixed(1) }}%</span>
           </div>
           <div class="metric">
             <span>fail-open</span>
@@ -532,7 +537,7 @@ useSilentRefresh(refreshQuotes, 3000)
             <span class="mono" :class="halfAi.p95 > 3000 ? 'down' : 'flat'">{{ halfAi.p95 ? halfAi.p95 + 'ms' : '--' }}</span>
           </div>
           <div class="metric">
-            <span>盘口 stale</span>
+            <span>盘口 stale（进程累计）</span>
             <span class="mono" :class="halfAi.bookStale > 0 ? 'down' : 'up'">{{ halfAi.bookStale.toFixed(1) }}%</span>
           </div>
           <div class="metric">
@@ -541,8 +546,9 @@ useSilentRefresh(refreshQuotes, 3000)
           </div>
         </div>
         <div class="hint">
-          最近 24 小时口径：AI 否决率只统计 AI 主动收紧/否决（数据质量、盈亏比、置信度、方向）；
-          fail-open 为 AI 复核失败后放行；盘口 stale 为本地 WebSocket 盘口过期并回退 REST 的比例。
+          最近 24 小时口径：AI 否决率 = AI 复核信号中否决占比（数据质量、盈亏比、置信度、方向，
+          或 AI 明确 reject/hold）；fail-open 为 AI 复核失败后放行；
+          盘口 stale 为本地 WebSocket 盘口过期并回退 REST 的进程累计比例。
         </div>
       </div>
     </div>
