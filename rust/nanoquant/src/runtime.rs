@@ -6005,95 +6005,21 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
-/// 账户面板专用：独立于策略周期，每 3 秒刷新持仓标记价和浮盈，
-/// 让 /engine/status 的权益/浮动盈亏跟行情同步（只读公开标记价）。
-pub(crate) async fn run_position_mark_task(
-    db: crate::db::Db,
-    mut stop: watch::Receiver<bool>,
-) {
-    loop {
-        if *stop.borrow() {
-            break;
-        }
-        if let Err(error) = refresh_position_marks(&db).await {
-            tracing::debug!(%error, "持仓标记价刷新失败");
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
-            _ = stop.changed() => break,
-        }
-    }
-}
-
-async fn refresh_position_marks(db: &crate::db::Db) -> Result<(), String> {
-    let rows: Vec<(i64, String, String, f64, f64)> = {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())?;
-        let mode: String = conn
-            .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or_else(|_| "demo".to_string());
-        if mode != "live" {
-            return Ok(());
-        }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id,symbol,side,qty,entry_price FROM positions \
-                 WHERE mode='live' AND status='open'",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, f64>(4)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        rows
-    };
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
-        .map_err(|error| format!("{error:?}"))?;
-    let mut updates = Vec::new();
-    for (id, symbol, side, qty, entry) in rows {
-        if let Ok(mark) = provider.public_mark_price(&symbol).await {
-            if mark.is_finite() && mark > 0.0 {
-                let direction = if side == "long" { 1.0 } else { -1.0 };
-                updates.push((id, mark, (mark - entry) * qty * direction));
-            }
-        }
-    }
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库锁不可用".to_string())?;
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| error.to_string())?;
-    let now = crate::now();
-    for (id, mark, unrealized) in updates {
-        tx.execute(
-            "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
-             WHERE id=?4 AND status='open'",
-            (mark, unrealized, now, id),
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    tx.commit().map_err(|error| error.to_string())
+/// 把最新标记价和浮盈写回持仓。快速风控每 0.5 秒调用一次，
+/// 即使未命中风控分支也刷新，权益面板因此与行情同步。
+fn apply_position_mark(
+    conn: &rusqlite::Connection,
+    id: i64,
+    mark: f64,
+    entry: f64,
+    qty: f64,
+    direction: f64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
+         WHERE id=?4 AND status='open'",
+        (mark, (mark - entry) * qty * direction, crate::now(), id),
+    )
 }
 
 /// 持仓风控专用：有仓位时每 0.5 秒用公开标记价检查全局/单仓止盈止损，
@@ -6259,11 +6185,7 @@ async fn fast_risk_cycle(
         let direction = if side == "long" { 1.0 } else { -1.0 };
 
         if let Ok(conn) = db.conn.lock() {
-            let _ = conn.execute(
-                "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
-                 WHERE id=?4 AND status='open'",
-                (mark, (mark - entry) * qty * direction, crate::now(), id),
-            );
+            let _ = apply_position_mark(&conn, id, mark, entry, qty, direction);
         }
         let limits = crate::mean_reversion::position_margin_limits(features.as_deref());
         let reason = fast_risk_reason(&FastRiskInput {
@@ -6526,6 +6448,49 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn fast_risk_cycle_updates_mark_price_without_trigger() {
+        // 快速风控每 0.5 秒查一次持仓，即便未命中任何止损/止盈分支，
+        // 也必须把标记价和浮盈写回 positions，供权益面板展示。
+        // fast_risk_cycle 内部固定走真实 Binance REST 取标记价，没有注入点，
+        // 因此这里直接覆盖其 UPDATE 语句路径。
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let terms = EntryTerms {
+            leverage: 5.0,
+            stop: 95.0,
+            take_profit: 110.0,
+            score: 0.8,
+            invalidation_price: None,
+        };
+        EngineRuntime::insert_entry_position(
+            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM positions WHERE symbol='BTCUSDT'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let changed = apply_position_mark(&conn, id, 105.0, 100.0, 2.0, 1.0).unwrap();
+        assert_eq!(changed, 1);
+
+        let (mark, unrealized, ts, status): (f64, f64, i64, String) = conn
+            .query_row(
+                "SELECT mark_price,venue_unrealized,venue_ts,status FROM positions WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mark, 105.0);
+        assert_eq!(unrealized, (105.0 - 100.0) * 2.0);
+        assert!(ts > 0);
+        assert_eq!(status, "open", "未触发风控时不得改变持仓状态");
     }
 
     #[test]

@@ -318,12 +318,8 @@ async fn main() {
         if crate::book_stream::startup_enabled(&db) {
             tokio::spawn(crate::book_stream::run_task(db.clone(), stop_tx.subscribe()));
         }
-        // 账户面板的标记价刷新独立于策略周期，避免权益/浮盈要等 10 分钟一轮才变。
-        tokio::spawn(crate::runtime::run_position_mark_task(
-            db.clone(),
-            stop_tx.subscribe(),
-        ));
         // 只要存在仓位，0.5 秒风控任务会直接检查止盈止损并平仓，不再等 480 秒周期。
+        // 标记价/浮盈在同一循环里刷新，无需额外的 3 秒持仓标记任务。
         tokio::spawn(crate::runtime::run_fast_risk_task(
             db.clone(),
             master_key.clone(),
