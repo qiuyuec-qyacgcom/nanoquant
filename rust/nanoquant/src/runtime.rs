@@ -1206,9 +1206,15 @@ impl EngineControl {
         mode: &str,
     ) -> Result<crate::providers::AccountSnapshot, String> {
         let creds = self.credentials_for_mode(mode)?;
+        let data = self
+            .db
+            .setting("data")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
         let provider =
             crate::providers::BinanceProvider::for_account(creds.base, creds.api_key, creds.secret)
-                .map_err(|error| format!("{error:?}"))?;
+                .map_err(|error| format!("{error:?}"))?
+                .with_backups(crate::providers::configured_backup_urls(&data, mode));
         provider
             .account_snapshot()
             .await
@@ -2440,6 +2446,11 @@ impl EngineRuntime {
             return Ok(Vec::new());
         }
         let creds = self.live_credentials()?;
+        let data = self
+            .db
+            .setting("data")
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
         let locals: Vec<(String, String, f64)> = {
             let conn = self
                 .db
@@ -2483,7 +2494,8 @@ impl EngineRuntime {
             crate::providers::ProviderError::Timeout => "交易所持仓快照超时".to_string(),
             crate::providers::ProviderError::Unavailable(message)
             | crate::providers::ProviderError::InvalidData(message) => message,
-        })?;
+        })?
+        .with_backups(crate::providers::configured_backup_urls(&data, "live"));
         let venue = provider
             .positions_only()
             .await
@@ -5248,6 +5260,7 @@ impl EngineRuntime {
             .get("book_stale_ms")
             .and_then(Value::as_i64)
             .unwrap_or(3_000);
+        let backup_urls = crate::providers::configured_backup_urls(&data, mode);
         let provider = match credentials {
             Some((api_key, secret)) => crate::providers::BinanceProvider::with_symbols(
                 base,
@@ -5263,7 +5276,11 @@ impl EngineRuntime {
             ),
         }
         .and_then(|provider| provider.with_timeframe(timeframe))
-        .map(|provider| provider.with_book_config(book_ws_enabled, book_stale_ms))
+        .map(|provider| {
+            provider
+                .with_book_config(book_ws_enabled, book_stale_ms)
+                .with_backups(backup_urls)
+        })
         .map_err(|error| format!("无法初始化交易所快照客户端: {error:?}"))?;
         let plans = self.refresh_snapshot(mode, &provider).await?;
         Ok((mode.to_string(), plans))

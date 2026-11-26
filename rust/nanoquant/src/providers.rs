@@ -175,6 +175,8 @@ impl SnapshotProvider for DemoProvider {
 pub struct BinanceProvider {
     client: reqwest::Client,
     base_url: String,
+    /// 主域名不可用（传输失败/超时/5xx）时依次重试的备用域名。
+    backup_urls: Vec<String>,
     symbols: Vec<String>,
     api_key: String,
     secret: String,
@@ -222,6 +224,7 @@ impl BinanceProvider {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            backup_urls: Vec::new(),
             symbols,
             api_key,
             secret,
@@ -244,6 +247,7 @@ impl BinanceProvider {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            backup_urls: Vec::new(),
             symbols: Vec::new(),
             api_key: String::new(),
             secret: String::new(),
@@ -272,6 +276,7 @@ impl BinanceProvider {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            backup_urls: Vec::new(),
             symbols: Vec::new(),
             api_key,
             secret,
@@ -320,6 +325,7 @@ impl BinanceProvider {
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            backup_urls: Vec::new(),
             symbols,
             api_key: String::new(),
             secret: String::new(),
@@ -452,6 +458,19 @@ impl BinanceProvider {
         self
     }
 
+    /// 注入实盘/模拟盘备用域名。统一 trim、去空、去重，并排除与主域名相同的值。
+    pub fn with_backups(mut self, urls: Vec<String>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(self.base_url.clone());
+        self.backup_urls = urls
+            .into_iter()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty())
+            .filter(|url| seen.insert(url.clone()))
+            .collect();
+        self
+    }
+
     /// 只拉交易所持仓，不拉行情/K 线。用于手动平仓后的快速对账。
     pub async fn positions_only(&self) -> Result<Vec<PositionSnapshot>, ProviderError> {
         let value = self.get_json("/fapi/v3/positionRisk", &[], true).await?;
@@ -536,6 +555,34 @@ impl BinanceProvider {
                 "未配置交易所 API 凭证，公开 provider 不支持签名接口".into(),
             ));
         }
+        let mut hosts = Vec::with_capacity(self.backup_urls.len() + 1);
+        hosts.push(self.base_url.as_str());
+        hosts.extend(self.backup_urls.iter().map(String::as_str));
+        let attempts = hosts.len();
+        let mut last_error = None;
+        for host in hosts {
+            match self.get_json_once(host, path, params, signed).await {
+                Ok(value) => return Ok(value),
+                // 传输错误/超时/5xx 可以换备用域名，签名请求每次尝试都会重新生成时间戳。
+                Err(FetchError::Retryable(error)) => last_error = Some(error),
+                // 4xx 属于认证/参数错误，重试其它域名没有意义。
+                Err(FetchError::Fatal(error)) => return Err(error),
+            }
+        }
+        Err(annotate_attempts(
+            last_error
+                .unwrap_or_else(|| ProviderError::Unavailable(format!("交易所请求失败 ({path})"))),
+            attempts,
+        ))
+    }
+
+    async fn get_json_once(
+        &self,
+        host: &str,
+        path: &str,
+        params: &[(String, String)],
+        signed: bool,
+    ) -> Result<Value, FetchError> {
         let timestamp = crate::now_millis();
         let query = if signed {
             let refs: Vec<(&str, &str)> = params
@@ -550,29 +597,81 @@ impl BinanceProvider {
                 .collect::<Vec<_>>()
                 .join("&")
         };
-        let url = format!("{}{path}?{query}", self.base_url);
+        let url = format!("{host}{path}?{query}");
         let mut request = self.client.get(url);
         if signed {
             request = request.header("X-MBX-APIKEY", &self.api_key);
         }
         let transport_error = |error: reqwest::Error| {
             if error.is_timeout() {
-                ProviderError::Timeout
+                FetchError::Retryable(ProviderError::Timeout)
             } else {
-                ProviderError::Unavailable(format!("交易所请求传输失败 ({path})"))
+                FetchError::Retryable(ProviderError::Unavailable(format!(
+                    "交易所请求传输失败 ({path})"
+                )))
             }
         };
         let response = request.send().await.map_err(transport_error)?;
         let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderError::Unavailable(format!(
+        if status.is_client_error() {
+            return Err(FetchError::Fatal(ProviderError::Unavailable(format!(
                 "交易所请求失败 ({path}, HTTP {status})"
-            )));
+            ))));
+        }
+        if !status.is_success() {
+            return Err(FetchError::Retryable(ProviderError::Unavailable(format!(
+                "交易所请求失败 ({path}, HTTP {status})"
+            ))));
         }
         let body = response.bytes().await.map_err(transport_error)?;
-        serde_json::from_slice(&body)
-            .map_err(|_| ProviderError::InvalidData(format!("交易所响应不是合法 JSON ({path})")))
+        serde_json::from_slice(&body).map_err(|_| {
+            FetchError::Fatal(ProviderError::InvalidData(format!(
+                "交易所响应不是合法 JSON ({path})"
+            )))
+        })
     }
+}
+
+/// 单次域名尝试的失败分类：只有可重试的失败才会切换到备用域名。
+enum FetchError {
+    Retryable(ProviderError),
+    Fatal(ProviderError),
+}
+
+/// 全部域名失败后保留最后一个错误，并在错误信息中给出尝试过的域名数。
+fn annotate_attempts(error: ProviderError, attempts: usize) -> ProviderError {
+    if attempts <= 1 {
+        return error;
+    }
+    match error {
+        ProviderError::Unavailable(message) => {
+            ProviderError::Unavailable(format!("{message}，已尝试 {attempts} 个域名"))
+        }
+        ProviderError::Timeout => {
+            tracing::warn!(attempts, "交易所所有域名请求均超时");
+            ProviderError::Timeout
+        }
+        other => other,
+    }
+}
+
+/// 从 `data` 配置组按交易环境读取备用域名；缺失或类型不符时返回空列表。
+pub fn configured_backup_urls(data: &Value, mode: &str) -> Vec<String> {
+    let key = if mode == "live" {
+        "backup_base_urls"
+    } else {
+        "demo_backup_urls"
+    };
+    data.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl SnapshotProvider for BinanceProvider {
@@ -1519,6 +1618,111 @@ mod tests {
                 other => panic!("公开 provider 调用签名接口应为 Unavailable: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn with_backups_filters_empty_duplicate_and_primary() {
+        let provider = BinanceProvider::public("https://primary.example")
+            .unwrap()
+            .with_backups(vec![
+                " https://backup-a.example/ ".into(),
+                "https://backup-a.example".into(),
+                "   ".into(),
+                "".into(),
+                "https://primary.example".into(),
+                "https://backup-b.example".into(),
+            ]);
+        assert_eq!(
+            provider.backup_urls,
+            vec![
+                "https://backup-a.example".to_string(),
+                "https://backup-b.example".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_falls_back_to_backup() {
+        let app = axum::Router::new().route(
+            "/fapi/v1/ping",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = BinanceProvider::public("http://127.0.0.1:1")
+            .unwrap()
+            .with_backups(vec![backup]);
+        let value = provider.get_json("/fapi/v1/ping", &[], false).await;
+        server.abort();
+        assert_eq!(value.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_fallback_on_4xx() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let backup_hits = Arc::new(AtomicUsize::new(0));
+        let hits = backup_hits.clone();
+        let backup_app = axum::Router::new().route(
+            "/fapi/v1/ping",
+            axum::routing::get(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"ok": true}))
+                }
+            }),
+        );
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup = format!("http://{}", backup_listener.local_addr().unwrap());
+        let backup_server =
+            tokio::spawn(async move { axum::serve(backup_listener, backup_app).await.unwrap() });
+
+        let primary_app = axum::Router::new().route(
+            "/fapi/v1/ping",
+            axum::routing::get(|| async { axum::http::StatusCode::BAD_REQUEST }),
+        );
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_server =
+            tokio::spawn(async move { axum::serve(primary_listener, primary_app).await.unwrap() });
+
+        let provider = BinanceProvider::public(primary)
+            .unwrap()
+            .with_backups(vec![backup]);
+        let result = provider.get_json("/fapi/v1/ping", &[], false).await;
+        backup_server.abort();
+        primary_server.abort();
+        match result {
+            Err(ProviderError::Unavailable(message)) => {
+                assert!(message.contains("HTTP 400"), "{message}");
+            }
+            other => panic!("4xx 必须立即失败: {other:?}"),
+        }
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            0,
+            "4xx 是认证/参数错误，不应重试备用域名"
+        );
+    }
+
+    #[test]
+    fn configured_backup_urls_follows_mode() {
+        let data = serde_json::json!({
+            "backup_base_urls": ["https://live-backup.example"],
+            "demo_backup_urls": ["https://demo-backup.example"]
+        });
+        assert_eq!(
+            configured_backup_urls(&data, "live"),
+            vec!["https://live-backup.example".to_string()]
+        );
+        assert_eq!(
+            configured_backup_urls(&data, "demo"),
+            vec!["https://demo-backup.example".to_string()]
+        );
+        assert!(configured_backup_urls(&serde_json::json!({}), "live").is_empty());
     }
 
     #[test]

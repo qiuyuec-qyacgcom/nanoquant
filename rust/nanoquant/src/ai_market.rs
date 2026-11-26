@@ -81,7 +81,8 @@ impl AiMarketSource for BinanceMarketSource {
             )
             .map_err(|error| format!("{error:?}"))?
             .with_timeframe(interval)
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| format!("{error:?}"))?
+            .with_backups(crate::providers::configured_backup_urls(&data, &mode));
             let snapshot = provider
                 .snapshot()
                 .await

@@ -251,6 +251,7 @@ struct Config {
     timeframe: String,
     gates: ScanGates,
     base_url: String,
+    backup_urls: Vec<String>,
 }
 
 // `ScanGates` 定义在 scan 模块且未 derive；受本任务改动范围限制不能改 scan.rs，
@@ -356,6 +357,7 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| fallback.to_string()),
+        backup_urls: crate::providers::configured_backup_urls(&data, &mode),
     })
 }
 
@@ -682,6 +684,7 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
 
     let provider = crate::providers::BinanceProvider::public(cfg.base_url.clone())
         .and_then(|provider| provider.with_timeframe(&cfg.timeframe))
+        .map(|provider| provider.with_backups(cfg.backup_urls.clone()))
         .map_err(|error| format!("初始化行情客户端失败: {error:?}"))?;
 
     let current = current_pool(db)?;
