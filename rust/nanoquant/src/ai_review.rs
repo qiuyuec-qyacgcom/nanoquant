@@ -391,6 +391,11 @@ mod tests {
             risk_flags: Vec::new(),
             invalidation: String::new(),
             params: Vec::new(),
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }
     }
 
@@ -723,6 +728,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             risk_flags: Vec::new(),
             invalidation: String::new(),
             params: Vec::new(),
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         };
         let reviewed =
             decision_to_review(&proposal("long"), "any", &long, 0.45, true, false).unwrap();
@@ -746,6 +756,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             risk_flags: Vec::new(),
             invalidation: String::new(),
             params: Vec::new(),
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         };
         let reviewed =
             decision_to_review(&proposal("short"), "any", &short, 0.45, true, false).unwrap();
@@ -771,6 +786,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             risk_flags: Vec::new(),
             invalidation: String::new(),
             params: Vec::new(),
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         };
         let reviewed =
             decision_to_review(&proposal("long"), "any", &raised, 0.45, true, false).unwrap();
@@ -806,6 +826,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             risk_flags: Vec::new(),
             invalidation: String::new(),
             params: Vec::new(),
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         };
         let reviewed =
             decision_to_review(&proposal("long"), "any", &wider, 0.45, true, false).unwrap();

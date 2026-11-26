@@ -1010,6 +1010,11 @@ pub struct Decision {
     pub risk_flags: Vec<String>,
     pub invalidation: String,
     pub params: Vec<ParamUpdate>,
+    pub invalidation_price: Option<f64>,
+    pub valid_bars: Option<i64>,
+    pub data_quality: Option<f64>,
+    pub rr_target: Option<f64>,
+    pub entry_price: Option<f64>,
 }
 
 impl Decision {
@@ -1033,9 +1038,9 @@ impl Decision {
             .map(|value| value.clamp(0.0, 100.0));
         self.sl_pct = self.sl_pct.clamp(0.0, 50.0);
         self.tp_pct = self.tp_pct.clamp(0.0, 100.0);
-        self.reason = self.reason.chars().take(800).collect();
+        self.reason = self.reason.chars().take(2000).collect();
         self.risk_flags.truncate(6);
-        self.invalidation = self.invalidation.chars().take(400).collect();
+        self.invalidation = self.invalidation.chars().take(500).collect();
         self
     }
 }
@@ -1116,7 +1121,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
             items
                 .iter()
                 .filter_map(|item| item.as_str())
-                .map(|item| item.chars().take(120).collect::<String>())
+                .map(|item| item.chars().take(500).collect::<String>())
                 .take(6)
                 .collect::<Vec<_>>()
         })
@@ -1129,6 +1134,13 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
                 .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
         })
         .filter(|value| value.is_finite() && *value > 0.0);
+    let mark = ctx
+        .and_then(|c| c.get("price"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let within = |v: f64, pct: f64| mark > 0.0 && v > 0.0 && (v - mark).abs() / mark <= pct;
+    let opt_float =
+        |key: &str| localized.get(key).and_then(Value::as_f64).filter(|v| v.is_finite());
     Ok(Decision {
         action: text_of("action"),
         confidence: float("confidence"),
@@ -1140,6 +1152,14 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
         risk_flags: flags,
         invalidation: text_of("invalidation"),
         params,
+        invalidation_price: opt_float("invalidation_price").filter(|v| within(*v, 0.10)),
+        valid_bars: localized
+            .get("valid_bars")
+            .and_then(Value::as_i64)
+            .map(|v| v.clamp(1, 24)),
+        data_quality: opt_float("data_quality").map(|v| v.clamp(0.0, 1.0)),
+        rr_target: opt_float("rr_target").map(|v| v.clamp(0.0, 10.0)),
+        entry_price: opt_float("entry_price").filter(|v| within(*v, 0.005)),
     }
     .normalized())
 }
@@ -1181,32 +1201,67 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
             "模型未给出理由码".to_string()
         });
     }
-    let mut reason = reasons.join("；");
-    let numeric = numbers_text(&numbers);
-    if !numeric.is_empty() {
-        reason.push_str(&format!("｜指标：{numeric}"));
+
+    // 四个自由文本字段共用总预算，按 why → inv → risk → f 顺序占用。
+    fn take_budget(text: &str, max: usize, left: &mut usize) -> String {
+        let out: String = text.chars().take(max.min(*left)).collect();
+        *left -= out.chars().count();
+        out
     }
-    let free = data
+    const TEXT_BUDGET: usize = 2000;
+    let mut left = TEXT_BUDGET;
+    let why = take_budget(
+        data.get("why").and_then(Value::as_str).unwrap_or("").trim(),
+        800,
+        &mut left,
+    );
+    let inv_text = take_budget(
+        data.get("inv").and_then(Value::as_str).unwrap_or("").trim(),
+        500,
+        &mut left,
+    );
+    let risk_text = take_budget(
+        data.get("risk").and_then(Value::as_str).unwrap_or("").trim(),
+        500,
+        &mut left,
+    );
+    let free_source: String = data
         .get("f")
         .and_then(Value::as_str)
         .unwrap_or("")
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || " .,;%+-/:".contains(*ch))
-        .take(100)
-        .collect::<String>()
-        .trim()
-        .to_string();
+        .filter(|ch| !ch.is_control())
+        .collect();
+    let free = take_budget(&free_source, 200, &mut left);
+
+    let mut reason = if why.is_empty() {
+        reasons.join("；")
+    } else {
+        why.clone()
+    };
+    let numeric = numbers_text(&numbers);
+    if !numeric.is_empty() {
+        reason.push_str(&format!("｜指标：{numeric}"));
+    }
     if !free.is_empty() {
         reason.push_str(&format!("｜补充：{free}"));
     }
 
-    let risks = codes_text(data.get("k"), &CODE_TEXT, 3);
+    let risks = if risk_text.is_empty() {
+        codes_text(data.get("k"), &CODE_TEXT, 3)
+    } else {
+        vec![risk_text]
+    };
     let x_code = data.get("x").and_then(Value::as_i64).unwrap_or(0);
-    let invalidation = INVALIDATION_CODES
-        .iter()
-        .find(|(code, _)| *code == x_code)
-        .map(|(_, text)| text.to_string())
-        .unwrap_or_else(|| "数据或行情结构发生变化时本判断失效".to_string());
+    let invalidation = if inv_text.is_empty() {
+        INVALIDATION_CODES
+            .iter()
+            .find(|(code, _)| *code == x_code)
+            .map(|(_, text)| text.to_string())
+            .unwrap_or_else(|| "数据或行情结构发生变化时本判断失效".to_string())
+    } else {
+        inv_text
+    };
 
     let number = |key: &str| {
         data.get(key)
@@ -1227,10 +1282,19 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
     out.insert("tp_pct".to_string(), json!(number("t")));
     out.insert(
         "reason".to_string(),
-        json!(reason.chars().take(800).collect::<String>()),
+        json!(reason.chars().take(TEXT_BUDGET).collect::<String>()),
     );
     out.insert("risk_flags".to_string(), json!(risks));
     out.insert("invalidation".to_string(), json!(invalidation));
+    let opt = |key: &str| data.get(key).and_then(Value::as_f64).filter(|v| v.is_finite());
+    out.insert("invalidation_price".to_string(), json!(opt("ip")));
+    out.insert(
+        "valid_bars".to_string(),
+        json!(data.get("vb").and_then(Value::as_i64)),
+    );
+    out.insert("data_quality".to_string(), json!(opt("dq")));
+    out.insert("rr_target".to_string(), json!(opt("rr")));
+    out.insert("entry_price".to_string(), json!(opt("ep")));
     out
 }
 
@@ -1841,5 +1905,54 @@ mod tests {
         let urls = transport.seen_urls.lock().unwrap();
         assert_eq!(urls[0], "https://api.example.com/v1/models");
         assert_eq!(urls[1], "https://api.example.com/models");
+    }
+
+    #[test]
+    fn v2_extended_fields_are_parsed() {
+        let ctx = json!({"price": 100.0});
+        let text = r#"{"a":"L","c":0.7,"l":5,"m":20,"s":30,"t":60,
+        "why":"趋势向上，量能放大","risk":"上方套牢盘密集","inv":"跌破 EMA21",
+        "ip":95.0,"vb":6,"dq":0.8,"rr":1.5,"ep":100.2}"#;
+        let d = parse_decision(text, Some(&ctx)).unwrap();
+        assert_eq!(d.reason, "趋势向上，量能放大");
+        assert_eq!(d.invalidation, "跌破 EMA21");
+        assert_eq!(d.invalidation_price, Some(95.0));
+        assert_eq!(d.valid_bars, Some(6));
+        assert_eq!(d.data_quality, Some(0.8));
+        assert_eq!(d.rr_target, Some(1.5));
+        assert_eq!(d.entry_price, Some(100.2));
+    }
+
+    #[test]
+    fn free_text_fields_keep_chinese_and_respect_total_budget() {
+        let ctx = json!({"price": 100.0});
+        let long = "很".repeat(3000);
+        let text = format!(
+            r#"{{"a":"H","c":0.5,"why":"{}","risk":"{}","inv":"{}","f":"中文补充"}}"#,
+            long, long, long
+        );
+        let d = parse_decision(&text, Some(&ctx)).unwrap();
+        assert!(d.reason.contains('很'));
+        assert!(d.reason.chars().count() <= 2000);
+        assert!(d.invalidation.chars().count() <= 500);
+        assert!(d.risk_flags.iter().map(|s| s.chars().count()).sum::<usize>() <= 500);
+    }
+
+    #[test]
+    fn invalidation_and_entry_price_outside_range_become_none() {
+        let ctx = json!({"price": 100.0});
+        let text = r#"{"a":"L","c":0.7,"ip":50.0,"ep":101.0}"#;
+        let d = parse_decision(text, Some(&ctx)).unwrap();
+        assert_eq!(d.invalidation_price, None);
+        assert_eq!(d.entry_price, None);
+    }
+
+    #[test]
+    fn v1_payload_still_parses() {
+        let ctx = json!({"price": 100.0});
+        let text = r#"{"action":"hold","confidence":0.4,"reason":"观望"}"#;
+        let d = parse_decision(text, Some(&ctx)).unwrap();
+        assert_eq!(d.action, "hold");
+        assert_eq!(d.data_quality, None);
     }
 }
