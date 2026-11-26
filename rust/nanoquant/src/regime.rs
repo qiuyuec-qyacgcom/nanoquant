@@ -1,7 +1,7 @@
 use crate::providers::{candle_metrics, CandleSnapshot};
 
 const MIN_BARS_FOR_REGIME: usize = 30;
-const MARKET_QUORUM: usize = 6;
+pub(crate) const MARKET_QUORUM: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Regime {
@@ -133,8 +133,10 @@ impl RegimeTracker {
 }
 
 /// 启用标的池的等权多数 regime；少于 quorum 无结果，平票取 range。
-pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
-    if regimes.len() < MARKET_QUORUM {
+///
+/// 允许调用方按标的池规模下调 quorum（例如回测 basket 存在单标的缺失）。
+pub(crate) fn market_regime_with_quorum(regimes: &[Regime], quorum: usize) -> Option<Regime> {
+    if quorum == 0 || regimes.len() < quorum {
         return None;
     }
     let trend = regimes
@@ -164,6 +166,11 @@ pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
     } else {
         Regime::Range
     })
+}
+
+/// 实盘默认判定：固定要求 `MARKET_QUORUM` 个标的同时投票。
+pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
+    market_regime_with_quorum(regimes, MARKET_QUORUM)
 }
 
 /// 逐根 bar 计算前缀的 regime；不足 30 根或指标不可用时为 None。
@@ -277,6 +284,35 @@ mod tests {
                 Regime::Trend,
             ]),
             Some(Regime::Chaos)
+        );
+    }
+
+    #[test]
+    fn market_regime_with_lower_quorum_tolerates_missing_symbol() {
+        let votes = [
+            Regime::Trend,
+            Regime::Trend,
+            Regime::Trend,
+            Regime::Trend,
+            Regime::Trend,
+            Regime::Range,
+        ];
+        assert_eq!(market_regime(&votes), Some(Regime::Trend));
+        assert_eq!(market_regime_with_quorum(&votes, 5), Some(Regime::Trend));
+        assert_eq!(
+            market_regime_with_quorum(&votes[..5], 5),
+            Some(Regime::Trend),
+            "6 票中 5 票同向时，低 quorum 应仍给出结果"
+        );
+        assert_eq!(
+            market_regime_with_quorum(&votes[..2], 3),
+            None,
+            "票数少于 quorum 时应无结果"
+        );
+        assert_eq!(
+            market_regime_with_quorum(&votes, 0),
+            None,
+            "quorum 为 0 属于无效配置，应无结果"
         );
     }
 

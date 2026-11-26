@@ -1138,7 +1138,13 @@ fn build_market_regime_map(
                 }
             }
         }
-        if let Some(regime) = crate::regime::market_regime(&votes) {
+        // 回测 basket 规模仅略高于 quorum，任一标的上市时间差/数据缺口都会导致该桶少一票；
+        // 允许缺失 1 个标的，同时以 3 票兜底，避免票数过少时噪声放大。
+        let quorum = votes
+            .len()
+            .saturating_sub(1)
+            .clamp(3, crate::regime::MARKET_QUORUM);
+        if let Some(regime) = crate::regime::market_regime_with_quorum(&votes, quorum) {
             regimes.insert(ts, regime);
         }
     }
@@ -1296,7 +1302,12 @@ pub fn run_walkforward_basket_fixed(
     }
 
     if fold_results.len() < MIN_FOLDS {
-        return Err(format!("评估到的 symbol×fold 单元少于 {MIN_FOLDS} 个"));
+        return Err(format!(
+            "评估到的 symbol×fold 单元少于 {MIN_FOLDS} 个（目标 regime {target}，实际 {} 个，已用 {} 个标的，跳过 {} 个）",
+            fold_results.len(),
+            used.len(),
+            skipped.len()
+        ));
     }
     if used.len() < 6 {
         return Err("有效标的少于 6 个".to_string());
@@ -1772,6 +1783,30 @@ let bars = trending_bars(1200);
         );
         assert!(metrics.positive_folds <= metrics.folds);
         assert!(metrics.oos_trades > 0);
+    }
+
+    #[test]
+    fn build_market_regime_map_tolerates_one_missing_symbol() {
+        let mut basket = synthetic_basket(6, 700);
+        basket[0].1.truncate(697);
+        let frame_ms = timeframe_ms("1h").unwrap();
+        let last_ts = basket[1].1.last().unwrap().close_time;
+        assert_eq!(
+            crate::regime::market_regime(&[
+                crate::regime::Regime::Range,
+                crate::regime::Regime::Range,
+                crate::regime::Regime::Range,
+                crate::regime::Regime::Range,
+                crate::regime::Regime::Range,
+            ]),
+            None,
+            "5 票在固定 quorum=6 下不应给出 regime"
+        );
+        let regimes = build_market_regime_map(&basket, frame_ms);
+        assert!(
+            regimes.contains_key(&last_ts),
+            "某个标的最末桶缺 1 票时，动态 quorum 仍应给出 regime"
+        );
     }
 
     #[test]
