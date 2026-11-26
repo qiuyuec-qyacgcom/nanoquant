@@ -129,6 +129,8 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai", "review_cache_ttl_sec", 0.0, 600.0, 1.0),
     ("ai", "review_concurrency", 1.0, 16.0, 1.0),
     ("ai", "review_timeout_sec", 5.0, 120.0, 1.0),
+    ("ai", "circuit_breaker_failures", 0.0, 10.0, 1.0),
+    ("ai", "circuit_breaker_sec", 10.0, 600.0, 10.0),
     ("data", "kline_limit", 10.0, 1000.0, 10.0),
     ("data", "ticker_ttl_sec", 1.0, 3600.0, 1.0),
     ("data", "kline_ttl_sec", 1.0, 3600.0, 1.0),
@@ -245,6 +247,9 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "review_cache_ttl_sec",
             "review_concurrency",
             "review_timeout_sec",
+            "provider_order_mode",
+            "circuit_breaker_failures",
+            "circuit_breaker_sec",
         ],
     ),
     (
@@ -754,5 +759,27 @@ mod tests {
         assert_eq!(ai_bounds("risk", "max_leverage"), None);
         assert_eq!(ai_bounds("strategy", "ema_fast"), None);
         assert_eq!(ai_bounds("ai_tuning", "min_oos_trades"), None);
+    }
+
+    #[test]
+    fn provider_order_and_circuit_params_are_registered() {
+        let d = defaults();
+        assert_eq!(d["ai"]["provider_order_mode"], json!("fastest"));
+        assert_eq!(d["ai"]["circuit_breaker_failures"], json!(3));
+        assert_eq!(d["ai"]["circuit_breaker_sec"], json!(60));
+        for key in [
+            "provider_order_mode",
+            "circuit_breaker_failures",
+            "circuit_breaker_sec",
+        ] {
+            assert!(is_visible("ai", key), "{key} 应在 AI 参数页可见");
+        }
+        assert_eq!(
+            find("ai", "circuit_breaker_failures").unwrap().max,
+            Some(10.0)
+        );
+        assert_eq!(find("ai", "circuit_breaker_sec").unwrap().min, Some(10.0));
+        assert_eq!(find("ai", "circuit_breaker_sec").unwrap().max, Some(600.0));
+        assert!(!is_ai_writable("ai", "provider_order_mode"));
     }
 }

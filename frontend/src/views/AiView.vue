@@ -35,6 +35,9 @@ const aiCfg = reactive<any>({
   veto_only: true,
   scale_on_confidence: true,
   fail_open_scale: 0.5,
+  provider_order_mode: 'fastest',
+  circuit_breaker_failures: 3,
+  circuit_breaker_sec: 60,
   max_calls_per_hour: 30,
   monthly_budget_usd: 3,
   timeout_sec: 45,
@@ -382,6 +385,21 @@ onMounted(loadAll)
               <option :value="2">v2 紧凑英文 · 后台转中文（省 token）</option>
               <option :value="1">v1 中文详细 JSON（兼容旧模型）</option>
             </select>
+          </div>
+          <div class="field">
+            <span class="label">供应商排序</span>
+            <select v-model="aiCfg.provider_order_mode" class="select">
+              <option value="fastest">按 P95 延迟升序（24h）</option>
+              <option value="config">按配置顺序</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="label">熔断失败阈值 (次)</span>
+            <input v-model.number="aiCfg.circuit_breaker_failures" type="number" min="0" max="10" class="input mono" />
+          </div>
+          <div class="field">
+            <span class="label">熔断冷却 (秒)</span>
+            <input v-model.number="aiCfg.circuit_breaker_sec" type="number" min="10" max="600" step="10" class="input mono" />
           </div>
         </div>
         <div class="hint">

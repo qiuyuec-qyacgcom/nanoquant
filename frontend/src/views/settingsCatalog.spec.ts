@@ -199,9 +199,12 @@ describe('参数配置目录', () => {
 
   it('AI 复核分组覆盖否决与降仓开关', () => {
     expect([...explicitKeys('ai')].sort()).toEqual([
+      'circuit_breaker_failures',
+      'circuit_breaker_sec',
       'fail_open_scale',
       'high_score_threshold',
       'low_score_threshold',
+      'provider_order_mode',
       'review_cache_ttl_sec',
       'review_concurrency',
       'review_timeout_sec',

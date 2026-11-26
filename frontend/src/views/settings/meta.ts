@@ -320,6 +320,20 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
     use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓' },
     use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 或方向不符（BUY 高于现价 / SELL 低于现价）时忽略' },
+    provider_order_mode: {
+      label: '供应商排序',
+      widget: 'select',
+      options: [['fastest', '按延迟 P95 升序（最近 24h）'], ['config', '按配置顺序']],
+      hint: '样本不足 5 次时保持配置顺序；熔断中的供应商会被自动跳过',
+    },
+    circuit_breaker_failures: {
+      label: '连续失败熔断阈值', unit: '次', min: 0, max: 10, step: 1,
+      hint: '连续失败达到该次数后暂停调用该供应商；0=关闭熔断',
+    },
+    circuit_breaker_sec: {
+      label: '熔断冷却时长', unit: '秒', min: 10, max: 600, step: 10,
+      hint: '熔断后跳过该供应商的秒数，到期自动恢复',
+    },
     param_tuning_min_interval_sec: {
       label: '调参最小间隔', unit: '秒', min: 60, max: 604800,
       hint: '独立调参任务的最小间隔；0 已废弃，最低 60 秒，86400=每天一次',

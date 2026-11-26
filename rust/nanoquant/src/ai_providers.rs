@@ -4,6 +4,7 @@
 //! API Key 以主密钥加密落库，查询只返回脱敏值与 `has_key`；
 //! 探测端点先支持"未保存的地址 + 密钥"，也能用 `provider_id` 复用已存配置。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -161,11 +162,71 @@ fn load_provider(conn: &rusqlite::Connection, id: i64) -> Option<ProviderRow> {
     .ok()
 }
 
+/// 最近一段时间内按供应商聚合的 P95 延迟；样本不足的供应商不进入结果。
+pub fn provider_p95_latency(
+    conn: &rusqlite::Connection,
+    since: i64,
+    min_samples: usize,
+) -> HashMap<String, f64> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT provider, latency_ms FROM ai_call_logs \
+         WHERE ts >= ?1 AND ok = 1 AND latency_ms > 0",
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([since], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) else {
+        return HashMap::new();
+    };
+    let mut grouped: HashMap<String, Vec<i64>> = HashMap::new();
+    for (provider, latency) in rows.flatten() {
+        grouped.entry(provider).or_default().push(latency);
+    }
+    let mut out = HashMap::new();
+    for (provider, mut values) in grouped {
+        if values.len() < min_samples.max(1) {
+            continue;
+        }
+        values.sort_unstable();
+        let rank = ((values.len() as f64 * 0.95).ceil() as usize).clamp(1, values.len()) - 1;
+        out.insert(provider, values[rank] as f64);
+    }
+    out
+}
+
+/// 稳定排序：有数据的供应商按 P95 升序在前，样本不足/无数据者保持原顺序在后。
+pub fn order_chain_by_latency(
+    chain: &[ProviderConfig],
+    p95: &HashMap<String, f64>,
+    min_samples: usize,
+) -> Vec<ProviderConfig> {
+    // p95 已由调用方按 min_samples 过滤；保留参数以便函数自证样本门槛语义。
+    let _ = min_samples;
+    let (mut ranked, rest): (Vec<ProviderConfig>, Vec<ProviderConfig>) = chain
+        .iter()
+        .cloned()
+        .partition(|provider| p95.contains_key(&provider.name));
+    ranked.sort_by(|left, right| {
+        p95.get(&left.name)
+            .unwrap_or(&f64::MAX)
+            .partial_cmp(p95.get(&right.name).unwrap_or(&f64::MAX))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.extend(rest);
+    ranked
+}
+
 /// 按 ai 配置生成调用链：主供应商 → 回退 → 其余启用项，最多 5 个。
 pub fn provider_chain(state: &AiState) -> (ai_client::AiConfig, Vec<ProviderConfig>) {
     let conn = state.db.lock();
     let cfg = ai_client::read_ai_config_conn(&conn);
     let rows = load_providers(&conn);
+    let p95 = if cfg.provider_order_mode == "fastest" {
+        provider_p95_latency(&conn, crate::now() - 86400, 5)
+    } else {
+        HashMap::new()
+    };
     drop(conn);
     let enabled: Vec<ProviderConfig> = rows
         .iter()
@@ -193,6 +254,9 @@ pub fn provider_chain(state: &AiState) -> (ai_client::AiConfig, Vec<ProviderConf
         }
     }
     chain.truncate(5);
+    if cfg.provider_order_mode == "fastest" {
+        chain = order_chain_by_latency(&chain, &p95, 5);
+    }
     (cfg, chain)
 }
 
@@ -1225,6 +1289,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn chain_provider(id: i64, name: &str) -> ProviderConfig {
+        ProviderConfig {
+            id,
+            name: name.to_string(),
+            protocol: "openai_chat".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "k".to_string(),
+            model: "m".to_string(),
+            temperature: 0.2,
+            max_tokens: 1024,
+            reasoning_effort: "auto".to_string(),
+            timeout_sec: 5,
+            json_mode: false,
+        }
+    }
+
+    #[test]
+    fn order_chain_by_latency_puts_fastest_first() {
+        let chain = vec![
+            chain_provider(1, "slow"),
+            chain_provider(2, "fast"),
+            chain_provider(3, "unknown"),
+            chain_provider(4, "tie"),
+        ];
+        let p95 = HashMap::from([
+            ("slow".to_string(), 900.0),
+            ("fast".to_string(), 200.0),
+            ("tie".to_string(), 200.0),
+        ]);
+        let ordered = order_chain_by_latency(&chain, &p95, 5);
+        let names: Vec<&str> = ordered.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["fast", "tie", "slow", "unknown"]);
+        assert_eq!(ordered[3].id, 3, "无数据供应商应保持原顺序排在最后");
+    }
+
+    #[test]
+    fn order_chain_keeps_config_order_when_samples_insufficient() {
+        let chain = vec![
+            chain_provider(1, "alpha"),
+            chain_provider(2, "beta"),
+            chain_provider(3, "gamma"),
+        ];
+        let ordered = order_chain_by_latency(&chain, &HashMap::new(), 5);
+        let ids: Vec<i64> = ordered.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn provider_p95_latency_skips_thin_and_failed_samples() {
+        let path = std::env::temp_dir().join("nq-ai-p95.db");
+        let db = fixture(&path);
+        let now = crate::now();
+        let conn = db.lock();
+        for latency in 100..108 {
+            conn.execute(
+                "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms) \
+                 VALUES(?1, 'fast', 'm', 'decision', 1, ?2)",
+                (now, latency),
+            )
+            .unwrap();
+        }
+        for latency in [200, 210, 220] {
+            conn.execute(
+                "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms) \
+                 VALUES(?1, 'thin', 'm', 'decision', 1, ?2)",
+                (now, latency),
+            )
+            .unwrap();
+        }
+        for _ in 0..8 {
+            conn.execute(
+                "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms) \
+                 VALUES(?1, 'failed', 'm', 'decision', 0, 500)",
+                [now],
+            )
+            .unwrap();
+        }
+        let p95 = provider_p95_latency(&conn, now - 86400, 5);
+        assert!(p95.contains_key("fast"));
+        assert!(!p95.contains_key("thin"), "样本不足不应参与排序");
+        assert!(!p95.contains_key("failed"), "失败调用不计入延迟");
+        drop(conn);
         let _ = std::fs::remove_file(&path);
     }
 }

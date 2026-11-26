@@ -6,8 +6,10 @@
 //! 不让整次调用失败。决策协议默认 v2（英文短键与枚举码），解析时自动兼容 v1，
 //! 中文 reason / risk_flags / invalidation 由本地码表生成后落库。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -16,6 +18,42 @@ use crate::db::Db;
 use crate::reasoning;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// 供应商熔断状态：连续失败达到阈值后，在 `open_until` 之前直接跳过。
+#[derive(Debug, Clone, Copy, Default)]
+struct CircuitState {
+    failures: i64,
+    open_until: i64,
+}
+
+static CIRCUITS: LazyLock<Mutex<HashMap<String, CircuitState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn circuit_allow(name: &str, now: i64) -> bool {
+    match CIRCUITS.lock() {
+        Ok(map) => map.get(name).is_none_or(|state| state.open_until <= now),
+        Err(_) => true,
+    }
+}
+
+fn circuit_success(name: &str) {
+    if let Ok(mut map) = CIRCUITS.lock() {
+        map.remove(name);
+    }
+}
+
+fn circuit_failure(name: &str, now: i64, threshold: i64, cooldown: i64) {
+    if threshold <= 0 {
+        return;
+    }
+    if let Ok(mut map) = CIRCUITS.lock() {
+        let state = map.entry(name.to_string()).or_default();
+        state.failures += 1;
+        if state.failures >= threshold {
+            state.open_until = now.saturating_add(cooldown.max(0));
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpReply {
@@ -728,8 +766,25 @@ pub async fn chat_with_fallback(
     }
     let mut merged: Vec<Value> = Vec::new();
     let mut last = ChatOutcome::default();
+    let now = crate::now();
+    let mut blocked = 0usize;
     for provider in chain {
+        if !circuit_allow(&provider.name, now) {
+            merged.push(json!({"provider": provider.name, "status": -1, "note": "circuit_open"}));
+            blocked += 1;
+            continue;
+        }
         let mut outcome = chat(transport, db, provider, call).await;
+        if outcome.ok {
+            circuit_success(&provider.name);
+        } else {
+            circuit_failure(
+                &provider.name,
+                crate::now(),
+                cfg.circuit_breaker_failures,
+                cfg.circuit_breaker_sec,
+            );
+        }
         merged.append(&mut outcome.attempts);
         outcome.attempts = merged.clone();
         if outcome.ok {
@@ -738,6 +793,9 @@ pub async fn chat_with_fallback(
         last = outcome;
     }
     last.attempts = merged;
+    if blocked == chain.len() {
+        last.error = "所有 AI 供应商暂时熔断".to_string();
+    }
     last
 }
 
@@ -782,6 +840,12 @@ pub struct AiConfig {
     pub scale_on_confidence: bool,
     /// AI 不可用/复核失败时的降仓系数。
     pub fail_open_scale: f64,
+    /// 供应商排序模式："config" 按配置顺序，"fastest" 按最近 24h P95 延迟升序。
+    pub provider_order_mode: String,
+    /// 连续失败达到该次数后熔断；0=关闭熔断。
+    pub circuit_breaker_failures: i64,
+    /// 熔断后跳过该供应商的秒数。
+    pub circuit_breaker_sec: i64,
     // AI 新协议字段：是否在复核出口透传失效价与入场价，默认关闭以保持旧行为。
     pub use_invalidation_price: bool,
     pub use_entry_price: bool,
@@ -808,6 +872,9 @@ impl Default for AiConfig {
             veto_only: true,
             scale_on_confidence: true,
             fail_open_scale: 0.5,
+            provider_order_mode: "fastest".to_string(),
+            circuit_breaker_failures: 3,
+            circuit_breaker_sec: 60,
             use_invalidation_price: false,
             use_entry_price: false,
             personas: Vec::new(),
@@ -894,6 +961,22 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     if let Some(item) = value.get("use_entry_price").and_then(Value::as_bool) {
         cfg.use_entry_price = item;
     }
+    if let Some(item) = value.get("provider_order_mode").and_then(Value::as_str) {
+        cfg.provider_order_mode = match item {
+            "config" => "config".to_string(),
+            _ => "fastest".to_string(),
+        };
+    }
+    if let Some(item) = value
+        .get("circuit_breaker_failures")
+        .and_then(Value::as_i64)
+    {
+        cfg.circuit_breaker_failures = item.clamp(0, 10);
+    }
+    if let Some(item) = value.get("circuit_breaker_sec").and_then(Value::as_i64) {
+        cfg.circuit_breaker_sec = item.clamp(10, 600);
+    }
+
     if let Some(items) = value.get("personas").and_then(Value::as_array) {
         cfg.personas = items
             .iter()
@@ -2190,5 +2273,104 @@ mod tests {
         assert!(d.reason.starts_with(&"很".repeat(WHY_MAX)));
         assert!(d.reason.contains(METRIC_PREFIX));
         assert!(d.reason.contains(FREE_PREFIX));
+    }
+
+    #[test]
+    fn circuit_opens_after_threshold_and_blocks() {
+        let name = format!("circuit-threshold-{}", std::process::id());
+        let now = 10_000;
+        assert!(circuit_allow(&name, now));
+        circuit_failure(&name, now, 3, 60);
+        circuit_failure(&name, now, 3, 60);
+        assert!(circuit_allow(&name, now), "未达阈值仍应放行");
+        circuit_failure(&name, now, 3, 60);
+        assert!(!circuit_allow(&name, now), "达到阈值后应熔断");
+        assert!(!circuit_allow(&name, now + 59), "冷却期内继续熔断");
+        assert!(circuit_allow(&name, now + 60), "冷却结束后恢复");
+    }
+
+    #[test]
+    fn circuit_resets_after_success() {
+        let name = format!("circuit-success-{}", std::process::id());
+        let now = 20_000;
+        circuit_failure(&name, now, 1, 60);
+        assert!(!circuit_allow(&name, now));
+        circuit_success(&name);
+        assert!(circuit_allow(&name, now), "成功后失败计数必须清零");
+        circuit_failure(&name, now, 2, 60);
+        assert!(circuit_allow(&name, now), "成功后再失败一次不应立即熔断");
+    }
+
+    #[test]
+    fn circuit_allows_after_cooldown() {
+        let name = format!("circuit-cooldown-{}", std::process::id());
+        let now = 30_000;
+        circuit_failure(&name, now, 1, 60);
+        assert!(!circuit_allow(&name, now));
+        assert!(circuit_allow(&name, now + 60));
+    }
+
+    #[tokio::test]
+    async fn chat_with_fallback_skips_open_circuit() {
+        let path = std::env::temp_dir().join("nq-ai-circuit-fallback.db");
+        let db = fixture_db(&path);
+        let primary_name = format!("alpha-circuit-{}", std::process::id());
+        let fallback_name = format!("beta-circuit-{}", std::process::id());
+        let mut primary = provider();
+        primary.name = primary_name.clone();
+        let mut fallback = provider();
+        fallback.name = fallback_name.clone();
+        fallback.model = "fallback-model".to_string();
+        for _ in 0..3 {
+            circuit_failure(&primary_name, crate::now(), 3, 60);
+        }
+        assert!(!circuit_allow(&primary_name, crate::now()));
+        let body = "{\"choices\":[{\"message\":{\"content\":\"{\\\"a\\\":\\\"H\\\"}\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}";
+        let transport = FakeTransport::new(
+            vec![HttpReply {
+                status: 200,
+                body: body.to_string(),
+            }],
+            Vec::new(),
+        );
+        let messages = vec![ChatMessage::new("user", "decide")];
+        let cfg = AiConfig::default();
+        let chain = vec![primary.clone(), fallback.clone()];
+        let outcome = chat_with_fallback(
+            &transport,
+            &db,
+            &chain,
+            ChatCall::new(&messages, "decision"),
+            &cfg,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.error);
+        assert_eq!(outcome.provider, fallback_name);
+        assert_eq!(
+            transport.seen_posts.lock().unwrap().len(),
+            1,
+            "熔断的供应商不应发起请求"
+        );
+        assert_eq!(outcome.attempts[0]["note"], "circuit_open");
+
+        for _ in 0..3 {
+            circuit_failure(&fallback_name, crate::now(), 3, 60);
+        }
+        let blocked = chat_with_fallback(
+            &transport,
+            &db,
+            &chain,
+            ChatCall::new(&messages, "decision"),
+            &cfg,
+        )
+        .await;
+        assert!(!blocked.ok);
+        assert!(blocked.error.contains("熔断"), "{}", blocked.error);
+        assert_eq!(
+            transport.seen_posts.lock().unwrap().len(),
+            1,
+            "全部熔断时不发请求"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

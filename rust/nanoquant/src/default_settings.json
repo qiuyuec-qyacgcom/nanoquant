@@ -147,6 +147,9 @@
     "monthly_budget_usd": 3.0,
     "timeout_sec": 45,
     "temperature": 0.2,
+    "provider_order_mode": "fastest",
+    "circuit_breaker_failures": 3,
+    "circuit_breaker_sec": 60,
     "inject_news": true,
     "inject_mantras": true,
     "personas": [
