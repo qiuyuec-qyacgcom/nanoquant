@@ -253,10 +253,10 @@ pub fn provider_chain(state: &AiState) -> (ai_client::AiConfig, Vec<ProviderConf
             chain.push(provider);
         }
     }
-    chain.truncate(5);
     if cfg.provider_order_mode == "fastest" {
         chain = order_chain_by_latency(&chain, &p95, 5);
     }
+    chain.truncate(5);
     (cfg, chain)
 }
 
@@ -1374,6 +1374,53 @@ mod tests {
         assert!(!p95.contains_key("thin"), "样本不足不应参与排序");
         assert!(!p95.contains_key("failed"), "失败调用不计入延迟");
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fast_provider_outside_initial_five_enters_chain() {
+        let path = std::env::temp_dir().join("nq-ai-fast-chain.db");
+        let db = fixture(&path);
+        let now = crate::now();
+        let cipher = secret::encrypt_secret(MASTER_KEY, "k").unwrap();
+        let conn = db.lock();
+        for idx in 1..=6_i64 {
+            conn.execute(
+                "INSERT INTO ai_providers(id, name, protocol, base_url, api_key_enc, model, \
+                 temperature, max_tokens, reasoning_effort, timeout_sec, json_mode, enabled, \
+                 priority, role, extra, created_at, updated_at) \
+                 VALUES(?1, ?2, 'openai_chat', 'https://api.example.com/v1', ?3, 'm', \
+                 0.2, 1024, 'auto', 5, 0, 1, ?4, 'primary', '{}', 0, 0)",
+                (idx, format!("p{idx}"), cipher.as_str(), idx),
+            )
+            .unwrap();
+        }
+        for idx in 1..=6_i64 {
+            let base = if idx == 6 { 100 } else { 500 + idx * 10 };
+            for offset in 0..5 {
+                conn.execute(
+                    "INSERT INTO ai_call_logs(ts, provider, model, purpose, ok, latency_ms) \
+                     VALUES(?1, ?2, 'm', 'decision', 1, ?3)",
+                    (now, format!("p{idx}"), base + offset),
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            Arc::new(FakeTransport::http(vec![], vec![])),
+        );
+        let (_, chain) = provider_chain(&state);
+        let names: Vec<&str> = chain.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(chain.len(), 5, "链上限仍为 5: {names:?}");
+        assert_eq!(
+            names[0], "p6",
+            "第 6 个供应商应因 P95 最低进入前 5 并排第一: {names:?}"
+        );
+        assert!(names.contains(&"p6"));
         let _ = std::fs::remove_file(&path);
     }
 }
