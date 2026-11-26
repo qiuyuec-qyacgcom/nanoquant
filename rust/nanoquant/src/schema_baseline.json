@@ -2173,6 +2173,14 @@
           "notnull": true,
           "default": null,
           "pk": false
+        },
+        {
+          "cid": 29,
+          "name": "invalidation_price",
+          "type": "FLOAT",
+          "notnull": false,
+          "default": null,
+          "pk": false
         }
       ],
       "indexes": [

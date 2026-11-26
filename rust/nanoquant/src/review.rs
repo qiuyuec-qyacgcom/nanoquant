@@ -18,6 +18,16 @@ pub(crate) struct ReviewDecision {
     pub reason: String,
     /// AI 自报的置信度（0~1）；没有就 0。
     pub confidence: f64,
+    /// AI 给出的失效价（ip）；用于持仓失效平仓。
+    pub invalidation_price: Option<f64>,
+    /// AI 估计的有效 K 线根数（vb）。
+    pub valid_bars: Option<i64>,
+    /// AI 自评的数据质量分（dq）。
+    pub data_quality: Option<f64>,
+    /// AI 估计的盈亏比（rr）。
+    pub rr_target: Option<f64>,
+    /// AI 建议的入场价（ep）。
+    pub entry_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +62,16 @@ pub(crate) struct ReviewedEntry {
     /// 归一化后的动作：open_long / open_short / tighten。
     pub action: String,
     pub confidence: f64,
+    /// AI 给出的失效价（ip）；用于持仓失效平仓。
+    pub invalidation_price: Option<f64>,
+    /// AI 估计的有效 K 线根数（vb）。
+    pub valid_bars: Option<i64>,
+    /// AI 自评的数据质量分（dq）。
+    pub data_quality: Option<f64>,
+    /// AI 估计的盈亏比（rr）。
+    pub rr_target: Option<f64>,
+    /// AI 建议的入场价（ep）。
+    pub entry_price: Option<f64>,
 }
 
 /// AI 复核没给出可执行结论：原因、动作、置信度都要留痕，
@@ -120,6 +140,11 @@ pub(crate) fn apply_review(
             reason: "AI 复核未启用".to_string(),
             action: action_for(&proposal.side),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
@@ -191,6 +216,11 @@ fn apply_decision(
             margin_pct: clamp_margin(proposal, decision.margin_pct),
             stop_price,
             take_profit,
+            invalidation_price: decision.invalidation_price,
+            valid_bars: decision.valid_bars,
+            data_quality: decision.data_quality,
+            rr_target: decision.rr_target,
+            entry_price: decision.entry_price,
             reason: decision.reason,
             action: action_for(&side),
             confidence,
@@ -222,6 +252,11 @@ fn apply_decision(
                 margin_pct: clamp_margin(proposal, decision.margin_pct),
                 stop_price,
                 take_profit,
+                invalidation_price: decision.invalidation_price,
+                valid_bars: decision.valid_bars,
+                data_quality: decision.data_quality,
+                rr_target: decision.rr_target,
+                entry_price: decision.entry_price,
                 reason: decision.reason,
                 action: "tighten".to_string(),
                 confidence,
@@ -269,6 +304,11 @@ mod tests {
             take_profit: None,
             reason: String::new(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }
     }
 
@@ -308,6 +348,11 @@ mod tests {
             take_profit: None,
             reason: "tighten".to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
@@ -322,6 +367,11 @@ mod tests {
             take_profit: None,
             reason: "raise within bounds".to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&raised), true).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
@@ -335,6 +385,11 @@ mod tests {
             take_profit: None,
             reason: "tighten".to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_low), true).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
@@ -360,6 +415,11 @@ mod tests {
             take_profit: None,
             reason: "行情不匹配".to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         assert!(apply_review(&proposal(), Some(&reject), false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
@@ -379,6 +439,11 @@ mod tests {
             take_profit: None,
             reason: "观望".to_string(),
             confidence: 0.62,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         let error = apply_review(&proposal(), Some(&hold), true).unwrap_err();
         assert_eq!(error.action, "hold");
@@ -397,7 +462,30 @@ mod tests {
             take_profit: None,
             reason: "bad".to_string(),
             confidence: 0.0,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
+    }
+
+    /// 迁移测试放在本模块，避免改动 schema.rs；断言 positions 已补失效价列。
+    #[test]
+    fn migrate_adds_invalidation_price_to_positions() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT);")
+            .unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info('positions')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"invalidation_price".to_string()));
     }
 }

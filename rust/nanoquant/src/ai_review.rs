@@ -238,6 +238,11 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         take_profit: None,
         reason: reason.into(),
         confidence: 0.0,
+        invalidation_price: None,
+        valid_bars: None,
+        data_quality: None,
+        rr_target: None,
+        entry_price: None,
     }
 }
 
@@ -276,6 +281,11 @@ fn decision_to_review(
                     decision.reason.clone()
                 },
                 confidence: decision.confidence,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
             })
         }
     };
@@ -381,6 +391,11 @@ fn decision_to_review(
         take_profit: Some(take_profit),
         reason: decision.reason.clone(),
         confidence: decision.confidence,
+        invalidation_price: decision.invalidation_price,
+        valid_bars: decision.valid_bars,
+        data_quality: decision.data_quality,
+        rr_target: decision.rr_target,
+        entry_price: decision.entry_price,
     })
 }
 

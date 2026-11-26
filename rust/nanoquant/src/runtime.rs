@@ -125,6 +125,8 @@ struct EntryTerms {
     stop: f64,
     take_profit: f64,
     score: f64,
+    /// AI 给出的失效价（ip）；落库后供持仓失效平仓使用。
+    invalidation_price: Option<f64>,
 }
 
 struct EntryDraft {
@@ -3042,6 +3044,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 stop: stop_price,
                 take_profit,
                 score: draft.score,
+                invalidation_price: reviewed.invalidation_price,
             };
             if mode == "live" {
                 // 上一轮挂出去的开仓单还没结论时，绝不能再发第二张；
@@ -5730,6 +5733,11 @@ mod tests {
                     take_profit: None,
                     reason: "flat 候选不自动开仓".to_string(),
                     confidence: 0.0,
+                    invalidation_price: None,
+                    valid_bars: None,
+                    data_quality: None,
+                    rr_target: None,
+                    entry_price: None,
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -5741,6 +5749,11 @@ mod tests {
                 take_profit: Some(proposal.take_profit),
                 reason: "test approve".to_string(),
                 confidence: 0.0,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
             })
         }
     }
@@ -6101,6 +6114,11 @@ mod tests {
                 take_profit: None,
                 reason: "测试观望".to_string(),
                 confidence: 0.62,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
             })
         }
     }
@@ -6744,6 +6762,11 @@ mod tests {
                 take_profit: None,
                 reason: "test reject".to_string(),
                 confidence: 0.0,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
             })
         }
     }
@@ -8628,7 +8651,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT, latency_ms INTEGER NOT NULL DEFAULT 0); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE signals(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, score REAL, features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
+        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE cooldowns(symbol TEXT PRIMARY KEY, until_ts INTEGER, reason TEXT, kind TEXT); CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL, tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL, opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT, realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL, venue_ts INTEGER, partial_taken_at INTEGER, features TEXT, trade_id INTEGER DEFAULT 0, invalidation_price REAL); CREATE TABLE orders(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, side TEXT, order_type TEXT, qty REAL, price REAL, status TEXT, purpose TEXT, client_order_id TEXT, exchange_order_id TEXT, reduce_only INTEGER, mode TEXT, latency_ms INTEGER NOT NULL DEFAULT 0); CREATE TABLE engine_events(id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT); CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, exit_price REAL, leverage REAL, notional REAL, pnl REAL, pnl_pct REAL, roi_pct REAL, fees REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, exit_reason TEXT, ai_confidence REAL, ai_reason TEXT, signal_score REAL, slippage_bps REAL, mode TEXT, reviewed INTEGER, review_note TEXT, features TEXT, mantra_ids TEXT); CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, category TEXT, source TEXT, confidence REAL, health REAL, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, visible INTEGER, version INTEGER, superseded_by INTEGER, evidence TEXT, created_at INTEGER, updated_at INTEGER, expires_at INTEGER); CREATE TABLE experiences(id INTEGER PRIMARY KEY, symbol TEXT, tags TEXT, scenario TEXT, lesson TEXT, outcome TEXT, source_decision_id INTEGER, source TEXT, hits INTEGER, wins INTEGER, losses INTEGER, enabled INTEGER, created_at INTEGER, updated_at INTEGER); CREATE TABLE decision_journal(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, confidence REAL, entry_price REAL, target_pct REAL, reason TEXT, snapshot TEXT, decision TEXT, signal_id INTEGER, injected_experience_ids TEXT, status TEXT, outcome TEXT, actual_price REAL, actual_pct REAL, labeled_at INTEGER, archived INTEGER, mode TEXT); CREATE TABLE signals(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, score REAL, features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER); CREATE TABLE evolution_runs(id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, input_count INTEGER, produced INTEGER, replaced INTEGER, ok INTEGER, summary TEXT, raw TEXT); INSERT INTO app_settings VALUES('engine','{\"enabled\":false,\"cycle_interval_sec\":0,\"mode\":\"demo\"}',0); INSERT INTO engine_state VALUES('enabled','false',0); INSERT INTO engine_state VALUES('mode','demo',0);").unwrap();
         Db {
             path: String::new(),
             conn: Arc::new(std::sync::Mutex::new(conn)),
