@@ -21,6 +21,7 @@ mod ai_client;
 mod ai_market;
 mod ai_providers;
 mod ai_review;
+mod account_balance;
 mod app_state;
 mod archive;
 mod auth;
@@ -43,6 +44,7 @@ mod evolution_review;
 mod exchange_time;
 mod exec_client;
 mod execution;
+mod fast_risk;
 mod ga_tune;
 mod history;
 mod interpreter_refs;
@@ -320,13 +322,13 @@ async fn main() {
         }
         // 只要存在仓位，0.5 秒风控任务会直接检查止盈止损并平仓，不再等 480 秒周期。
         // 标记价/浮盈在同一循环里刷新，无需额外的 3 秒持仓标记任务。
-        tokio::spawn(crate::runtime::run_fast_risk_task(
+        tokio::spawn(crate::fast_risk::run_fast_risk_task(
             db.clone(),
             master_key.clone(),
             stop_tx.subscribe(),
         ));
         // 可用余额/钱包直接读交易所账户接口，同样不受策略周期限制。
-        tokio::spawn(crate::runtime::run_account_balance_task(
+        tokio::spawn(crate::account_balance::run_account_balance_task(
             db,
             master_key.clone(),
             stop_tx.subscribe(),

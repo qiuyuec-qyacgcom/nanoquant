@@ -3658,7 +3658,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     .unwrap_or((draft.mark_price, draft.mark_price));
                 let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
                 // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
-                let configured_limit = gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
+                let configured_limit = crate::fast_risk::gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
                     .and_then(|ai_entry_price| {
                         Self::preferred_limit_price(
                             side,
@@ -6005,268 +6005,8 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
-/// 把最新标记价和浮盈写回持仓。快速风控每 0.5 秒调用一次，
-/// 即使未命中风控分支也刷新，权益面板因此与行情同步。
-fn apply_position_mark(
-    conn: &rusqlite::Connection,
-    id: i64,
-    mark: f64,
-    entry: f64,
-    qty: f64,
-    direction: f64,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE positions SET mark_price=?1, venue_unrealized=?2, venue_ts=?3 \
-         WHERE id=?4 AND status='open'",
-        (mark, (mark - entry) * qty * direction, crate::now(), id),
-    )
-}
 
-/// 持仓风控专用：有仓位时每 0.5 秒用公开标记价检查全局/单仓止盈止损，
-/// 命中后立即走平仓链路，不再等待 480 秒策略周期。
-pub(crate) async fn run_fast_risk_task(
-    db: crate::db::Db,
-    master_key: Vec<u8>,
-    mut stop: watch::Receiver<bool>,
-) {
-    let control = EngineControl::new(db.clone(), master_key);
-    let mut closing = std::collections::HashSet::new();
-    loop {
-        if *stop.borrow() {
-            break;
-        }
-        if let Err(error) = fast_risk_cycle(&db, &control, &mut closing).await {
-            tracing::debug!(%error, "快速风控检查失败");
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            _ = stop.changed() => break,
-        }
-    }
-}
 
-/// 开关只在消费点生效：关闭时一律回退旧行为，不采用 AI 值。
-fn gate_ai_value<T>(value: Option<T>, enabled: bool) -> Option<T> {
-    if enabled {
-        value
-    } else {
-        None
-    }
-}
-
-/// 快速风控判定输入：9 个量具名化，避免调用点位置参数错位。
-struct FastRiskInput<'a> {
-    side: &'a str,
-    entry: f64,
-    mark: f64,
-    sl: f64,
-    tp: f64,
-    leverage: f64,
-    invalidation_price: Option<f64>,
-    global_stop_pct: f64,
-    global_tp_pct: f64,
-}
-
-/// 快速风控裁决：先看全局止盈止损（保证金收益率），再看 AI 失效价，
-/// 最后看单仓止盈止损。返回 None 表示继续持仓。
-fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
-    // 价格非法时直接放行，避免除零或 NaN 比较导致误平仓。
-    if !input.entry.is_finite()
-        || input.entry <= 0.0
-        || !input.mark.is_finite()
-        || input.mark <= 0.0
-    {
-        return None;
-    }
-    // 非 "long" 一律按空单处理（沿用旧行为）。
-    let direction = if input.side == "long" { 1.0 } else { -1.0 };
-    let margin_pct = (input.mark - input.entry) * direction / input.entry * 100.0
-        * input.leverage.max(1.0);
-    if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
-        return Some("global_stop_loss");
-    }
-    if input.global_tp_pct > 0.0 && margin_pct >= input.global_tp_pct {
-        return Some("global_take_profit");
-    }
-    if let Some(ip) = input
-        .invalidation_price
-        .filter(|v| *v > 0.0 && v.is_finite())
-    {
-        if (direction > 0.0 && input.mark <= ip) || (direction < 0.0 && input.mark >= ip) {
-            return Some("invalidation");
-        }
-    }
-    if input.sl > 0.0
-        && ((direction > 0.0 && input.mark <= input.sl)
-            || (direction < 0.0 && input.mark >= input.sl))
-    {
-        return Some("stop_loss");
-    }
-    if input.tp > 0.0
-        && ((direction > 0.0 && input.mark >= input.tp)
-            || (direction < 0.0 && input.mark <= input.tp))
-    {
-        return Some("take_profit");
-    }
-    None
-}
-
-async fn fast_risk_cycle(
-    db: &crate::db::Db,
-    control: &EngineControl,
-    closing: &mut std::collections::HashSet<i64>,
-) -> Result<(), String> {
-    let (rows, global_stop, global_tp, ai_cfg) = {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())?;
-        let ai_cfg = crate::ai_client::read_ai_config_conn(&conn);
-        let mode: String = conn
-            .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or_else(|_| "demo".to_string());
-        if mode != "live" {
-            return Ok(());
-        }
-        let risk = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='risk'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| json!({}));
-        let global_stop = risk["global_stop_loss_pct"].as_f64().unwrap_or(10.0);
-        let global_tp = risk["global_take_profit_pct"].as_f64().unwrap_or(15.0);
-        let mut stmt = conn
-            .prepare(
-"SELECT id,symbol,side,entry_price,sl_price,tp_price,leverage,qty,invalidation_price,features \
-                 FROM positions WHERE mode='live' AND status='open' AND qty > 0",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    row.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
-                    row.get::<_, f64>(7)?,
-                    row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        (rows, global_stop, global_tp, ai_cfg)
-    };
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let provider = crate::providers::BinanceProvider::public("https://fapi.binance.com")
-        .map_err(|error| format!("{error:?}"))?;
-    for (id, symbol, side, entry, sl, tp, leverage, qty, invalidation_price, features) in rows {
-        if closing.contains(&id) {
-            continue;
-        }
-        let Ok(mark) = provider.public_mark_price(&symbol).await else {
-            continue;
-        };
-        if !mark.is_finite() || mark <= 0.0 || entry <= 0.0 {
-            continue;
-        }
-        let direction = if side == "long" { 1.0 } else { -1.0 };
-
-        if let Ok(conn) = db.conn.lock() {
-            let _ = apply_position_mark(&conn, id, mark, entry, qty, direction);
-        }
-        let limits = crate::mean_reversion::position_margin_limits(features.as_deref());
-        let reason = fast_risk_reason(&FastRiskInput {
-            side: &side,
-            entry,
-            mark,
-            sl,
-            tp,
-            leverage,
-            invalidation_price: gate_ai_value(invalidation_price, ai_cfg.use_invalidation_price),
-            global_stop_pct: limits.map_or(global_stop, |limits| limits.0),
-            global_tp_pct: limits.map_or(global_tp, |limits| limits.1),
-        });
-        let Some(reason) = reason else {
-            continue;
-        };
-        closing.insert(id);
-        if let Err(error) = control.close_position(id, reason).await {
-            tracing::debug!(error = ?error, symbol = %symbol, reason, "快速风控平仓失败");
-        }
-        closing.remove(&id);
-    }
-    Ok(())
-}
-
-/// 账户面板专用：每 3 秒从交易所账户接口刷新钱包/可用/权益。
-pub(crate) async fn run_account_balance_task(
-    db: crate::db::Db,
-    master_key: Vec<u8>,
-    mut stop: watch::Receiver<bool>,
-) {
-    let control = EngineControl::new(db.clone(), master_key);
-    loop {
-        if *stop.borrow() {
-            break;
-        }
-        if let Err(error) = refresh_account_balance(&db, &control).await {
-            tracing::debug!(%error, "账户余额刷新失败");
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
-            _ = stop.changed() => break,
-        }
-    }
-}
-
-async fn refresh_account_balance(
-    db: &crate::db::Db,
-    control: &EngineControl,
-) -> Result<(), String> {
-    let mode: String = {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())?;
-        conn.query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_else(|_| "demo".to_string())
-    };
-    if mode != "live" {
-        return Ok(());
-    }
-    let account = control.account_snapshot("live").await?;
-    let payload = serde_json::json!({
-        "ts": crate::now(),
-        "equity": account.equity,
-        "wallet": account.wallet,
-        "available": account.available_balance,
-    });
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库锁不可用".to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO engine_state(key,value) VALUES('account.live',?1)",
-        [payload.to_string()],
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
-}
 
 /// 同向持仓的相关性判定：三大主流视为同一风险簇，
 /// 其余标的按去掉 USDT 后的基础资产归组。
@@ -6287,30 +6027,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[allow(clippy::too_many_arguments)]
-    fn risk_input<'a>(
-        side: &'a str,
-        entry: f64,
-        mark: f64,
-        sl: f64,
-        tp: f64,
-        leverage: f64,
-        invalidation_price: Option<f64>,
-        global_stop_pct: f64,
-        global_tp_pct: f64,
-    ) -> FastRiskInput<'a> {
-        FastRiskInput {
-            side,
-            entry,
-            mark,
-            sl,
-            tp,
-            leverage,
-            invalidation_price,
-            global_stop_pct,
-            global_tp_pct,
-        }
-    }
 
     #[test]
     fn local_leverage_rises_for_low_atr_high_score() {
@@ -6357,100 +6073,15 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_price_triggers_fast_close() {
-        // 快速风控需在 AI 失效价被触及时立即返回 invalidation：
-        // 多单标记价跌到失效价、空单标记价涨到失效价即视为失效。
-        // 全局止损阈值需高于杠杆放大后的浮亏（-4% × 5 = -20%），
-        // 否则会先命中 global_stop_loss，无法验证失效价分支。
-        assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
-            Some("invalidation")
-        );
-        assert_eq!(
-            fast_risk_reason(&risk_input("short", 100.0, 104.0, 105.0, 90.0, 5.0, Some(103.0), 30.0, 15.0)),
-            Some("invalidation")
-        );
-        assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
-            None
-        );
-    }
 
-    #[test]
-    fn fast_risk_ignores_invalidation_when_switch_off() {
-        // 开关关闭时消费点把 invalidation_price 置空，失效价不再触发平仓。
-        assert_eq!(
-            fast_risk_reason(&risk_input(
-                "long",
-                100.0,
-                96.0,
-                95.0,
-                110.0,
-                5.0,
-                gate_ai_value(Some(97.0), false),
-                30.0,
-                15.0,
-            )),
-            None
-        );
-        // 开关打开时与旧行为一致。
-        assert_eq!(
-            fast_risk_reason(&risk_input(
-                "long",
-                100.0,
-                96.0,
-                95.0,
-                110.0,
-                5.0,
-                gate_ai_value(Some(97.0), true),
-                30.0,
-                15.0,
-            )),
-            Some("invalidation")
-        );
-    }
-
-    #[test]
     fn limit_entry_ignores_ai_price_when_switch_off() {
         // 限价委托在开关关闭时不采用 AI 入场价，直接回退买一/卖一。
-        assert_eq!(gate_ai_value(Some(101.0), false), None);
-        assert_eq!(gate_ai_value(Some(101.0), true), Some(101.0));
+        assert_eq!(crate::fast_risk::gate_ai_value(Some(101.0), false), None);
+        assert_eq!(crate::fast_risk::gate_ai_value(Some(101.0), true), Some(101.0));
     }
 
     #[test]
-    fn global_stop_wins_over_invalidation() {
-        // 5 倍杠杆下 -10% 价格即 -50% 保证金，全局止损应先于失效价命中。
-        assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 90.0, 0.0, 0.0, 5.0, Some(95.0), 10.0, 0.0)),
-            Some("global_stop_loss")
-        );
-    }
 
-    #[test]
-    fn fast_risk_reason_ignores_invalid_prices() {
-        // entry/mark 非法时不得触发任何平仓，避免除零或脏数据误杀持仓。
-        assert_eq!(
-            fast_risk_reason(&risk_input("long", 0.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
-            None
-        );
-        assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 0.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
-            None
-        );
-    }
-
-    #[test]
-    fn fast_risk_reason_ignores_negative_and_nonfinite_invalidation() {
-        // 失效价仅在有限正数时才参与判定。
-        for ip in [-1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                fast_risk_reason(&risk_input("long", 100.0, 99.0, 0.0, 0.0, 5.0, Some(ip), 0.0, 0.0)),
-                None
-            );
-        }
-    }
-
-    #[test]
     fn fast_risk_cycle_updates_mark_price_without_trigger() {
         // 快速风控每 0.5 秒查一次持仓，即便未命中任何止损/止盈分支，
         // 也必须把标记价和浮盈写回 positions，供权益面板展示。
@@ -6477,7 +6108,7 @@ mod tests {
             })
             .unwrap();
 
-        let changed = apply_position_mark(&conn, id, 105.0, 100.0, 2.0, 1.0).unwrap();
+        let changed = crate::fast_risk::apply_position_mark(&conn, id, 105.0, 100.0, 2.0, 1.0).unwrap();
         assert_eq!(changed, 1);
 
         let (mark, unrealized, ts, status): (f64, f64, i64, String) = conn
