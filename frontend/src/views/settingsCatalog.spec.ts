@@ -148,9 +148,10 @@ describe('参数配置目录', () => {
     expect(keys).toEqual(['ema_fast', 'entry_threshold'])
   })
 
-  it('valid_bars 排在 K 线周期之后', () => {
+  it('valid_bars 紧跟 K 线周期', () => {
     const basic = SETTINGS_SECTIONS.strategy.find((s) => s.title === '基础')
-    expect(basic?.fields.slice(0, 2)).toEqual(['timeframe', 'valid_bars'])
+    const fields = basic?.fields || []
+    expect(fields.indexOf('valid_bars')).toBe(fields.indexOf('timeframe') + 1)
   })
 
   it('min_entry_rr 出现在策略入场过滤', () => {
@@ -159,8 +160,6 @@ describe('参数配置目录', () => {
   })
 
   it('AI 复核分组包含两个开关', () => {
-    const keys = (SETTINGS_SECTIONS.ai || []).flatMap((s) => s.fields)
-    expect(keys).toContain('use_invalidation_price')
-    expect(keys).toContain('use_entry_price')
+    expect([...explicitKeys('ai')].sort()).toEqual(['use_entry_price', 'use_invalidation_price'])
   })
 })

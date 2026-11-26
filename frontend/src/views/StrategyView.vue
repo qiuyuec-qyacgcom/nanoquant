@@ -28,6 +28,7 @@ interface FieldMeta {
   options?: [string, string][]
   min?: number
   max?: number
+  step?: number
 }
 
 
@@ -306,14 +307,14 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       options: [['fusion', 'NQ-Fusion（当前）']],
       hint: '当前唯一信号模型；按 regime 加权相对强弱、波动突破、资金费率与 OI/订单流',
     },
-    valid_bars: { label: '信号有效期', unit: '根 K 线', hint: 'AI 未给出有效期时使用；1 根 = 1 个当前 K 线周期，超过后该信号不再作为开仓依据' },
-    min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', hint: 'AI 预期盈亏比低于该值时不采纳' },
+    valid_bars: { label: '信号有效期', unit: '根 K 线', min: 1, max: 24, step: 1, hint: 'AI 未给出有效期时使用；1 根 = 1 个当前 K 线周期，超过后该信号不再作为开仓依据（当前版本尚未生效，待后续任务启用）' },
+    min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', min: 0, max: 10, step: 0.1, hint: 'AI 预期盈亏比低于该值时不采纳（当前版本尚未生效，待后续任务启用）' },
   },
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
-    use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓' },
-    use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 时忽略' },
+    use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓（当前版本尚未生效，待后续任务启用）' },
+    use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 或方向不符（BUY 高于现价 / SELL 低于现价）时忽略（当前版本尚未生效，待后续任务启用）' },
     param_tuning_min_interval_sec: {
       label: '调参最小间隔', unit: '秒', min: 60, max: 604800,
       hint: '独立调参任务的最小间隔；0 已废弃，最低 60 秒，86400=每天一次',
@@ -418,7 +419,7 @@ function widgetOf(value: any, meta: FieldMeta): Widget {
 
 function rowOf(group: string, key: string, value: any): Row {
   const meta = metaOf(group, key)
-  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min, max: meta.max }
+  return { key, value, widget: widgetOf(value, meta), label: meta.label, hint: meta.hint || '', unit: meta.unit || '', options: meta.options, min: meta.min, max: meta.max, step: meta.step }
 }
 
 function skippedKeys(): Set<string> {
@@ -1363,7 +1364,7 @@ onUnmounted(() => {
                   </select>
 
                   <div v-else-if="f.widget === 'number'" class="num-wrap">
-                    <input v-model.number="draft[f.key]" type="number" step="any" :min="f.min" :max="f.max" class="input mono" />
+                    <input v-model.number="draft[f.key]" type="number" :step="f.step ?? 'any'" :min="f.min" :max="f.max" class="input mono" />
                     <span v-if="f.unit" class="num-unit">{{ f.unit }}</span>
                   </div>
 

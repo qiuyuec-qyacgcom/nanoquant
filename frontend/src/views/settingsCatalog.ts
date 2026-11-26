@@ -13,7 +13,7 @@ export interface SettingSection {
 export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
-  { id: 'ai', label: 'AI 复核', hint: 'AI 复核门槛与失效价/限价开关' },
+  { id: 'ai', label: 'AI 复核', hint: '失效价与限价开关（AI 复核行为的开关）' },
   { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 每周期自动调整隐藏参数' },
   { id: 'symbol_scan', label: '自动换池', hint: '按配置的间隔与数量扫描 USDT 永续，自动替换不达标且无持仓的标的' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
@@ -60,7 +60,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
   ],
   ai: [
-    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核', fields: ['use_invalidation_price', 'use_entry_price'] },
+    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核（当前版本尚未生效，待后续任务启用）', fields: ['use_invalidation_price', 'use_entry_price'] },
   ],
   ai_tuning: [
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
