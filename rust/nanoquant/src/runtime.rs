@@ -293,20 +293,31 @@ struct CachedReviewer<'a> {
     now: i64,
 }
 
+impl CachedReviewer<'_> {
+    /// TTL 内命中的结论；并发调度用它把命中项留在主线程，不占用工作线程。
+    fn cached_decision(&self) -> Option<crate::review::ReviewDecision> {
+        if self.ttl_sec <= 0 {
+            return None;
+        }
+        let mut cache = self.cache.lock().ok()?;
+        match cache.get(&self.key) {
+            Some(hit) if self.now - hit.ts <= self.ttl_sec => Some(hit.decision.clone()),
+            Some(_) => {
+                cache.remove(&self.key);
+                None
+            }
+            None => None,
+        }
+    }
+}
+
 impl crate::review::AiReviewer for CachedReviewer<'_> {
     fn review(
         &self,
         proposal: &crate::review::EntryProposal,
     ) -> Result<crate::review::ReviewDecision, String> {
-        if self.ttl_sec > 0 {
-            if let Ok(mut cache) = self.cache.lock() {
-                if let Some(hit) = cache.get(&self.key) {
-                    if self.now - hit.ts <= self.ttl_sec {
-                        return Ok(hit.decision.clone());
-                    }
-                    cache.remove(&self.key);
-                }
-            }
+        if let Some(decision) = self.cached_decision() {
+            return Ok(decision);
         }
         let decision = self.inner.review(proposal)?;
         if self.ttl_sec > 0 {
@@ -322,6 +333,18 @@ impl crate::review::AiReviewer for CachedReviewer<'_> {
             }
         }
         Ok(decision)
+    }
+}
+
+/// 把已命中的缓存结论包成复核器，交给 `apply_review` 走统一语义。
+struct CachedAnswerReviewer<'a>(&'a crate::review::ReviewDecision);
+
+impl crate::review::AiReviewer for CachedAnswerReviewer<'_> {
+    fn review(
+        &self,
+        _proposal: &crate::review::EntryProposal,
+    ) -> Result<crate::review::ReviewDecision, String> {
+        Ok(self.0.clone())
     }
 }
 
@@ -1406,8 +1429,10 @@ impl EngineRuntime {
             ),
         );
         let reviewer = ai.as_ref().map(|state| {
-            Arc::new(crate::ai_review::EngineAiReviewer::new(state.clone()))
-                as Arc<dyn crate::review::AiReviewer>
+            Arc::new(crate::ai_review::EngineAiReviewer::new(
+                state.clone(),
+                tokio::runtime::Handle::try_current().ok(),
+            )) as Arc<dyn crate::review::AiReviewer>
         });
         Self {
             db,
@@ -1745,8 +1770,12 @@ impl EngineRuntime {
             )?;
         }
         let ai_cfg = crate::ai_client::read_ai_config_conn(&tx);
-        let (high_score_threshold, low_score_threshold, review_cache_ttl_sec) =
-            Self::ai_split_config(&tx);
+        let (
+            high_score_threshold,
+            low_score_threshold,
+            review_cache_ttl_sec,
+            review_concurrency,
+        ) = Self::ai_split_config(&tx);
         let drafts = if engine_is_enabled && !report.ai_symbols.is_empty() {
             Self::collect_entries(
                 &tx,
@@ -1805,6 +1834,7 @@ impl EngineRuntime {
             low_score_threshold,
             Some(self.review_cache.as_ref()),
             review_cache_ttl_sec,
+            review_concurrency,
             crate::now(),
         );
 
@@ -3143,7 +3173,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
 
     /// 读 AI 评分分流参数：高分区直接通过、低分区直接拒绝、中间区才复核。
     /// 缺省值与 `param_registry` / `default_settings.json` 保持一致。
-    fn ai_split_config(tx: &rusqlite::Transaction<'_>) -> (f64, f64, i64) {
+    fn ai_split_config(tx: &rusqlite::Transaction<'_>) -> (f64, f64, i64, usize) {
         let value = tx
             .query_row(
                 "SELECT value FROM app_settings WHERE key = 'ai'",
@@ -3175,10 +3205,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             .and_then(Value::as_i64)
             .unwrap_or(60)
             .clamp(0, 600);
-        (high, low, ttl)
+        // 中间区复核并发上限：8 个线程足以覆盖常见标的数，且不压垮模型限流。
+        let concurrency = value
+            .get("review_concurrency")
+            .and_then(Value::as_i64)
+            .unwrap_or(8)
+            .clamp(1, 16) as usize;
+        (high, low, ttl, concurrency)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn review_drafts(
         reviewer: Option<&dyn crate::review::AiReviewer>,
         drafts: Vec<EntryDraft>,
@@ -3190,29 +3226,57 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         low_score_threshold: f64,
         cache: Option<&std::sync::Mutex<std::collections::HashMap<String, ReviewCache>>>,
         cache_ttl_sec: i64,
+        review_concurrency: usize,
         now: i64,
     ) -> Vec<ReviewedDraft> {
-        drafts
-            .into_iter()
-            .map(|draft| {
+        // 中间区统一出口：AI 明确拒绝/观望仍然否决，其它失败按 fail-open 降仓。
+        let resolve = |draft: &EntryDraft, active: Option<&dyn crate::review::AiReviewer>| {
+            let proposal = draft.proposal();
+            match crate::review::apply_review(&proposal, active, required, veto_only) {
+                Ok(mut entry) => {
+                    if !required {
+                        entry.scale = Some(fail_open_scale);
+                    }
+                    Ok(entry)
+                }
+                Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
+                Err(error) => {
+                    crate::review::apply_review(&proposal, None, false, false).map(|mut entry| {
+                        entry.reason = format!(
+                            "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
+                            error.reason
+                        );
+                        entry.scale = Some(fail_open_scale);
+                        entry
+                    })
+                }
+            }
+        };
+
+        let mut results: Vec<Option<ReviewedDraft>> = drafts.iter().map(|_| None).collect();
+        let mut pending: Vec<(usize, EntryDraft, Option<CachedReviewer<'_>>)> = Vec::new();
+        for (idx, draft) in drafts.into_iter().enumerate() {
+            let score = draft.signal_score();
+            // 只对量化正式信号分流；预览信号本身置信不足，仍交给 AI 判断。
+            let split_enabled = required && reviewer.is_some() && draft.quant_side.is_some();
+            if split_enabled && score >= high_score_threshold {
+                // 高分直接放行，按满仓处理，不花 AI 调用。
                 let proposal = draft.proposal();
-                let score = draft.signal_score();
-                // 只对量化正式信号分流；预览信号本身置信不足，仍交给 AI 判断。
-                let split_enabled = required && reviewer.is_some() && draft.quant_side.is_some();
-                let result = if split_enabled && score >= high_score_threshold {
-                    // 高分直接放行，按满仓处理，不花 AI 调用。
-                    crate::review::apply_review(&proposal, None, false, veto_only).map(
-                        |mut entry| {
-                            entry.scale = Some(1.0);
-                            entry.reason = format!(
-                                "ai_skip=high_score；评分 {score:.3} >= {high_score_threshold:.3}，跳过 AI 复核"
-                            );
-                            entry
-                        },
-                    )
-                } else if split_enabled && score < low_score_threshold {
-                    // 低分直接拒绝，不花 AI 调用；评分保留在 confidence 里供审计。
-                    Err(crate::review::ReviewError {
+                let result = crate::review::apply_review(&proposal, None, false, veto_only).map(
+                    |mut entry| {
+                        entry.scale = Some(1.0);
+                        entry.reason = format!(
+                            "ai_skip=high_score；评分 {score:.3} >= {high_score_threshold:.3}，跳过 AI 复核"
+                        );
+                        entry
+                    },
+                );
+                results[idx] = Some(ReviewedDraft { draft, result });
+            } else if split_enabled && score < low_score_threshold {
+                // 低分直接拒绝，不花 AI 调用；评分保留在 confidence 里供审计。
+                results[idx] = Some(ReviewedDraft {
+                    draft,
+                    result: Err(crate::review::ReviewError {
                         reason: format!(
                             "{SCORE_SPLIT_LOW_PREFIX} {score:.3} < {low_score_threshold:.3}"
                         ),
@@ -3225,53 +3289,83 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         entry_price: None,
                         invalidation_text: None,
                         risk_text: None,
-                    })
-                } else {
-                    let cached = match (split_enabled, cache, reviewer) {
-                        (true, Some(cache), Some(inner)) => Some(CachedReviewer {
-                            inner,
-                            cache,
-                            key: review_cache_key(
-                                mode,
-                                &draft.symbol,
-                                draft.signal_side().unwrap_or("flat"),
-                                score,
-                            ),
-                            ttl_sec: cache_ttl_sec,
-                            now,
-                        }),
-                        _ => None,
-                    };
-                    let active: Option<&dyn crate::review::AiReviewer> = match cached.as_ref() {
-                        Some(cached) => Some(cached),
-                        None => reviewer,
-                    };
-                    match crate::review::apply_review(&proposal, active, required, veto_only) {
-                        Ok(mut entry) => {
-                            if !required {
-                                entry.scale = Some(fail_open_scale);
-                            }
-                            Ok(entry)
-                        }
-                        // AI 明确拒绝/观望时仍然否决，不能被 fail-open 绕过。
-                        Err(error) if matches!(error.action.as_str(), "reject" | "hold") => {
-                            Err(error)
-                        }
-                        Err(error) => crate::review::apply_review(
-                            &proposal, None, false, false,
-                        )
-                        .map(|mut entry| {
-                            entry.reason = format!(
-                                "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
-                                error.reason
-                            );
-                            entry.scale = Some(fail_open_scale);
-                            entry
-                        }),
-                    }
+                    }),
+                });
+            } else {
+                let cached = match (split_enabled, cache, reviewer) {
+                    (true, Some(cache), Some(inner)) => Some(CachedReviewer {
+                        inner,
+                        cache,
+                        key: review_cache_key(
+                            mode,
+                            &draft.symbol,
+                            draft.signal_side().unwrap_or("flat"),
+                            score,
+                        ),
+                        ttl_sec: cache_ttl_sec,
+                        now,
+                    }),
+                    _ => None,
                 };
-                ReviewedDraft { draft, result }
-            })
+                // 缓存命中留在主线程，不占用并发工作线程。
+                if let Some(decision) = cached.as_ref().and_then(CachedReviewer::cached_decision) {
+                    let result = resolve(&draft, Some(&CachedAnswerReviewer(&decision)));
+                    results[idx] = Some(ReviewedDraft { draft, result });
+                } else {
+                    pending.push((idx, draft, cached));
+                }
+            }
+        }
+
+        let workers = review_concurrency.clamp(1, 16).min(pending.len());
+        if reviewer.is_none() || workers <= 1 {
+            for (idx, draft, cached) in pending {
+                let active = cached
+                    .as_ref()
+                    .map(|inner| inner as &dyn crate::review::AiReviewer);
+                let result = resolve(&draft, active.or(reviewer));
+                results[idx] = Some(ReviewedDraft { draft, result });
+            }
+        } else {
+            // 中间区按硬件并发上限分桶，每桶串行、桶间并行；结果按原 idx 还原顺序。
+            let mut buckets: Vec<Vec<(usize, EntryDraft, Option<CachedReviewer<'_>>)>> =
+                (0..workers).map(|_| Vec::new()).collect();
+            for (offset, item) in pending.into_iter().enumerate() {
+                buckets[offset % workers].push(item);
+            }
+            let mut collected: Vec<(usize, ReviewedDraft)> = Vec::with_capacity(buckets.len());
+            let resolve = &resolve;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for bucket in buckets {
+                    handles.push(scope.spawn(move || {
+                        bucket
+                            .into_iter()
+                            .map(|(idx, draft, cached)| {
+                                let active = cached
+                                    .as_ref()
+                                    .map(|inner| inner as &dyn crate::review::AiReviewer);
+                                let result = resolve(&draft, active.or(reviewer));
+                                (idx, ReviewedDraft { draft, result })
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                }
+                for handle in handles {
+                    match handle.join() {
+                        Ok(items) => collected.extend(items),
+                        Err(_) => panic!("AI 复核工作线程异常退出"),
+                    }
+                }
+            });
+            for (idx, reviewed) in collected {
+                results[idx] = Some(reviewed);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|item| item.expect("每个候选都必须有复核结果"))
             .collect()
     }
 
@@ -8245,6 +8339,16 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         cache: Option<&std::sync::Mutex<std::collections::HashMap<String, ReviewCache>>>,
         now: i64,
     ) -> Vec<ReviewedDraft> {
+        split_review_with_concurrency(reviewer, drafts, cache, now, 8)
+    }
+
+    fn split_review_with_concurrency(
+        reviewer: &dyn crate::review::AiReviewer,
+        drafts: Vec<EntryDraft>,
+        cache: Option<&std::sync::Mutex<std::collections::HashMap<String, ReviewCache>>>,
+        now: i64,
+        concurrency: usize,
+    ) -> Vec<ReviewedDraft> {
         EngineRuntime::review_drafts(
             Some(reviewer),
             drafts,
@@ -8256,8 +8360,141 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             0.45,
             cache,
             60,
+            concurrency,
             now,
         )
+    }
+
+    /// 每个候选固定睡眠，用于验证中间区复核并发而不是串行等待。
+    struct SlowReviewer {
+        calls: std::sync::atomic::AtomicUsize,
+        delay: std::time::Duration,
+        stagger: bool,
+    }
+
+    impl SlowReviewer {
+        fn new(delay: std::time::Duration) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                delay,
+                stagger: false,
+            }
+        }
+
+        fn staggered(delay: std::time::Duration) -> Self {
+            Self {
+                stagger: true,
+                ..Self::new(delay)
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::review::AiReviewer for SlowReviewer {
+        fn review(
+            &self,
+            proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let delay = if self.stagger {
+                // 序号越小睡得越久，完成顺序与输入顺序相反，便于校验还原。
+                let rank = proposal
+                    .symbol
+                    .trim_start_matches("BTCUSDT")
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                self.delay * (3 - rank.min(3) as u32)
+            } else {
+                self.delay
+            };
+            std::thread::sleep(delay);
+            Ok(crate::review::ReviewDecision {
+                action: crate::review::ReviewAction::Agree,
+                side: Some(proposal.side.clone()),
+                leverage: None,
+                margin_pct: None,
+                stop_price: None,
+                take_profit: Some(proposal.take_profit),
+                reason: "slow approve".to_string(),
+                confidence: 0.8,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
+                invalidation_text: None,
+                risk_text: None,
+                scale: None,
+            })
+        }
+    }
+
+    fn labeled_drafts(count: usize, score: f64) -> Vec<EntryDraft> {
+        (0..count)
+            .map(|index| {
+                let mut draft = score_draft(score);
+                draft.symbol = format!("BTCUSDT{index}");
+                draft.client_id = format!("draft-{index}");
+                draft
+            })
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_review_does_not_serialize() {
+        let reviewer = SlowReviewer::new(std::time::Duration::from_millis(50));
+        let drafts = labeled_drafts(4, 0.6);
+        let started = std::time::Instant::now();
+        let reviewed = split_review_with_concurrency(&reviewer, drafts, None, 1_000, 4);
+        let elapsed = started.elapsed();
+        assert_eq!(reviewed.len(), 4);
+        assert_eq!(reviewer.calls(), 4, "中间区每个候选都要真实复核");
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "4 个 50ms 复核应并发完成（而非 200ms 串行），实际 {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_review_keeps_order() {
+        let reviewer = SlowReviewer::staggered(std::time::Duration::from_millis(10));
+        let drafts = labeled_drafts(4, 0.6);
+        let reviewed = split_review_with_concurrency(&reviewer, drafts, None, 1_000, 4);
+        let order: Vec<String> = reviewed
+            .iter()
+            .map(|item| item.draft.client_id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["draft-0", "draft-1", "draft-2", "draft-3"],
+            "并发完成后必须按输入顺序还原"
+        );
+        assert!(reviewed.iter().all(|item| item.result.is_ok()));
+    }
+
+    #[test]
+    fn concurrent_review_skips_high_and_low_score() {
+        let reviewer = SlowReviewer::new(std::time::Duration::from_millis(5));
+        let mut drafts = labeled_drafts(3, 0.6);
+        let mut high = score_draft(0.9);
+        high.client_id = "high".to_string();
+        let mut low = score_draft(0.2);
+        low.client_id = "low".to_string();
+        drafts.push(high);
+        drafts.push(low);
+        let reviewed = split_review_with_concurrency(&reviewer, drafts, None, 1_000, 8);
+        assert_eq!(reviewer.calls(), 3, "高/低分区不得占用并发工作线程");
+        assert_eq!(
+            reviewed[3].result.as_ref().expect("高分直接通过").scale,
+            Some(1.0)
+        );
+        assert_eq!(
+            reviewed[4].result.as_ref().expect_err("低分直接拒绝").action,
+            "reject"
+        );
     }
 
     #[test]

@@ -6,26 +6,61 @@ use crate::review::{AiReviewer, EntryProposal, ReviewAction, ReviewDecision};
 
 pub(crate) struct EngineAiReviewer {
     state: AiState,
+    /// 执行复核的 Tokio 句柄。并发复核跑在普通线程上时，线程内拿不到
+    /// `Handle::try_current()`，必须预先保存句柄才能驱动异步复核。
+    handle: Option<tokio::runtime::Handle>,
+    timeout: std::time::Duration,
 }
 
 impl EngineAiReviewer {
-    pub(crate) fn new(state: AiState) -> Self {
-        Self { state }
+    pub(crate) fn new(state: AiState, handle: Option<tokio::runtime::Handle>) -> Self {
+        Self {
+            state,
+            handle,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
 impl AiReviewer for EngineAiReviewer {
     fn review(&self, proposal: &EntryProposal) -> Result<ReviewDecision, String> {
+        let handle = self
+            .handle
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            .ok_or_else(|| "AI 复核需要 Tokio 运行时".to_string())?;
         let state = self.state.clone();
         let conn = state.db.conn.clone();
         let proposal = proposal.clone();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "AI 复核需要 Tokio 运行时".to_string())?;
-        tokio::task::block_in_place(|| {
+        let timeout = self.timeout;
+        let run = move || {
             wait_for_lock(&conn, std::time::Duration::from_millis(2000))?;
-            handle.block_on(review_entry(state, proposal))
-        })
+            handle.block_on(review_entry_with_timeout(state, proposal, timeout))
+        };
+        // 当前线程已在运行时里时必须 block_in_place，否则 block_on 会 panic；
+        // 普通线程（并发复核的子线程）直接 block_on 即可。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        }
     }
+}
+
+async fn review_entry_with_timeout(
+    state: AiState,
+    proposal: EntryProposal,
+    timeout: std::time::Duration,
+) -> Result<ReviewDecision, String> {
+    tokio::time::timeout(timeout, review_entry(state, proposal))
+        .await
+        .map_err(|_| "AI 复核超时".to_string())?
 }
 
 /// 等待数据库连接锁释放，避免后台任务短暂持锁被误判为事务内调用。
@@ -1030,6 +1065,41 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         }
     }
 
+    /// 慢速模型：让复核链路在超时窗口内收不到回复。
+    struct SlowTransport;
+
+    impl crate::ai_client::AiTransport for SlowTransport {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _body: &'a Value,
+            _timeout_secs: u64,
+        ) -> crate::ai_client::BoxFuture<'a, Result<crate::ai_client::HttpReply, String>> {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(crate::ai_client::HttpReply {
+                    status: 200,
+                    body: r#"{"choices":[{"message":{"content":"{\"a\":\"L\",\"c\":0.8}"},"finish_reason":"stop"}]}"#.to_string(),
+                })
+            })
+        }
+
+        fn get_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(String, String)],
+            _timeout_secs: u64,
+        ) -> crate::ai_client::BoxFuture<'a, Result<crate::ai_client::HttpReply, String>> {
+            Box::pin(async move {
+                Ok(crate::ai_client::HttpReply {
+                    status: 404,
+                    body: "not found".to_string(),
+                })
+            })
+        }
+    }
+
     fn stored_strategy(db: &crate::db::Db) -> Value {
         let raw: String = db
             .conn
@@ -1075,7 +1145,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             std::sync::Arc::new(HoldParamTransport),
         )
         .with_market(std::sync::Arc::new(StaticMarket));
-        let reviewed = EngineAiReviewer::new(state)
+        let reviewed = EngineAiReviewer::new(state, None)
             .review(&proposal("long"))
             .unwrap();
         assert_eq!(reviewed.action, ReviewAction::Hold);
@@ -1103,7 +1173,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             std::sync::Arc::new(FakeTransport),
         )
         .with_market(std::sync::Arc::new(StaticMarket));
-        let reviewer = EngineAiReviewer::new(state);
+        let reviewer = EngineAiReviewer::new(state, None);
         let reviewed = reviewer.review(&proposal("long")).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
         let applied: String = db
@@ -1117,6 +1187,24 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             )
             .unwrap();
         assert_eq!(applied, "突破追多");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_timeout_returns_error() {
+        let path = std::env::temp_dir().join("nq-ai-reviewer-timeout.db");
+        let db = fixture(&path);
+        let state = AiState::with_transport(
+            db.clone(),
+            MASTER_KEY.as_bytes().to_vec(),
+            std::sync::Arc::new(SlowTransport),
+        )
+        .with_market(std::sync::Arc::new(StaticMarket));
+        let error = EngineAiReviewer::new(state, None)
+            .with_timeout(std::time::Duration::from_millis(50))
+            .review(&proposal("long"))
+            .expect_err("超过复核超时窗口必须失败");
+        assert!(error.contains("超时"), "错误要说明超时: {error}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1490,7 +1578,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             }),
         )
         .with_market(std::sync::Arc::new(StaticMarket));
-        let reviewed = EngineAiReviewer::new(state)
+        let reviewed = EngineAiReviewer::new(state, None)
             .review(&proposal("long"))
             .unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);

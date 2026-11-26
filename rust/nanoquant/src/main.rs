@@ -416,7 +416,10 @@ async fn main() {
         (Some(db), Some(ai)) if core_ready => match runtime::acquire_lock(&data_dir) {
             Ok(lock) => {
                 let mut engine = runtime::EngineRuntime::new(db, lock, master_key, events_bus)
-                    .with_reviewer(std::sync::Arc::new(ai_review::EngineAiReviewer::new(ai)))
+                    .with_reviewer(std::sync::Arc::new(ai_review::EngineAiReviewer::new(
+                        ai,
+                        tokio::runtime::Handle::try_current().ok(),
+                    )))
                     .with_cycle(cycle_signal, cycle_busy, runtime_active);
                 if let Some(client) = core_client.clone() {
                     engine = engine.with_exec_client(client);
