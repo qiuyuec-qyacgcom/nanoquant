@@ -62,6 +62,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   ai: [
     { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核', fields: ['use_invalidation_price', 'use_entry_price'] },
     { title: '否决与降仓', hint: 'AI 只决定能否开仓与降仓，不改写方向、杠杆、止损止盈', fields: ['veto_only', 'scale_on_confidence', 'fail_open_scale'] },
+    { title: '评分分流与缓存', hint: '高分直接放行、低分直接拒绝，仅中间区调用 AI；中间区结论按标的+方向+评分桶缓存', fields: ['high_score_threshold', 'low_score_threshold', 'review_cache_ttl_sec'] },
   ],
   ai_tuning: [
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
