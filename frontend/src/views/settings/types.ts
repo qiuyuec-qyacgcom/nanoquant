@@ -1,5 +1,16 @@
 export type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
 
+export interface FieldMeta {
+  label: string
+  hint?: string
+  unit?: string
+  widget?: Widget
+  options?: [string, string][]
+  min?: number
+  max?: number
+  step?: number
+}
+
 export interface FieldRow {
   key: string
   label: string
