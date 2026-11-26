@@ -1658,6 +1658,7 @@ impl EngineRuntime {
                 &crate::now().to_string(),
             )?;
         }
+        let ai_cfg = crate::ai_client::read_ai_config_conn(&tx);
         let drafts = if engine_is_enabled && !report.ai_symbols.is_empty() {
             Self::collect_entries(
                 &tx,
@@ -1698,7 +1699,20 @@ impl EngineRuntime {
         };
         tx.commit().map_err(|error| error.to_string())?;
         drop(conn);
-        let reviewed = Self::review_drafts(self.reviewer.as_deref(), drafts, true);
+        // AI 关闭或未要求同向时，量化信号独立开仓，只按 fail-open 系数降仓。
+        let ai_required = ai_cfg.enabled && ai_cfg.require_agreement;
+        let reviewer = if ai_required {
+            self.reviewer.as_deref()
+        } else {
+            None
+        };
+        let reviewed = Self::review_drafts(
+            reviewer,
+            drafts,
+            ai_required,
+            ai_cfg.veto_only,
+            ai_cfg.fail_open_scale,
+        );
 
         let mut conn = self
             .db
@@ -3029,15 +3043,36 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         reviewer: Option<&dyn crate::review::AiReviewer>,
         drafts: Vec<EntryDraft>,
         required: bool,
+        veto_only: bool,
+        fail_open_scale: f64,
     ) -> Vec<ReviewedDraft> {
         drafts
             .into_iter()
             .map(|draft| {
                 let proposal = draft.proposal();
-                let result = if required {
-                    crate::review::apply_review(&proposal, reviewer, true)
-                } else {
-                    crate::review::apply_review(&proposal, None, false)
+                let result = match crate::review::apply_review(
+                    &proposal, reviewer, required, veto_only,
+                ) {
+                    Ok(mut entry) => {
+                        if !required {
+                            entry.scale = Some(fail_open_scale);
+                        }
+                        Ok(entry)
+                    }
+                    // AI 明确拒绝/观望时仍然否决，不能被 fail-open 绕过。
+                    Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
+                    Err(error) => {
+                        crate::review::apply_review(&proposal, None, false, false).map(
+                            |mut entry| {
+                                entry.reason = format!(
+                                    "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
+                                    error.reason
+                                );
+                                entry.scale = Some(fail_open_scale);
+                                entry
+                            },
+                        )
+                    }
                 };
                 ReviewedDraft { draft, result }
             })
@@ -3059,7 +3094,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         let mut available = snapshot.account.available_balance;
         let now = crate::now();
         let mut audit: Vec<crate::signal_audit::AuditSignal> = Vec::new();
-        for ReviewedDraft { draft, result } in reviewed {
+        for ReviewedDraft { mut draft, result } in reviewed {
             let reviewed = match result {
                 Ok(reviewed) => reviewed,
                 Err(error) => {
@@ -3094,11 +3129,13 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         "leverage": reviewed.leverage,
                         "margin_pct": reviewed.margin_pct,
                         "stop_price": reviewed.stop_price,
+                        "scale": reviewed.scale,
                     }),
                 );
             }
             let features_text = serde_json::to_string(&features_value)
                 .unwrap_or_else(|_| draft.features_text.clone());
+            draft.features_text = features_text.clone();
             let final_side = if reviewed.side.is_empty() {
                 draft.side.clone()
             } else {
@@ -3118,7 +3155,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     * draft.scale.clamp(0.25, 2.0))
                 .clamp(0.0, 100.0)
             });
-            let (qty, _) = crate::risk::estimate_qty(
+            let (base_qty, _) = crate::risk::estimate_qty(
                 snapshot.account.equity,
                 draft.mark_price,
                 leverage,
@@ -3129,6 +3166,23 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 &draft.filter,
                 Some(available),
             );
+            // scale 只缩放下单数量，不改变保证金比例；缩到最小名义额以下时按交易所下限抬回。
+            let scale = reviewed.scale.unwrap_or(1.0).clamp(0.0, 1.0);
+            let mut qty = draft.filter.floor_qty(base_qty * scale);
+            if base_qty > 0.0 {
+                let buffer = cfg["min_notional_buffer"]
+                    .as_f64()
+                    .unwrap_or(1.05)
+                    .clamp(1.0, 3.0);
+                let need = draft.filter.effective_min_notional(draft.mark_price) * buffer;
+                let min_qty = draft
+                    .filter
+                    .effective_min_qty(draft.mark_price)
+                    .max(draft.filter.ceil_qty(need / draft.mark_price));
+                if qty < min_qty {
+                    qty = min_qty;
+                }
+            }
             let blocked = if qty <= 0.0 {
                 Some("可用余额或风险预算不足，下单量为 0".to_string())
             } else {
@@ -6258,6 +6312,7 @@ mod tests {
                     entry_price: None,
                     invalidation_text: None,
                     risk_text: None,
+                    scale: None,
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -6276,6 +6331,7 @@ mod tests {
                 entry_price: self.0,
                 invalidation_text: None,
                 risk_text: None,
+                scale: None,
             })
         }
     }
@@ -6643,6 +6699,7 @@ mod tests {
                 entry_price: None,
                 invalidation_text: None,
                 risk_text: None,
+                scale: None,
             })
         }
     }
@@ -7348,6 +7405,7 @@ mod tests {
                 entry_price: Some(99.8),
                 invalidation_text: Some("跌破 97.5 失效".to_string()),
                 risk_text: Some("高位放量；资金费率抬升".to_string()),
+                scale: None,
             })
         }
     }
@@ -7754,6 +7812,158 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             )
             .unwrap();
         assert_eq!(open, 1, "去重后新仓不应被再次全平");
+    }
+
+    fn entry_qty(db: &Db) -> f64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT qty FROM orders WHERE mode='demo' AND purpose='entry' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ai_disabled_opens_quant_entry_with_half_scale() {
+        let (base_db, base_snapshot) = entry_fixture().await;
+        test_runtime(&base_db)
+            .persist_snapshot("demo", &base_snapshot)
+            .unwrap();
+        let base_qty = entry_qty(&base_db);
+        assert!(base_qty > 0.0, "AI 启用时应正常开仓");
+
+        let (db, snapshot) = entry_fixture().await;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) \
+                 VALUES('ai','{\"enabled\":false,\"fail_open_scale\":0.5}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )
+            .unwrap();
+        test_runtime(&db)
+            .persist_snapshot("demo", &snapshot)
+            .unwrap();
+        let qty = entry_qty(&db);
+        assert!(qty > 0.0, "AI 关闭时量化信号必须照常开仓");
+        assert!(
+            (qty - base_qty * 0.5).abs() < 1e-9,
+            "AI 关闭时按 fail_open_scale 降仓: base={base_qty}, qty={qty}"
+        );
+    }
+
+    struct ErrorReviewer;
+
+    impl crate::review::AiReviewer for ErrorReviewer {
+        fn review(
+            &self,
+            _proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            Err("timeout".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_review_error_falls_open_with_half_scale() {
+        let (base_db, base_snapshot) = entry_fixture().await;
+        test_runtime(&base_db)
+            .persist_snapshot("demo", &base_snapshot)
+            .unwrap();
+        let base_qty = entry_qty(&base_db);
+        assert!(base_qty > 0.0, "AI 正常时应开仓");
+
+        let (db, snapshot) = entry_fixture().await;
+        test_runtime(&db)
+            .with_reviewer(Arc::new(ErrorReviewer))
+            .persist_snapshot("demo", &snapshot)
+            .unwrap();
+        let qty = entry_qty(&db);
+        assert!(qty > 0.0, "AI 复核失败必须 fail-open 到量化");
+        assert!(
+            (qty - base_qty * 0.5).abs() < 1e-9,
+            "AI 失败时按 fail_open_scale 降仓: base={base_qty}, qty={qty}"
+        );
+    }
+
+    struct ScaleReviewer {
+        margin_pct: Option<f64>,
+        scale: Option<f64>,
+    }
+
+    impl crate::review::AiReviewer for ScaleReviewer {
+        fn review(
+            &self,
+            proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            Ok(crate::review::ReviewDecision {
+                action: crate::review::ReviewAction::Agree,
+                side: Some(proposal.side.clone()),
+                leverage: None,
+                margin_pct: self.margin_pct,
+                stop_price: None,
+                take_profit: Some(proposal.take_profit),
+                reason: "scale test".to_string(),
+                confidence: 0.8,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
+                invalidation_text: None,
+                risk_text: None,
+                scale: self.scale,
+            })
+        }
+    }
+
+    async fn entry_with_scale(margin_pct: f64, scale: f64) -> (Db, f64, Value) {
+        let (db, snapshot) = entry_fixture().await;
+        test_runtime(&db)
+            .with_reviewer(Arc::new(ScaleReviewer {
+                margin_pct: Some(margin_pct),
+                scale: Some(scale),
+            }))
+            .persist_snapshot("demo", &snapshot)
+            .unwrap();
+        let qty = entry_qty(&db);
+        let features: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT features FROM signals WHERE mode='demo' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        (db, qty, value)
+    }
+
+    #[tokio::test]
+    async fn scale_only_affects_qty_not_margin_pct() {
+        let (_full_db, full_qty, full_features) = entry_with_scale(12.0, 1.0).await;
+        let (_half_db, half_qty, half_features) = entry_with_scale(12.0, 0.5).await;
+        assert!(full_qty > 0.0 && half_qty > 0.0);
+        assert!(
+            (half_qty - full_qty * 0.5).abs() < 1e-9,
+            "scale 必须只缩放下单数量: full={full_qty}, half={half_qty}"
+        );
+        assert_eq!(
+            full_features["ai_review"]["margin_pct"],
+            serde_json::json!(12.0)
+        );
+        assert_eq!(
+            half_features["ai_review"]["margin_pct"],
+            serde_json::json!(12.0),
+            "scale 不得作用于 margin_pct"
+        );
+        assert_eq!(half_features["ai_review"]["scale"], serde_json::json!(0.5));
     }
 
     fn entry_orders(db: &Db) -> i64 {

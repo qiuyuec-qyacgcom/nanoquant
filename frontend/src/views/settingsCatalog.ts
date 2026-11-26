@@ -61,6 +61,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   ],
   ai: [
     { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核', fields: ['use_invalidation_price', 'use_entry_price'] },
+    { title: '否决与降仓', hint: 'AI 只决定能否开仓与降仓，不改写方向、杠杆、止损止盈', fields: ['veto_only', 'scale_on_confidence', 'fail_open_scale'] },
   ],
   ai_tuning: [
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },

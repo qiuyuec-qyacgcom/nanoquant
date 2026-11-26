@@ -213,7 +213,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         },
     });
     crate::ai_analysis::gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
-    let messages = crate::ai_analysis::decision_messages_with_personas(&context, &cfg.personas);
+    let messages = crate::ai_analysis::decision_messages_for_mode(
+        &context,
+        &cfg.personas,
+        cfg.veto_only,
+    );
     let mut call = ChatCall::new(&messages, "engine_review");
     call.max_tokens = Some(16000);
     call.min_max_tokens = true;
@@ -239,7 +243,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
     // AI 新协议字段照常落在审计里；`use_invalidation_price` / `use_entry_price`
     // 只在消费点（快速风控、限价开仓）决定是否采用，复核出口不得清空。
-    let reviewed = decision_to_review(
+    let reviewed = decision_to_review_mode(
         &proposal,
         side_lock,
         &decision,
@@ -247,6 +251,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.require_agreement,
         cfg.allow_ai_override,
         min_entry_rr,
+        cfg.veto_only,
+        cfg.scale_on_confidence,
     )?;
     Ok(fill_default_valid_bars(reviewed, &strategy_cfg))
 }
@@ -285,6 +291,7 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         entry_price: None,
         invalidation_text: None,
         risk_text: None,
+        scale: None,
     }
 }
 
@@ -319,6 +326,8 @@ fn reject_with(reason: impl Into<String>, decision: &ai_client::Decision) -> Rev
     }
 }
 
+/// 兼容旧调用：保留完整的 AI 覆盖语义（非否决、无置信度缩放）。
+#[cfg(test)]
 fn decision_to_review(
     proposal: &EntryProposal,
     side_lock: &str,
@@ -327,6 +336,30 @@ fn decision_to_review(
     require_agreement: bool,
     allow_ai_override: bool,
     min_entry_rr: f64,
+) -> Result<ReviewDecision, String> {
+    decision_to_review_mode(
+        proposal,
+        side_lock,
+        decision,
+        min_confidence,
+        require_agreement,
+        allow_ai_override,
+        min_entry_rr,
+        false,
+        false,
+    )
+}
+
+fn decision_to_review_mode(
+    proposal: &EntryProposal,
+    side_lock: &str,
+    decision: &ai_client::Decision,
+    min_confidence: f64,
+    require_agreement: bool,
+    allow_ai_override: bool,
+    min_entry_rr: f64,
+    veto_only: bool,
+    scale_on_confidence: bool,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
         let mut rejected = reject_with(
@@ -340,6 +373,11 @@ fn decision_to_review(
         return Ok(rejected);
     }
     let action = decision.action.as_str();
+    let scale = if scale_on_confidence {
+        Some((0.5 + 0.5 * decision.confidence).clamp(0.5, 1.0))
+    } else {
+        None
+    };
     let side = match action {
         "open_long" => "long",
         "open_short" => "short",
@@ -365,6 +403,7 @@ fn decision_to_review(
                 entry_price: decision.entry_price,
                 invalidation_text,
                 risk_text,
+                scale: None,
             })
         }
     };
@@ -394,6 +433,38 @@ fn decision_to_review(
     }
     if side_lock == "short" && side == "long" {
         return Ok(reject_with("策略只允许做空，AI 方向相反", decision));
+    }
+    // 否决模式：AI 只保留能否开仓与降仓，方向、杠杆、止损、止盈全部交回量化。
+    if veto_only {
+        if side != proposal.side {
+            return Ok(reject_with(
+                "AI 方向与量化相反，否决模式不覆盖方向",
+                decision,
+            ));
+        }
+        let (invalidation_text, risk_text) = text_fields(decision);
+        return Ok(ReviewDecision {
+            action: ReviewAction::Agree,
+            side: None,
+            leverage: None,
+            margin_pct: None,
+            stop_price: None,
+            take_profit: None,
+            reason: if decision.reason.is_empty() {
+                "AI 通过（否决模式）".to_string()
+            } else {
+                decision.reason.clone()
+            },
+            confidence: decision.confidence,
+            invalidation_price: decision.invalidation_price,
+            valid_bars: decision.valid_bars,
+            data_quality: decision.data_quality,
+            rr_target: decision.rr_target,
+            entry_price: decision.entry_price,
+            invalidation_text,
+            risk_text,
+            scale,
+        });
     }
     if let Some(quant_side) = proposal.quant_side.as_deref() {
         if quant_side != side {
@@ -484,6 +555,7 @@ fn decision_to_review(
         entry_price: decision.entry_price,
         invalidation_text,
         risk_text,
+        scale,
     })
 }
 
@@ -1181,7 +1253,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             }
         }
         let clamped =
-            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
+            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true, false).unwrap();
         assert_eq!(clamped.leverage, 2.0, "AI 未给杠杆时取全局下限");
         assert_eq!(clamped.stop_price, 90.0, "AI 给出的止损价直接生效");
     }

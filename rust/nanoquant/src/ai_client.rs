@@ -778,6 +778,12 @@ pub struct AiConfig {
     pub inject_mantras: bool,
     pub require_agreement: bool,
     pub allow_ai_override: bool,
+    /// 否决模式：AI 只决定能否开仓与降仓，不改写方向、杠杆、止损、止盈。
+    pub veto_only: bool,
+    /// 是否按 AI 置信度缩放仓位（0.5 + 0.5 * c）。
+    pub scale_on_confidence: bool,
+    /// AI 不可用/复核失败时的降仓系数。
+    pub fail_open_scale: f64,
     // AI 新协议字段：是否在复核出口透传失效价与入场价，默认关闭以保持旧行为。
     pub use_invalidation_price: bool,
     pub use_entry_price: bool,
@@ -801,6 +807,9 @@ impl Default for AiConfig {
             inject_mantras: true,
             require_agreement: true,
             allow_ai_override: false,
+            veto_only: false,
+            scale_on_confidence: false,
+            fail_open_scale: 0.5,
             use_invalidation_price: false,
             use_entry_price: false,
             personas: Vec::new(),
@@ -869,6 +878,17 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     }
     if let Some(item) = value.get("allow_ai_override").and_then(Value::as_bool) {
         cfg.allow_ai_override = item;
+    }
+    if let Some(item) = value.get("veto_only").and_then(Value::as_bool) {
+        cfg.veto_only = item;
+    }
+    if let Some(item) = value.get("scale_on_confidence").and_then(Value::as_bool) {
+        cfg.scale_on_confidence = item;
+    }
+    if let Some(item) = value.get("fail_open_scale").and_then(Value::as_f64) {
+        if item.is_finite() {
+            cfg.fail_open_scale = item.clamp(0.0, 1.0);
+        }
     }
     if let Some(item) = value.get("use_invalidation_price").and_then(Value::as_bool) {
         cfg.use_invalidation_price = item;

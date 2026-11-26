@@ -32,6 +32,8 @@ pub(crate) struct ReviewDecision {
     pub invalidation_text: Option<String>,
     /// AI 给出的风险提示文本（risk）。
     pub risk_text: Option<String>,
+    /// 下单数量缩放系数（0~1）；None 表示不缩放。
+    pub scale: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +82,8 @@ pub(crate) struct ReviewedEntry {
     pub invalidation_text: Option<String>,
     /// AI 给出的风险提示文本（risk）。
     pub risk_text: Option<String>,
+    /// 下单数量缩放系数（0~1）；None 表示不缩放。
+    pub scale: Option<f64>,
 }
 
 /// AI 自评字段的载体：拒单/观望也要把 dq、rr 等落进审计。
@@ -203,6 +207,7 @@ pub(crate) fn apply_review(
     proposal: &EntryProposal,
     reviewer: Option<&dyn AiReviewer>,
     required: bool,
+    veto_only: bool,
 ) -> Result<ReviewedEntry, ReviewError> {
     if !proposal.leverage.is_finite() || proposal.leverage <= 0.0 {
         return Err(ReviewError::new("原始杠杆无效", "reject"));
@@ -226,7 +231,7 @@ pub(crate) fn apply_review(
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
             leverage: proposal.leverage,
-            margin_pct: None,
+            margin_pct: veto_only.then_some(proposal.margin_pct),
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
@@ -239,15 +244,16 @@ pub(crate) fn apply_review(
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
         ReviewError::new(
-            format!("AI 复核失败，按 fail-closed 跳过: {error}"),
+            format!("AI 复核失败，按 fail-open 降仓: {error}"),
             "error",
         )
     })?;
-    apply_decision(proposal, decision)
+    apply_decision(proposal, decision, veto_only)
 }
 
 /// 杠杆由 AI 在 [下限, 上限] 内决定；未给值时回退到下限。
@@ -270,7 +276,85 @@ fn clamp_margin(proposal: &EntryProposal, requested: Option<f64>) -> Option<f64>
 fn apply_decision(
     proposal: &EntryProposal,
     decision: ReviewDecision,
+    veto_only: bool,
 ) -> Result<ReviewedEntry, ReviewError> {
+    let confidence = decision.confidence;
+    let meta = AiMeta::from(&decision);
+    let scale = decision
+        .scale
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(0.0, 1.0));
+    // 否决模式：AI 只能拦单和降仓，不得改写方向、杠杆、止损、止盈与保证金。
+    if veto_only {
+        if proposal.stop_price <= 0.0 || proposal.take_profit <= 0.0 {
+            return Err(
+                ReviewError::new("缺少有效止损/止盈价，无法开仓", "reject").with_meta(&decision)
+            );
+        }
+        match decision.action {
+            ReviewAction::Agree | ReviewAction::Tighten => {
+                let action = if decision.action == ReviewAction::Tighten {
+                    "tighten".to_string()
+                } else {
+                    action_for(&proposal.side)
+                };
+                return Ok(ReviewedEntry {
+                    side: proposal.side.clone(),
+                    leverage: proposal.leverage,
+                    margin_pct: Some(proposal.margin_pct),
+                    stop_price: proposal.stop_price,
+                    take_profit: proposal.take_profit,
+                    invalidation_price: decision.invalidation_price,
+                    valid_bars: decision.valid_bars,
+                    data_quality: decision.data_quality,
+                    rr_target: decision.rr_target,
+                    entry_price: decision.entry_price,
+                    invalidation_text: decision.invalidation_text,
+                    risk_text: decision.risk_text,
+                    reason: decision.reason,
+                    action,
+                    confidence,
+                    scale,
+                });
+            }
+            ReviewAction::Hold => {
+                return Err(ReviewError {
+                    reason: if decision.reason.is_empty() {
+                        "AI 观望".to_string()
+                    } else {
+                        decision.reason
+                    },
+                    action: "hold".to_string(),
+                    confidence,
+                    invalidation_price: meta.invalidation_price,
+                    valid_bars: meta.valid_bars,
+                    data_quality: meta.data_quality,
+                    rr_target: meta.rr_target,
+                    entry_price: meta.entry_price,
+                    invalidation_text: meta.invalidation_text,
+                    risk_text: meta.risk_text,
+                })
+            }
+            ReviewAction::Reject => {
+                return Err(ReviewError {
+                    reason: if decision.reason.is_empty() {
+                        "AI 拒绝".to_string()
+                    } else {
+                        decision.reason
+                    },
+                    action: "reject".to_string(),
+                    confidence,
+                    invalidation_price: meta.invalidation_price,
+                    valid_bars: meta.valid_bars,
+                    data_quality: meta.data_quality,
+                    rr_target: meta.rr_target,
+                    entry_price: meta.entry_price,
+                    invalidation_text: meta.invalidation_text,
+                    risk_text: meta.risk_text,
+                })
+            }
+        }
+    }
     let side = decision
         .side
         .clone()
@@ -303,8 +387,6 @@ fn apply_decision(
     if !stop_price.is_finite() || stop_price <= 0.0 {
         return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision));
     }
-    let confidence = decision.confidence;
-    let meta = AiMeta::from(&decision);
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
             side: side.clone(),
@@ -326,6 +408,7 @@ fn apply_decision(
             reason: decision.reason,
             action: action_for(&side),
             confidence,
+            scale,
         }),
         ReviewAction::Hold => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -378,6 +461,7 @@ fn apply_decision(
                 reason: decision.reason,
                 action: "tighten".to_string(),
                 confidence,
+                scale,
             })
         }
     }
@@ -429,31 +513,68 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }
     }
 
     #[test]
     fn agree_keeps_the_original_plan() {
         let reviewer = FakeReviewer(Ok(decision(ReviewAction::Agree)));
-        let reviewed = apply_review(&proposal(), Some(&reviewer), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&reviewer), true, false).unwrap();
         assert_eq!(reviewed.leverage, 10.0);
         assert_eq!(reviewed.stop_price, 95.0);
+    }
+
+    #[test]
+    fn veto_only_ignores_ai_leverage_stop_and_side() {
+        let reviewer = FakeReviewer(Ok(ReviewDecision {
+            action: ReviewAction::Tighten,
+            side: Some("short".to_string()),
+            leverage: Some(18.0),
+            margin_pct: Some(22.0),
+            stop_price: Some(80.0),
+            take_profit: Some(200.0),
+            reason: "ai tighten".to_string(),
+            confidence: 0.8,
+            invalidation_price: None,
+            valid_bars: None,
+            data_quality: None,
+            rr_target: None,
+            entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
+            scale: Some(0.7),
+        }));
+        let reviewed = apply_review(&proposal(), Some(&reviewer), true, true).unwrap();
+        assert_eq!(reviewed.side, "long", "否决模式必须保留量化方向");
+        assert_eq!(reviewed.leverage, 10.0, "AI 杠杆不得生效");
+        assert_eq!(reviewed.stop_price, 95.0, "AI 止损不得生效");
+        assert_eq!(reviewed.take_profit, 110.0, "AI 止盈不得生效");
+        assert_eq!(
+            reviewed.margin_pct,
+            Some(20.0),
+            "保证金必须保留量化中枢比例"
+        );
+        assert_eq!(reviewed.scale, Some(0.7), "scale 仍可用于降仓");
+        assert_eq!(reviewed.action, "tighten", "保留 AI 的动作语义");
+        assert_eq!(reviewed.confidence, 0.8);
+        assert_eq!(reviewed.reason, "ai tighten");
     }
 
     #[test]
     fn ai_margin_is_clamped_to_the_configured_center_band() {
         let mut low = decision(ReviewAction::Agree);
         low.margin_pct = Some(12.0);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(low))), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(low))), true, false).unwrap();
         assert_eq!(reviewed.margin_pct, Some(15.0), "低于中枢-5% 必须抬回 15%");
 
         let mut high = decision(ReviewAction::Agree);
         high.margin_pct = Some(28.0);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(high))), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(high))), true, false).unwrap();
         assert_eq!(reviewed.margin_pct, Some(25.0), "高于中枢+5% 必须压回 25%");
 
         let missing = decision(ReviewAction::Agree);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(missing))), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(missing))), true, false).unwrap();
         assert_eq!(reviewed.margin_pct, None, "未给 margin 时交给 runtime 走 ATR 回退");
     }
 
@@ -475,8 +596,9 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&too_high), true, false).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
         assert_eq!(reviewed.stop_price, 90.0, "AI 给出的止损价直接生效");
 
@@ -496,8 +618,9 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        let reviewed = apply_review(&proposal(), Some(&raised), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&raised), true, false).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
 
         let too_low = FakeReviewer(Ok(ReviewDecision {
@@ -516,17 +639,18 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        let reviewed = apply_review(&proposal(), Some(&too_low), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&too_low), true, false).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
     }
 
     #[test]
     fn missing_ai_leverage_falls_back_to_the_lower_bound() {
         let silent = FakeReviewer(Ok(decision(ReviewAction::Tighten)));
-        let reviewed = apply_review(&proposal(), Some(&silent), true).unwrap();
+        let reviewed = apply_review(&proposal(), Some(&silent), true, false).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "AI 未给杠杆时取下限");
-        let unreviewed = apply_review(&proposal(), None, false).unwrap();
+        let unreviewed = apply_review(&proposal(), None, false, false).unwrap();
         assert_eq!(unreviewed.leverage, 10.0, "AI 未启用时同样取下限");
     }
 
@@ -548,12 +672,13 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        assert!(apply_review(&proposal(), Some(&reject), false).is_err());
+        assert!(apply_review(&proposal(), Some(&reject), false, false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
-        assert!(apply_review(&proposal(), Some(&timeout), false).is_err());
-        assert!(apply_review(&proposal(), None, true).is_err());
-        assert!(apply_review(&proposal(), None, false).is_ok());
+        assert!(apply_review(&proposal(), Some(&timeout), false, false).is_err());
+        assert!(apply_review(&proposal(), None, true, false).is_err());
+        assert!(apply_review(&proposal(), None, false, false).is_ok());
     }
 
     #[test]
@@ -574,8 +699,9 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        let error = apply_review(&proposal(), Some(&hold), true).unwrap_err();
+        let error = apply_review(&proposal(), Some(&hold), true, false).unwrap_err();
         assert_eq!(error.action, "hold");
         assert!((error.confidence - 0.62).abs() < 1e-9);
         assert_eq!(error.reason, "观望");
@@ -599,8 +725,9 @@ mod tests {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }));
-        assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
+        assert!(apply_review(&proposal(), Some(&invalid), true, false).is_err());
     }
 
     #[test]
@@ -612,7 +739,7 @@ mod tests {
         rejected.invalidation_price = Some(97.5);
         rejected.valid_bars = Some(6);
         rejected.entry_price = Some(99.8);
-        let error = apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true)
+        let error = apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true, false)
             .expect_err("Reject 必须转成错误");
         assert_eq!(error.action, "reject");
         assert_eq!(error.data_quality, Some(0.3));
@@ -634,7 +761,7 @@ mod tests {
         rejected.data_quality = Some(0.3);
         rejected.rr_target = Some(0.5);
         let error =
-            apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true).unwrap_err();
+            apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true, false).unwrap_err();
         let mut row = crate::signal_audit::AuditSignal::new("BTCUSDT");
         let meta = AiMeta::from(&error);
         row.data_quality = meta.data_quality;

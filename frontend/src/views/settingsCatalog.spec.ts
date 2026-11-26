@@ -159,7 +159,13 @@ describe('参数配置目录', () => {
     expect(filter?.fields).toContain('min_entry_rr')
   })
 
-  it('AI 复核分组包含两个开关', () => {
-    expect([...explicitKeys('ai')].sort()).toEqual(['use_entry_price', 'use_invalidation_price'])
+  it('AI 复核分组覆盖否决与降仓开关', () => {
+    expect([...explicitKeys('ai')].sort()).toEqual([
+      'fail_open_scale',
+      'scale_on_confidence',
+      'use_entry_price',
+      'use_invalidation_price',
+      'veto_only',
+    ])
   })
 })

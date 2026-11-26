@@ -106,6 +106,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai", "timeout_sec", 1.0, 300.0, 1.0),
     ("ai", "temperature", 0.0, 2.0, 0.1),
     ("ai", "decision_schema_version", 1.0, 10.0, 1.0),
+    ("ai", "fail_open_scale", 0.0, 1.0, 0.05),
     ("data", "kline_limit", 10.0, 1000.0, 10.0),
     ("data", "ticker_ttl_sec", 1.0, 3600.0, 1.0),
     ("data", "kline_ttl_sec", 1.0, 3600.0, 1.0),
@@ -200,7 +201,16 @@ const VISIBLE: &[(&str, &[&str])] = &[
         "symbol_scan",
         &["enabled", "interval_hours", "market_limit"],
     ),
-    ("ai", &["use_invalidation_price", "use_entry_price"]),
+    (
+        "ai",
+        &[
+            "use_invalidation_price",
+            "use_entry_price",
+            "veto_only",
+            "scale_on_confidence",
+            "fail_open_scale",
+        ],
+    ),
     (
         "risk",
         &[

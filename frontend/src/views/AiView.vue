@@ -32,6 +32,9 @@ const aiCfg = reactive<any>({
   min_confidence: 0.45,
   require_agreement: true,
   allow_ai_override: false,
+  veto_only: true,
+  scale_on_confidence: true,
+  fail_open_scale: 0.5,
   max_calls_per_hour: 30,
   monthly_budget_usd: 3,
   timeout_sec: 45,
@@ -394,6 +397,18 @@ onMounted(loadAll)
           <div class="row" style="gap: 6px">
             <div class="switch" :class="{ on: aiCfg.allow_ai_override }" @click="aiCfg.allow_ai_override = !aiCfg.allow_ai_override" />
             <span class="label">允许 AI 反向覆盖信号</span>
+          </div>
+          <div class="row" style="gap: 6px">
+            <div class="switch" :class="{ on: aiCfg.veto_only }" @click="aiCfg.veto_only = !aiCfg.veto_only" />
+            <span class="label">仅否决/降仓（不改方向、杠杆、止损止盈）</span>
+          </div>
+          <div class="row" style="gap: 6px">
+            <div class="switch" :class="{ on: aiCfg.scale_on_confidence }" @click="aiCfg.scale_on_confidence = !aiCfg.scale_on_confidence" />
+            <span class="label">按置信度缩放仓位</span>
+          </div>
+          <div class="field" style="min-width: 150px">
+            <span class="label">AI 不可用降仓系数</span>
+            <input v-model.number="aiCfg.fail_open_scale" type="number" step="0.05" min="0" max="1" class="input mono" />
           </div>
           <div class="row" style="gap: 6px">
             <div class="switch" :class="{ on: aiCfg.inject_mantras }" @click="aiCfg.inject_mantras = !aiCfg.inject_mantras" />
