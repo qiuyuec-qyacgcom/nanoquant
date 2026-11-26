@@ -3207,7 +3207,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         now: i64,
         features: Option<&str>,
     ) -> Result<(), String> {
-        tx.execute("INSERT INTO positions(symbol,side,qty,entry_price,mark_price,leverage,margin,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,realized_pnl,fees,status,mode,venue_unrealized,venue_ts,partial_taken_at,ai_confidence,ai_reason,entry_slippage_bps,trade_id) VALUES(?1,?2,?3,?4,?4,?5,?6,?7,?8,?4,?7,?9,?10,0,0,'',0,?11,'open',?12,0,0,0,0,'',0,0)", (symbol, side, qty, price, entry.leverage, qty * price / entry.leverage, entry.stop, entry.take_profit, entry.score, now, qty * price * fee_rate, mode)).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO positions(symbol,side,qty,entry_price,mark_price,leverage,margin,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,realized_pnl,fees,status,mode,venue_unrealized,venue_ts,partial_taken_at,ai_confidence,ai_reason,entry_slippage_bps,trade_id,invalidation_price) VALUES(?1,?2,?3,?4,?4,?5,?6,?7,?8,?4,?7,?9,?10,0,0,'',0,?11,'open',?12,0,0,0,0,'',0,0,?13)", (symbol, side, qty, price, entry.leverage, qty * price / entry.leverage, entry.stop, entry.take_profit, entry.score, now, qty * price * fee_rate, mode, entry.invalidation_price)).map_err(|e| e.to_string())?;
         if let Some(features) = features {
             let id = tx.last_insert_rowid();
             tx.execute(
@@ -5566,6 +5566,43 @@ async fn refresh_account_balance(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn entry_position_persists_invalidation_price() {
+        // 开仓落库必须把 AI 失效价写进 positions.invalidation_price。
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL,
+             entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL,
+             tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL,
+             opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT,
+             realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL,
+             venue_ts INTEGER, partial_taken_at INTEGER, ai_confidence REAL, ai_reason TEXT,
+             entry_slippage_bps REAL, trade_id INTEGER, invalidation_price REAL, features TEXT);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        let terms = EntryTerms {
+            leverage: 5.0,
+            stop: 95.0,
+            take_profit: 110.0,
+            score: 0.8,
+            invalidation_price: Some(97.0),
+        };
+        EngineRuntime::insert_entry_position(
+            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let stored: Option<f64> = conn
+            .query_row(
+                "SELECT invalidation_price FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, Some(97.0));
+    }
 
     #[test]
     fn roi_min_r_reads_strategy_and_matches_backtest_config() {
