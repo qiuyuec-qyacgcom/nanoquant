@@ -3699,55 +3699,101 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     side,
                     rl_cfg.max_wait_ms,
                 );
+                // Wait：上限内本轮不生成订单，候选留待下一轮重新评估。
+                if matches!(resolved.kind, crate::rl_exec::OrderKind::Wait) {
+                    let mut row = draft
+                        .audit_row(
+                            "pending",
+                            draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                            "",
+                            &reviewed.action,
+                            reviewed.confidence,
+                            &reviewed.reason,
+                            Some(&crate::review::AiMeta::from(&reviewed)),
+                        )
+                        .with_feature("client_order_id", serde_json::json!(&draft.client_id))
+                        .with_feature("rl_action", serde_json::json!("wait"))
+                        .with_feature("rl_deferred", serde_json::json!(true));
+                    if let Some(note) = &resolved.note {
+                        row = row.with_feature("rl_note", serde_json::json!(note));
+                    }
+                    audit.push(row);
+                    break;
+                }
                 let order_type = match resolved.kind {
                     crate::rl_exec::OrderKind::Market => LiveOrderType::Market,
                     crate::rl_exec::OrderKind::Limit => LiveOrderType::LimitPostOnly,
+                    crate::rl_exec::OrderKind::Wait => {
+                        unreachable!("Wait 已在上方提前跳过")
+                    }
                 };
                 // RL 偏移价必须按交易所 tick 归整：买单向下、卖单向上，
                 // 与 AI 限价走同一条归整路径，避免 -4014 精度拒绝。
-                let price = resolved.price.map(|price| match resolved.kind {
-                    crate::rl_exec::OrderKind::Limit => {
+                let price = match resolved.kind {
+                    crate::rl_exec::OrderKind::Limit => resolved.price.map(|price| {
                         if side == "BUY" {
                             crate::live::floor_to_step(price, draft.filter.price_tick)
                         } else {
                             crate::live::ceil_to_step(price, draft.filter.price_tick)
                         }
+                    }),
+                    crate::rl_exec::OrderKind::Market => resolved.price,
+                    crate::rl_exec::OrderKind::Wait => None,
+                };
+                // Split：每笔真实下单，单笔按 filter.floor_qty 归整，余量并入最后一笔。
+                let qtys = if resolved.parts >= 2 {
+                    crate::rl_exec::split_qtys(qty, resolved.parts, |value| {
+                        draft.filter.floor_qty(value)
+                    })
+                } else {
+                    vec![qty]
+                };
+                let split_total = qtys.len();
+                for (part_index, part_qty) in qtys.iter().copied().enumerate() {
+                    let client_id = if split_total > 1 {
+                        format!("{}-s{part_index}", draft.client_id)
+                    } else {
+                        draft.client_id.clone()
+                    };
+                    plans.push(LivePlan {
+                        symbol: draft.symbol.clone(),
+                        position_side: final_side.clone(),
+                        side: side.into(),
+                        qty: part_qty,
+                        purpose: "entry".into(),
+                        mark_price: draft.mark_price,
+                        order_type,
+                        price,
+                        entry: Some(entry.clone()),
+                        features: Some(features_text.clone()),
+                    });
+                    // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
+                    let mut row = draft
+                        .audit_row(
+                            "pending",
+                            draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                            "",
+                            &reviewed.action,
+                            reviewed.confidence,
+                            &reviewed.reason,
+                            Some(&crate::review::AiMeta::from(&reviewed)),
+                        )
+                        .with_feature("client_order_id", serde_json::json!(&client_id));
+                    if rl_cfg.enabled {
+                        row = row
+                            .with_feature("rl_action", serde_json::json!(&resolved.action_key))
+                            .with_feature("rl_degraded", serde_json::json!(resolved.degraded));
+                        if let Some(note) = &resolved.note {
+                            row = row.with_feature("rl_note", serde_json::json!(note));
+                        }
+                        if split_total > 1 {
+                            row = row
+                                .with_feature("rl_split", serde_json::json!(split_total))
+                                .with_feature("rl_part", serde_json::json!(part_index));
+                        }
                     }
-                    crate::rl_exec::OrderKind::Market => price,
-                });
-                plans.push(LivePlan {
-                    symbol: draft.symbol.clone(),
-                    position_side: final_side.clone(),
-                    side: side.into(),
-                    qty,
-                    purpose: "entry".into(),
-                    mark_price: draft.mark_price,
-                    order_type,
-                    price,
-                    entry: Some(entry),
-                    features: Some(features_text.clone()),
-                });
-                // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
-                let mut row = draft
-                    .audit_row(
-                        "pending",
-                        draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
-                        "",
-                        &reviewed.action,
-                        reviewed.confidence,
-                        &reviewed.reason,
-                        Some(&crate::review::AiMeta::from(&reviewed)),
-                    )
-                    .with_feature("client_order_id", serde_json::json!(&draft.client_id));
-                if rl_cfg.enabled {
-                    row = row
-                        .with_feature("rl_action", serde_json::json!(&resolved.action_key))
-                        .with_feature("rl_degraded", serde_json::json!(resolved.degraded));
-                    if let Some(note) = &resolved.note {
-                        row = row.with_feature("rl_note", serde_json::json!(note));
-                    }
+                    audit.push(row);
                 }
-                audit.push(row);
                 break;
             }
             let exists: bool = tx

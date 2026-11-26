@@ -416,11 +416,12 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// 下单方式，与 runtime 的 `LiveOrderType` 一一对应。
+/// 下单方式，与 runtime 的 `LiveOrderType` 对应；`Wait` 表示本轮不生成订单。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OrderKind {
     Market,
     Limit,
+    Wait,
 }
 
 /// 执行器真正能落地的下单方式。
@@ -432,6 +433,8 @@ pub(crate) struct ResolvedExecution {
     /// 动作在当前执行器不可实现，已退化。
     pub degraded: bool,
     pub note: Option<String>,
+    /// 拆单笔数；非拆单为 1。
+    pub parts: u8,
 }
 
 /// 把 RL 动作落成真实下单参数。
@@ -439,8 +442,8 @@ pub(crate) struct ResolvedExecution {
 /// - 关闭时原样返回默认执行方式（市场/限价与价格都不动）。
 /// - `Market` 保持默认。
 /// - `Limit(offset)` 在默认限价上按 bps 偏移：买单下移、卖单上移。
-/// - `Wait` 暂无跨轮挂起机制，退化为 `Limit(0)`。
-/// - `Split` 暂无拆单机制，退化为单笔，保留默认下单方式。
+/// - `Wait(ms)` 在 `max_wait_ms` 内本轮不下单，候选留待下一轮；超上限才退化为 `Limit(0)`。
+/// - `Split(n)` 返回拆单笔数，由调用方按 `n` 笔真实下单。
 pub(crate) fn resolve_execution(
     enabled: bool,
     default_kind: OrderKind,
@@ -453,12 +456,13 @@ pub(crate) fn resolve_execution(
     let untouched = ResolvedExecution {
         kind: default_kind,
         price: match default_kind {
-            OrderKind::Market => None,
+            OrderKind::Market | OrderKind::Wait => None,
             OrderKind::Limit => default_price,
         },
         action_key: "market".to_string(),
         degraded: false,
         note: None,
+        parts: 1,
     };
     if !enabled {
         return untouched;
@@ -490,10 +494,22 @@ pub(crate) fn resolve_execution(
                 action_key: action.key(),
                 degraded: false,
                 note: None,
+                parts: 1,
             }
         }
         RlAction::Wait(ms) => {
-            let capped = ms.min(max_wait_ms.max(1));
+            if ms > 0 && ms <= max_wait_ms {
+                return ResolvedExecution {
+                    kind: OrderKind::Wait,
+                    price: None,
+                    action_key: "wait".to_string(),
+                    degraded: false,
+                    note: Some(format!(
+                        "本轮等待 {ms}ms，候选留待下一轮重新评估"
+                    )),
+                    parts: 1,
+                };
+            }
             let Some(base) = default_price else {
                 return ResolvedExecution {
                     action_key: action.key(),
@@ -502,28 +518,55 @@ pub(crate) fn resolve_execution(
                     ..untouched
                 };
             };
-            let note = if ms > max_wait_ms {
-                format!("等待 {ms}ms 超过上限 {max_wait_ms}ms，退化为限价挂单")
-            } else {
-                format!("等待 {capped}ms 暂无跨轮挂起，退化为限价挂单")
-            };
             ResolvedExecution {
                 kind: OrderKind::Limit,
                 price: Some(base),
                 action_key: action.key(),
                 degraded: true,
-                note: Some(note),
+                note: Some(format!(
+                    "等待 {ms}ms 超过上限 {max_wait_ms}ms，退化为限价挂单"
+                )),
+                parts: 1,
             }
         }
-        RlAction::Split(parts) => ResolvedExecution {
-            action_key: action.key(),
-            degraded: true,
-            note: Some(format!(
-                "拆 {parts} 笔暂无执行器支持，退化为单笔"
-            )),
-            ..untouched
-        },
+        RlAction::Split(parts) => {
+            let parts = parts.clamp(2, 3);
+            ResolvedExecution {
+                action_key: action.key(),
+                degraded: false,
+                note: Some(format!("拆 {parts} 笔下单")),
+                parts,
+                ..untouched
+            }
+        }
     }
+}
+
+/// 拆单数量：每笔按 `floor` 归整，余量并入最后一笔。
+///
+/// `floor` 由调用方传入 `SymbolFilter::floor_qty`；单笔归整后为 0
+/// 或余量非正时退化为单笔，避免生成无法下单的子单。
+pub(crate) fn split_qtys<F>(qty: f64, parts: u8, floor: F) -> Vec<f64>
+where
+    F: Fn(f64) -> f64,
+{
+    let parts = parts.clamp(2, 3);
+    if !qty.is_finite() || qty <= 0.0 {
+        return Vec::new();
+    }
+    let per = floor(qty / parts as f64);
+    if !per.is_finite() || per <= 0.0 {
+        return vec![qty];
+    }
+    let last = qty - per * (parts - 1) as f64;
+    if !last.is_finite() || last <= 0.0 {
+        return vec![qty];
+    }
+    let mut qtys = vec![per; parts as usize];
+    if let Some(slot) = qtys.last_mut() {
+        *slot = last;
+    }
+    qtys
 }
 
 /// 滑点模型：市价吃半价差，限价挂 offset 换来更优价，拆单摊薄冲击。
@@ -900,7 +943,57 @@ mod tests {
             3000,
         );
         assert_eq!(split.kind, OrderKind::Market);
-        assert!(split.degraded);
+        assert!(!split.degraded);
+        assert_eq!(split.parts, 3);
+    }
+
+    #[test]
+    fn split_action_creates_n_orders() {
+        let floor = |value: f64| (value * 100.0).floor() / 100.0;
+        let qtys = split_qtys(1.0, 3, floor);
+        assert_eq!(qtys.len(), 3, "必须拆成 3 笔订单");
+        assert!((qtys[0] - 0.33).abs() < 1e-9);
+        assert!((qtys[1] - 0.33).abs() < 1e-9);
+        assert!((qtys[2] - 0.34).abs() < 1e-9, "余量并入最后一笔");
+        assert!((qtys.iter().sum::<f64>() - 1.0).abs() < 1e-9, "总量必须等于原 qty");
+
+        let qtys = split_qtys(0.05, 2, floor);
+        assert_eq!(qtys.len(), 2);
+        assert!((qtys.iter().sum::<f64>() - 0.05).abs() < 1e-9);
+
+        let qtys = split_qtys(0.005, 2, floor);
+        assert_eq!(qtys.len(), 1, "单笔归整为 0 时退化为单笔");
+        assert!((qtys[0] - 0.005).abs() < 1e-9);
+
+        let qtys = split_qtys(0.0, 3, floor);
+        assert!(qtys.is_empty(), "零数量不拆单");
+    }
+
+    #[test]
+    fn wait_action_skips_order_and_audits() {
+        let wait = resolve_execution(
+            true,
+            OrderKind::Market,
+            Some(100.0),
+            RlAction::Wait(500),
+            "BUY",
+            3000,
+        );
+        assert_eq!(wait.kind, OrderKind::Wait, "上限内必须真实等待，不生成订单");
+        assert_eq!(wait.price, None);
+        assert!(!wait.degraded);
+        assert!(wait.note.unwrap().contains("下一轮"));
+
+        let over = resolve_execution(
+            true,
+            OrderKind::Market,
+            Some(100.0),
+            RlAction::Wait(5000),
+            "BUY",
+            3000,
+        );
+        assert_eq!(over.kind, OrderKind::Limit, "超出等待上限退化为限价挂单");
+        assert!(over.degraded);
     }
 
     #[test]
