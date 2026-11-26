@@ -16,9 +16,20 @@ pub(crate) struct MeanReversionSignal {
     pub reason: String,
 }
 
-/// 当前 regime 是否应走均值回归。缺省关闭，避免空配置的回测误启用。
+/// 当前 regime 是否应走均值回归。
+///
+/// 对象配置缺 `mr_enabled` 时按 `default_settings.json` 的 `true` 处理，
+/// 避免旧库未补键或未重启的窗口期与默认配置行为不一致；
+/// 非对象配置（回测的 `Value::Null`）仍默认关闭，保持既有回测语义。
 pub(crate) fn mean_reversion_active(regime: Option<&str>, cfg: &Value) -> bool {
-    cfg["mr_enabled"].as_bool().unwrap_or(false) && regime == Some("range")
+    let enabled = match cfg {
+        Value::Object(map) => map
+            .get("mr_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        _ => false,
+    };
+    enabled && regime == Some("range")
 }
 
 pub(crate) fn mean_reversion_signal(
@@ -247,6 +258,26 @@ mod tests {
         assert!(
             !mean_reversion_active(Some("range"), &Value::Null),
             "空配置必须默认关闭，避免回测误启用"
+        );
+    }
+
+    #[test]
+    fn missing_mr_enabled_defaults_to_true() {
+        let legacy = serde_json::json!({
+            "mr_rsi_low": 30,
+            "mr_rsi_high": 70,
+            "mr_band_k": 2.0,
+            "mr_sl_pct": 20,
+            "mr_tp_pct": 30,
+        });
+        assert!(
+            mean_reversion_active(Some("range"), &legacy),
+            "旧库缺 mr_enabled 时应与 default_settings 一致，默认 true"
+        );
+        assert!(!mean_reversion_active(Some("trend"), &legacy));
+        assert!(
+            !mean_reversion_active(Some("range"), &Value::Null),
+            "非对象配置（回测空配置）仍保持默认关闭"
         );
     }
 
