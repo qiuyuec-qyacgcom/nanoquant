@@ -168,6 +168,16 @@ const halfAi = computed(() => {
   const topGate = ranked.length && Number(ranked[0][1]) > 0
     ? `${HALF_AI_GATE_LABELS[ranked[0][0]] || ranked[0][0]} ${ranked[0][1]}`
     : '--'
+  const byProvider: Record<string, any> = h.ai_latency_by_provider || {}
+  const topProviders = Object.entries(byProvider)
+    .map(([name, row]) => ({
+      name,
+      samples: Number(row?.samples || 0),
+      p95: Number(row?.p95_ms || 0),
+    }))
+    .filter((row) => row.samples > 0)
+    .sort((a, b) => b.samples - a.samples)
+    .slice(0, 2)
   return {
     total: Number(h.signals_total || 0),
     opened: Number(h.opened || 0),
@@ -183,6 +193,10 @@ const halfAi = computed(() => {
     topGate,
     p50: Number(h.ai_latency_p50_ms || 0),
     p95: Number(h.ai_latency_p95_ms || 0),
+    p99: Number(h.ai_latency_p99_ms || 0),
+    max: Number(h.ai_latency_max_ms || 0),
+    samples: Number(h.ai_latency_samples || 0),
+    topProviders,
     bookStale: Number(h.book_stale_pct || 0),
     bookQueries: Number(h.book?.queries || 0),
   }
@@ -535,6 +549,34 @@ useSilentRefresh(refreshQuotes, 3000)
           <div class="metric">
             <span>AI 延迟 P95</span>
             <span class="mono" :class="halfAi.p95 > 3000 ? 'down' : 'flat'">{{ halfAi.p95 ? halfAi.p95 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span title="nearest-rank 分位；样本很少时 P99 可能等于最大值，需结合样本数解读">AI 延迟 P99</span>
+            <span class="mono" :class="halfAi.p99 > 3000 ? 'down' : 'flat'">{{ halfAi.p99 ? halfAi.p99 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span>AI 延迟 max</span>
+            <span class="mono" :class="halfAi.max > 3000 ? 'down' : 'flat'">{{ halfAi.max ? halfAi.max + 'ms' : '--' }}</span>
+          </div>
+        </div>
+        <div class="grid g2" style="gap: 10px">
+          <div class="metric">
+            <span>{{ halfAi.topProviders[0] ? halfAi.topProviders[0].name + ' P95' : '供应商 P95' }}</span>
+            <span class="mono" :class="halfAi.topProviders[0]?.p95 > 3000 ? 'down' : 'flat'">
+              {{ halfAi.topProviders[0]?.p95 ? halfAi.topProviders[0].p95 + 'ms' : '--' }}
+            </span>
+          </div>
+          <div class="metric">
+            <span>{{ halfAi.topProviders[1] ? halfAi.topProviders[1].name + ' P95' : '供应商 P95（Top2）' }}</span>
+            <span class="mono" :class="halfAi.topProviders[1]?.p95 > 3000 ? 'down' : 'flat'">
+              {{ halfAi.topProviders[1]?.p95 ? halfAi.topProviders[1].p95 + 'ms' : '--' }}
+            </span>
+          </div>
+        </div>
+        <div class="grid g3" style="gap: 10px">
+          <div class="metric">
+            <span title="窗口内正延迟的 AI 调用条数，样本越少 P99 越接近最大值">AI 延迟样本</span>
+            <span class="mono">{{ halfAi.samples }} 条</span>
           </div>
           <div class="metric">
             <span>盘口 stale（进程累计）</span>

@@ -485,16 +485,31 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
     };
 
     let mut latencies: Vec<f64> = Vec::new();
+    let mut by_provider: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     if let Ok(mut stmt) =
-        conn.prepare("SELECT latency_ms FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
+        conn.prepare("SELECT latency_ms, provider FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
     {
-        if let Ok(rows) = stmt.query_map([since], |r| r.get::<_, i64>(0)) {
-            for latency in rows.flatten() {
-                latencies.push(latency as f64);
+        if let Ok(rows) = stmt.query_map([since], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (latency, provider) in rows.flatten() {
+                let ms = latency as f64;
+                // 空 provider 归入 unknown，避免分供应商视图出现空 key。
+                let key = provider
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "unknown".to_string());
+                latencies.push(ms);
+                by_provider.entry(key).or_default().push(ms);
             }
         }
     }
     latencies.sort_by(f64::total_cmp);
+    let max_latency = latencies.last().map(|ms| round2(*ms)).unwrap_or(0.0);
+    let mut provider_stats = serde_json::Map::new();
+    for (provider, samples) in by_provider.iter_mut() {
+        samples.sort_by(f64::total_cmp);
+        provider_stats.insert(provider.clone(), latency_summary(samples));
+    }
 
     let book = crate::book_stream::stats();
     let book_queries = book["queries"].as_u64().unwrap_or(0);
@@ -519,11 +534,26 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "ai_fail_open": ai_fail_open,
         "high_score_skip": high_score_skip,
         "gates": gates,
+        "ai_latency_samples": latencies.len(),
         "ai_latency_p50_ms": percentile(&latencies, 0.50),
         "ai_latency_p95_ms": percentile(&latencies, 0.95),
+        "ai_latency_p99_ms": percentile(&latencies, 0.99),
+        "ai_latency_max_ms": max_latency,
+        "ai_latency_percentile_method": "nearest_rank",
+        "ai_latency_by_provider": provider_stats,
         "ai_latency_scope": "all_modes",
         "book_stale_pct": book_stale_pct,
         "book": book,
+    })
+}
+
+/// 一组已排序延迟样本的分位数摘要；`samples` 用来看清尾分位在小样本下的可信度。
+fn latency_summary(sorted: &[f64]) -> Value {
+    json!({
+        "samples": sorted.len(),
+        "p50_ms": percentile(sorted, 0.50),
+        "p95_ms": percentile(sorted, 0.95),
+        "p99_ms": percentile(sorted, 0.99),
     })
 }
 
@@ -628,10 +658,21 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE signals(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, \
              score REAL, features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, \
-             decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER);",
+             decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER); \
+             CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, model TEXT, \
+             purpose TEXT, ok INTEGER, latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, \
+             cost_usd REAL, error TEXT, raw_text TEXT);",
         )
         .unwrap();
         conn
+    }
+
+    fn insert_ai_call(conn: &Connection, ts: i64, provider: &str, latency_ms: i64) {
+        conn.execute(
+            "INSERT INTO ai_call_logs(ts, provider, latency_ms) VALUES(?1, ?2, ?3)",
+            rusqlite::params![ts, provider, latency_ms],
+        )
+        .unwrap();
     }
 
     fn count(conn: &Connection) -> i64 {
@@ -732,6 +773,10 @@ mod tests {
             value["ai_veto_rate_pct"], 20.0,
             "仅 AI 主动否决计入: 1 / ai_reviewed 5"
         );
+        assert_eq!(value["ai_latency_samples"], 0, "无 AI 调用样本");
+        assert_eq!(value["ai_latency_p99_ms"], 0.0);
+        assert_eq!(value["ai_latency_max_ms"], 0.0);
+        assert_eq!(value["ai_latency_by_provider"], json!({}));
     }
 
     #[test]
@@ -836,8 +881,70 @@ mod tests {
         assert_eq!(value["high_score_skip"], 0);
         assert_eq!(value["ai_latency_p50_ms"], 0.0);
         assert_eq!(value["ai_latency_p95_ms"], 0.0);
+        assert_eq!(value["ai_latency_p99_ms"], 0.0);
+        assert_eq!(value["ai_latency_max_ms"], 0.0);
+        assert_eq!(value["ai_latency_samples"], 0);
+        assert_eq!(value["ai_latency_by_provider"], json!({}));
         assert_eq!(value["gates"]["none"], 0);
         assert_eq!(value["gates"]["ai_dq"], 0);
+    }
+
+    #[test]
+    fn half_ai_stats_includes_p99_and_max() {
+        let conn = table();
+        let now = 500_000;
+        for latency in 1..=100 {
+            insert_ai_call(&conn, now - 10, "alpha", latency);
+        }
+        insert_ai_call(&conn, now - 90_000, "alpha", 9_999);
+
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["ai_latency_samples"], 100, "只统计窗口内正延迟样本");
+        assert_eq!(value["ai_latency_p50_ms"], 51.0, "nearest-rank: floor(100*0.5)");
+        assert_eq!(value["ai_latency_p95_ms"], 96.0);
+        assert_eq!(value["ai_latency_p99_ms"], 100.0);
+        assert_eq!(value["ai_latency_max_ms"], 100.0);
+        assert_eq!(value["ai_latency_scope"], "all_modes");
+        assert_eq!(value["ai_latency_by_provider"]["alpha"]["samples"], 100);
+        assert_eq!(value["ai_latency_by_provider"]["alpha"]["p99_ms"], 100.0);
+    }
+
+    #[test]
+    fn half_ai_stats_groups_latency_by_provider() {
+        let conn = table();
+        let now = 600_000;
+        insert_ai_call(&conn, now - 10, "alpha", 100);
+        insert_ai_call(&conn, now - 20, "alpha", 200);
+        insert_ai_call(&conn, now - 30, "alpha", 300);
+        insert_ai_call(&conn, now - 40, "beta", 50);
+        insert_ai_call(&conn, now - 50, "beta", 60);
+        insert_ai_call(&conn, now - 60, "", 10);
+        insert_ai_call(&conn, now - 70, "beta", 0);
+
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["ai_latency_samples"], 6, "零延迟不计入样本");
+        let by_provider = &value["ai_latency_by_provider"];
+        assert_eq!(by_provider["alpha"]["samples"], 3);
+        assert_eq!(by_provider["alpha"]["p50_ms"], 200.0);
+        assert_eq!(by_provider["alpha"]["p95_ms"], 300.0);
+        assert_eq!(by_provider["alpha"]["p99_ms"], 300.0);
+        assert_eq!(by_provider["beta"]["samples"], 2);
+        assert_eq!(by_provider["beta"]["p95_ms"], 60.0);
+        assert_eq!(
+            by_provider["unknown"]["samples"], 1,
+            "空 provider 归入 unknown"
+        );
+        assert_eq!(by_provider["unknown"]["p50_ms"], 10.0);
+    }
+
+    #[test]
+    fn percentile_handles_small_sample_without_panic() {
+        assert_eq!(percentile(&[], 0.99), 0.0);
+        assert_eq!(percentile(&[42.0], 0.99), 42.0);
+        assert_eq!(percentile(&[42.0], 0.0), 42.0);
+        assert_eq!(percentile(&[10.0, 20.0], 0.99), 20.0);
+        assert_eq!(percentile(&[10.0, 20.0], 0.0), 10.0);
+        assert_eq!(percentile(&[10.0, 20.0], 1.0), 20.0, "q=1 不越界");
     }
 
     #[test]
