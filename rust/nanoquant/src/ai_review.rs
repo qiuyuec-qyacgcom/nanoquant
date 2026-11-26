@@ -16,17 +16,38 @@ impl EngineAiReviewer {
 
 impl AiReviewer for EngineAiReviewer {
     fn review(&self, proposal: &EntryProposal) -> Result<ReviewDecision, String> {
-        self.state
-            .db
-            .conn
-            .try_lock()
-            .map_err(|_| "AI 复核不能在数据库事务内执行".to_string())
-            .map(drop)?;
         let state = self.state.clone();
+        let conn = state.db.conn.clone();
         let proposal = proposal.clone();
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "AI 复核需要 Tokio 运行时".to_string())?;
-        tokio::task::block_in_place(|| handle.block_on(review_entry(state, proposal)))
+        tokio::task::block_in_place(|| {
+            wait_for_lock(&conn, std::time::Duration::from_millis(2000))?;
+            handle.block_on(review_entry(state, proposal))
+        })
+    }
+}
+
+/// 等待数据库连接锁释放，避免后台任务短暂持锁被误判为事务内调用。
+/// 仅在超时后返回 Err，调用方据此按 fail-closed 跳过本次复核。
+fn wait_for_lock<T>(
+    lock: &std::sync::Arc<std::sync::Mutex<T>>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                return Ok(());
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("数据库连接繁忙，AI 复核暂时跳过".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 }
 
@@ -1455,6 +1476,36 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
                 fill_default_valid_bars(reviewed_with_new_fields(), &json!({"valid_bars": input}));
             assert_eq!(reviewed.valid_bars, Some(expected), "valid_bars={input}");
         }
+    }
+
+    #[test]
+    fn wait_for_lock_acquires_after_release() {
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(0u8));
+        let holder = lock.clone();
+        let thread = std::thread::spawn(move || {
+            let guard = holder.lock().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(guard);
+        });
+        let result = wait_for_lock(&lock, std::time::Duration::from_millis(500));
+        thread.join().unwrap();
+        assert!(result.is_ok(), "锁释放后应等待成功: {result:?}");
+    }
+
+    #[test]
+    fn wait_for_lock_times_out_when_held() {
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(0u8));
+        let guard = lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        let result = wait_for_lock(&lock, std::time::Duration::from_millis(50));
+        drop(guard);
+        let error = result.expect_err("持锁期间必须超时失败");
+        assert!(error.contains("繁忙"), "错误应说明连接繁忙: {error}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "必须等待满超时才失败，实际 {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
