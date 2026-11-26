@@ -16,6 +16,7 @@ import { useAppStore } from '../stores/app'
 import { useAuthStore } from '../stores/auth'
 import { useParamCatalogStore } from '../stores/paramCatalog'
 
+import SettingsSection from './settings/SettingsSection.vue'
 import { SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 
 type Widget = 'switch' | 'number' | 'text' | 'seg' | 'select' | 'tags' | 'json' | 'roi'
@@ -435,9 +436,7 @@ const credForms = reactive({
 const proxyForm = ref('')
 const credSaving = ref<'' | 'demo' | 'live'>('')
 const pwd = reactive({ old_password: '', new_password: '' })
-const tagDraft = reactive<Record<string, string>>({})
-const jsonText = reactive<Record<string, string>>({})
-const jsonError = reactive<Record<string, string>>({})
+
 const engineBusy = ref(false)
 
 
@@ -645,15 +644,6 @@ const currentSections = computed(() => {
   return out
 })
 
-function syncJsonText() {
-  for (const key of Object.keys(jsonText)) delete jsonText[key]
-  for (const [key, value] of Object.entries(draft.value || {})) {
-    if (value && typeof value === 'object' && metaOf(current.value, key).widget !== 'roi') {
-      jsonText[key] = JSON.stringify(value, null, 2)
-      jsonError[key] = ''
-    }
-  }
-}
 
 // ---------------------------------------------------- 交易模式（双向逐仓）
 const tradeMode = ref<any>(null)
@@ -681,7 +671,7 @@ async function toggleIsolated() {
       // 开关是独立保存的；必须同步表单草稿，否则随后「保存并生效」会用旧值覆盖。
       draft.value = { ...draft.value, isolated: enabled }
       baseline.value = { ...baseline.value, isolated: enabled }
-      syncJsonText()
+
     }
     if (enabled && tradeMode.value?.can_switch) {
       const res = await http.post(
@@ -713,7 +703,7 @@ function loadGroup(id: string) {
   baseline.value = clone(app.settings[id] || {})
   onlyDirty.value = false
   focusKey.value = ''
-  syncJsonText()
+
   if (id === 'engine') loadTradeMode()
   if (id === 'risk') loadUnprotected()
   loadAudit()
@@ -740,7 +730,7 @@ async function save() {
     const data = await app.saveGroup(current.value, payload)
     draft.value = clone(data)
     baseline.value = clone(data)
-    syncJsonText()
+
     onlyDirty.value = false
     app.notify('配置已保存并热生效', 'ok')
     if (current.value === 'engine' || current.value === 'data') await app.loadStatus()
@@ -758,7 +748,7 @@ async function reset() {
     const data = await app.resetGroup(current.value)
     draft.value = clone(data)
     baseline.value = clone(data)
-    syncJsonText()
+
     onlyDirty.value = false
     if (current.value === 'engine' || current.value === 'data') await app.loadStatus()
     app.notify('已恢复默认值', 'ok')
@@ -770,7 +760,7 @@ async function reset() {
 /** 放弃本次改动：退回上次保存的值，不用重新加载页面 */
 function discard() {
   draft.value = clone(baseline.value)
-  syncJsonText()
+
   onlyDirty.value = false
   app.notify('已放弃未保存的修改', 'ok')
 }
@@ -919,65 +909,6 @@ async function onEnvChanged() {
   await app.loadStatus()
 }
 
-function addTag(key: string) {
-  const raw = (tagDraft[key] || '').trim()
-  if (!raw) return
-  const list: string[] = Array.isArray(draft.value[key]) ? [...draft.value[key]] : []
-  for (const part of raw.split(/[\s,，]+/)) {
-    if (part && !list.includes(part)) list.push(part)
-  }
-  draft.value[key] = list
-  tagDraft[key] = ''
-}
-
-function removeTag(key: string, value: string) {
-  draft.value[key] = (draft.value[key] || []).filter((v: string) => v !== value)
-}
-
-function applyJson(key: string) {
-  try {
-    draft.value[key] = JSON.parse(jsonText[key] || 'null')
-    jsonError[key] = ''
-  } catch {
-    jsonError[key] = 'JSON 格式有误，保存前请修正'
-  }
-}
-
-/** 阶梯止盈：两列档位编辑器，保存时仍是 [[分钟, 保证金收益率%], ...] */
-function roiRows(key: string): number[][] {
-  const raw = draft.value[key]
-  return Array.isArray(raw) ? raw.map((r: any) => [Number(r?.[0] ?? 0), Number(r?.[1] ?? 0)]) : []
-}
-
-function setRoiCell(key: string, idx: number, col: 0 | 1, event: Event) {
-  const rows = draft.value[key]
-  if (!Array.isArray(rows) || !rows[idx]) return
-  const num = Number((event.target as HTMLInputElement).value)
-  const next = Array.isArray(rows[idx]) ? [...rows[idx]] : [0, 0]
-  next[col] = Number.isFinite(num) ? num : 0
-  rows[idx] = next // 只替换当前行，输入过程中不重建整表，避免输入框失焦
-}
-
-function addRoiTier(key: string) {
-  const rows = roiRows(key)
-  if (rows.length >= 12) return
-  const last = rows[rows.length - 1]
-  rows.push([
-    last ? Math.min(2880, Number(last[0]) + 15) : 0,
-    last ? Number(Math.max(0.05, Number(last[1]) * 0.75).toFixed(2)) : 0.8,
-  ])
-  draft.value[key] = rows
-}
-
-function removeRoiTier(key: string, idx: number) {
-  const rows = roiRows(key)
-  rows.splice(idx, 1)
-  draft.value[key] = rows
-}
-
-function clearRoiTiers(key: string) {
-  draft.value[key] = []
-}
 
 async function loadCredentials() {
   try {
@@ -1047,7 +978,7 @@ async function changePassword() {
 watch(current, (id) => {
   draft.value = clone(app.settings[id] || {})
   baseline.value = clone(app.settings[id] || {})
-  syncJsonText()
+
 })
 
 onMounted(async () => {
@@ -1368,128 +1299,16 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <div v-for="sec in currentSections" :key="sec.title" class="section">
-              <div class="section-hd">
-                <span class="section-title">{{ sec.title }}</span>
-                <span v-if="sec.hint" class="section-hint">{{ sec.hint }}</span>
-              </div>
-
-              <div
-                v-for="f in sec.rows"
-                :key="f.key"
-                :id="`fld-${current}-${f.key}`"
-                class="field-row"
-                :class="{ focus: focusKey === f.key, changed: changedKeys.includes(f.key) }"
-              >
-                <div class="field-meta">
-                  <div class="field-name" :title="f.key">
-                    {{ f.label }}
-                    <span v-if="f.unit" class="field-unit">{{ f.unit }}</span>
-                  </div>
-                  <div v-if="f.hint" class="field-hint">{{ f.hint }}</div>
-                </div>
-
-                <div class="field-ctrl">
-                  <div v-if="f.widget === 'switch'" class="row" style="gap: 10px">
-                    <div class="switch" :class="{ on: draft[f.key] }" @click="draft[f.key] = !draft[f.key]" />
-                    <span class="muted" style="font-size: 11.5px">{{ draft[f.key] ? '开启' : '关闭' }}</span>
-                  </div>
-
-                  <div v-else-if="f.widget === 'seg'" class="seg" role="group">
-                    <button
-                      v-for="opt in f.options || []"
-                      :key="opt[0]"
-                      type="button"
-                      class="seg-btn"
-                      :class="{ on: draft[f.key] === opt[0] }"
-                      @click="draft[f.key] = opt[0]"
-                    >
-                      {{ opt[1] }}
-                    </button>
-                  </div>
-
-                  <select v-else-if="f.widget === 'select'" v-model="draft[f.key]" class="input">
-                    <option v-for="opt in f.options || []" :key="opt[0]" :value="opt[0]">{{ opt[1] }}</option>
-                  </select>
-
-                  <div v-else-if="f.widget === 'number'" class="num-wrap">
-                    <input v-model.number="draft[f.key]" type="number" :step="f.step ?? 'any'" :min="f.min" :max="f.max" class="input mono" />
-                    <span v-if="f.unit" class="num-unit">{{ f.unit }}</span>
-                  </div>
-
-                  <div v-else-if="f.widget === 'tags'" class="tags-box">
-                    <span v-for="v in draft[f.key]" :key="v" class="chip">
-                      {{ v }}<b class="chip-x" @click="removeTag(f.key, v)">×</b>
-                    </span>
-                    <input
-                      v-model="tagDraft[f.key]"
-                      class="chip-input"
-                      :placeholder="draft[f.key]?.length ? '继续添加…' : '输入后回车'"
-                      @keyup.enter="addTag(f.key)"
-                      @blur="addTag(f.key)"
-                    />
-                  </div>
-
-                  <div v-else-if="f.widget === 'json'" class="stack" style="gap: 4px">
-                    <textarea
-                      class="input mono"
-                      rows="3"
-                      :value="jsonText[f.key]"
-                      @input="jsonText[f.key] = ($event.target as HTMLTextAreaElement).value"
-                      @change="applyJson(f.key)"
-                    />
-                    <span v-if="jsonError[f.key]" class="down" style="font-size: 11px">{{ jsonError[f.key] }}</span>
-                  </div>
-
-                  <div v-else-if="f.widget === 'roi'" class="roi-editor">
-                    <div class="roi-head">
-                      <span>持仓分钟</span>
-                      <span>盈利达 % 自动平仓</span>
-                      <span></span>
-                    </div>
-                    <div v-for="(tier, idx) in draft[f.key] || []" :key="idx" class="roi-row">
-                      <input
-                        type="number" min="0" max="2880" step="1" class="input mono"
-                        :value="tier[0]"
-                        @input="setRoiCell(f.key, idx, 0, $event)"
-                      />
-                      <input
-                        type="number" min="0" max="50" step="0.05" class="input mono"
-                        :value="tier[1]"
-                        @input="setRoiCell(f.key, idx, 1, $event)"
-                      />
-                      <button class="btn btn-xs btn-danger" title="删除该档" @click="removeRoiTier(f.key, idx)">✕</button>
-                    </div>
-                    <div v-if="!(draft[f.key] || []).length" class="hint">没有档位 = 关闭按盈利百分比自动平仓</div>
-                    <div class="row" style="gap: 8px; margin-top: 6px; flex-wrap: wrap">
-                      <button
-                        class="btn btn-xs"
-                        :disabled="(draft[f.key] || []).length >= 12"
-                        @click="addRoiTier(f.key)"
-                      >
-                        + 添加一档
-                      </button>
-                      <button
-                        class="btn btn-xs btn-ghost"
-                        :disabled="!(draft[f.key] || []).length"
-                        @click="clearRoiTiers(f.key)"
-                      >
-                        清空（关闭）
-                      </button>
-                      <span class="hint">最多 12 档；保存后自动按分钟升序生效</span>
-                    </div>
-                  </div>
-
-                  <input
-                    v-else
-                    v-model="draft[f.key]"
-                    class="input"
-                    :class="{ mono: f.key === 'base_url' || f.key === 'proxy' || f.key === 'rsshub_base' }"
-                  />
-                </div>
-              </div>
-
-            </div>
+            <SettingsSection
+              v-for="sec in currentSections"
+              :key="sec.title"
+              :section="sec"
+              :draft="draft"
+              :changed-keys="changedKeys"
+              :focus-key="focusKey"
+              :group-id="current"
+              @update="(key, value) => draft[key] = value"
+            />
 
 
             <div v-if="auditRows.length" class="section">
@@ -1608,138 +1427,7 @@ onUnmounted(() => {
   font-size: 10.5px;
   color: var(--muted);
 }
-.field-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(180px, 0.95fr);
-  gap: 14px;
-  align-items: center;
-  padding: 9px 0;
-  border-top: 1px dashed rgba(26, 41, 66, 0.6);
-}
 
-/* 改过但还没保存的字段：左边一条黄线 + "已改"角标，滚动时也能一眼看到 */
-.field-row.changed {
-  box-shadow: inset 2px 0 0 var(--warn);
-  padding-left: 8px;
-}
-.field-row.changed .field-name::after {
-  content: '已改';
-  margin-left: 6px;
-  padding: 0 3px;
-  font-size: 9px;
-  font-weight: 400;
-  color: var(--warn);
-  border: 1px solid rgba(240, 169, 42, 0.35);
-  border-radius: 4px;
-  vertical-align: middle;
-}
-.field-row:first-of-type {
-  border-top: none;
-}
-.field-meta {
-  min-width: 0;
-}
-.field-name {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  font-size: 12.5px;
-  color: var(--text);
-}
-.field-unit {
-  font-size: 10px;
-  color: var(--muted);
-  font-family: var(--mono);
-}
-.field-hint {
-  margin-top: 2px;
-  font-size: 10.5px;
-  color: var(--muted);
-  line-height: 1.55;
-}
-.field-ctrl {
-  min-width: 0;
-}
-.num-wrap {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.num-unit {
-  font-size: 10.5px;
-  color: var(--muted);
-  font-family: var(--mono);
-  white-space: nowrap;
-}
-.seg {
-  display: inline-flex;
-  padding: 3px;
-  gap: 3px;
-  background: #070d18;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  flex-wrap: wrap;
-}
-.seg-btn {
-  padding: 5px 11px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  cursor: pointer;
-  font-family: var(--sans);
-  transition: all 0.15s ease;
-}
-.seg-btn:hover {
-  color: var(--text);
-}
-.seg-btn.on {
-  background: rgba(59, 130, 246, 0.16);
-  border-color: rgba(59, 130, 246, 0.4);
-  color: #dbe9ff;
-}
-.tags-box {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  min-height: 38px;
-  background: #070d18;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-}
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 7px;
-  border-radius: 5px;
-  background: rgba(59, 130, 246, 0.12);
-  border: 1px solid rgba(59, 130, 246, 0.28);
-  color: #b9d1ff;
-  font-size: 11px;
-  font-family: var(--mono);
-}
-.chip-x {
-  cursor: pointer;
-  color: var(--muted);
-  font-weight: 400;
-}
-.chip-x:hover {
-  color: var(--down);
-}
-.chip-input {
-  flex: 1;
-  min-width: 90px;
-  border: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 11.5px;
-  outline: none;
-  font-family: var(--mono);
-}
 .cred-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -1768,10 +1456,7 @@ onUnmounted(() => {
   .nav-hint {
     display: none;
   }
-  .field-row {
-    grid-template-columns: 1fr;
-    gap: 8px;
-  }
+
 }
 
 /* ------------------------------------------------------ 交易模式卡片 */
@@ -1810,35 +1495,6 @@ onUnmounted(() => {
 .switch:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-
-/* ------------------------------------------------ 阶梯止盈档位编辑器 */
-.roi-editor {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-}
-.roi-head,
-.roi-row {
-  display: grid;
-  grid-template-columns: minmax(88px, 1fr) minmax(110px, 1fr) 28px;
-  gap: 8px;
-  align-items: center;
-}
-.roi-head {
-  font-size: 10.5px;
-  color: var(--muted);
-}
-.roi-row .input {
-  padding: 5px 8px;
-}
-@media (max-width: 560px) {
-  .roi-head,
-  .roi-row {
-    grid-template-columns: minmax(70px, 1fr) minmax(88px, 1fr) 26px;
-    gap: 5px;
-  }
 }
 
 
@@ -2002,20 +1658,6 @@ onUnmounted(() => {
   border-color: rgba(59, 130, 246, 0.4);
 }
 
-/* 搜索跳转后闪一下，解决"点完不知道跳到哪了" */
-.field-row.focus {
-  animation: field-flash 2s ease;
-}@keyframes field-flash {
-  0%,
-  55% {
-    background: rgba(59, 130, 246, 0.16);
-    box-shadow: inset 2px 0 0 var(--accent);
-  }
-  100% {
-    background: transparent;
-    box-shadow: inset 2px 0 0 transparent;
-  }
-}
 
 /* 未保存时悬浮的保存条：长表单滚到最下面也不用回去找按钮 */
 .save-bar {
