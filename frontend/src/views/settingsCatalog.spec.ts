@@ -131,6 +131,13 @@ describe('参数配置目录', () => {
     expect(risk.has('max_leverage')).toBe(true)
   })
 
+  it('风控暴露本地杠杆规则参数', () => {
+    const risk = explicitKeys('risk')
+    expect(risk.has('local_leverage_base')).toBe(true)
+    expect(risk.has('local_leverage_vol_target')).toBe(true)
+    expect(risk.has('local_leverage_score_weight')).toBe(true)
+  })
+
   it('不再导出前端写死的隐藏清单', async () => {
     const catalog = await import('./settingsCatalog')
     expect('HIDDEN_BY_GROUP' in catalog).toBe(false)

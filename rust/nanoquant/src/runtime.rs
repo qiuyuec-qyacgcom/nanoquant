@@ -40,6 +40,27 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+/// 半 AI 模式下由本地规则决定杠杆：ATR% 相对波动目标给出 0.5–2 倍缩放，
+/// 评分相对中性值 0.5 再做加减，最后夹到全局上下限并取整。
+fn local_leverage(
+    atr_pct: f64,
+    score: f64,
+    base: f64,
+    vol_target: f64,
+    score_weight: f64,
+    min_lev: f64,
+    max_lev: f64,
+) -> f64 {
+    let vol = if atr_pct > 0.0 {
+        (vol_target / atr_pct).clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    (base * vol + (score - 0.5) * score_weight)
+        .clamp(min_lev, max_lev)
+        .round()
+}
+
 /// 当前扫描周期（秒）。读不到配置就用最小值。
 pub(crate) fn cycle_interval_sec(conn: &rusqlite::Connection) -> u64 {
     conn.query_row(
@@ -143,7 +164,7 @@ struct EntryDraft {
     preview_side: Option<String>,
     preview_score: Option<f64>,
     quant_passed: bool,
-    /// 全局杠杆下限（AI 未给杠杆时的回退值）。
+    /// 本地规则按 ATR 与评分算出的杠杆，仍受全局上下限约束。
     leverage: f64,
     /// 全局杠杆上限，已并入交易所与单标的限制。
     max_leverage: f64,
@@ -2904,8 +2925,16 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
                 .clamp(1, 100);
             let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
-            // 杠杆由 AI 在 [lower, upper] 内决定；这里只给出回退值（下限）。
-            let leverage = lower as f64;
+            // 杠杆由本地规则按 ATR 与评分计算，AI 复核不再决定杠杆。
+            let leverage = local_leverage(
+                metric.atr_pct,
+                score,
+                cfg["local_leverage_base"].as_f64().unwrap_or(10.0),
+                cfg["local_leverage_vol_target"].as_f64().unwrap_or(2.0),
+                cfg["local_leverage_score_weight"].as_f64().unwrap_or(10.0),
+                lower as f64,
+                upper as f64,
+            );
             // 保证金以参数值为中枢，AI 可按波动率上下调整 5 个百分点。
             let margin_base = cfg["margin_pct"].as_f64().unwrap_or(20.0);
             let margin_min = (margin_base - 5.0).max(0.0);
@@ -5860,6 +5889,41 @@ mod tests {
             global_stop_pct,
             global_tp_pct,
         }
+    }
+
+    #[test]
+    fn local_leverage_rises_for_low_atr_high_score() {
+        let leverage = local_leverage(1.0, 0.9, 10.0, 2.0, 10.0, 1.0, 100.0);
+        assert_eq!(leverage, 24.0, "低波动 + 高评分应放大到基准之上");
+    }
+
+    #[test]
+    fn local_leverage_falls_for_high_atr_low_score() {
+        let leverage = local_leverage(4.0, 0.1, 10.0, 2.0, 10.0, 1.0, 100.0);
+        assert_eq!(leverage, 1.0, "高波动 + 低评分应压到基准之下");
+    }
+
+    #[test]
+    fn local_leverage_clamps_to_bounds() {
+        assert_eq!(
+            local_leverage(0.5, 1.0, 10.0, 2.0, 10.0, 1.0, 5.0),
+            5.0,
+            "超过上限时夹到全局杠杆上限"
+        );
+        assert_eq!(
+            local_leverage(8.0, 0.0, 10.0, 2.0, 10.0, 8.0, 100.0),
+            8.0,
+            "低于下限时夹到全局杠杆下限"
+        );
+    }
+
+    #[test]
+    fn local_leverage_handles_zero_atr() {
+        assert_eq!(
+            local_leverage(0.0, 0.5, 10.0, 2.0, 10.0, 1.0, 100.0),
+            10.0,
+            "ATR 缺失时波动倍率回落到 1，按评分中性值给基准杠杆"
+        );
     }
 
     #[test]

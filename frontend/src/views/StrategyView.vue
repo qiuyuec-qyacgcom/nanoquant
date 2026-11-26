@@ -48,6 +48,9 @@ const PLAIN_HINTS: Record<string, string> = {
   max_positions: '最多同时持有几个仓位',
 
   margin_pct: '单仓保证金中心值；AI 按波动率在 ±5 个百分点内调整',
+  local_leverage_base: '波动与评分都中性时的杠杆；实际值再按 ATR 与评分加减并夹在上下限内',
+  local_leverage_vol_target: 'ATR% 等于该值时杠杆不缩放；波动越小杠杆越高，波动越大杠杆越低',
+  local_leverage_score_weight: '评分每高出中性值 1.0 就多加这么多倍杠杆；0=评分不影响杠杆',
   max_exposure_pct: '所有持仓名义额合计最多是权益的几倍',
   max_same_direction: '同一方向最多同时持有几个仓；0=不限制',
   daily_loss_limit_pct: '当天亏到这个比例就停止开新仓',
@@ -123,11 +126,26 @@ const BASE_META: Record<string, FieldMeta> = {
   },
   min_leverage: {
     label: '杠杆下限', unit: 'x', min: 1,
-    hint: '全局杠杆下限，也是 AI 未给杠杆时的回退值；AI 给出的杠杆低于该值会抬到此处',
+    hint: '本地杠杆规则的下限：算出的杠杆低于该值会抬到此处',
   },
   max_leverage: {
     label: '杠杆上限', unit: 'x', max: 100,
-    hint: '全局硬上限；AI 与单标的配置都只能收紧不能突破',
+    hint: '本地杠杆规则的硬上限；单标的配置也只能收紧不能突破',
+  },
+  local_leverage_base: {
+    label: '本地杠杆基准',
+    unit: 'x',
+    hint: '波动率中性（ATR% = 波动目标）且评分中性（0.5）时的杠杆；实际值再按波动与评分加减并夹在上限内',
+  },
+  local_leverage_vol_target: {
+    label: '杠杆波动目标',
+    unit: '%',
+    hint: 'ATR% 等于该值时波动倍率为 1；ATR% 越低倍率越高（最高 2x），越高越低（最低 0.5x）',
+  },
+  local_leverage_score_weight: {
+    label: '杠杆评分权重',
+    unit: 'x',
+    hint: '评分相对 0.5 每高 1.0 增加的杠杆；0=评分不影响杠杆',
   },
   max_exposure_pct: { label: '总敞口上限', unit: '%', hint: '所有持仓名义额 / 权益' },
   max_same_direction: {
@@ -473,6 +491,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: 'K 线周期', group: 'strategy', key: 'timeframe' },
   { label: '单仓保证金中枢', group: 'risk', key: 'margin_pct' },
   { label: '最大杠杆', group: 'risk', key: 'max_leverage' },
+  { label: '本地杠杆基准', group: 'risk', key: 'local_leverage_base' },
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
   { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },
 
