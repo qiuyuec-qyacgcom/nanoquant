@@ -1882,6 +1882,7 @@ fn live_entry_inflight(
     .map_err(|error| error.to_string())
 }
 
+
 /// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
 fn live_plans(
         symbols: &[String],
@@ -3085,12 +3086,13 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         let (bid, ask) = book
                             .map(|market| (market.bid, market.ask))
                             .unwrap_or((draft.mark_price, draft.mark_price));
-                        Some(Self::limit_entry_price(
-                            side,
-                            bid,
-                            ask,
-                            draft.mark_price,
-                        ))
+                        let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
+                        // AI 建议价只在方向正确且贴近现价时采用，否则回退宿主挂单价。
+                        let price = reviewed
+                            .entry_price
+                            .and_then(|ep| preferred_limit_price(side, draft.mark_price, ep))
+                            .unwrap_or(fallback);
+                        Some(price)
                     }
                 };
                 plans.push(LivePlan {
@@ -5621,6 +5623,20 @@ async fn refresh_account_balance(
     .map_err(|error| error.to_string())
 }
 
+/// AI 建议限价只在「方向正确且偏离现价 ≤0.5%」时采用，否则回退宿主挂单价。
+fn preferred_limit_price(side: &str, mark: f64, preferred: f64) -> Option<f64> {
+    if !preferred.is_finite() || preferred <= 0.0 || mark <= 0.0 {
+        return None;
+    }
+    if (preferred - mark).abs() / mark > 0.005 {
+        return None;
+    }
+    if (side == "BUY" && preferred > mark) || (side == "SELL" && preferred < mark) {
+        return None;
+    }
+    Some(preferred)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5894,6 +5910,19 @@ mod tests {
         );
         assert_eq!(LiveOrderType::Market.as_str(), "MARKET");
         assert_eq!(LiveOrderType::LimitPostOnly.as_str(), "LIMIT");
+    }
+
+    #[test]
+    fn preferred_entry_price_used_only_when_valid() {
+        // 只做 Maker 时，AI 建议价必须方向正确且贴近现价才采用；
+        // 越界、反向、偏离超 0.5% 或非有限值一律回退宿主挂单价。
+        assert_eq!(preferred_limit_price("BUY", 100.0, 99.8), Some(99.8));
+        assert_eq!(preferred_limit_price("BUY", 100.0, 100.5), None);
+        assert_eq!(preferred_limit_price("SELL", 100.0, 100.2), Some(100.2));
+        assert_eq!(preferred_limit_price("SELL", 100.0, 99.8), None);
+        assert_eq!(preferred_limit_price("BUY", 100.0, 99.0), None);
+        assert_eq!(preferred_limit_price("BUY", 100.0, f64::NAN), None);
+
     }
 
     #[test]
