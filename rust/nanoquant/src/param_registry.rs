@@ -76,6 +76,8 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
+    ("strategy", "min_entry_rr", 0.0, 10.0, 0.1),
+    ("strategy", "valid_bars", 1.0, 24.0, 1.0),
     ("ai_tuning", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
     (
         "ai_tuning",
@@ -153,7 +155,9 @@ const VISIBLE: &[(&str, &[&str])] = &[
         "strategy",
         &[
             "timeframe",
+            "valid_bars",
             "entry_threshold",
+            "min_entry_rr",
             "exit_threshold",
             "volume_ratio_min",
             "atr_pct_min",
@@ -184,6 +188,10 @@ const VISIBLE: &[(&str, &[&str])] = &[
     (
         "symbol_scan",
         &["enabled", "interval_hours", "market_limit"],
+    ),
+    (
+        "ai",
+        &["use_invalidation_price", "use_entry_price"],
     ),
     (
         "risk",
@@ -637,6 +645,19 @@ mod tests {
         assert_eq!(defaults["symbol_scan"]["market_limit"], json!(300));
         assert!(!is_ai_writable("symbol_scan", "enabled"));
         assert!(!is_ai_writable("symbol_scan", "future_hidden_field"));
+    }
+
+    #[test]
+    fn v2_threshold_params_are_registered() {
+        let d = defaults();
+        assert_eq!(d["strategy"]["min_entry_rr"], json!(0.8));
+        assert_eq!(d["strategy"]["valid_bars"], json!(6));
+        assert_eq!(d["ai"]["use_invalidation_price"], json!(false));
+        assert_eq!(d["ai"]["use_entry_price"], json!(false));
+        assert!(is_visible("strategy", "valid_bars"));
+        assert!(is_visible("strategy", "min_entry_rr"));
+        assert!(is_visible("ai", "use_invalidation_price"));
+        assert!(is_visible("ai", "use_entry_price"));
     }
 
     #[test]

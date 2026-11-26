@@ -41,12 +41,14 @@
   "strategy": {
     "mode": "fusion",
     "timeframe": "4h",
+    "valid_bars": 6,
 
     "ema_fast": 9,
     "ema_slow": 21,
     "rsi_period": 14,
     "atr_period": 14,
     "entry_threshold": 0.3,
+    "min_entry_rr": 0.8,
     "exit_threshold": 0.1,
     "volume_ratio_min": 0.8,
     "atr_pct_min": 0.05,
@@ -137,7 +139,9 @@
     ],
     "decision_schema_version": 2,
     "allow_param_tuning": true,
-    "param_tuning_min_interval_sec": 86400
+    "param_tuning_min_interval_sec": 86400,
+    "use_invalidation_price": false,
+    "use_entry_price": false
   },
   "data": {
     "live_base_url": "https://fapi.binance.com",
