@@ -1079,7 +1079,6 @@ pub fn run_walkforward(
     }))
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BasketMetrics {
     /// 已评估的 symbol×fold 单元数；B3 以 positive_folds/folds 比例判定稳健性。
@@ -1098,7 +1097,6 @@ pub struct BasketMetrics {
     pub timeframe: String,
 }
 
-#[allow(dead_code)]
 fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
     let value = timeframe.trim();
     if value.is_empty() {
@@ -1130,7 +1128,6 @@ fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("timeframe {timeframe} 超出范围"))
 }
 
-#[allow(dead_code)]
 fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnapshot> {
     let step = interval_ms.max(1);
     bars.iter()
@@ -1145,7 +1142,6 @@ fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnap
         .collect()
 }
 
-#[allow(dead_code)]
 fn build_market_regime_map(
     basket: &[(String, Vec<HistoryBar>)],
     frame_ms: i64,
@@ -1191,7 +1187,6 @@ fn build_market_regime_map(
     regimes
 }
 
-#[allow(dead_code)]
 fn market_regime_at(
     regimes: &BTreeMap<i64, crate::regime::Regime>,
     ts: i64,
@@ -1201,7 +1196,6 @@ fn market_regime_at(
     (ts - stamp <= frame_ms).then_some(regime)
 }
 
-#[allow(dead_code)]
 fn tag_trades(
     result: &mut BacktestResult,
     regimes: &BTreeMap<i64, crate::regime::Regime>,
@@ -1214,7 +1208,6 @@ fn tag_trades(
     }
 }
 
-#[allow(dead_code)]
 fn target_returns(trades: &[BacktestTrade], target: &str) -> Vec<f64> {
     trades
         .iter()
@@ -1223,7 +1216,6 @@ fn target_returns(trades: &[BacktestTrade], target: &str) -> Vec<f64> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn compounded_max_drawdown(returns: &[(i64, f64)]) -> f64 {
     let mut ordered = returns.to_vec();
     ordered.sort_by_key(|(exit_ts, _)| *exit_ts);
@@ -1238,7 +1230,7 @@ fn compounded_max_drawdown(returns: &[(i64, f64)]) -> f64 {
     max_drawdown
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_walkforward_basket_fixed(
     basket: &[(String, Vec<HistoryBar>)],
     base: &EngineConfig,

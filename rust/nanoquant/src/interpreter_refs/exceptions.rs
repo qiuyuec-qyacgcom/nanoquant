@@ -426,9 +426,9 @@ mod tests {
             "{:?}",
             registry.invalid
         );
-        assert_eq!(registry.total, 7);
+        assert_eq!(registry.total, 6);
         assert_eq!(registry.by_grade.get("exec"), Some(&1));
-        assert_eq!(registry.by_grade.get("text"), Some(&6));
+        assert_eq!(registry.by_grade.get("text"), Some(&5));
         assert_eq!(registry.by_grade.get("naming"), Some(&3));
         assert_eq!(registry.by_grade.get("artifact"), Some(&1));
     }

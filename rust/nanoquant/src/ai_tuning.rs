@@ -303,7 +303,6 @@ const MAX_CANDIDATE_KEYS: usize = 3;
 const MAX_RELATIVE_CHANGE: f64 = 0.25;
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AiTuningSet {
     pub id: i64,
@@ -875,7 +874,6 @@ fn engine_mode(conn: &Connection) -> String {
 
 /// 手动回滚：写 `trigger='rollback'` 的 activation 与事件。
 /// C4 手动 API 才会调用，C3 自动守卫走 `rollback_with_trigger(...,\"no_candidate\")`。
-#[allow(dead_code)]
 pub(crate) fn rollback(conn: &Connection, current_id: i64, mode: &str) -> Result<(), String> {
     rollback_with_trigger(conn, current_id, mode, "rollback")
 }

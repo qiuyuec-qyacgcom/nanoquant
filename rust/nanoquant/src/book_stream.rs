@@ -43,9 +43,7 @@ pub struct BookState {
     pub bid: f64,
     pub ask: f64,
     // 盘口量暂未进入 MarketSnapshot，保留给后续执行层使用。
-    #[allow(dead_code)]
     pub bid_qty: f64,
-    #[allow(dead_code)]
     pub ask_qty: f64,
     pub ts: i64,
 }

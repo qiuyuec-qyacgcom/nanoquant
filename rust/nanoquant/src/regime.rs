@@ -55,7 +55,7 @@ pub(crate) struct RegimeTracker {
 }
 
 impl RegimeTracker {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(confirm_sec: i64, cooldown_sec: i64) -> Self {
         Self {
             current: None,
@@ -175,8 +175,7 @@ pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
 
 /// 逐根 bar 计算前缀的 regime；不足 30 根或指标不可用时为 None。
 ///
-/// A 期只读判定与记录，B 期回测复用；当前仅由测试直接调用。
-#[allow(dead_code)]
+/// A 期只读判定与记录，B 期回测复用。
 pub(crate) fn regime_series(candles: &[CandleSnapshot], atr_period: usize) -> Vec<Option<Regime>> {
     (0..candles.len())
         .map(|index| {

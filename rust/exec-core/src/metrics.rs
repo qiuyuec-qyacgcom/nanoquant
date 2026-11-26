@@ -107,11 +107,6 @@ impl MetricsHub {
         (accepted, dropped)
     }
 
-    #[allow(dead_code)]
-    pub fn total_rejected(&self) -> u64 {
-        self.rejected.lock().map(|v| *v).unwrap_or(0)
-    }
-
     /// 七段视图：每段 {count,p50,p95,p99,max,last}，无样本的字段为 null。
     pub fn view(&self) -> Value {
         let rings = self.rings.lock().unwrap_or_else(|e| e.into_inner());

@@ -95,23 +95,7 @@
       }
     },
     {
-      "code": "EX-06",
-      "scopes": [
-        "scripts/p2_linux_docker_probe.sh"
-      ],
-      "rules": [
-        "text"
-      ],
-      "reason": "该脚本做的是镜像内不存在解释器的负向断言，必须列举被禁解释器名才能检测。",
-      "owner": "维护者",
-      "expires_when": "该探针脚本删除时",
-      "verify": {
-        "kind": "contains",
-        "target": "scripts/p2_linux_docker_probe.sh",
-        "needle": "NO_INTERPRETER"
-      }
-    },
-    {
+
       "code": "EX-07",
       "scopes": [
         "docs/archive/evidence/"

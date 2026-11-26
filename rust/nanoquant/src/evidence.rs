@@ -10,7 +10,6 @@ const MAX_DRAWDOWN_PCT: f64 = 15.0;
 const MIN_RELATIVE_ADVANTAGE_PP: f64 = 0.10;
 const RELATIVE_ADVANTAGE_EPSILON: f64 = 1e-9;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct EvidenceReport {
     pub pass: bool,
@@ -19,7 +18,6 @@ pub(crate) struct EvidenceReport {
 
 /// 证据门判定：所有阈值均为代码常量，AI 与页面不可改（规格 §7.3/§10）。
 /// 任一条件失败即 `pass=false`，且全部失败原因都会收集到 `reasons`。
-#[allow(dead_code)]
 pub(crate) fn evaluate_gate(
     metrics: &BasketMetrics,
     min_oos_trades: usize,
@@ -112,7 +110,6 @@ pub(crate) fn evaluate_gate(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn evidence_json(
     metrics: &BasketMetrics,
     report: &EvidenceReport,
