@@ -126,6 +126,8 @@ struct EntryTerms {
     take_profit: f64,
     score: f64,
     /// AI 给出的失效价（ip）；落库后供持仓失效平仓使用。
+    /// 旧版 entry_terms 快照不含该键，反序列化时缺省为 None，避免升级后 pending 结算报错。
+    #[serde(default)]
     invalidation_price: Option<f64>,
 }
 
@@ -5570,17 +5572,9 @@ mod tests {
     #[test]
     fn entry_position_persists_invalidation_price() {
         // 开仓落库必须把 AI 失效价写进 positions.invalidation_price。
+        // 用真实迁移建表，避免手抄 DDL 与 schema 漂移造成假阳性。
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE positions(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL,
-             entry_price REAL, mark_price REAL, leverage REAL, margin REAL, sl_price REAL,
-             tp_price REAL, peak_price REAL, initial_sl_price REAL, signal_score REAL,
-             opened_at INTEGER, closed_at INTEGER, exit_price REAL, exit_reason TEXT,
-             realized_pnl REAL, fees REAL, status TEXT, mode TEXT, venue_unrealized REAL,
-             venue_ts INTEGER, partial_taken_at INTEGER, ai_confidence REAL, ai_reason TEXT,
-             entry_slippage_bps REAL, trade_id INTEGER, invalidation_price REAL, features TEXT);",
-        )
-        .unwrap();
+        crate::schema::migrate(&conn).unwrap();
         let tx = conn.transaction().unwrap();
         let terms = EntryTerms {
             leverage: 5.0,
@@ -5602,6 +5596,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, Some(97.0));
+    }
+
+    #[test]
+    fn entry_position_persists_null_when_invalidation_missing() {
+        // AI 未给失效价时应落 NULL，而非沿用旧值或写入哨兵值。
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let terms = EntryTerms {
+            leverage: 5.0,
+            stop: 95.0,
+            take_profit: 110.0,
+            score: 0.8,
+            invalidation_price: None,
+        };
+        EngineRuntime::insert_entry_position(
+            &tx, "live", "ETHUSDT", "short", 1.0, 200.0, &terms, 0.0005, 1, None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let stored: Option<f64> = conn
+            .query_row(
+                "SELECT invalidation_price FROM positions WHERE symbol='ETHUSDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[test]
+    fn legacy_entry_terms_without_invalidation_price_still_deserialize() {
+        // 升级前 engine_state 里存的是不含 invalidation_price 的 entry_terms，
+        // reconcile_pending 反序列化必须照常成功，否则 pending 结算会持续报错。
+        let legacy = r#"{"leverage":5.0,"stop":95.0,"take_profit":110.0,"score":0.8}"#;
+        let terms: EntryTerms = serde_json::from_str(legacy).unwrap();
+        assert_eq!(terms.invalidation_price, None);
+        assert_eq!(terms.leverage, 5.0);
     }
 
     #[test]
