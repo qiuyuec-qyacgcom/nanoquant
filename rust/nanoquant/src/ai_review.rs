@@ -262,6 +262,8 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         data_quality: None,
         rr_target: None,
         entry_price: None,
+        invalidation_text: None,
+        risk_text: None,
     }
 }
 
@@ -273,6 +275,8 @@ fn reject_with(reason: impl Into<String>, decision: &ai_client::Decision) -> Rev
         data_quality: decision.data_quality,
         rr_target: decision.rr_target,
         entry_price: decision.entry_price,
+        invalidation_text: (!decision.invalidation.is_empty()).then(|| decision.invalidation.clone()),
+        risk_text: (!decision.risk_flags.is_empty()).then(|| decision.risk_flags.join("；")),
         ..reject(reason)
     }
 }
@@ -320,6 +324,10 @@ fn decision_to_review(
                 data_quality: decision.data_quality,
                 rr_target: decision.rr_target,
                 entry_price: decision.entry_price,
+                invalidation_text: (!decision.invalidation.is_empty())
+                    .then(|| decision.invalidation.clone()),
+                risk_text: (!decision.risk_flags.is_empty())
+                    .then(|| decision.risk_flags.join("；")),
             })
         }
     };
@@ -436,6 +444,8 @@ fn decision_to_review(
         data_quality: decision.data_quality,
         rr_target: decision.rr_target,
         entry_price: decision.entry_price,
+        invalidation_text: (!decision.invalidation.is_empty()).then(|| decision.invalidation.clone()),
+        risk_text: (!decision.risk_flags.is_empty()).then(|| decision.risk_flags.join("；")),
     })
 }
 
@@ -574,6 +584,17 @@ mod tests {
             (result.confidence - 0.9).abs() < 1e-9,
             "门槛拒单必须保留 AI 置信度"
         );
+    }
+
+    #[test]
+    fn tighten_gate_blocks_low_quality_open() {
+        // 数据质量门槛必须在校验 tighten 之前生效，否则低质量开仓会被当作可执行计划。
+        let mut item = decision("open_long", 0.9);
+        item.data_quality = Some(0.2);
+        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8)
+            .unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("数据质量"));
     }
 
     #[test]

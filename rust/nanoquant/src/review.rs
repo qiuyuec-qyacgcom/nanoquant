@@ -28,6 +28,10 @@ pub(crate) struct ReviewDecision {
     pub rr_target: Option<f64>,
     /// AI 建议的入场价（ep）。
     pub entry_price: Option<f64>,
+    /// AI 给出的失效条件文本（inv）。
+    pub invalidation_text: Option<String>,
+    /// AI 给出的风险提示文本（risk）。
+    pub risk_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +76,10 @@ pub(crate) struct ReviewedEntry {
     pub rr_target: Option<f64>,
     /// AI 建议的入场价（ep）。
     pub entry_price: Option<f64>,
+    /// AI 给出的失效条件文本（inv）。
+    pub invalidation_text: Option<String>,
+    /// AI 给出的风险提示文本（risk）。
+    pub risk_text: Option<String>,
 }
 
 /// AI 自评字段的载体：拒单/观望也要把 dq、rr 等落进审计。
@@ -82,6 +90,8 @@ pub(crate) struct AiMeta {
     pub data_quality: Option<f64>,
     pub rr_target: Option<f64>,
     pub entry_price: Option<f64>,
+    pub invalidation_text: Option<String>,
+    pub risk_text: Option<String>,
 }
 
 impl From<&ReviewedEntry> for AiMeta {
@@ -92,6 +102,8 @@ impl From<&ReviewedEntry> for AiMeta {
             data_quality: value.data_quality,
             rr_target: value.rr_target,
             entry_price: value.entry_price,
+            invalidation_text: value.invalidation_text.clone(),
+            risk_text: value.risk_text.clone(),
         }
     }
 }
@@ -104,6 +116,8 @@ impl From<&ReviewDecision> for AiMeta {
             data_quality: value.data_quality,
             rr_target: value.rr_target,
             entry_price: value.entry_price,
+            invalidation_text: value.invalidation_text.clone(),
+            risk_text: value.risk_text.clone(),
         }
     }
 }
@@ -116,6 +130,8 @@ impl From<&ReviewError> for AiMeta {
             data_quality: value.data_quality,
             rr_target: value.rr_target,
             entry_price: value.entry_price,
+            invalidation_text: value.invalidation_text.clone(),
+            risk_text: value.risk_text.clone(),
         }
     }
 }
@@ -133,6 +149,10 @@ pub(crate) struct ReviewError {
     pub data_quality: Option<f64>,
     pub rr_target: Option<f64>,
     pub entry_price: Option<f64>,
+    /// AI 给出的失效条件文本（inv）。
+    pub invalidation_text: Option<String>,
+    /// AI 给出的风险提示文本（risk）。
+    pub risk_text: Option<String>,
 }
 
 impl ReviewError {
@@ -146,6 +166,8 @@ impl ReviewError {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }
     }
 
@@ -157,6 +179,8 @@ impl ReviewError {
         self.data_quality = meta.data_quality;
         self.rr_target = meta.rr_target;
         self.entry_price = meta.entry_price;
+        self.invalidation_text = meta.invalidation_text;
+        self.risk_text = meta.risk_text;
         self
     }
 }
@@ -213,6 +237,8 @@ pub(crate) fn apply_review(
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
@@ -295,6 +321,8 @@ fn apply_decision(
             data_quality: decision.data_quality,
             rr_target: decision.rr_target,
             entry_price: decision.entry_price,
+            invalidation_text: decision.invalidation_text,
+            risk_text: decision.risk_text,
             reason: decision.reason,
             action: action_for(&side),
             confidence,
@@ -312,6 +340,8 @@ fn apply_decision(
             data_quality: meta.data_quality,
             rr_target: meta.rr_target,
             entry_price: meta.entry_price,
+            invalidation_text: meta.invalidation_text,
+            risk_text: meta.risk_text,
         }),
         ReviewAction::Reject => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -326,6 +356,8 @@ fn apply_decision(
             data_quality: meta.data_quality,
             rr_target: meta.rr_target,
             entry_price: meta.entry_price,
+            invalidation_text: meta.invalidation_text,
+            risk_text: meta.risk_text,
         }),
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
@@ -341,6 +373,8 @@ fn apply_decision(
                 data_quality: decision.data_quality,
                 rr_target: decision.rr_target,
                 entry_price: decision.entry_price,
+                invalidation_text: decision.invalidation_text,
+                risk_text: decision.risk_text,
                 reason: decision.reason,
                 action: "tighten".to_string(),
                 confidence,
@@ -393,6 +427,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }
     }
 
@@ -437,6 +473,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
@@ -456,6 +494,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&raised), true).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
@@ -474,6 +514,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         let reviewed = apply_review(&proposal(), Some(&too_low), true).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
@@ -504,6 +546,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         assert!(apply_review(&proposal(), Some(&reject), false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
@@ -528,6 +572,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         let error = apply_review(&proposal(), Some(&hold), true).unwrap_err();
         assert_eq!(error.action, "hold");
@@ -551,6 +597,8 @@ mod tests {
             data_quality: None,
             rr_target: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true).is_err());
     }

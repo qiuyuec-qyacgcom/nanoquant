@@ -38,6 +38,10 @@ pub struct AuditSignal {
     pub invalidation_price: Option<f64>,
     /// AI 建议的入场价（ep）。
     pub entry_price: Option<f64>,
+    /// AI 给出的失效条件文本（inv）。
+    pub invalidation_text: Option<String>,
+    /// AI 给出的风险提示文本（risk）。
+    pub risk_text: Option<String>,
 }
 
 impl AuditSignal {
@@ -58,6 +62,8 @@ impl AuditSignal {
             valid_bars: None,
             invalidation_price: None,
             entry_price: None,
+            invalidation_text: None,
+            risk_text: None,
         }
     }
 
@@ -127,6 +133,12 @@ impl AuditSignal {
             if let Some(v) = self.entry_price {
                 object.insert("ai_ep".into(), json!(v));
             }
+            if let Some(v) = self.invalidation_text.as_ref() {
+                object.insert("ai_inv".into(), json!(v));
+            }
+            if let Some(v) = self.risk_text.as_ref() {
+                object.insert("ai_risk".into(), json!(v));
+            }
         }
         features
     }
@@ -158,7 +170,15 @@ fn stored_key(features: &str) -> Option<String> {
 }
 
 /// 写入 signals.features 的 AI 自评字段键。
-const AI_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
+const AI_META_KEYS: [&str; 7] = [
+    "ai_dq",
+    "ai_rr",
+    "ai_vb",
+    "ai_ip",
+    "ai_ep",
+    "ai_inv",
+    "ai_risk",
+];
 
 /// 合并时把新行缺失的 AI 自评字段用旧值补齐，避免模型本轮没给就被清空。
 fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
@@ -437,6 +457,30 @@ mod tests {
         assert_eq!(features["ai_vb"], 6);
         assert_eq!(features["ai_ip"], 97.5);
         assert_eq!(features["ai_ep"], 99.8);
+    }
+
+    #[test]
+    fn audit_signal_persists_ai_text_fields() {
+        let mut row = AuditSignal::new("BTCUSDT").with_ai("open_long", 0.8, "趋势向上");
+        row.invalidation_text = Some("跌破 97.5 失效".to_string());
+        row.risk_text = Some("高位放量；资金费率抬升".to_string());
+        let features = row.features_with_meta();
+        assert_eq!(features["ai_inv"], "跌破 97.5 失效");
+        assert_eq!(features["ai_risk"], "高位放量；资金费率抬升");
+    }
+
+    #[test]
+    fn audit_signal_omits_empty_ai_text_fields() {
+        let row = AuditSignal::new("BTCUSDT");
+        let features = row.features_with_meta();
+        assert!(
+            features.get("ai_inv").is_none(),
+            "无失效文本时不应写入 ai_inv: {features}"
+        );
+        assert!(
+            features.get("ai_risk").is_none(),
+            "无风险文本时不应写入 ai_risk: {features}"
+        );
     }
 
     #[test]

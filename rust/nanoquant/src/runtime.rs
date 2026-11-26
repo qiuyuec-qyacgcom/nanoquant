@@ -235,6 +235,8 @@ impl EntryDraft {
             row.valid_bars = meta.valid_bars;
             row.invalidation_price = meta.invalidation_price;
             row.entry_price = meta.entry_price;
+            row.invalidation_text = meta.invalidation_text.clone();
+            row.risk_text = meta.risk_text.clone();
         }
         if !self.quant_passed
             && self.preview_side.as_deref() == Some(direction)
@@ -6160,6 +6162,8 @@ mod tests {
                     data_quality: None,
                     rr_target: None,
                     entry_price: None,
+                    invalidation_text: None,
+                    risk_text: None,
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -6176,6 +6180,8 @@ mod tests {
                 data_quality: None,
                 rr_target: None,
                 entry_price: self.0,
+                invalidation_text: None,
+                risk_text: None,
             })
         }
     }
@@ -6541,6 +6547,8 @@ mod tests {
                 data_quality: None,
                 rr_target: None,
                 entry_price: None,
+                invalidation_text: None,
+                risk_text: None,
             })
         }
     }
@@ -7244,6 +7252,8 @@ mod tests {
                 data_quality: Some(0.3),
                 rr_target: Some(0.5),
                 entry_price: Some(99.8),
+                invalidation_text: Some("跌破 97.5 失效".to_string()),
+                risk_text: Some("高位放量；资金费率抬升".to_string()),
             })
         }
     }
@@ -7324,6 +7334,15 @@ mod tests {
         assert_eq!(value["ai_rr"], 0.5, "拒单路径也要落 ai_rr: {value}");
         assert_eq!(value["ai_vb"], 6, "拒单路径也要落 ai_vb: {value}");
         assert_eq!(value["ai_ip"], 97.5, "拒单路径也要落 ai_ip: {value}");
+        assert_eq!(value["ai_ep"], 99.8, "拒单路径也要落 ai_ep: {value}");
+        assert_eq!(
+            value["ai_inv"], "跌破 97.5 失效",
+            "拒单路径也要落 ai_inv: {value}"
+        );
+        assert_eq!(
+            value["ai_risk"], "高位放量；资金费率抬升",
+            "拒单路径也要落 ai_risk: {value}"
+        );
     }
 
     #[tokio::test]
