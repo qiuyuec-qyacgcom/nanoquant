@@ -51,6 +51,8 @@ fn local_leverage(
     min_lev: f64,
     max_lev: f64,
 ) -> f64 {
+    // 无评分（如非 fusion 预览信号）按中性 0.5 处理，避免被当成 0 分压低杠杆。
+    let score = if score > 0.0 { score } else { 0.5 };
     let vol = if atr_pct > 0.0 {
         (vol_target / atr_pct).clamp(0.5, 2.0)
     } else {
@@ -5914,6 +5916,15 @@ mod tests {
             local_leverage(8.0, 0.0, 10.0, 2.0, 10.0, 8.0, 100.0),
             8.0,
             "低于下限时夹到全局杠杆下限"
+        );
+    }
+
+    #[test]
+    fn local_leverage_treats_zero_score_as_neutral() {
+        assert_eq!(
+            local_leverage(1.0, 0.0, 10.0, 2.0, 10.0, 1.0, 100.0),
+            local_leverage(1.0, 0.5, 10.0, 2.0, 10.0, 1.0, 100.0),
+            "无评分应与中性评分 0.5 等价"
         );
     }
 
