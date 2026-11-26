@@ -7829,6 +7829,17 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test]
     async fn ai_disabled_opens_quant_entry_with_half_scale() {
         let (base_db, base_snapshot) = entry_fixture().await;
+        base_db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) \
+                 VALUES('ai','{\"enabled\":true,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )
+            .unwrap();
         test_runtime(&base_db)
             .persist_snapshot("demo", &base_snapshot)
             .unwrap();
@@ -7871,6 +7882,17 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test]
     async fn ai_review_error_falls_open_with_half_scale() {
         let (base_db, base_snapshot) = entry_fixture().await;
+        base_db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) \
+                 VALUES('ai','{\"enabled\":true,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )
+            .unwrap();
         test_runtime(&base_db)
             .persist_snapshot("demo", &base_snapshot)
             .unwrap();
@@ -7923,6 +7945,16 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
 
     async fn entry_with_scale(margin_pct: f64, scale: f64) -> (Db, f64, Value) {
         let (db, snapshot) = entry_fixture().await;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_settings(key,value,updated_at) \
+                 VALUES('ai','{\"enabled\":true,\"veto_only\":false,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )
+            .unwrap();
         test_runtime(&db)
             .with_reviewer(Arc::new(ScaleReviewer {
                 margin_pct: Some(margin_pct),

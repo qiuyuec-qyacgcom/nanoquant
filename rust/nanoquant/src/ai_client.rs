@@ -807,8 +807,8 @@ impl Default for AiConfig {
             inject_mantras: true,
             require_agreement: true,
             allow_ai_override: false,
-            veto_only: false,
-            scale_on_confidence: false,
+            veto_only: true,
+            scale_on_confidence: true,
             fail_open_scale: 0.5,
             use_invalidation_price: false,
             use_entry_price: false,
@@ -1671,6 +1671,14 @@ fn parse_model_list(data: &Value) -> Vec<Value> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn ai_config_default_enables_veto_only() {
+        let cfg = AiConfig::default();
+        assert!(cfg.veto_only, "默认必须启用否决模式");
+        assert!(cfg.scale_on_confidence, "默认必须按置信度降仓");
+        assert_eq!(cfg.fail_open_scale, 0.5);
+    }
 
     struct FakeTransport {
         posts: Mutex<Vec<HttpReply>>,

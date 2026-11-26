@@ -16,6 +16,20 @@ pub struct BootstrapReport {
 const SCHEMA_VERSION: &str = "1";
 const DEFAULT_SETTINGS: &str = include_str!("default_settings.json");
 
+/// 递归补齐缺失键：已有值（含用户改动与密码哈希）一律保留，数组整体不合并。
+fn merge_missing(target: &mut Value, defaults: &Value) {
+    if let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) {
+        for (key, value) in defaults {
+            match target.get_mut(key) {
+                Some(existing) => merge_missing(existing, value),
+                None => {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+}
+
 pub fn initialize(
     db_path: &Path,
     master_key_path: &Path,
@@ -41,6 +55,36 @@ pub fn initialize(
             params![key, raw, now],
         )
         .map_err(|e| format!("写入默认配置 {key} 失败: {e}"))?;
+    }
+
+    // INSERT OR IGNORE 不会更新旧库已有分组：逐组补齐新增默认键，保留用户已配置的值。
+    for (key, default_value) in &defaults {
+        let existing = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key=?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("读取 {key} 配置失败: {e}"))?;
+        let Some(raw) = existing else {
+            continue;
+        };
+        let Ok(mut current) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let before = current.clone();
+        merge_missing(&mut current, default_value);
+        if current == before {
+            continue;
+        }
+        let merged =
+            serde_json::to_string(&current).map_err(|e| format!("序列化 {key} 失败: {e}"))?;
+        conn.execute(
+            "UPDATE app_settings SET value=?1, updated_at=?2 WHERE key=?3",
+            params![merged, now, key],
+        )
+        .map_err(|e| format!("补齐默认配置 {key} 失败: {e}"))?;
     }
 
     // 必须在默认配置逐组写入之后：空库此时才有 strategy 行可供快照。
@@ -389,6 +433,71 @@ mod tests {
             )
             .ok();
         assert!(since.is_none(), "非 1h 默认策略不得写自动启用起点");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stored_group(conn: &Connection, group: &str) -> Value {
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key=?1",
+                params![group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_fills_missing_ai_keys() {
+        let dir = workspace("fill-ai-keys");
+        let db = dir.join("nanoquant.db");
+        let key = dir.join(".master_key");
+        initialize(&db, &key, Some("test-password")).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='ai'",
+                params![r#"{"enabled":false,"min_confidence":0.6}"#],
+            )
+            .unwrap();
+        }
+
+        initialize(&db, &key, Some("test-password")).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let ai = stored_group(&conn, "ai");
+        assert_eq!(ai["enabled"], false, "已有值不得被默认值覆盖");
+        assert_eq!(ai["min_confidence"], serde_json::json!(0.6));
+        assert_eq!(ai["veto_only"], true, "旧库必须补上 veto_only");
+        assert_eq!(
+            ai["scale_on_confidence"], true,
+            "旧库必须补上 scale_on_confidence"
+        );
+        assert_eq!(ai["fail_open_scale"], serde_json::json!(0.5));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_does_not_override_existing_veto_only() {
+        let dir = workspace("keep-veto-only");
+        let db = dir.join("nanoquant.db");
+        let key = dir.join(".master_key");
+        initialize(&db, &key, Some("test-password")).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='ai'",
+                params![r#"{"enabled":true,"veto_only":false}"#],
+            )
+            .unwrap();
+        }
+
+        initialize(&db, &key, Some("test-password")).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let ai = stored_group(&conn, "ai");
+        assert_eq!(ai["veto_only"], false, "用户显式关闭时不得被默认值改回");
+        assert_eq!(ai["scale_on_confidence"], true, "其余缺失键仍要补齐");
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
