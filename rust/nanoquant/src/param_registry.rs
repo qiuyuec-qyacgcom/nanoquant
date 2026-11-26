@@ -114,6 +114,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai", "low_score_threshold", 0.0, 0.7, 0.01),
     ("ai", "review_cache_ttl_sec", 0.0, 600.0, 1.0),
     ("ai", "review_concurrency", 1.0, 16.0, 1.0),
+    ("ai", "review_timeout_sec", 5.0, 120.0, 1.0),
     ("data", "kline_limit", 10.0, 1000.0, 10.0),
     ("data", "ticker_ttl_sec", 1.0, 3600.0, 1.0),
     ("data", "kline_ttl_sec", 1.0, 3600.0, 1.0),
@@ -221,6 +222,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "low_score_threshold",
             "review_cache_ttl_sec",
             "review_concurrency",
+            "review_timeout_sec",
         ],
     ),
     (

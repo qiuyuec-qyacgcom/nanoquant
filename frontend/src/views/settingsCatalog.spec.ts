@@ -173,6 +173,7 @@ describe('参数配置目录', () => {
       'low_score_threshold',
       'review_cache_ttl_sec',
       'review_concurrency',
+      'review_timeout_sec',
       'scale_on_confidence',
       'use_entry_price',
       'use_invalidation_price',

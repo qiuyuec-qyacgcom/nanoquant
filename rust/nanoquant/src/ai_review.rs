@@ -9,22 +9,11 @@ pub(crate) struct EngineAiReviewer {
     /// 执行复核的 Tokio 句柄。并发复核跑在普通线程上时，线程内拿不到
     /// `Handle::try_current()`，必须预先保存句柄才能驱动异步复核。
     handle: Option<tokio::runtime::Handle>,
-    timeout: std::time::Duration,
 }
 
 impl EngineAiReviewer {
     pub(crate) fn new(state: AiState, handle: Option<tokio::runtime::Handle>) -> Self {
-        Self {
-            state,
-            handle,
-            timeout: std::time::Duration::from_secs(30),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.timeout = timeout;
-        self
+        Self { state, handle }
     }
 }
 
@@ -38,9 +27,9 @@ impl AiReviewer for EngineAiReviewer {
         let state = self.state.clone();
         let conn = state.db.conn.clone();
         let proposal = proposal.clone();
-        let timeout = self.timeout;
         let run = move || {
             wait_for_lock(&conn, std::time::Duration::from_millis(2000))?;
+            let timeout = review_timeout(&state);
             handle.block_on(review_entry_with_timeout(state, proposal, timeout))
         };
         // 当前线程已在运行时里时必须 block_in_place，否则 block_on 会 panic；
@@ -51,6 +40,25 @@ impl AiReviewer for EngineAiReviewer {
             run()
         }
     }
+}
+
+/// 复核超时独立于 HTTP 请求超时（`ai.timeout_sec`）：`ai.review_timeout_sec`
+/// 控制整段复核（取行情 + 模型调用）的截止时间，缺省 30 秒。
+fn review_timeout(state: &AiState) -> std::time::Duration {
+    let value = match state.db.setting("ai") {
+        Ok(value) => value.unwrap_or(Value::Null),
+        Err(error) => {
+            tracing::debug!(error = ?error, "读取 ai 配置失败，复核超时回退默认值");
+            Value::Null
+        }
+    };
+    // UI 建议范围是 5–120 秒；读取侧放宽到 1 秒下限，便于老配置与测试快速收敛。
+    let secs = value
+        .get("review_timeout_sec")
+        .and_then(Value::as_u64)
+        .unwrap_or(30)
+        .clamp(1, 120);
+    std::time::Duration::from_secs(secs)
 }
 
 async fn review_entry_with_timeout(
@@ -1066,7 +1074,9 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     /// 慢速模型：让复核链路在超时窗口内收不到回复。
-    struct SlowTransport;
+    struct SlowTransport {
+        delay: std::time::Duration,
+    }
 
     impl crate::ai_client::AiTransport for SlowTransport {
         fn post_json<'a>(
@@ -1077,7 +1087,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             _timeout_secs: u64,
         ) -> crate::ai_client::BoxFuture<'a, Result<crate::ai_client::HttpReply, String>> {
             Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(self.delay).await;
                 Ok(crate::ai_client::HttpReply {
                     status: 200,
                     body: r#"{"choices":[{"message":{"content":"{\"a\":\"L\",\"c\":0.8}"},"finish_reason":"stop"}]}"#.to_string(),
@@ -1190,21 +1200,51 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 覆盖 ai 配置中的单个键，验证运行时读取路径。
+    fn set_ai_setting(db: &crate::db::Db, key: &str, value: Value) {
+        let mut ai: Value = {
+            let conn = db.conn.lock().unwrap();
+            let raw: String = conn
+                .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        ai[key] = value;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='ai'",
+                [serde_json::to_string(&ai).unwrap()],
+            )
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_timeout_returns_error() {
-        let path = std::env::temp_dir().join("nq-ai-reviewer-timeout.db");
+    async fn review_timeout_uses_config() {
+        let path = std::env::temp_dir().join("nq-ai-reviewer-timeout-config.db");
         let db = fixture(&path);
+        set_ai_setting(&db, "review_timeout_sec", json!(1));
         let state = AiState::with_transport(
             db.clone(),
             MASTER_KEY.as_bytes().to_vec(),
-            std::sync::Arc::new(SlowTransport),
+            std::sync::Arc::new(SlowTransport {
+                delay: std::time::Duration::from_millis(1500),
+            }),
         )
         .with_market(std::sync::Arc::new(StaticMarket));
+        let started = std::time::Instant::now();
         let error = EngineAiReviewer::new(state, None)
-            .with_timeout(std::time::Duration::from_millis(50))
             .review(&proposal("long"))
-            .expect_err("超过复核超时窗口必须失败");
+            .expect_err("超过配置的复核超时必须失败");
         assert!(error.contains("超时"), "错误要说明超时: {error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1400),
+            "必须按 ai.review_timeout_sec=1 返回，而不是等模型回复，实际 {:?}",
+            started.elapsed()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
