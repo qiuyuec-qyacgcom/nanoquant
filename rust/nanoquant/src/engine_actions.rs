@@ -469,9 +469,7 @@ mod tests {
     }
 
     fn seed_protect_position(db: &crate::db::Db) {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO positions(id,symbol,side,qty,mark_price,sl_price,tp_price,status,mode) \
                  VALUES(1,'BTCUSDT','long',1,100,95,110,'open','demo')",
@@ -576,9 +574,7 @@ mod tests {
     }
 
     fn insert_position(db: &crate::db::Db, id: i64, symbol: &str, mode: &str) {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,leverage,margin,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,realized_pnl,fees,status,mode,venue_unrealized,venue_ts,partial_taken_at,ai_confidence,ai_reason,entry_slippage_bps,trade_id) \
                  VALUES(?1,?2,'long',1,100,100,5,20,95,110,100,95,0.5,0,0,0,'',0,0,'open',?3,0,0,0,0,'',0,0)",
@@ -636,9 +632,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["cancelled"], 2);
         let closed: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT status FROM positions WHERE id=1", [], |row| {
                 row.get(0)
             })
@@ -665,9 +659,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["closed"].as_array().unwrap().len(), 2);
         let open: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM positions WHERE status='open'",
                 [],
@@ -676,9 +668,7 @@ mod tests {
             .unwrap();
         assert_eq!(open, 0);
         let enabled: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='enabled'",
                 [],
@@ -689,9 +679,7 @@ mod tests {
     }
 
     fn open_positions(db: &crate::db::Db, mode: &str) -> i64 {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row(
                 "SELECT COUNT(*) FROM positions WHERE mode=?1 AND status='open'",
                 [mode],
@@ -759,9 +747,7 @@ mod tests {
         assert_eq!(body["symbol"], "BTCUSDT");
         assert_eq!(open_positions(&db, "demo"), 1);
         let other: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT status FROM positions WHERE id=2", [], |row| {
                 row.get(0)
             })

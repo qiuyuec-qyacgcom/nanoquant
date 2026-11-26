@@ -1870,7 +1870,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-ai-budget.db");
         let db = fixture_db(&path);
         let cfg = read_ai_config(&db);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         assert_eq!(cfg.max_calls_per_hour, 2);
         assert!(budget_blocked(&conn, &cfg, 10_000).is_none());
         set_state_i64(&conn, "ai_calls_hour_bucket", 10_000 / 3600);
@@ -1920,7 +1920,7 @@ mod tests {
         assert!(seen[0].get("reasoning_effort").is_some());
         assert!(seen[1].get("reasoning_effort").is_none());
         assert!(seen[1].get("response_format").is_none());
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let logs: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_call_logs", [], |row| row.get(0))
             .unwrap();
@@ -1951,7 +1951,7 @@ mod tests {
         .await;
         assert!(outcome.ok, "{}", outcome.error);
         assert!(outcome.log_id > 0);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let found: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM ai_call_logs WHERE id=?1",

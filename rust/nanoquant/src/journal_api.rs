@@ -255,7 +255,7 @@ async fn search_experiences(State(db): State<Db>, Query(q): Query<SearchQuery>) 
 }
 
 async fn remove_experience(State(db): State<Db>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let changed = conn
         .execute("DELETE FROM experiences WHERE id = ?1", [id])
         .unwrap_or(0);

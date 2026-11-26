@@ -252,7 +252,7 @@ async fn main() {
     };
     if let Some(db) = db_handle.as_ref() {
         // 记录本次启动时间：总览的「运行时长」与「进程是否重启过」都靠它。
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         let started = now();
         let _ = conn.execute(
             "INSERT INTO engine_state(key, value, updated_at) VALUES('service_started_at', ?1, ?2) \

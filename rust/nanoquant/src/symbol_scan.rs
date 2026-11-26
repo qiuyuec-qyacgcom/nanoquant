@@ -884,7 +884,7 @@ mod tests {
     fn record_event_writes_symbol_scan_warning() {
         let db = memory_db(&[]);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "CREATE TABLE engine_events(ts INTEGER, level TEXT, category TEXT, message TEXT, payload TEXT);",
             )
@@ -896,7 +896,7 @@ mod tests {
             "自动换池失败",
             json!({"error": "network down"}),
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let row: (String, String, String, String) = conn
             .query_row(
                 "SELECT level, category, message, payload FROM engine_events",

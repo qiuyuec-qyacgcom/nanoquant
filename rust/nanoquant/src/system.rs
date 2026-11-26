@@ -421,7 +421,7 @@ async fn replay_one_handler(State(state): State<SystemState>, Path(id): Path<i64
 }
 
 async fn ignore_handler(State(state): State<SystemState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let changed = conn
         .execute("UPDATE write_failures SET resolved=1 WHERE id=?1", [id])
         .unwrap_or(0);
@@ -434,7 +434,7 @@ async fn ignore_handler(State(state): State<SystemState>, Path(id): Path<i64>) -
 
 async fn replay_all_handler(State(state): State<SystemState>) -> Json<Value> {
     let ids: Vec<i64> = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let mut stmt = conn
             .prepare("SELECT id FROM write_failures WHERE resolved = 0 ORDER BY ts ASC LIMIT 50")
             .expect("prepare replay all");
@@ -462,7 +462,7 @@ async fn replay_all_handler(State(state): State<SystemState>) -> Json<Value> {
 
 /// 单条重放。幂等靠 `client_order_id`：订单已落库即标记处理，绝不重复记账。
 fn replay_one(db: &Db, id: i64, auto: bool) -> Value {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let row = conn
         .query_row(
             "SELECT kind, payload, resolved FROM write_failures WHERE id=?1",
@@ -597,7 +597,7 @@ fn record_db_event(conn: &rusqlite::Connection, level: &str, message: String) {
 }
 
 async fn write_health(State(state): State<SystemState>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let dead = dead_letter_summary(&conn);
     let total = engine_int(&conn, "write_total");
     let slow = engine_int(&conn, "write_slow_count");
@@ -938,7 +938,7 @@ async fn alert_logs(
     Query(query): Query<AlertQuery>,
 ) -> Json<Value> {
     let limit = query.limit.clamp(1, 200);
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, level, category, message, channels, ok, error \
@@ -977,7 +977,7 @@ async fn alert_test(
             .into_response();
     }
     let cfg = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         alert_cfg(&conn)
     };
     let urls = cfg.webhook_urls(&level);
@@ -1143,7 +1143,7 @@ pub fn spawn_alert_task(state: SystemState) {
 
 /// 启动时的游标：只处理这之后的新事件。
 fn latest_event_id(state: &SystemState) -> i64 {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     conn.query_row(
         "SELECT COALESCE(MAX(id), 0) FROM engine_events",
         [],
@@ -1154,7 +1154,7 @@ fn latest_event_id(state: &SystemState) -> i64 {
 
 /// 取游标之后的新事件。单次上限 200 条，避免一次把几千行全捞出来。
 fn new_events(state: &SystemState, cursor: i64) -> Vec<AlertEvent> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, level, category, message FROM engine_events \
          WHERE id > ?1 ORDER BY id ASC LIMIT 200",
@@ -1178,7 +1178,7 @@ fn new_events(state: &SystemState, cursor: i64) -> Vec<AlertEvent> {
 /// 判断一条事件要不要推：总开关、级别、通道、静默时段、冷却窗口。
 async fn dispatch_alert(state: &SystemState, event: &AlertEvent) -> Result<(), String> {
     let cfg = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         alert_cfg(&conn)
     };
     if !cfg.enabled {
@@ -1294,7 +1294,7 @@ fn exec_secret_configured(conn: &rusqlite::Connection, mode: &str) -> bool {
 
 async fn exec_core(State(state): State<SystemState>) -> Json<Value> {
     let (trading_mode, has_key, pending) = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let trading_mode = current_mode(&conn);
         let has_key = exec_secret_configured(&conn, &trading_mode);
         let pending: i64 = conn
@@ -1392,7 +1392,7 @@ fn exec_check_outcome(connected: bool, has_key: bool) -> ExecCheck {
 
 async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
     let has_key = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         exec_secret_configured(&conn, &current_mode(&conn))
     };
     let client = state.exec_client.clone();
@@ -1466,7 +1466,7 @@ async fn exec_reconcile(
 ) -> Json<Value> {
     let lookback = query.lookback_hours.clamp(1, 168) * 3600;
     let limit = query.limit.clamp(1, 5000);
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let checked: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM orders WHERE ts >= ?1",
@@ -1664,7 +1664,7 @@ async fn get_exchange_credentials(State(state): State<SystemState>) -> axum::res
                 .into_response()
         }
     };
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let data = read_data_setting(&conn);
     let mode = current_mode(&conn);
     Json(json!({
@@ -1749,7 +1749,7 @@ async fn save_exchange_credentials(
             .into_response();
     }
     let updated = patch.keys().cloned().collect::<Vec<_>>();
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     if let Err(error) = update_data_setting(&conn, &patch) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1959,7 +1959,7 @@ async fn list_events(
     State(state): State<SystemState>,
     Query(query): Query<EventsQuery>,
 ) -> impl IntoResponse {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let since = query.since.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let level = query.level;
@@ -2424,9 +2424,7 @@ mod tests {
     async fn diagnostics_flags_undecryptable_credentials() {
         let path = std::env::temp_dir().join("nq-diagnostics-creds.db");
         let db = fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO app_settings VALUES('data','{\"demo_api_key_enc\":\"invalid-token\"}',0)",
                 [],
@@ -2681,7 +2679,7 @@ mod tests {
         .await;
         assert_eq!(missing["status"], "missing");
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let orders: i64 = conn
             .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
             .unwrap();
@@ -2725,7 +2723,7 @@ mod tests {
         let (_, again) =
             request_json(app.clone(), "POST", "/api/v1/system/dead-letters/2/ignore").await;
         assert_eq!(again["status"], "ignored", "重复忽略仍标记为已处理");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM write_failures WHERE resolved=0",
@@ -2792,7 +2790,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-write-health.db");
         let db = dead_fixture(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "INSERT INTO engine_state VALUES('write_total','20',0); \
                  INSERT INTO engine_state VALUES('write_slow_count','3',0); \
@@ -2821,7 +2819,7 @@ mod tests {
         let db = dead_fixture(&path);
         let dir = std::env::temp_dir().join(format!("nq-archive-{}", crate::now_millis()));
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "INSERT INTO engine_events VALUES(1,100,'info','engine','旧一','{}'); \
                  INSERT INTO engine_events VALUES(2,200,'warn','risk','旧二','{}');",
@@ -2845,9 +2843,7 @@ mod tests {
         assert!(name.starts_with("engine_events-") && name.ends_with(".jsonl.gz"));
         assert!(dir.join(&name).exists());
         let left: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM engine_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(left, 1, "归档后原表减少");
@@ -2882,7 +2878,7 @@ mod tests {
         let db = dead_fixture(&path);
         let dir = std::env::temp_dir().join(format!("nq-archive-cap-{}", crate::now_millis()));
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let tx = conn.unchecked_transaction().unwrap();
             {
                 let mut stmt = tx
@@ -2900,9 +2896,7 @@ mod tests {
         let (count, _) = archive_table(&db, "engine_events", "engine_events", 6000, &dir).unwrap();
         assert_eq!(count, 5000, "单次最多归档 5000 行");
         let (left, oldest): (i64, i64) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*), MIN(ts) FROM engine_events", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })
@@ -2965,9 +2959,7 @@ mod tests {
         let (port, hits) = fake_webhook().await;
         let path = std::env::temp_dir().join("nq-auto-alert.db");
         let db = dead_fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
                 [json!({
@@ -2989,9 +2981,7 @@ mod tests {
             "启用后应真的发出一次 webhook"
         );
         let logged: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(logged, 1, "推送结果应写入 alert_logs");
@@ -3012,9 +3002,7 @@ mod tests {
         let (port, hits) = fake_webhook().await;
         let path = std::env::temp_dir().join("nq-auto-alert-off.db");
         let db = dead_fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
                 [json!({
@@ -3034,9 +3022,7 @@ mod tests {
             "总开关关闭时不应发出任何请求"
         );
         let logged: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(logged, 0, "关闭时不写告警记录");
@@ -3062,9 +3048,7 @@ mod tests {
             request_json(app.clone(), "POST", "/api/v1/system/alerts/test?level=warn").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("未配置"));
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO alert_logs VALUES(1,100,'warn','test','测试告警','webhook',1,'')",
                 [],
@@ -3147,9 +3131,7 @@ mod tests {
         assert_eq!(reset["counts"]["errors"], 0);
         assert_eq!(reset["core_reset"], json!(false), "未连接时无内核可清零");
         let events: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM engine_events WHERE category='exec'",
                 [],
@@ -3165,7 +3147,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-diag-heartbeat.db");
         let db = dead_fixture(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
                 [json!({"enabled": true, "cycle_interval_sec": 600}).to_string()],
@@ -3289,9 +3271,7 @@ mod tests {
         assert!(!view.to_string().contains("abcdefghijk"));
         assert!(!view.to_string().contains("secret123456"));
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='data'",
                 [],
@@ -3317,9 +3297,7 @@ mod tests {
     async fn diagnostics_has_ten_timed_checks_and_isolates_credential_failure() {
         let path = std::env::temp_dir().join("nq-diagnostics-nine.db");
         let db = dead_fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "DELETE FROM write_failures; \
                  INSERT INTO app_settings VALUES('data','{\"demo_api_key_enc\":\"invalid-token\"}',0);",
@@ -3384,7 +3362,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-metrics-secret.db");
         let db = dead_fixture(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "INSERT INTO equity_points VALUES(1,100,'demo',12345,1000,0,0,1); \
                  INSERT INTO signals VALUES(1,100,'BTCUSDT','long',0.8,1); \

@@ -47,7 +47,7 @@ fn default_priority() -> i64 {
 }
 
 async fn list_strategies(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let rows = load(&conn);
     json!({
         "items": rows.iter().map(serialize).collect::<Vec<_>>(),
@@ -69,7 +69,7 @@ async fn create_strategy(
     if rule.chars().count() < 8 {
         return Err(bad("策略内容至少 8 个字（AI 需要可执行的判断依据）"));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let taken: bool = conn
         .query_row(
             "SELECT 1 FROM strategy_profiles WHERE name = ?1",
@@ -113,7 +113,7 @@ async fn update_strategy(
     Path(id): Path<i64>,
     Json(patch): Json<StrategyPatch>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let Some(mut row) = load(&conn).into_iter().find(|r| r.id == id) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -170,7 +170,7 @@ async fn remove_strategy(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let changed = conn
         .execute("DELETE FROM strategy_profiles WHERE id = ?1", [id])
         .unwrap_or(0);
@@ -185,7 +185,7 @@ async fn remove_strategy(
 }
 
 async fn preview(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let limit = engine_int(&conn, "max_symbols_per_cycle").max(1);
     let mut stmt = conn
         .prepare("SELECT symbol FROM trading_symbols WHERE enabled = 1 ORDER BY sort_order, symbol LIMIT ?1")

@@ -74,8 +74,12 @@ impl Db {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("db")
+    /// 取主连接锁。互斥量曾被毒化（持锁线程 panic）时忽略中毒标记继续使用，
+    /// 让单次线程崩溃不再连锁放大成后续请求全线 panic。
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 只读查询入口。文件库新开一个 `query_only` 连接，避免和写事务抢主连接锁；
@@ -114,10 +118,7 @@ impl Db {
     }
 
     fn shared(&self) -> Result<DbRead<'_>, String> {
-        self.conn
-            .lock()
-            .map(DbRead::Shared)
-            .map_err(|_| "数据库锁不可用".to_string())
+        Ok(DbRead::Shared(self.lock()))
     }
 
     /// 用库里的 security 组构造鉴权状态；缺字段时回退到安全默认值。
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn read_does_not_block_on_main_connection() {
         let (path, db) = seeded_file_db("read-not-block");
-        let guard = db.conn.lock().unwrap();
+        let guard = db.lock();
         let read = db.read().expect("主连接持锁时仍应取出独立连接");
         assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
         let label: String = read
@@ -335,6 +336,32 @@ mod tests {
         drop(read);
         drop(guard);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lock_recovers_after_poison() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe(id INTEGER PRIMARY KEY, label TEXT); \
+             INSERT INTO probe VALUES(1,'recovered');",
+        )
+        .unwrap();
+        let db = Db {
+            path: String::new(),
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        };
+        let worker = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = worker.lock();
+            panic!("故意持锁 panic，让互斥量中毒");
+        })
+        .join();
+        assert!(db.conn.is_poisoned(), "线程 panic 后互斥量应处于中毒状态");
+        let label: String = db
+            .lock()
+            .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "recovered", "中毒后仍应能通过 db.lock() 正常查询");
     }
 
     #[test]

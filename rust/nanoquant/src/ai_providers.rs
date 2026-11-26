@@ -163,7 +163,7 @@ fn load_provider(conn: &rusqlite::Connection, id: i64) -> Option<ProviderRow> {
 
 /// 按 ai 配置生成调用链：主供应商 → 回退 → 其余启用项，最多 5 个。
 pub fn provider_chain(state: &AiState) -> (ai_client::AiConfig, Vec<ProviderConfig>) {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let cfg = ai_client::read_ai_config_conn(&conn);
     let rows = load_providers(&conn);
     drop(conn);
@@ -275,7 +275,7 @@ fn not_found() -> (StatusCode, Json<Value>) {
 }
 
 async fn list_providers(State(state): State<AiState>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let items: Vec<Value> = load_providers(&conn)
         .iter()
         .map(|row| serialize(row, &state.master_key))
@@ -378,7 +378,7 @@ async fn create_provider(
     let encrypted = secret::encrypt_secret(&key, &body.api_key).map_err(bad_request)?;
     let extra = body.extra.unwrap_or_else(|| json!({}));
     let now = crate::now();
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM ai_providers WHERE name = ?1 LIMIT 1",
@@ -460,7 +460,7 @@ async fn patch_provider(
     Path(id): Path<i64>,
     Json(body): Json<ProviderPatch>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let Some(mut row) = load_provider(&conn, id) else {
         return Err(not_found());
     };
@@ -554,7 +554,7 @@ async fn delete_provider(
     State(state): State<AiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     if load_provider(&conn, id).is_none() {
         return Err(not_found());
     }
@@ -597,7 +597,7 @@ async fn fetch_models(
     let mut key = body.api_key.trim().to_string();
     let mut protocol = body.protocol;
     if body.provider_id > 0 {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let Some(row) = load_provider(&conn, body.provider_id) else {
             return Err(not_found());
         };
@@ -633,7 +633,7 @@ async fn test_provider(
     Json(body): Json<TestProviderIn>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let provider = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let Some(row) = load_provider(&conn, id) else {
             return Err(not_found());
         };
@@ -671,7 +671,7 @@ async fn diagnose_provider(
     Query(query): Query<DiagnoseQuery>,
 ) -> Json<Value> {
     let row = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         load_provider(&conn, id)
     };
     let Some(row) = row else {
@@ -794,7 +794,7 @@ async fn provider_models(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let provider = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let Some(row) = load_provider(&conn, id) else {
             return Err(not_found());
         };
@@ -1008,7 +1008,7 @@ mod tests {
             "首个模型自动成为当前供应商"
         );
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let cipher: String = conn
             .query_row(
                 "SELECT api_key_enc FROM ai_providers WHERE id = ?1",

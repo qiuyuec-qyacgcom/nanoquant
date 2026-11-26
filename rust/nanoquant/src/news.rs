@@ -147,7 +147,7 @@ async fn list_news(State(state): State<NewsState>, Query(q): Query<NewsQuery>) -
 
 pub(crate) fn items(db: &Db, limit: i64, source: &str, symbol: &str) -> Vec<Value> {
     let symbol = symbol.to_uppercase();
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let fetch = (limit * 4).min(800);
     let (sql, source_filter) = if source.is_empty() {
         ("SELECT id, ts, source, title, url, summary, sentiment, symbols FROM news_items ORDER BY ts DESC LIMIT ?1".to_string(), None)
@@ -215,7 +215,7 @@ async fn overview(State(state): State<NewsState>) -> Json<Value> {
 /// 近 24 小时的情绪分布。阈值读 `news.sentiment_threshold`，缺省 0.35，
 /// 超过 ±阈值才算显著多空，否则中性。
 pub(crate) fn sentiment_overview(db: &Db) -> Value {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let raw = conn
         .query_row(
             "SELECT value FROM app_settings WHERE key = 'news'",
@@ -1639,7 +1639,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-news-overview.db");
         let db = seed(&path);
         let now = crate::now();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO app_settings VALUES('news','{\"sentiment_threshold\":0.3}',0)",
             [],
@@ -1727,9 +1727,7 @@ mod tests {
             "request_timeout_sec": 3,
             "keep_days": 7,
         });
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(&format!(
                 "DELETE FROM news_items; INSERT INTO app_settings VALUES('news','{}',0);",
                 serde_json::to_string(&raw).unwrap()
@@ -1961,7 +1959,7 @@ mod tests {
             "rsshub_base 为空时不启用 RSSHub 源"
         );
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO app_settings(key,value,updated_at) VALUES('news','{\"rsshub_base\":\"https://rss.example.com/\"}',0)",
                 [],

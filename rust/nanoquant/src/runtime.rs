@@ -6543,7 +6543,7 @@ mod tests {
             candle.low = 99.0;
         }
         let read_scan = || {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let raw: String = conn
                 .query_row(
                     "SELECT value FROM engine_state WHERE key = 'cycle_preview.demo'",
@@ -6556,9 +6556,7 @@ mod tests {
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         assert_eq!(read_scan()["skipped"], "引擎未启用");
         assert_eq!(read_scan()["scan_candidates"], serde_json::json!([]));
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"demo"}"#],
@@ -6569,13 +6567,13 @@ mod tests {
             read_scan()["scan_candidates"],
             serde_json::json!(["BTCUSDT"])
         );
-        upsert_state(&db.conn.lock().unwrap(), "halted", "手动暂停").unwrap();
+        upsert_state(&db.lock(), "halted", "手动暂停").unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let preview = read_scan();
         assert_eq!(preview["scan_candidates"], serde_json::json!([]));
         assert!(preview["skipped"].as_str().unwrap().contains("熔断"));
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             upsert_state(&conn, "halted", "").unwrap();
             upsert_state(
                 &conn,
@@ -6590,7 +6588,7 @@ mod tests {
         assert!(preview["skipped"].as_str().unwrap().contains("最大回撤"));
         assert_eq!(preview["rejected"], serde_json::json!({}));
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             upsert_state(&conn, "equity_peak", "0").unwrap();
         }
         for candle in &mut snapshot.markets[0].candles {
@@ -6603,9 +6601,7 @@ mod tests {
             .unwrap()
             .contains("行情"));
         let audited: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM signals WHERE mode='demo' AND decision='rejected'",
                 [],
@@ -6629,7 +6625,7 @@ mod tests {
             candle.low = 99.5;
         }
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let raw: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key = 'symbol_regime.demo'",
@@ -6693,7 +6689,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut conn = db.conn.lock().unwrap();
+        let mut conn = db.lock();
         let tx = conn.transaction().unwrap();
         record_regimes(&tx, "demo", &markets, &metrics).unwrap();
         let market_regime: String = tx
@@ -6741,12 +6737,10 @@ mod tests {
             candle.high = 100.5;
             candle.low = 99.5;
         }
-        upsert_state(&db.conn.lock().unwrap(), "market_regime.demo", "chaos").unwrap();
+        upsert_state(&db.lock(), "market_regime.demo", "chaos").unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let value: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key = 'market_regime.demo'",
                 [],
@@ -6766,16 +6760,14 @@ mod tests {
             .await
             .unwrap();
         upsert_state(
-            &db.conn.lock().unwrap(),
+            &db.lock(),
             "symbol_regime.demo",
             r#"{"BTCUSDT":"range"}"#,
         )
         .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let value: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key = 'symbol_regime.demo'",
                 [],
@@ -6793,7 +6785,7 @@ mod tests {
         let (db, snapshot) = entry_fixture().await;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let rows: Vec<(String, String, String, i64)> = conn
             .prepare(
                 "SELECT symbol, decision, reject_reason, repeats FROM signals WHERE mode='demo'",
@@ -6826,7 +6818,7 @@ mod tests {
         market.candles.last_mut().unwrap().volume = 0.01;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (direction, score, features): (String, f64, String) = conn
             .query_row(
                 "SELECT direction, score, features FROM signals WHERE mode='demo' AND decision='rejected' \
@@ -6880,7 +6872,7 @@ mod tests {
         market.open_interest_change_pct = 0.0;
         let runtime = test_runtime(&db).with_reviewer(Arc::new(HoldReviewer));
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (direction, score, features, ai_action, ai_confidence, decision): (
             String,
             f64,
@@ -6929,7 +6921,7 @@ mod tests {
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (count, qty, leverage, sl, tp): (i64, f64, f64, f64, f64) = conn
             .query_row("SELECT COUNT(*),COALESCE(MAX(qty),0),COALESCE(MAX(leverage),0),COALESCE(MAX(sl_price),0),COALESCE(MAX(tp_price),0) FROM positions WHERE mode='demo' AND status='open' AND side='long'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
             .unwrap();
@@ -7008,7 +7000,7 @@ mod tests {
         assert_eq!(urls.len(), 4);
         assert!(urls[0].contains("/fapi/v1/positionSide/dual"));
         assert!(urls[1].contains("origClientOrderId=nq-entry-test"));
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let position: (String, f64, f64, f64) = conn
             .query_row(
                 "SELECT side,qty,entry_price,leverage FROM positions WHERE mode='live'",
@@ -7099,7 +7091,7 @@ mod tests {
         assert!(urls[2].contains("price=99.99"), "{}", urls[2]);
         assert!(urls[3].contains("origClientOrderId="), "{}", urls[3]);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let (order_type, status): (String, String) = conn
                 .query_row(
                     "SELECT order_type,status FROM orders WHERE mode='live'",
@@ -7132,9 +7124,7 @@ mod tests {
             &db,
             r#"{"enabled":true,"mode":"live","order_type":"limit_post_only"}"#,
         );
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) VALUES('ai',?1,0) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -7207,7 +7197,7 @@ mod tests {
             "拒单原因必须上报：{failures:?}"
         );
         assert_eq!(gateway.sent_count(), 3, "挂单被拒必须放弃，不能追价改市价");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (order_type, status): (String, String) = conn
             .query_row(
                 "SELECT order_type,status FROM orders WHERE mode='live'",
@@ -7262,7 +7252,7 @@ mod tests {
             "只有一笔真实的限价发单"
         );
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM orders WHERE mode='live'",
@@ -7312,7 +7302,7 @@ mod tests {
             .await
             .unwrap();
         assert!(failures.is_empty(), "{failures:?}");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (qty, entry_price, fees): (f64, f64, f64) = conn
             .query_row(
                 "SELECT qty,entry_price,fees FROM positions WHERE mode='live' AND status='open'",
@@ -7347,18 +7337,14 @@ mod tests {
         assert!(gateway.sent_urls()[0].contains("/fapi/v1/positionSide/dual"));
         assert!(gateway.sent_urls()[1].contains("/fapi/v1/leverage"));
         let orders: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
             .unwrap();
         assert_eq!(orders, 0);
     }
 
     fn seed_limit_entry_order(db: &Db, ts: i64, status: &str) {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
                  client_order_id,exchange_order_id,reduce_only,mode,latency_ms) \
@@ -7399,7 +7385,7 @@ mod tests {
             "超时后只查一次、撤一次，不能重发新单"
         );
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
@@ -7418,7 +7404,7 @@ mod tests {
             assert!(events > 0, "撤单必须写事件");
         }
         let inflight = {
-            let mut conn = db.conn.lock().unwrap();
+            let mut conn = db.lock();
             let tx = conn.transaction().unwrap();
             EngineRuntime::live_entry_inflight(&tx, "BTCUSDT").unwrap()
         };
@@ -7448,9 +7434,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(gateway.sent_count(), 2, "未超时不能发撤单请求");
         let status: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
                 [],
@@ -7493,7 +7477,7 @@ mod tests {
                 .all(|url| !url.contains("type=LIMIT")),
             "撤单未知时绝不能重发开仓单"
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let status: String = conn
             .query_row(
                 "SELECT status FROM orders WHERE client_order_id='nq-entry-old'",
@@ -7517,9 +7501,7 @@ mod tests {
         let (db, snapshot) = entry_fixture().await;
         let runtime = test_runtime(&db);
         let now = crate::now();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO cooldowns VALUES('BTCUSDT',?1,'loss','symbol')",
                 [now + 60],
@@ -7527,9 +7509,7 @@ mod tests {
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let entries = || {
-            db.conn
-                .lock()
-                .unwrap()
+            db.lock()
                 .query_row(
                     "SELECT COUNT(*) FROM orders WHERE purpose='entry'",
                     [],
@@ -7538,12 +7518,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(entries(), 0);
-        db.conn.lock().unwrap().execute_batch("UPDATE cooldowns SET until_ts=0; UPDATE app_settings SET value=json_set(value,'$.category_exposure_limit_pct',60) WHERE key='risk'; INSERT INTO positions(symbol,side,qty,entry_price,mark_price,mode,status) VALUES('BTCDOMUSDT','short',20,100,100,'demo','open');").unwrap();
+        db.lock().execute_batch("UPDATE cooldowns SET until_ts=0; UPDATE app_settings SET value=json_set(value,'$.category_exposure_limit_pct',60) WHERE key='risk'; INSERT INTO positions(symbol,side,qty,entry_price,mark_price,mode,status) VALUES('BTCDOMUSDT','short',20,100,100,'demo','open');").unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         assert_eq!(entries(), 0);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE positions SET symbol='ETHUSDT'", [])
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
@@ -7581,9 +7559,7 @@ mod tests {
     #[tokio::test]
     async fn ai_reject_prevents_entry_and_leaves_no_order() {
         let (db, snapshot) = entry_fixture().await;
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
                  INSERT OR REPLACE INTO ai_providers(id,enabled) VALUES(1,1); \
@@ -7594,9 +7570,7 @@ mod tests {
         let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let orders: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM orders WHERE purpose='entry'",
                 [],
@@ -7605,9 +7579,7 @@ mod tests {
             .unwrap();
         assert_eq!(orders, 0, "AI 拒绝后不能产生订单");
         let (score, features): (f64, String) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT score, features FROM signals WHERE mode='demo' AND decision='rejected' \
                  ORDER BY id DESC LIMIT 1",
@@ -7626,9 +7598,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_signal_persists_ai_meta_in_features() {
         let (db, snapshot) = entry_fixture().await;
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS ai_providers(id INTEGER PRIMARY KEY, enabled INTEGER); \
                  INSERT OR REPLACE INTO ai_providers(id,enabled) VALUES(1,1); \
@@ -7639,9 +7609,7 @@ mod tests {
         let runtime = test_runtime(&db).with_reviewer(Arc::new(RejectReviewer));
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let features: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT features FROM signals WHERE mode='demo' AND decision='rejected' \
                  ORDER BY id DESC LIMIT 1",
@@ -7673,9 +7641,7 @@ mod tests {
         snapshot.markets[0].mark_price = 95.0;
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let expiry: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT until_ts FROM cooldowns WHERE symbol='BTCUSDT'",
                 [],
@@ -7701,9 +7667,7 @@ mod tests {
     async fn cooldown_position_fixture(mark: f64) -> (Db, crate::providers::TradingSnapshot) {
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
 r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
@@ -7724,7 +7688,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let now = crate::now();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (until, kind): (i64, String) = conn
             .query_row(
                 "SELECT until_ts, kind FROM cooldowns WHERE symbol='__global__'",
@@ -7754,7 +7718,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let (db, snapshot) = cooldown_position_fixture(110.0).await;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (status, reason): (String, String) = conn
             .query_row(
                 "SELECT status, exit_reason FROM positions WHERE symbol='BTCUSDT'",
@@ -7778,9 +7742,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn global_cooldown_minutes_blocks_entries_until_it_expires() {
         let (db, snapshot) = entry_fixture().await;
         let runtime = test_runtime(&db);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO cooldowns VALUES('__global__',?1,'test','global')",
                 [crate::now() + 600],
@@ -7788,9 +7750,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         assert_eq!(entry_orders(&db), 0, "全局冷却内不能新开仓");
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE cooldowns SET until_ts=?1 WHERE kind='global'",
                 [crate::now() - 1],
@@ -7806,7 +7766,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE cooldowns SET until_ts=0 WHERE kind='global'",
                 [],
@@ -7815,7 +7775,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
         // 下一轮会清掉过期的全局冷却；symbol 冷却仍在有效期内，不能被一起删掉。
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let global: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM cooldowns WHERE kind='global'",
@@ -7838,7 +7798,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn halt_flatten_fixture(close_on_halt: bool) -> (Db, crate::providers::TradingSnapshot) {
         let (db, snapshot) = cooldown_position_fixture(100.0).await;
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [format!(
@@ -7862,7 +7822,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let (db, snapshot) = halt_flatten_fixture(true).await;
         let runtime = test_runtime_with_events(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (status, reason): (String, String) = conn
             .query_row(
                 "SELECT status, exit_reason FROM positions WHERE symbol='BTCUSDT'",
@@ -7895,7 +7855,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let (db, snapshot) = halt_flatten_fixture(false).await;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let status: String = conn
             .query_row(
                 "SELECT status FROM positions WHERE symbol='BTCUSDT'",
@@ -7918,13 +7878,13 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn close_on_halt_ignores_a_manual_halt() {
         let (db, snapshot) = halt_flatten_fixture(true).await;
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             upsert_state(&conn, "equity_peak", "0").unwrap();
             upsert_state(&conn, "halted", "手动暂停").unwrap();
         }
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let status: String = conn
             .query_row(
                 "SELECT status FROM positions WHERE symbol='BTCUSDT'",
@@ -7953,9 +7913,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let (db, snapshot) = halt_flatten_fixture(true).await;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
                  peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
@@ -7963,7 +7921,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             )
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let closes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM orders WHERE purpose='halt_flatten'",
@@ -7983,9 +7941,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     fn entry_qty(db: &Db) -> f64 {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row(
                 "SELECT qty FROM orders WHERE mode='demo' AND purpose='entry' ORDER BY id DESC LIMIT 1",
                 [],
@@ -7998,9 +7954,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn ai_disabled_opens_quant_entry_with_half_scale() {
         let (base_db, base_snapshot) = entry_fixture().await;
         base_db
-            .conn
             .lock()
-            .unwrap()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) \
                  VALUES('ai','{\"enabled\":true,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
@@ -8015,9 +7969,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert!(base_qty > 0.0, "AI 启用时应正常开仓");
 
         let (db, snapshot) = entry_fixture().await;
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) \
                  VALUES('ai','{\"enabled\":false,\"fail_open_scale\":0.5}',0) \
@@ -8051,9 +8003,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn ai_review_error_falls_open_with_half_scale() {
         let (base_db, base_snapshot) = entry_fixture().await;
         base_db
-            .conn
             .lock()
-            .unwrap()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) \
                  VALUES('ai','{\"enabled\":true,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
@@ -8426,9 +8376,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
 
     async fn entry_with_scale(margin_pct: f64, scale: f64) -> (Db, f64, Value) {
         let (db, snapshot) = entry_fixture().await;
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) \
                  VALUES('ai','{\"enabled\":true,\"veto_only\":false,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
@@ -8445,9 +8393,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         let qty = entry_qty(&db);
         let features: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT features FROM signals WHERE mode='demo' ORDER BY id DESC LIMIT 1",
                 [],
@@ -8480,9 +8426,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     fn entry_orders(db: &Db) -> i64 {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row(
                 "SELECT COUNT(*) FROM orders WHERE mode='demo' AND purpose='entry'",
                 [],
@@ -8492,9 +8436,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     fn set_engine_settings(db: &Db, value: &str) {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [value],
@@ -8505,7 +8447,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn entry_fixture() -> (Db, crate::providers::TradingSnapshot) {
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
-        db.conn.lock().unwrap().execute_batch(
+        db.lock().execute_batch(
             r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';
             ALTER TABLE positions ADD COLUMN entry_slippage_bps REAL NOT NULL DEFAULT 0;
@@ -8541,7 +8483,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
                  ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';",
@@ -8567,7 +8509,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let (status, exit_reason, qty): (String, String, f64) = conn
                 .query_row(
                     "SELECT status, exit_reason, qty FROM positions WHERE symbol='BTCUSDT'",
@@ -8590,9 +8532,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             assert_eq!(price, 50_000.0);
         }
         let raw: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='cycle_preview.demo'",
                 [],
@@ -8607,9 +8547,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         // 同一份快照再跑一轮：仓位已平，不能重复下单。
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let orders: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM orders WHERE mode='demo'", [], |row| {
                 row.get(0)
             })
@@ -8622,7 +8560,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"demo"}"#],
@@ -8646,9 +8584,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let status: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT status FROM positions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(status, "open", "停更行情上不能撮合");
@@ -8666,16 +8602,14 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 candle
             })
             .collect();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO orders(symbol,client_order_id,exchange_order_id,mode,status) \
                  VALUES('BTCUSDT','entry-1','','demo','pending');",
             )
             .unwrap();
         runtime.persist_snapshot("demo", &fresh).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let status: String = conn
             .query_row("SELECT status FROM positions", [], |row| row.get(0))
             .unwrap();
@@ -8752,7 +8686,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     fn seed_live_position(db: &Db) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         // test_db 的持仓夹具早于 trades 生产 schema 字段，补齐 record_trade 读取的列。
         conn.execute_batch(
             "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
@@ -8806,7 +8740,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             qty: 0.5,
             entry_price: 49_000.0,
         });
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let tx = conn.unchecked_transaction().unwrap();
         let closed = EngineRuntime::close_missing_positions(&tx, "live", &snapshot).unwrap();
         assert_eq!(closed.len(), 1, "交易所有空头不代表本地的多头还在");
@@ -8835,7 +8769,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
         assert!(plans.is_empty(), "交易所已无此仓，不能再发平仓单");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (status, exit_reason, exit_price): (String, String, f64) = conn
             .query_row(
                 "SELECT status, exit_reason, exit_price FROM positions WHERE mode='live'",
@@ -8852,9 +8786,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert_eq!(order_rows, 0, "交易所触发的平仓不该伪造委托");
         drop(conn);
         let raw: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='cycle_preview.live'",
                 [],
@@ -8892,7 +8824,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert!(gateway.sent_urls()[1].contains("reduceOnly=true"));
         assert!(!gateway.sent_urls()[1].contains("positionSide="));
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let (status, qty): (String, f64) = conn
                 .query_row(
                     "SELECT status, qty FROM positions WHERE mode='live'",
@@ -8945,9 +8877,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert!(urls[1].contains("/fapi/v1/order?"));
         assert!(urls[2].contains("origClientOrderId="));
         let (status, exchange_id): (String, String) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT status, exchange_order_id FROM orders WHERE mode='live'",
                 [],
@@ -8978,7 +8908,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             failures.iter().any(|failure| failure.contains("-2019")),
             "拒单原因必须上报：{failures:?}"
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let status: String = conn
             .query_row(
                 "SELECT status FROM positions WHERE mode='live'",
@@ -8999,7 +8929,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn protection_failure_is_reported_but_the_filled_leg_is_recorded() {
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"live"}"#],
@@ -9028,7 +8958,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             failures.iter().any(|failure| failure.contains("保护单")),
             "止盈挂不上必须让调用方看到：{failures:?}"
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (stop, take): (i64, i64) = conn
             .query_row(
                 "SELECT SUM(purpose='stop_loss'), SUM(purpose='take_profit') FROM orders WHERE mode='live'",
@@ -9052,9 +8982,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn an_unknown_close_is_reconciled_by_the_next_cycle() {
         let db = test_db();
         seed_live_position(&db);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
                  client_order_id,exchange_order_id,reduce_only,mode) \
@@ -9076,7 +9004,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(gateway.sent_count(), 2, "先查模式，再查未知单，不重发");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (status, exit_price): (String, f64) = conn
             .query_row(
                 "SELECT status, exit_price FROM positions WHERE mode='live'",
@@ -9101,7 +9029,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn reconciling_a_close_for_an_already_closed_position_only_updates_the_order() {
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
                  peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,\
@@ -9127,7 +9055,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .await
             .unwrap();
         assert!(failures.is_empty(), "{failures:?}");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (status, realized, fees): (String, f64, f64) = conn
             .query_row(
                 "SELECT status, realized_pnl, fees FROM positions WHERE mode='live'",
@@ -9150,9 +9078,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn an_inflight_close_blocks_a_second_plan_for_the_same_symbol() {
         let db = test_db();
         seed_live_position(&db);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,\
                  client_order_id,exchange_order_id,reduce_only,mode) \
@@ -9174,7 +9100,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn an_unknown_protection_leg_is_recorded_and_never_rearmed() {
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
                  peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
@@ -9199,9 +9125,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             "{failures:?}"
         );
         let unknown: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM orders WHERE mode='live' AND status='UNKNOWN' \
                  AND purpose IN ('stop_loss','take_profit')",
@@ -9238,9 +9162,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert!(error.contains("持仓模式"), "{error}");
         assert_eq!(gateway.sent_count(), 1);
         let orders: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM orders", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orders, 0, "模式不明不能发单");
@@ -9249,9 +9171,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test]
     async fn hedge_mode_protects_each_side_of_the_same_symbol() {
         let db = test_db();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
                  peak_price,initial_sl_price,signal_score,opened_at,status,mode) VALUES \
@@ -9288,9 +9208,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         assert_eq!((long_legs, short_legs), (2, 2));
         assert!(urls.iter().all(|url| !url.contains("reduceOnly=")));
         let recorded: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM orders WHERE purpose IN ('stop_loss','take_profit')",
                 [],
@@ -9321,7 +9239,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let db = test_db();
         let runtime = test_runtime(&db);
         assert!(runtime.tick(&RuntimeConfig::from_db(&db)).await.is_ok());
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let ts: i64 = conn
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM engine_state WHERE key='last_cycle_ts'",
@@ -9344,7 +9262,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn enabled_tick_refuses_to_fake_cycle_and_records_error() {
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='engine'",
                 [r#"{"enabled":true,"mode":"live","cycle_interval_sec":15}"#],
@@ -9354,7 +9272,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
         let runtime = test_runtime(&db);
         assert!(runtime.tick(&RuntimeConfig::from_db(&db)).await.is_err());
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let error: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='last_error'",
@@ -9389,7 +9307,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .refresh_snapshot("demo", &crate::providers::DemoProvider::new())
             .await
             .unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let raw: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='snapshot.demo'",
@@ -9423,9 +9341,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test]
     async fn position_differences_are_scoped_to_mode_symbol_and_side() {
         let db = test_db();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO positions(symbol, side, qty, mode, status) VALUES ('BTCUSDT','long',2,'demo','open'),
                  ('BTCUSDT','short',1,'demo','open'), ('ETHUSDT','long',4,'live','open'),
@@ -9442,7 +9358,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             entry_price: 100.0,
         });
         runtime.persist_snapshot("demo", &snapshot).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let raw: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='position_differences.demo'",
@@ -9470,7 +9386,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     async fn missing_open_order_remains_pending_and_is_reported() {
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
-        db.conn.lock().unwrap().execute_batch(
+        db.lock().execute_batch(
             "INSERT INTO orders(symbol, client_order_id, exchange_order_id, mode, status) VALUES
              ('BTCUSDT','entry-1','','demo','pending'),
              ('BTCUSDT','live-1','','live','NEW'),
@@ -9480,7 +9396,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         test_runtime(&db)
             .persist_snapshot("demo", &snapshot)
             .unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let report: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='order_differences.demo'",
@@ -9508,9 +9424,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test]
     async fn rejected_snapshot_timestamp_rolls_back_snapshot() {
         let db = test_db();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO positions(symbol, side, qty, mode, status) VALUES ('BTCUSDT','long',-1,'demo','open');
              CREATE TRIGGER reject_timestamp BEFORE INSERT ON engine_state
@@ -9523,9 +9437,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .await
             .is_err());
         let exists: bool = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key='snapshot.demo')",
                 [],
@@ -9543,9 +9455,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let has_tick = db
-                    .conn
                     .lock()
-                    .unwrap()
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM engine_state WHERE key='last_cycle_ts')",
                         [],
@@ -9573,7 +9483,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let (tx, rx) = stop_channel();
         tx.send(true).unwrap();
         test_runtime(&db).run(rx).await;
-        let writes: i64 = db.conn.lock().unwrap().query_row("SELECT count(*) FROM engine_state WHERE key IN ('last_cycle_ts', 'last_cycle_ms', 'last_error')", [], |r| r.get(0)).unwrap();
+        let writes: i64 = db.lock().query_row("SELECT count(*) FROM engine_state WHERE key IN ('last_cycle_ts', 'last_cycle_ms', 'last_error')", [], |r| r.get(0)).unwrap();
         assert_eq!(writes, 0, "收到停止信号后不能执行新的周期");
     }
 
@@ -9582,7 +9492,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         use crate::providers::{DemoProvider, SnapshotProvider};
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0; \
                  ALTER TABLE positions ADD COLUMN ai_reason TEXT NOT NULL DEFAULT '';",
@@ -9614,7 +9524,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let (features, trade_id): (String, i64) = conn
                 .query_row(
                     "SELECT features, trade_id FROM positions WHERE symbol='BTCUSDT'",
@@ -9636,7 +9546,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         let mut seen = false;
         for _ in 0..100 {
             {
-                let conn = db.conn.lock().unwrap();
+                let conn = db.lock();
                 let count: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM engine_events WHERE category='evolution'",
@@ -9998,7 +9908,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     fn combo_db(positions: &[(&str, &str, f64, f64)]) -> Db {
         let db = test_db();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             for (symbol, side, qty, mark) in positions {
                 conn.execute(
                     "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,status,mode) VALUES(?1,?2,?3,?4,?4,'open','demo')",
@@ -10030,7 +9940,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         side: &str,
         notional: f64,
     ) -> Result<Option<String>, String> {
-        let mut conn = db.conn.lock().unwrap();
+        let mut conn = db.lock();
         let tx = conn.transaction().unwrap();
         EngineRuntime::entry_allowed(
             &tx,

@@ -252,7 +252,7 @@ async fn options(State(state): State<AppState>) -> Json<Value> {
     let Some(db) = state.db.clone() else {
         return Json(json!({"available":false,"reason":"数据库未就绪"}));
     };
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = backup_config(&conn);
     let groups: Vec<&str> = GROUPS.to_vec();
     let tables: Vec<&str> = BACKUP_TABLES.to_vec();
@@ -282,7 +282,7 @@ async fn options(State(state): State<AppState>) -> Json<Value> {
 
 async fn jobs(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = storage(&state)?;
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut stmt = conn
         .prepare("SELECT id,ts,name,scope,file_path,size,sha256,encrypted,status,message,created_by FROM backup_jobs ORDER BY ts DESC LIMIT 100")
         .map_err(|error| bad(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -371,7 +371,7 @@ fn create_backup_inner(
     input: CreateIn,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let db = storage(state)?;
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = backup_config(&conn);
     let encrypt = input
         .encrypt
@@ -408,7 +408,7 @@ fn create_backup_inner(
     let label = safe_label(&input.name, ts);
     let mut entries = Vec::new();
     let mut row_counts = Map::new();
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     for group in &groups {
         let value = setting(&conn, group);
         entries.push(Entry {
@@ -703,7 +703,7 @@ fn restore_inner(
     let restore_settings = input["restore_settings"].as_bool().unwrap_or(true);
     let restore_tables = input["restore_tables"].as_bool().unwrap_or(true);
     let mut restored = Map::new();
-    let mut conn = db.conn.lock().expect("db");
+    let mut conn = db.lock();
     let tx = conn
         .transaction()
         .map_err(|error| bad(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -801,7 +801,7 @@ async fn delete_job(
     let db = storage(&state)?;
     let job = load_job(&db, job_id)?;
     let _ = std::fs::remove_file(&job.file_path);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     conn.execute("DELETE FROM backup_jobs WHERE id=?1", [job_id])
         .map_err(|error| bad(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     drop(conn);
@@ -821,7 +821,7 @@ struct JobRow {
 }
 
 fn load_job(db: &Db, job_id: i64) -> Result<JobRow, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     conn.query_row(
         "SELECT file_path, sha256, encrypted FROM backup_jobs WHERE id=?1",
         [job_id],
@@ -850,7 +850,7 @@ fn insert_job(
     message: &str,
     created_by: &str,
 ) -> Result<i64, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     conn.execute(
         "INSERT INTO backup_jobs(ts,name,scope,file_path,size,sha256,encrypted,status,message,created_by) \
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -872,7 +872,7 @@ fn insert_job(
 }
 
 fn apply_retention(db: &Db, retention: usize) {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut rows: Vec<(i64, String)> = conn
         .prepare("SELECT id,file_path FROM backup_jobs ORDER BY ts DESC")
         .ok()
@@ -1520,7 +1520,7 @@ mod tests {
         assert!(first.is_some(), "到点后应当执行一次自动备份");
         let recorded = {
             let db = state.db.clone().unwrap();
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let cfg = setting(&conn, "backup");
             cfg["last_run_ts"].as_i64().unwrap_or(0)
         };
@@ -1533,7 +1533,7 @@ mod tests {
         // 关掉自动备份后不应再执行。
         {
             let db = state.db.clone().unwrap();
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value = ?1 WHERE key = 'backup'",
                 [json!({"auto_daily": false, "last_run_ts": 0}).to_string()],
@@ -1657,7 +1657,7 @@ mod tests {
         let digest = hex::encode(Sha256::digest(&zip));
         let db = Db::open(&db_path.to_string_lossy()).unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO backup_jobs(id,ts,name,scope,file_path,size,sha256,encrypted,status,message,created_by) \
                  VALUES(1,0,'tampered','{}',?1,?2,?3,0,'ok','','manual')",
@@ -1673,7 +1673,7 @@ mod tests {
         )
         .expect("还原应成功");
         assert_eq!(outcome["ok"], true);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let saved: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='symbol_scan'",
@@ -1730,7 +1730,7 @@ mod tests {
         let digest = hex::encode(Sha256::digest(&zip));
         let db = Db::open(&db_path.to_string_lossy()).unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "CREATE TABLE evil_table(id INTEGER PRIMARY KEY, payload TEXT);
                  INSERT INTO evil_table(id,payload) VALUES(1,'original');",
@@ -1751,7 +1751,7 @@ mod tests {
         )
         .expect("还原应成功");
         assert_eq!(outcome["ok"], true);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let engine: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='engine'",
@@ -1830,7 +1830,7 @@ mod tests {
         .await;
         assert!(result.is_err(), "快照失败必须中止还原");
         assert_eq!(result.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let engine: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='engine'",

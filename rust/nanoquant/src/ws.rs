@@ -268,7 +268,7 @@ fn symbol_in_pool(state: &AppState, symbol: &str) -> bool {
     let Some(db) = state.db.as_ref() else {
         return false;
     };
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     conn.query_row(
         "SELECT COUNT(*) FROM trading_symbols WHERE symbol = ?1 AND enabled != 0",
         [symbol],

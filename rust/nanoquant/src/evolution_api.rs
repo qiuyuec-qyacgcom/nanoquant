@@ -76,7 +76,7 @@ async fn create_mantra(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let title = sanitize(&body.title);
     let rule = sanitize(&body.rule);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = write_cfg(&conn);
     if let Some(reason) = audit(&title, &rule, &body.category, body.confidence, &cfg) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": reason }).into()));
@@ -160,7 +160,7 @@ async fn update_mantra(
     Path(id): Path<i64>,
     Json(patch): Json<MantraPatch>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let Some(mut row) = load_mantras(&conn).into_iter().find(|r| r.id == id) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -201,7 +201,7 @@ async fn remove_mantra(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let changed = conn
         .execute("DELETE FROM mantras WHERE id = ?1", [id])
         .unwrap_or(0);
@@ -217,7 +217,7 @@ async fn remove_mantra(
 /// 存量去重：语义重复的只留置信度最高的一条，其余标记为被它替代。
 /// `use_ai` 目前忽略——语义判断要等模型接入，字符相似度是 legacy 内核（已退役） 的同一条回退路径。
 async fn dedupe_mantras(State(db): State<Db>, Query(_q): Query<DedupeQuery>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut rows = load_mantras(&conn);
     rows.retain(|r| r.enabled && r.superseded_by == 0);
     rows.sort_by(|a, b| {
@@ -672,7 +672,7 @@ fn tokens(text: &str) -> std::collections::BTreeSet<String> {
 
 async fn list_mantras(State(db): State<Db>, Query(q): Query<MantrasQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 1000);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = evolution_cfg(&conn);
     json!({ "items": mantra_items(&conn, q.include_disabled, &q.category, limit, cfg.ttl_days), "stats": mantra_stats(&conn, &cfg) }).into()
 }
@@ -689,18 +689,18 @@ fn default_runs_limit() -> i64 {
 
 async fn list_runs(State(db): State<Db>, Query(q): Query<RunsQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 200);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     json!({ "items": run_items(&conn, limit) }).into()
 }
 
 async fn injection_view(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = evolution_cfg(&conn);
     json!(injection_report(&conn, &cfg)).into()
 }
 
 async fn stats(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let cfg = evolution_cfg(&conn);
     let mode = current_mode(&conn);
     json!({ "mantras": mantra_stats(&conn, &cfg), "trades": trade_stats(&conn, &mode) }).into()
@@ -1349,7 +1349,7 @@ mod tests {
     async fn a_near_duplicate_reinforces_the_existing_mantra() {
         let path = std::env::temp_dir().join("nq-mantras-merge.db");
         let db = fixture(&path);
-        db.conn.lock().unwrap().execute(
+        db.lock().execute(
             "UPDATE mantras SET title='突破追涨确认', rule='当价格突破后追涨，不要在回踩时追' WHERE id=1",
             [],
         ).unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
     async fn dedupe_retires_the_lower_confidence_copy() {
         let path = std::env::temp_dir().join("nq-mantras-dedupe.db");
         let db = fixture(&path);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute("UPDATE mantras SET title='突破追涨确认', rule='当价格突破后追涨，不要在回踩时追' WHERE id=1", []).unwrap();
         conn.execute(
             "INSERT INTO mantras VALUES(4,'突破追涨确认','当价格突破后追涨，不要回踩时追','[]','entry','manual',0.55,0.5,0,0,0,1,1,1,0,'{}',400,400,0)",

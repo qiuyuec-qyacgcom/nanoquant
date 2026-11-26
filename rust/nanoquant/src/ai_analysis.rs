@@ -558,7 +558,7 @@ async fn decision_preview(
         return Err(bad_request("symbol 不能为空"));
     }
     let strategy_profile = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let profile = crate::strategies::profile_for(&conn, &symbol);
         if let Some(profile) = &profile {
             crate::strategies::mark_applied(&conn, profile);
@@ -1095,9 +1095,7 @@ CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, c
 
     fn encrypt_fixture_key(db: &Db) {
         let cipher = crate::secret::encrypt_secret(MASTER_KEY, "sk-test").unwrap();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE ai_providers SET api_key_enc = ?1", [&cipher])
             .unwrap();
     }

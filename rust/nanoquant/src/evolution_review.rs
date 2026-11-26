@@ -635,7 +635,7 @@ pub(crate) async fn review_trade_inner(
     force: bool,
 ) -> Result<Value, (StatusCode, Value)> {
     let (cfg, pending, injected, pnl) = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let trade = load_trades(&conn, 5000, false, "")
             .into_iter()
             .find(|trade| trade.id == trade_id);
@@ -672,7 +672,7 @@ pub(crate) async fn review_trade_inner(
         }));
     }
     if !injected.is_empty() {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         for id in injected {
             conn.execute(
                 "UPDATE mantras SET hits = hits + 1, wins = wins + ?2, losses = losses + ?3, \
@@ -708,7 +708,7 @@ pub(crate) async fn review_trade_and_record(
         }
     }
     let enabled = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let cfg = evolution_cfg(&conn);
         cfg.enabled && cfg.review_on_close
     };
@@ -852,7 +852,7 @@ async fn run_batch(
     focus: Option<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (cfg, rows) = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let cfg = evolution_cfg(&conn);
         let enabled: bool = conn
             .query_row(
@@ -953,7 +953,7 @@ async fn run_batch(
         .map(|trade| trade_payload(trade, false))
         .collect();
     let (existing, write_cfg) = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let existing: Vec<String> = load_mantras(&conn)
             .into_iter()
             .filter(|row| row.superseded_by == 0)
@@ -1024,7 +1024,7 @@ async fn run_batch(
         Vec::new()
     };
     let applied = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let mut applied: Vec<Value> = Vec::new();
         for item in &lessons {
             let result = upsert_lesson(
@@ -1070,7 +1070,7 @@ async fn run_batch(
         verdict.clone()
     };
     {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         for trade in &rows {
             conn.execute(
                 "UPDATE trades SET reviewed = 1, review_note = ?2 WHERE id = ?1",
@@ -1121,7 +1121,7 @@ async fn run_batch(
 }
 
 async fn health_refresh(State(state): State<AiState>) -> Json<Value> {
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let cfg = evolution_cfg(&conn);
     let purged = purge_superseded(&conn);
     let result = refresh_health(&conn, &cfg);
@@ -1136,7 +1136,7 @@ async fn global_review(
     State(state): State<AiState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (cfg, stats, rows, existing) = {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let cfg = evolution_cfg(&conn);
         let rows = load_trades(&conn, 60, false, "");
         let stats = batch_stats(&rows);
@@ -1203,7 +1203,7 @@ async fn global_review(
                 })
                 .unwrap_or_default();
             change_status = normalize_change(map, &proposals);
-            let conn = state.db.conn.lock().expect("db");
+            let conn = state.db.lock();
             let cfg_write = write_cfg(&conn);
             if change_status != "NO_CHANGE" {
                 for item in &proposals {
@@ -1264,7 +1264,7 @@ async fn global_review(
             .unwrap_or_default();
     }
     {
-        let conn = state.db.conn.lock().expect("db");
+        let conn = state.db.lock();
         let archived = purge_superseded(&conn);
         let health = refresh_health(&conn, &cfg);
         let produced = applied
@@ -1336,7 +1336,7 @@ async fn effectiveness(
     } else {
         ""
     };
-    let conn = state.db.conn.lock().expect("db");
+    let conn = state.db.lock();
     let rows = load_trades(&conn, limit, false, mode);
     drop(conn);
     let mut adopted: Vec<&TradeRow> = Vec::new();
@@ -1514,7 +1514,7 @@ mod tests {
 
     /// 追加 `count` 笔待复盘闭环交易，用于跨过 10 笔结构性证据门。
     fn seed_pending_trades(db: &Db, count: i64) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         for offset in 0..count {
             let id = 10 + offset;
             conn.execute(
@@ -1566,7 +1566,7 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("nq-evo-rule-{stamp}.db"));
         let db = fixture(&path, false);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let cfg = write_cfg(&conn);
         let result = insert_lesson(
             &conn,
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(item["wins"], 1);
         assert_eq!(item["losses"], 1);
         assert_eq!(item["health"], 0.55, "样本不足 10 笔时用先验分");
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let updated: i64 = conn
             .query_row("SELECT updated_at FROM mantras WHERE id = 1", [], |row| {
                 row.get(0)
@@ -1665,7 +1665,7 @@ mod tests {
         assert_eq!(body["change_status"], "NO_CHANGE");
         assert!(body["reason"].as_str().unwrap().contains("3/10"));
         assert!(body["insights"].as_array().unwrap().is_empty());
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM trades WHERE reviewed = 0",
@@ -1709,7 +1709,7 @@ mod tests {
         assert_eq!(body["used_ai"], true);
         assert_eq!(body["change_status"], "CHANGE");
         assert_eq!(body["applied"].as_array().unwrap().len(), 1);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let created: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM mantras WHERE source = 'batch_review'",
@@ -1729,9 +1729,7 @@ mod tests {
     async fn batch_with_two_samples_does_not_create_mantra() {
         let path = std::env::temp_dir().join("nq-evo-low-sample.db");
         let db = fixture(&path, true);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE trades SET reviewed = 1 WHERE id = 3", [])
             .unwrap();
         let router = app(
@@ -1747,7 +1745,7 @@ mod tests {
         assert_eq!(body["skipped"], true);
         assert_eq!(body["change_status"], "NO_CHANGE");
         assert!(body["reason"].as_str().unwrap().contains("2/10"));
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let mantras: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM mantras WHERE source = 'batch_review'",
@@ -1778,7 +1776,7 @@ mod tests {
         assert_eq!(body["change_status"], "CHANGE");
         assert_eq!(body["sample_size"], 10);
         assert_eq!(body["applied"].as_array().unwrap().len(), 1);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let (sample, enabled, visible): (i64, i64, i64) = conn
             .query_row(
                 "SELECT CAST(json_extract(evidence, '$.sample_size') AS INTEGER), enabled, visible \
@@ -1797,7 +1795,7 @@ mod tests {
     fn cleanup_disables_low_sample_mantras() {
         let path = std::env::temp_dir().join("nq-evo-cleanup-low-sample.db");
         let db = fixture(&path, false);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute_batch(
             "INSERT INTO mantras VALUES(20,'低样本','当量比放大时追多','[]','entry','batch_review',0.7,0.6,0,0,0,1,1,1,0, \
              '{\"sample_size\":2}',200,200,0); \
@@ -1845,7 +1843,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(DETERMINISTIC_PREFIX));
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let runs: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evolution_runs WHERE kind = 'global_review'",
@@ -1859,9 +1857,7 @@ mod tests {
         let empty_path = std::env::temp_dir().join("nq-evo-global-empty.db");
         let empty = fixture(&empty_path, false);
         empty
-            .conn
             .lock()
-            .unwrap()
             .execute("DELETE FROM trades", [])
             .unwrap();
         let router = app(
@@ -1881,9 +1877,7 @@ mod tests {
     async fn review_batch_rejects_when_evolution_is_disabled() {
         let path = std::env::temp_dir().join("nq-evo-disabled.db");
         let db = fixture(&path, false);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value = '{\"enabled\":false}' WHERE key = 'evolution'",
                 [],
@@ -1906,7 +1900,7 @@ mod tests {
     fn fresh_lesson_merges_within_six_hours_then_replaces_after_the_window() {
         let path = std::env::temp_dir().join("nq-evo-merge-window.db");
         let db = fixture(&path, false);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "UPDATE mantras SET title='突破确认', rule='当突破前高并且量比放大时追多', updated_at=?1 WHERE id=1",
             [crate::now()],
@@ -1937,7 +1931,7 @@ mod tests {
         );
         let old_id: i64 = replaced["mantra"]["id"].as_i64().unwrap();
         drop(conn);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let superseded: i64 = conn
             .query_row("SELECT superseded_by FROM mantras WHERE id=1", [], |r| {
                 r.get(0)
@@ -1951,7 +1945,7 @@ mod tests {
     fn purge_is_idempotent_and_keeps_manually_disabled_rows() {
         let path = std::env::temp_dir().join("nq-evo-purge.db");
         let db = fixture(&path, false);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute_batch(
             "INSERT INTO mantras VALUES(2,'新规则','当回踩时开多','[]','entry','manual',0.7,0.6,0,0,0,1,1,1,0,'{}',200,200,0); \
              UPDATE mantras SET superseded_by=2 WHERE id=1; \

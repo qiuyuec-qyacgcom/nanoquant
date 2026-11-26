@@ -59,7 +59,7 @@ async fn home(State(db): State<Db>) -> Result<Json<Value>, MarketError> {
             .setting("engine")
             .map_err(|_| public_unavailable())?
             .unwrap_or(Value::Null);
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         let last: i64 = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='last_cycle_ts'",
@@ -113,7 +113,7 @@ async fn performance(
         return Ok(Json(json!({"enabled": false})));
     }
     let mode = if market_live(&db)? { "live" } else { "demo" };
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let (total, wins, gross_win, gross_loss, hold): (i64, i64, f64, f64, f64) = conn.query_row(
         "SELECT COUNT(*), COUNT(CASE WHEN pnl > 0 THEN 1 END),
                 COALESCE(SUM(MAX(pnl,0)),0), COALESCE(-SUM(MIN(pnl,0)),0), COALESCE(AVG(hold_seconds),0)
@@ -166,7 +166,7 @@ fn public_unavailable() -> MarketError {
 /// 前台标的池，严格按添加时间排序，停用的不展示。
 async fn pool(State(db): State<Db>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     require_site(&db)?;
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut stmt = conn
         .prepare("SELECT symbol, name, tier, created_at FROM trading_symbols WHERE enabled = 1 ORDER BY sort_order, created_at, symbol")
         .expect("prepare pool");
@@ -217,7 +217,7 @@ async fn mantras(
     if !public["show_mantras"].as_bool().unwrap_or(true) {
         return Ok(Json(json!({"enabled": false, "items": [], "stats": null})));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut payload = crate::evolution_api::public_mantras(&conn, limit as usize);
     if let Some(category) = query.category.as_deref().filter(|value| !value.is_empty()) {
         if let Some(items) = payload["items"].as_array_mut() {
@@ -347,7 +347,7 @@ async fn klines(
 type MarketError = (StatusCode, Json<Value>);
 
 fn enabled_symbols(db: &Db) -> Result<Vec<String>, MarketError> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut stmt = conn
         .prepare("SELECT symbol FROM trading_symbols WHERE enabled = 1 ORDER BY sort_order, created_at, symbol")
         .map_err(|_| market_unavailable())?;
@@ -361,7 +361,7 @@ fn enabled_symbols(db: &Db) -> Result<Vec<String>, MarketError> {
 /// 当前交易环境与引擎同口径：`engine_state.mode` 优先，其次 `engine` 配置组。
 pub(crate) fn market_live(db: &Db) -> Result<bool, MarketError> {
     {
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         if let Ok(mode) = conn.query_row(
             "SELECT value FROM engine_state WHERE key = 'mode'",
             [],
@@ -821,7 +821,7 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
     async fn public_overview_news_and_performance_respect_visibility_and_mode() {
         let path = std::env::temp_dir().join("nq-public-overview-perf.db");
         let db = site(&path, true);
-        db.conn.lock().unwrap().execute_batch("CREATE TABLE news_items(id INTEGER, ts INTEGER, source TEXT, title TEXT, url TEXT, summary TEXT, sentiment REAL, symbols TEXT);
+        db.lock().execute_batch("CREATE TABLE news_items(id INTEGER, ts INTEGER, source TEXT, title TEXT, url TEXT, summary TEXT, sentiment REAL, symbols TEXT);
             CREATE TABLE trades(mode TEXT, pnl REAL, hold_seconds INTEGER, closed_at INTEGER);
             CREATE TABLE signals(mode TEXT);
             INSERT INTO trades VALUES('demo', 10, 60, 1), ('demo', -4, 120, 2), ('live', 90, 999, 3);
@@ -847,7 +847,7 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
         assert!(home.get("engine").is_none());
         assert_eq!(get("/public/news").await["sentiment"]["total_24h"], 0);
         assert_eq!(get("/public/performance").await, json!({"enabled":false}));
-        db.conn.lock().unwrap().execute("UPDATE app_settings SET value = '{\"show_performance\":true}' WHERE key = 'public'", []).unwrap();
+        db.lock().execute("UPDATE app_settings SET value = '{\"show_performance\":true}' WHERE key = 'public'", []).unwrap();
         let perf = get("/public/performance").await;
         assert_eq!(
             perf,
@@ -929,9 +929,7 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
             app.clone().oneshot(request).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value = '{\"site_enabled\":true}' WHERE key='public'",
                 [],
@@ -964,9 +962,7 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
             app.clone().oneshot(request()).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE trading_symbols SET enabled = 0", [])
             .unwrap();
         let response = app.oneshot(request()).await.unwrap();
@@ -987,9 +983,7 @@ CREATE TABLE trading_symbols(symbol TEXT, name TEXT, tier TEXT, enabled INTEGER,
     async fn batch_and_quotes_return_empty_objects_without_market_requests() {
         let path = std::env::temp_dir().join("nq-public-empty-market.db");
         let db = site(&path, true);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE trading_symbols SET enabled = 0", [])
             .unwrap();
         let app = routes().with_state(db);

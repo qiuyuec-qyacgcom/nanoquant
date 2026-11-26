@@ -570,7 +570,7 @@ async fn control(State(db): State<Db>, Json(body): Json<ControlIn>) -> (StatusCo
 /// 只解除「日内亏损」和「回撤」两类熔断；连亏、止损熔断是定时自愈的，不碰。
 /// 权益取本地最近一次采样，交易所实时权益要等凭证接入。
 async fn reset_anchors(State(db): State<Db>) -> (StatusCode, Json<Value>) {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let equity: f64 = conn
         .query_row(
             "SELECT value FROM engine_state WHERE key = 'equity'",
@@ -789,7 +789,7 @@ async fn execution(State(_db): State<Db>) -> Json<Value> {
 }
 
 fn write_state(db: &Db, key: &str, value: &str) {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let now = crate::now();
     conn.execute(
         "INSERT INTO engine_state(key, value, updated_at) VALUES(?1, ?2, ?3) \
@@ -1827,9 +1827,7 @@ mod tests {
     async fn engine_stats_cover_only_the_current_mode() {
         let path = std::env::temp_dir().join("nq-stats.db");
         let db = seed(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "INSERT INTO trades(symbol,pnl,hold_seconds,exit_reason,mode,closed_at) VALUES \
              ('BTCUSDT',10,100,'tp','demo',300), \
@@ -1870,7 +1868,7 @@ mod tests {
     async fn stale_venue_snapshot_falls_back_to_estimate_and_skips_closed() {
         let path = std::env::temp_dir().join("nq-positions.db");
         let db = seed(&path);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         // 多头：标记价 110、开仓价 100、数量 2 → 估算浮盈 20；快照时间戳为 0，应视为过期。
         conn.execute(
             "INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,leverage,margin,\
@@ -1921,7 +1919,7 @@ mod tests {
     async fn orders_only_list_entries_scoped_to_current_mode_newest_first() {
         let path = std::env::temp_dir().join("nq-orders.db");
         let db = seed(&path);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO orders VALUES(1,100,'BTCUSDT','BUY','MARKET',1,100,'FILLED','entry','c1','e1',0,'demo')",
             [],
@@ -1969,7 +1967,7 @@ mod tests {
 
     fn ledger(path: &std::path::Path) -> Db {
         let db = seed(path);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute_batch(
             "CREATE TABLE signals(id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT, direction TEXT, score REAL, \
              features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, decision TEXT, reject_reason TEXT, \
@@ -2093,7 +2091,7 @@ mod tests {
     async fn resetting_anchors_clears_a_stale_drawdown_halt() {
         let path = std::env::temp_dir().join("nq-anchors.db");
         let db = seed(&path);
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO engine_state VALUES('day_start_equity','100',0)",
             [],
@@ -2119,7 +2117,7 @@ mod tests {
             body["cleared_halt"].as_str().unwrap().contains("回撤"),
             "回撤熔断应被解除"
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let peak: String = conn
             .query_row(
                 "SELECT value FROM engine_state WHERE key='equity_peak'",
@@ -2216,7 +2214,7 @@ mod tests {
     async fn admission_blocks_when_credentials_and_snapshot_are_missing() {
         let db = control_db("nq-admission-blocked.db");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "DELETE FROM engine_state WHERE key='snapshot.demo'; \
                  DELETE FROM app_settings WHERE key='data';",
@@ -2241,7 +2239,7 @@ mod tests {
         // 判活阈值写死 180 秒的话，面板每 10 分钟有 7 分钟误报「引擎未运行」。
         let db = control_db("nq-status-long-interval.db");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
                 [json!({
@@ -2278,7 +2276,7 @@ mod tests {
     async fn the_admission_reports_a_missing_heartbeat_instead_of_claiming_the_engine_runs() {
         let db = control_db("nq-admission-no-heartbeat.db");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO app_settings(key, value, updated_at) VALUES('engine', ?1, 0)",
                 [json!({

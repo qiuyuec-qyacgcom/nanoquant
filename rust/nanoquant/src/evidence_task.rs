@@ -724,7 +724,7 @@ mod tests {
     fn setup(timeframe: &str) -> (AiState, i64) {
         let state = memory_state();
         let candidate_id = {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             crate::ai_tuning::seed_bootstrap(&conn).unwrap();
             let parent = crate::ai_tuning::active_for_regime(&conn, "range")
                 .unwrap()
@@ -746,7 +746,7 @@ mod tests {
     }
 
     fn events(state: &AiState) -> Vec<Value> {
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let mut statement = conn
             .prepare("SELECT payload FROM engine_events WHERE category='ai_tuning' ORDER BY id")
             .unwrap();
@@ -809,7 +809,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(history.calls(), 0, "注定失败的门不应触网");
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "rejected");
         assert_eq!(set.evidence["gate"]["pass"], false);
@@ -838,7 +838,7 @@ mod tests {
 
         assert!(result.is_err(), "历史不可用必须报错，不能判 rejected");
         assert!(history.calls() > 0);
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "数据失败时候选必须保持待评估");
         assert_eq!(set.evidence, json!({}), "数据失败不得写证据");
@@ -861,9 +861,7 @@ mod tests {
         let (state, candidate_id) = setup("1h");
         state
             .db
-            .conn
             .lock()
-            .unwrap()
             .execute(
                 "UPDATE ai_tuning_sets SET status='approved' WHERE id=?1",
                 [candidate_id],
@@ -970,7 +968,7 @@ mod tests {
     #[test]
     fn select_pending_respects_window_and_cooldown() {
         let (state, candidate_id) = setup("1h");
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let now = crate::now();
 
         assert_eq!(select_pending(&conn, 1, now).unwrap(), vec![candidate_id]);
@@ -1004,7 +1002,7 @@ mod tests {
     #[test]
     fn sweep_due_throttles_to_six_hours() {
         let (state, _) = setup("1h");
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let now = crate::now();
 
         assert!(sweep_due_at(&conn, now).unwrap());
@@ -1016,7 +1014,7 @@ mod tests {
     fn missing_ai_tuning_row_falls_back_to_defaults() {
         let (state, candidate_id) = setup("1h");
         {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             conn.execute("DELETE FROM app_settings WHERE key='ai_tuning'", [])
                 .unwrap();
         }
@@ -1035,7 +1033,7 @@ mod tests {
     async fn corrupt_ai_tuning_returns_error_and_keeps_candidate() {
         let (state, candidate_id) = setup("1h");
         {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             conn.execute(
                 "UPDATE app_settings SET value='{invalid' WHERE key='ai_tuning'",
                 [],
@@ -1051,7 +1049,7 @@ mod tests {
             "损坏配置必须走 evidence_failed 而非 gate 失败"
         );
         assert_eq!(history.calls(), 0);
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "配置错误不得把候选永久拒绝");
         assert_eq!(set.evidence, json!({}));
@@ -1061,7 +1059,7 @@ mod tests {
     async fn event_failure_rolls_back_status_and_keeps_candidate() {
         let (state, candidate_id) = setup("4h");
         {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             conn.execute_batch(
                 "CREATE TRIGGER block_ai_tuning_events BEFORE INSERT ON engine_events \
                  BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
@@ -1074,7 +1072,7 @@ mod tests {
 
         assert!(result.is_err(), "事件写失败必须整体失败");
         assert_eq!(history.calls(), 0);
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "事务回滚后候选必须保持待评估");
         assert_eq!(set.evidence, json!({}), "回滚不得留下证据");
@@ -1092,7 +1090,7 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let now = crate::now();
         let attempt: String = conn
             .query_row(
@@ -1120,7 +1118,7 @@ mod tests {
             .await
             .is_err());
 
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM engine_state WHERE key=?1",
@@ -1135,7 +1133,7 @@ mod tests {
     async fn explicit_empty_whitelist_rejects_instead_of_defaulting() {
         let (state, candidate_id) = setup("1h");
         {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
                 [json!({
@@ -1155,7 +1153,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(history.calls(), 0, "空白名单应直接失败，不触网");
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "rejected");
         assert_eq!(set.evidence["gate"]["pass"], false);
@@ -1173,7 +1171,7 @@ mod tests {
     async fn invalid_timeframe_whitelist_returns_error_and_keeps_candidate() {
         let (state, candidate_id) = setup("1h");
         {
-            let conn = state.db.conn.lock().unwrap();
+            let conn = state.db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
                 [json!({
@@ -1192,7 +1190,7 @@ mod tests {
 
         assert!(result.is_err(), "非法白名单必须走 evidence_failed");
         assert_eq!(history.calls(), 0);
-        let conn = state.db.conn.lock().unwrap();
+        let conn = state.db.lock();
         let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
         assert_eq!(set.status, "candidate", "配置错误不得永久拒绝候选");
         assert_eq!(set.evidence, json!({}));

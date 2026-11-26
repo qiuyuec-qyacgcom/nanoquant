@@ -241,7 +241,7 @@ fn add_with_contracts(
     }
     let custom_row = is_custom.then(|| custom_pool_row(symbol, leverage_cap(db)));
     let maximum = pool_maximum(db);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM trading_symbols WHERE symbol=?1",
@@ -326,9 +326,7 @@ fn bulk_with_contracts(db: &Db, contracts: &[Value], symbols: Vec<String>) -> Va
         }
     }
     let count: i64 = db
-        .conn
         .lock()
-        .expect("db")
         .query_row("SELECT COUNT(*) FROM trading_symbols", [], |r| r.get(0))
         .unwrap_or(0);
     json!({"added":added,"skipped":skipped,"invalid":invalid,"ok":true,"count":count})
@@ -462,7 +460,7 @@ fn leverage_cap(db: &Db) -> i64 {
 }
 
 fn pool_maximum(db: &Db) -> i64 {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     pool_maximum_from(&conn)
 }
 
@@ -499,7 +497,7 @@ async fn delete_symbol(
             json!({ "detail": format!("必须提供确认短语（精确为：REMOVE {symbol}）") }).into(),
         ));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM trading_symbols WHERE symbol = ?1",
@@ -549,7 +547,7 @@ async fn patch_symbol(
     Json(patch): Json<SymbolPatch>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let symbol = normalize_symbol(&symbol);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM trading_symbols WHERE symbol = ?1",
@@ -616,7 +614,7 @@ fn normalize_symbol(raw: &str) -> String {
 }
 
 pub(crate) fn current_mode(db: &Db) -> String {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     mode_from_conn(&conn)
 }
 
@@ -652,7 +650,7 @@ fn mode_from_conn(conn: &rusqlite::Connection) -> String {
 
 async fn list_symbols(State(db): State<Db>) -> Json<Value> {
     let (items, maximum, scan_last, scan_result) = {
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         pool_snapshot(&conn).expect("symbols snapshot")
     };
     let symbols: Vec<Value> = items.iter().map(|item| item["symbol"].clone()).collect();
@@ -678,7 +676,7 @@ async fn list_symbols(State(db): State<Db>) -> Json<Value> {
 /// 仅供测试直接断言池内容；生产列表走 [`pool_snapshot`]，只加锁一次。
 #[cfg(test)]
 fn read_symbols(db: &Db) -> Vec<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     read_symbols_from(&conn).expect("读取标的池失败")
 }
 
@@ -821,16 +819,12 @@ mod tests {
         assert_eq!(row["enabled"], true);
         assert_eq!(row["custom"], false);
         let count: i64 = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT COUNT(*) FROM trading_symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2, "seed 的 BTCUSDT 应保留，新插入 ETHUSDT 后共 2 条");
         let (enabled, min_score): (i64, f64) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT enabled, min_score FROM trading_symbols WHERE symbol='BTCUSDT'",
                 [],
@@ -846,9 +840,7 @@ mod tests {
     fn upsert_contract_row_does_not_overwrite_existing_configuration() {
         let path = std::env::temp_dir().join("nq-symbol-scan-upsert-conflict.db");
         let db = seed(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE trading_symbols SET enabled=0, min_score=9 WHERE symbol='BTCUSDT'",
                 [],
@@ -861,9 +853,7 @@ mod tests {
             "主键冲突必须说明重复，实际错误：{err}"
         );
         let (enabled, min_score): (i64, f64) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT enabled, min_score FROM trading_symbols WHERE symbol='BTCUSDT'",
                 [],
@@ -1042,7 +1032,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-symbols-scan-state.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
                  INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','123',0); \
@@ -1076,7 +1066,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-symbols-scan-corrupt.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
                  INSERT OR REPLACE INTO engine_state(key,value,updated_at) VALUES('symbol_scan.last_run_ts','abc',0); \
@@ -1113,7 +1103,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-symbols-add.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO app_settings(key,value) VALUES('risk','{\"max_leverage\":50}')",
                 [],
@@ -1253,9 +1243,7 @@ mod tests {
     async fn an_open_position_blocks_removal() {
         let path = std::env::temp_dir().join("nq-symbols-held.db");
         let db = seed(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO positions(symbol, status, mode) VALUES('BTCUSDT','open','demo')",
                 [],

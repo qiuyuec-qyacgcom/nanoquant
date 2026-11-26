@@ -954,9 +954,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         drop(conn);
         let db = crate::db::Db::open(path.to_str().unwrap()).unwrap();
         let cipher = crate::secret::encrypt_secret(MASTER_KEY, "sk-test").unwrap();
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute("UPDATE ai_providers SET api_key_enc=?1", [&cipher])
             .unwrap();
         db
@@ -1112,9 +1110,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
 
     fn stored_strategy(db: &crate::db::Db) -> Value {
         let raw: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='strategy'",
                 [],
@@ -1125,9 +1121,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     fn parameter_change_count(db: &crate::db::Db) -> i64 {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
                 row.get(0)
             })
@@ -1139,7 +1133,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         let path = std::env::temp_dir().join("nq-ai-reviewer-ignores-params.db");
         let db = fixture(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             crate::schema::ensure_parameter_changes(&conn).unwrap();
             conn.execute(
                 "INSERT INTO parameter_changes(ts, group_name, key, old_value, new_value, reason, decision_id, mode, source) \
@@ -1187,9 +1181,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         let reviewed = reviewer.review(&proposal("long")).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
         let applied: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='strategy_applied'",
                 [],
@@ -1203,7 +1195,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     /// 覆盖 ai 配置中的单个键，验证运行时读取路径。
     fn set_ai_setting(db: &crate::db::Db, key: &str, value: Value) {
         let mut ai: Value = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let raw: String = conn
                 .query_row("SELECT value FROM app_settings WHERE key='ai'", [], |row| {
                     row.get(0)
@@ -1212,9 +1204,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             serde_json::from_str(&raw).unwrap()
         };
         ai[key] = value;
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai'",
                 [serde_json::to_string(&ai).unwrap()],
@@ -1601,9 +1591,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             "inject_news": inject,
             "inject_mantras": inject,
         });
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai'",
                 [serde_json::to_string(&ai_value).unwrap()],

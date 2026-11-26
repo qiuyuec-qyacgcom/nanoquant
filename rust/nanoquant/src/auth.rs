@@ -640,7 +640,7 @@ mod tests {
     async fn password_change_write_failure_keeps_current_credentials() {
         let db = password_db();
         let original = db.setting("security").unwrap();
-        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_security_update BEFORE UPDATE ON app_settings WHEN OLD.key = 'security' BEGIN SELECT RAISE(ABORT, 'write rejected'); END;").unwrap();
+        db.lock().execute_batch("CREATE TRIGGER reject_security_update BEFORE UPDATE ON app_settings WHEN OLD.key = 'security' BEGIN SELECT RAISE(ABORT, 'write rejected'); END;").unwrap();
         let state = db.auth_state(b"test-key".to_vec(), "salt".into());
         let response = submit_password_change(state.clone()).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

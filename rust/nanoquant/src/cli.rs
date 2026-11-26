@@ -2255,7 +2255,7 @@ mod tests {
         {
             // 模拟老库：建库后清空标的池
             let db = Db::open(db_path.to_string_lossy().as_ref()).unwrap();
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch("DELETE FROM trading_symbols").unwrap();
         }
         let mut cfg = config();
@@ -2279,7 +2279,7 @@ mod tests {
         ];
         let count = |db_path: &str| -> i64 {
             let db = Db::open(db_path).unwrap();
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.query_row("SELECT COUNT(*) FROM trading_symbols", [], |row| row.get(0))
                 .unwrap()
         };

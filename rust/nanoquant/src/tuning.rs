@@ -611,7 +611,7 @@ mod tests {
     }
 
     fn seed_settings(db: &Db, allow: bool, ai_enabled: bool) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO app_settings VALUES('ai',?1,0)",
             [ai_config(allow, ai_enabled).to_string()],
@@ -638,7 +638,7 @@ mod tests {
     }
 
     fn seed_provider(db: &Db) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO ai_providers(id,name,protocol,base_url,api_key_enc,model,temperature, \
              max_tokens,reasoning_effort,timeout_sec,json_mode,enabled,priority,role,extra, \
@@ -654,9 +654,7 @@ mod tests {
     }
 
     fn seed_regime(db: &Db, regime: &str) {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute(
                 "INSERT INTO engine_state(key,value,updated_at) VALUES('market_regime.demo',?1,0)",
                 [regime],
@@ -683,9 +681,7 @@ mod tests {
     }
 
     fn strategy_value(db: &Db) -> String {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='strategy'",
                 [],
@@ -695,9 +691,7 @@ mod tests {
     }
 
     fn candidate_count(db: &Db) -> i64 {
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .query_row(
                 "SELECT COUNT(*) FROM ai_tuning_sets WHERE source='ai'",
                 [],
@@ -707,7 +701,7 @@ mod tests {
     }
 
     fn event_payloads(db: &Db) -> Vec<Value> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let mut statement = conn
             .prepare("SELECT payload FROM engine_events WHERE category='ai_tuning' ORDER BY id")
             .unwrap();
@@ -746,7 +740,7 @@ mod tests {
         seed_provider(&db);
         seed_regime(&db, "range");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         // 空 replies：若误调用模型，chat 会因 500 失败并让 run_once 返回 Err。
@@ -760,9 +754,7 @@ mod tests {
             "AI 总开关关闭不应写AI 调参事件"
         );
         let last_ts: Option<String> = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='ai_tuning.last_tuning_ts'",
                 [],
@@ -795,7 +787,7 @@ mod tests {
         seed_provider(&db);
         seed_regime(&db, "range");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         let before = strategy_value(&db);
@@ -812,7 +804,7 @@ mod tests {
             .expect("决策含参数增量时应生成候选");
         assert!(set_id > 0);
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let parent_id: i64 = conn
             .query_row(
                 "SELECT id FROM ai_tuning_sets WHERE regime='range' AND status='active'",
@@ -874,7 +866,7 @@ mod tests {
         seed_provider(&db);
         seed_regime(&db, "range");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             crate::ai_tuning::seed_bootstrap(&conn).unwrap();
             conn.execute(
                 "INSERT INTO engine_state(key,value,updated_at) \
@@ -902,7 +894,7 @@ mod tests {
         seed_provider(&db);
         seed_regime(&db, "range");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             crate::ai_tuning::seed_bootstrap(&conn).unwrap();
         }
         let before = strategy_value(&db);
@@ -919,9 +911,7 @@ mod tests {
         assert_eq!(payloads[0]["event"], "ai_tuning.no_candidate");
 
         let last_ts: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM engine_state WHERE key='ai_tuning.last_tuning_ts'",
                 [],

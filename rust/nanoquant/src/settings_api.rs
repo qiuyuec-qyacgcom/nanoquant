@@ -51,7 +51,7 @@ pub(crate) const GROUPS: [&str; 15] = [
 ];
 
 async fn read_all(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut groups = Map::new();
     let mut defaults = Map::new();
     for name in GROUPS {
@@ -72,7 +72,7 @@ struct LimitQuery {
 }
 
 async fn parameter_changes(State(db): State<Db>, Query(query): Query<LimitQuery>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let _ = crate::schema::ensure_parameter_changes(&conn);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let mut stmt = conn
@@ -189,7 +189,7 @@ async fn rollback_parameter_change(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     rollback_param_change(&conn, id)
         .map_err(|detail| (StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()))?;
     Ok(json!({ "ok": true }).into())
@@ -202,7 +202,7 @@ async fn read_group(
     if !GROUPS.contains(&group.as_str()) {
         return Err(unknown(&group));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     Ok(json!({ "group": group, "data": group_value(&conn, &group) }).into())
 }
 
@@ -220,7 +220,7 @@ async fn write_group(
     if !GROUPS.contains(&group.as_str()) {
         return Err(unknown(&group));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     if group == "engine" {
         if let Some(mode) = body.patch.get("mode").and_then(|v| v.as_str()) {
             let current = group_value(&conn, "engine")
@@ -283,7 +283,7 @@ async fn reset_group(
     if !GROUPS.contains(&group.as_str()) {
         return Err(unknown(&group));
     }
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let before = group_value(&conn, &group);
     let mut candidate = defaults_of(&group);
     if group == "security" {
@@ -352,7 +352,7 @@ fn default_audit_limit() -> i64 {
 
 async fn audit(State(db): State<Db>, Query(q): Query<AuditQuery>) -> Json<Value> {
     let limit = q.limit.clamp(1, 200);
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut stmt = conn
         .prepare(
             "SELECT id, ts, user, group_name, changes, ip FROM settings_audit \
@@ -378,7 +378,7 @@ async fn audit(State(db): State<Db>, Query(q): Query<AuditQuery>) -> Json<Value>
 }
 
 async fn system_settings(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     json!({ "data": group_value(&conn, "system") }).into()
 }
 
@@ -817,9 +817,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["auto_apply_timeframes"], "1h");
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
                 [],
@@ -858,9 +856,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["auto_apply_timeframes"], "");
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
                 [],
@@ -1043,9 +1039,7 @@ mod tests {
         );
         assert_eq!(body["data"]["min_leverage"], 2);
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |r| {
                 r.get(0)
             })
@@ -1147,9 +1141,7 @@ mod tests {
             "{body}"
         );
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |r| {
                 r.get(0)
             })
@@ -1197,9 +1189,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["data"]["max_leverage"], 80, "写入后立即生效");
         let (ts, changes): (i64, String) = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT ts, changes FROM settings_audit ORDER BY id DESC LIMIT 1",
                 [],
@@ -1256,7 +1246,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-settings-reset.db");
         let db = fixture(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO app_settings VALUES('strategy','{\"mode\":\"trend\"}',0)",
                 [],
@@ -1291,9 +1281,7 @@ mod tests {
         assert_eq!(body["data"]["timeframe"], "4h");
 
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row(
                 "SELECT value FROM app_settings WHERE key='strategy'",
                 [],
@@ -1355,9 +1343,7 @@ mod tests {
             "字符串形式的风控参数不能绕过数值校验"
         );
         let stored: String = db
-            .conn
             .lock()
-            .unwrap()
             .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |r| {
                 r.get(0)
             })
@@ -1373,9 +1359,7 @@ mod tests {
     async fn a_failed_settings_write_returns_500_instead_of_panicking() {
         let path = std::env::temp_dir().join("nq-settings-write-fail.db");
         let db = fixture(&path);
-        db.conn
-            .lock()
-            .unwrap()
+        db.lock()
             .execute_batch(
                 "CREATE TRIGGER reject_settings BEFORE UPDATE ON app_settings \
                  BEGIN SELECT RAISE(ABORT, 'write rejected'); END;",

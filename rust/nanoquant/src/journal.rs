@@ -29,7 +29,7 @@ async fn label_pending_handler(
     Query(query): Query<LabelQuery>,
 ) -> Json<Value> {
     let (mode, prices) = {
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         let mode = current_mode(&conn);
         (mode.clone(), prices_from_state(&conn, &mode))
     };
@@ -132,7 +132,7 @@ pub(crate) fn label_due(
     now: i64,
     force: bool,
 ) -> Value {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let (enabled, after, threshold) = label_config(&conn);
     if !enabled {
         return json!({"ok": false, "error": "决策日志已关闭", "labeled": 0});
@@ -313,7 +313,7 @@ async fn retrieve_preview(
     let items = if !inject {
         Vec::new()
     } else {
-        let conn = db.conn.lock().expect("db");
+        let conn = db.lock();
         ranked_experiences(
             &conn,
             &query.symbol,
@@ -515,7 +515,7 @@ fn scenario_similarity(
 /// 把已打标且未归档的决策沉淀为经验。正确算赢、错误算输，部分正确不归档。
 /// 同币种、同结论、标签完全一致的并入已有条目，避免经验库被同一场景反复刷满。
 async fn journal_archive(State(db): State<Db>) -> Json<Value> {
-    let conn = db.conn.lock().expect("db");
+    let conn = db.lock();
     let mut stmt = conn
         .prepare(
             "SELECT id, symbol, direction, confidence, outcome, snapshot, actual_pct, target_pct \
@@ -868,7 +868,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-journal-merge.db");
 
         let db = seed(&path);
-        db.conn.lock().unwrap().execute(
+        db.lock().execute(
             "INSERT INTO decision_journal VALUES(5,500,'BTCUSDT','long',0.7,'open_long','labeled','correct','live','{\"rsi\":25,\"adx\":15}',1.2,3.0,0,550)",
             [],
         ).unwrap();
@@ -901,12 +901,12 @@ mod tests {
         let db = seed(&path);
         let _ = journal_archive(State(db.clone())).await;
         let ids = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             inject_ids(&conn, "BTCUSDT", &json!({"rsi":25,"adx":15}), "long")
         };
         assert!(ids.contains(&1), "同场景的赢家经验要注入: {ids:?}");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO app_settings VALUES('journal','{\"inject_experiences\":false}',0)",
                 [],
@@ -914,7 +914,7 @@ mod tests {
             .unwrap();
         }
         let ids = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             inject_ids(&conn, "BTCUSDT", &json!({"rsi":25,"adx":15}), "long")
         };
         assert!(ids.is_empty(), "关闭注入后不得再检索");
@@ -957,7 +957,7 @@ mod tests {
         let db = label_db(&path);
         let now = crate::now();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 90_000);
             insert_pending(&conn, 2, "BTCUSDT", 100.0, "live", now - 90_000);
             insert_pending(&conn, 3, "ETHUSDT", 200.0, "demo", now - 90_000);
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(result["deferred"], 1, "live 快照不得被 demo 价格打标");
         assert_eq!(result["missing_price"], 1, "无行情的保持 pending");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let (outcome, status, actual_pct): (String, String, f64) = conn
                 .query_row(
                     "SELECT outcome, status, actual_pct FROM decision_journal WHERE id=1",
@@ -1046,7 +1046,7 @@ mod tests {
         let db = label_db(&path);
         let now = crate::now();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 100);
             insert_pending(&conn, 2, "BTCUSDT", 100.0, "live", now - 100);
         }
@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!(forced["labeled"], 1, "force 立即打标当前环境: {forced}");
         assert_eq!(forced["deferred"], 1, "另一环境的 pending 不受影响");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM decision_journal WHERE id=1",
@@ -1085,7 +1085,7 @@ mod tests {
         let db = label_db(&path);
         let now = crate::now();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 90_000);
             insert_pending(&conn, 2, "BTCUSDT", 100.0, "demo", now - 600);
         }
@@ -1094,7 +1094,7 @@ mod tests {
         let result = label_due(&db, &prices, "demo", now, false);
         assert_eq!(result["labeled"], 1, "只标到期项: {result}");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM decision_journal WHERE id=2",
@@ -1115,13 +1115,13 @@ mod tests {
         let mut prices = std::collections::BTreeMap::new();
         prices.insert("BTCUSDT".to_string(), 100.5);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 90_000);
         }
         let first = label_due(&db, &prices, "demo", now, false);
         assert_eq!(first["labeled"], 1);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value='{\"label_after_sec\":86400,\"correct_threshold_pct\":1.0}' \
                  WHERE key='journal'",
@@ -1133,7 +1133,7 @@ mod tests {
         let second = label_due(&db, &prices, "demo", now, false);
         assert_eq!(second["labeled"], 1);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             let first_outcome: String = conn
                 .query_row(
                     "SELECT outcome FROM decision_journal WHERE id=1",
@@ -1159,7 +1159,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-journal-inject-threshold.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO experiences VALUES(1,'BTCUSDT','[\"sym:BTCUSDT\",\"dir:long\"]',\
                  '{\"rsi\":25,\"adx\":15}','突破回踩开多','win',0,'manual',1,1,0,1,100,100)",
@@ -1181,12 +1181,12 @@ mod tests {
         }
         let snapshot = json!({"rsi":25,"adx":15});
         let strict = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             inject_ids(&conn, "BTCUSDT", &snapshot, "long")
         };
         assert_eq!(strict, vec![1], "高阈值只注入同场景且数值接近的那条");
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "UPDATE app_settings SET value=\
                  '{\"inject_experiences\":true,\"retrieve_top_k\":5,\"min_similarity\":0.5}' \
@@ -1196,7 +1196,7 @@ mod tests {
             .unwrap();
         }
         let loose = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             inject_ids(&conn, "BTCUSDT", &snapshot, "long")
         };
         assert_eq!(loose.len(), 2, "调低阈值后注入条数上升: {loose:?}");
@@ -1209,7 +1209,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-journal-capacity.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "DELETE FROM experiences; \
                  INSERT INTO experiences VALUES(1,'BTCUSDT','[]','{}','A','win',0,'manual',3,3,0,1,400,400); \
@@ -1239,7 +1239,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-journal-max-experiences.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute(
                 "INSERT INTO app_settings(key,value,updated_at) VALUES('journal','{\"max_experiences\":37}',0)",
                 [],
@@ -1255,7 +1255,7 @@ mod tests {
         let path = std::env::temp_dir().join("nq-journal-min-confidence.db");
         let db = seed(&path);
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.lock();
             conn.execute_batch(
                 "ALTER TABLE decision_journal ADD COLUMN entry_price REAL; \
                  ALTER TABLE decision_journal ADD COLUMN reason TEXT; \

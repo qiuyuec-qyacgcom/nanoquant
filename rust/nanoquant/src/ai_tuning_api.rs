@@ -287,7 +287,7 @@ mod tests {
     }
 
     fn insert_set(db: &Db, name: &str, regime: &str, status: &str, evidence: &str) -> i64 {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let activated_at = if status == "active" { Some(1000i64) } else { None };
         conn.execute(
             "INSERT INTO ai_tuning_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn set_engine_state(db: &Db, key: &str, value: &str) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,0) \
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -309,7 +309,7 @@ mod tests {
     }
 
     fn seed_strategy(db: &Db, params: Value) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO app_settings(key,value,updated_at) VALUES('strategy',?1,0) \
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -326,7 +326,7 @@ mod tests {
         status: &str,
         params: Value,
     ) -> i64 {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.execute(
             "INSERT INTO ai_tuning_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
              VALUES(?1,?2,'1h',1,?3,?4,'manual','{\"kind\":\"manual\"}',NULL,1000,NULL)",
@@ -337,7 +337,7 @@ mod tests {
     }
 
     fn strategy_value(db: &Db) -> Value {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let raw: String = conn
             .query_row("SELECT value FROM app_settings WHERE key='strategy'", [], |row| {
                 row.get(0)
@@ -375,7 +375,7 @@ mod tests {
     }
 
     fn count_changes(db: &Db, source: &str, set_id: i64) -> i64 {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.query_row(
             "SELECT COUNT(*) FROM parameter_changes WHERE source=?1 AND set_id=?2",
             params![source, set_id],
@@ -385,7 +385,7 @@ mod tests {
     }
 
     fn count_activations(db: &Db, trigger: &str, set_id: i64) -> i64 {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         conn.query_row(
             "SELECT COUNT(*) FROM ai_tuning_activations WHERE trigger=?1 AND set_id=?2",
             params![trigger, set_id],
@@ -597,7 +597,7 @@ mod tests {
         );
         assert_eq!(count_activations(&db, "rollback", first), 1, "trigger 应为 rollback");
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.lock();
         let statuses: Vec<(i64, String)> = conn
             .prepare("SELECT id,status FROM ai_tuning_sets ORDER BY id")
             .unwrap()
