@@ -131,12 +131,17 @@ describe('参数配置目录', () => {
     }
   })
 
-  it('AI 调参分组覆盖全部八键', () => {
+  it('AI 调参分组覆盖全部十三键', () => {
     const keys = [...explicitKeys('ai_tuning')].sort()
     expect(keys).toEqual([
       'auto_apply',
       'auto_apply_timeframes',
       'enabled',
+      'ga_enabled',
+      'ga_generations',
+      'ga_mutation_rate',
+      'ga_population',
+      'ga_seed',
       'max_auto_apply_per_24h',
       'min_oos_trades',
       'no_candidate_rollback_sec',

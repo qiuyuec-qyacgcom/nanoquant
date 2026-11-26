@@ -38,6 +38,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
     ),
     ("rl-replay", "回放历史 orders/trades 训练 RL 执行 Q 表"),
+    (
+        "ga-tune",
+        "GA 离线参数搜索：只写候选参数集并走证据门，不自动应用",
+    ),
 
     ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
@@ -92,6 +96,10 @@ struct Options {
     episodes: Option<u32>,
     alpha: Option<f64>,
     gamma: Option<f64>,
+    regime: Option<String>,
+    population: Option<usize>,
+    generations: Option<usize>,
+    seed: Option<u64>,
 }
 
 fn parse(argv: &[String], config: &Config) -> Options {
@@ -130,6 +138,10 @@ fn parse(argv: &[String], config: &Config) -> Options {
     let mut episodes: Option<u32> = None;
     let mut alpha: Option<f64> = None;
     let mut gamma: Option<f64> = None;
+    let mut regime: Option<String> = None;
+    let mut population: Option<usize> = None;
+    let mut generations: Option<usize> = None;
+    let mut seed: Option<u64> = None;
     let mut exceptions = None;
     let mut archive_root = None;
     let mut max_depth = None;
@@ -288,6 +300,22 @@ fn parse(argv: &[String], config: &Config) -> Options {
                 index += 1;
                 gamma = argv.get(index).and_then(|value| value.parse().ok());
             }
+            "--regime" => {
+                index += 1;
+                regime = argv.get(index).cloned();
+            }
+            "--population" => {
+                index += 1;
+                population = argv.get(index).and_then(|value| value.parse().ok());
+            }
+            "--generations" => {
+                index += 1;
+                generations = argv.get(index).and_then(|value| value.parse().ok());
+            }
+            "--seed" => {
+                index += 1;
+                seed = argv.get(index).and_then(|value| value.parse().ok());
+            }
             other if other.starts_with("--") => {}
             other if command.is_empty() => command = other.to_string(),
             _ => {}
@@ -329,6 +357,10 @@ fn parse(argv: &[String], config: &Config) -> Options {
         episodes,
         alpha,
         gamma,
+        regime,
+        population,
+        generations,
+        seed,
         exceptions,
         archive_root,
         max_depth,
@@ -382,6 +414,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "show-exec-secret" => show_exec_secret(&options, config),
         "seed-symbols" => seed_symbols(&options),
         "rl-replay" => rl_replay(&options),
+        "ga-tune" => ga_tune_command(&options),
 
         "contract-diff" => contract_diff_command(&options, config),
         "zero-python" => zero_python(&options, config),
@@ -610,9 +643,248 @@ fn rl_replay(options: &Options) -> Result<(i32, Value), (i32, String)> {
     ))
 }
 
+const GA_REGIME: &str = "range";
+const GA_FOLDS: i64 = 3;
+const GA_TRAIN_BARS: i64 = 800;
+
+/// GA 离线参数搜索：真实历史 + 固定 walk-forward，结果只写 `source='ga'` 候选。
+/// 候选必须有 6 个以上可用标的，否则只报告数据不足，不写半成品参数。
+fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
+    use rusqlite::OptionalExtension;
+
+    let db = open_db(&options.db_path)?;
+    let (strategy, risk, ai_tuning, symbols, live, order_trades) = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|_| (1, "数据库连接锁被占用".to_string()))?;
+        let strategy = crate::settings_api::group_value_public(&conn, "strategy");
+        let risk = crate::settings_api::group_value_public(&conn, "risk");
+        let ai_tuning = crate::settings_api::group_value_public(&conn, "ai_tuning");
+        let symbols = match options.symbols.as_deref() {
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .map(str::to_uppercase)
+                .collect::<Vec<_>>(),
+            None => crate::evidence_task::pool_symbols(&conn)
+                .map_err(|error| (1, format!("读取启用标的失败: {error}")))?,
+        };
+        let stored_mode = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='mode'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|mode| !mode.trim().is_empty());
+        let mode = stored_mode.unwrap_or_else(|| {
+            crate::settings_api::group_value_public(&conn, "engine")
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("demo")
+                .to_string()
+        });
+        let live = matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            "live" | "mainnet"
+        );
+        let (orders, trades) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orders),(SELECT COUNT(*) FROM trades)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0));
+        (strategy, risk, ai_tuning, symbols, live, (orders, trades))
+    };
+
+    if symbols.is_empty() {
+        return Err((2, "缺少可用标的（--symbols 或 trading_symbols）".to_string()));
+    }
+    if symbols.len() < 6 {
+        return Err((
+            2,
+            format!("启用标的仅 {} 个，少于 GA 所需的 6 个", symbols.len()),
+        ));
+    }
+    let live_timeframe = strategy
+        .get("timeframe")
+        .and_then(Value::as_str)
+        .ok_or_else(|| (1, "strategy.timeframe 缺失或非法".to_string()))?
+        .to_string();
+    let gate_timeframes: Vec<String> = ai_tuning
+        .get("auto_apply_timeframes")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|frame| !frame.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // 默认按实盘周期回测；`--interval` 允许在部署周期未对齐时做离线诊断。
+    let timeframe = options
+        .interval
+        .clone()
+        .unwrap_or_else(|| live_timeframe.clone());
+    let evidence_gate_compatible = timeframe == live_timeframe
+        && gate_timeframes.iter().any(|frame| frame == &timeframe);
+    let interval_ms = crate::history::interval_ms(&timeframe)
+        .ok_or_else(|| (2, format!("不支持的回测周期: {timeframe}")))?;
+    let regime_name = options.regime.as_deref().unwrap_or(GA_REGIME);
+    let regime = crate::regime::Regime::from_str(regime_name)
+        .ok_or_else(|| (2, format!("未知 regime: {regime_name}")))?;
+
+    let mut cfg = crate::ga_tune::GaConfig::from_ai_tuning(&ai_tuning);
+    if let Some(population) = options.population {
+        cfg.population = population.clamp(10, 100);
+    }
+    if let Some(generations) = options.generations {
+        cfg.generations = generations.clamp(5, 100);
+    }
+    if let Some(seed) = options.seed {
+        cfg.seed = seed.min(1_000_000);
+    }
+
+    let (start_ms, end_ms) = crate::evidence_task::aligned_window(crate::now_millis(), interval_ms);
+    let history_timeframe = timeframe.clone();
+    let history_symbols = symbols.clone();
+    let (basket, skipped) = run_async(async move {
+        let source = crate::history::BinanceHistory::new(live);
+        crate::evidence_task::load_basket(
+            &source,
+            &history_symbols,
+            &history_timeframe,
+            start_ms,
+            end_ms,
+        )
+        .await
+    })
+    .map_err(|error| (1, error))?;
+    let skipped_json: Vec<Value> = skipped
+        .iter()
+        .map(|(symbol, reason)| json!({"symbol": symbol, "reason": reason}))
+        .collect();
+
+    if basket.len() < 6 {
+        return Ok((
+            1,
+            json!({
+                "ok": false,
+                "insufficient": true,
+                "regime": regime_name,
+                "timeframe": timeframe,
+                "live_timeframe": live_timeframe,
+                "gate_timeframes": gate_timeframes,
+                "evidence_gate_compatible": evidence_gate_compatible,
+                "symbols_requested": symbols.len(),
+                "basket": basket.len(),
+                "orders": order_trades.0,
+                "trades": order_trades.1,
+                "skipped": skipped_json,
+                "detail": format!(
+                    "可用历史标的仅 {} 个（orders={}, trades={}），少于 6 个，GA 无法回测",
+                    basket.len(), order_trades.0, order_trades.1
+                ),
+            }),
+        ));
+    }
+
+    let mut base = strategy.clone();
+    if let Some(map) = base.as_object_mut() {
+        map.insert("timeframe".to_string(), json!(timeframe));
+    }
+    let genes = crate::ga_tune::default_genes();
+
+    let result = crate::ga_tune::run_ga(
+        &genes,
+        &base,
+        &risk,
+        &basket,
+        GA_FOLDS,
+        GA_TRAIN_BARS,
+        regime,
+        &timeframe,
+        &cfg,
+    );
+    if !result.best_fitness.is_finite() {
+        return Ok((
+            1,
+            json!({
+                "ok": false,
+                "insufficient": false,
+                "regime": regime_name,
+                "timeframe": timeframe,
+                "live_timeframe": live_timeframe,
+                "gate_timeframes": gate_timeframes,
+                "evidence_gate_compatible": evidence_gate_compatible,
+                "basket": basket.len(),
+                "orders": order_trades.0,
+                "trades": order_trades.1,
+                "skipped": skipped_json,
+                "detail": format!(
+                    "所有基因组回测失败（orders={}, trades={}）；目标 regime {} 在 {} 周期下有效成交标的不足 6 个，未写入候选",
+                    order_trades.0, order_trades.1, regime_name, timeframe
+                ),
+            }),
+        ));
+    }
+
+    let params = crate::ga_tune::params_with_genome(&base, &result.best);
+    let candidate_id = {
+        let conn = db
+            .conn
+            .lock()
+            .map_err(|_| (1, "数据库连接锁被占用".to_string()))?;
+        let parent_id = crate::ai_tuning::active_for_regime(&conn, regime_name)
+            .ok()
+            .flatten()
+            .map(|set| set.id);
+        crate::ai_tuning::insert_ga_candidate(
+            &conn,
+            &format!("ga-{regime_name}-{}", crate::now()),
+            regime_name,
+            &timeframe,
+            &params,
+            parent_id,
+        )
+        .map_err(|error| (1, format!("写入 GA 候选失败: {error}")))?
+    };
+
+    Ok((
+        0,
+        json!({
+            "ok": true,
+            "regime": regime_name,
+            "timeframe": timeframe,
+            "live_timeframe": live_timeframe,
+            "gate_timeframes": gate_timeframes,
+            "evidence_gate_compatible": evidence_gate_compatible,
+            "symbols_used": basket.iter().map(|(symbol, _)| symbol.clone()).collect::<Vec<_>>(),
+            "skipped": skipped_json,
+            "population": cfg.population,
+            "generations": cfg.generations,
+            "mutation_rate": cfg.mutation_rate,
+            "seed": cfg.seed,
+            "best_fitness": result.best_fitness,
+            "best": result.best,
+            "history": result.history,
+            "candidate_id": candidate_id,
+            "auto_apply": false,
+            "detail": "GA 候选已写入 ai_tuning_sets（source=ga），待证据门评估，不自动应用",
+        }),
+    ))
+}
+
 fn preflight(options: &Options) -> Result<(i32, Value), (i32, String)> {
     let db = open_db(&options.db_path)?;
     let security = db.setting("security").ok().flatten().unwrap_or(Value::Null);
+
     let mut checks: Vec<Value> = Vec::new();
     checks.push(json!({
         "name": "数据库",
@@ -1843,7 +2115,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 21);
+        assert_eq!(text.len(), 22);
         for name in [
             "preflight",
             "reconcile",
@@ -1861,6 +2133,7 @@ mod tests {
             "show-exec-secret",
             "seed-symbols",
             "rl-replay",
+            "ga-tune",
             "mock-exec-core",
             "mock-exchange",
             "verify-partial-tp",

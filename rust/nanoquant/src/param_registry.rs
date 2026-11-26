@@ -107,6 +107,11 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai_tuning", "regime_confirm_sec", 60.0, 86400.0, 60.0),
     ("ai_tuning", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
     ("ai_tuning", "min_oos_trades", 1.0, 1000.0, 1.0),
+    // GA 离线参数搜索：只生成候选，不自动应用。
+    ("ai_tuning", "ga_population", 10.0, 100.0, 1.0),
+    ("ai_tuning", "ga_generations", 5.0, 100.0, 1.0),
+    ("ai_tuning", "ga_mutation_rate", 0.0, 1.0, 0.01),
+    ("ai_tuning", "ga_seed", 0.0, 1000000.0, 1.0),
     // RL 执行层：只影响下单方式与限价偏移，默认关闭。
     ("rl_exec", "epsilon", 0.0, 0.5, 0.01),
     ("rl_exec", "max_wait_ms", 0.0, 10000.0, 500.0),
@@ -222,6 +227,11 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "regime_cooldown_sec",
             "min_oos_trades",
             "auto_apply_timeframes",
+            "ga_enabled",
+            "ga_population",
+            "ga_generations",
+            "ga_mutation_rate",
+            "ga_seed",
         ],
     ),
     (

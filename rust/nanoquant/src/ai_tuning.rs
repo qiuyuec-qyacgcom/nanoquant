@@ -1021,6 +1021,47 @@ pub(crate) fn insert_candidate(
     params_value: &Value,
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
+    insert_candidate_with_source(
+        conn,
+        name,
+        regime,
+        timeframe,
+        params_value,
+        "ai",
+        parent_id,
+    )
+}
+
+/// GA 离线搜索结果同样只写候选：`source='ga'`，证据字段留空，待证据门评估。
+/// 自动启用只扫 `source='ai'`，因此 GA 候选即使 approved 也不会自动激活。
+pub(crate) fn insert_ga_candidate(
+    conn: &Connection,
+    name: &str,
+    regime: &str,
+    timeframe: &str,
+    params_value: &Value,
+    parent_id: Option<i64>,
+) -> Result<i64, String> {
+    insert_candidate_with_source(
+        conn,
+        name,
+        regime,
+        timeframe,
+        params_value,
+        "ga",
+        parent_id,
+    )
+}
+
+fn insert_candidate_with_source(
+    conn: &Connection,
+    name: &str,
+    regime: &str,
+    timeframe: &str,
+    params_value: &Value,
+    source: &str,
+    parent_id: Option<i64>,
+) -> Result<i64, String> {
     if !params_value.is_object() {
         return Err("候选参数必须是对象快照".to_string());
     }
@@ -1043,14 +1084,14 @@ pub(crate) fn insert_candidate(
         timeframe,
         params_value,
         "candidate",
-        "ai",
+        source,
         "{}",
         parent_id,
         crate::now(),
     )
 }
 
-/// 证据门结果落库：只允许改写待评估的 AI 候选。
+/// 证据门结果落库：只允许改写待评估的 AI/GA 候选。
 /// `active`/`strategy` 与人工AI 调参一律不动；没有匹配行时返回 Err，避免静默丢结果。
 pub(crate) fn mark_evidence(
     conn: &Connection,
@@ -1062,12 +1103,12 @@ pub(crate) fn mark_evidence(
     let updated = conn
         .execute(
             "UPDATE ai_tuning_sets SET status=?1, evidence=?2 \
-             WHERE id=?3 AND source='ai' AND status='candidate'",
+             WHERE id=?3 AND source IN ('ai','ga') AND status='candidate'",
             params![status, evidence.to_string(), id],
         )
         .map_err(|error| format!("写入AI 调参 {id} 证据失败: {error}"))?;
     if updated == 0 {
-        return Err(format!("AI 调参 {id} 不是待评估的 AI 候选，未写入证据"));
+        return Err(format!("AI 调参 {id} 不是待评估的 AI/GA 候选，未写入证据"));
     }
     Ok(())
 }
@@ -1798,6 +1839,39 @@ mod tests {
 
         let active = active_for_regime(&conn, "range").unwrap().unwrap();
         assert_eq!(active.id, parent.id, "插入候选不得改变 active");
+    }
+
+    #[test]
+    fn ga_candidate_is_not_auto_applied() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let parent = active_for_regime(&conn, "range").unwrap().unwrap();
+        let mut snapshot = parent.params.clone();
+        snapshot["entry_threshold"] = json!(0.2);
+
+        let id = insert_ga_candidate(&conn, "ga-range-1", "range", "1h", &snapshot, None).unwrap();
+        let candidate = load_set(&conn, id).unwrap();
+        assert_eq!(candidate.source, "ga");
+        assert_eq!(candidate.status, "candidate");
+        assert_eq!(candidate.evidence, json!({}), "证据字段留空待门评估");
+        assert!(candidate.activated_at.is_none(), "GA 候选不得被激活");
+
+        mark_evidence(&conn, id, true, &json!({"gate": {"pass": true}})).unwrap();
+        conn.execute(
+            "INSERT INTO engine_state(key,value,updated_at) \
+             VALUES('ai_tuning.auto_apply_since',?1,?1)",
+            [crate::now().to_string()],
+        )
+        .unwrap();
+        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now() + 1).unwrap();
+        assert!(applied.is_none(), "GA 候选不得被自动应用");
+
+        let after = load_set(&conn, id).unwrap();
+        assert_eq!(after.status, "approved");
+        assert_eq!(after.source, "ga");
+        assert!(after.activated_at.is_none(), "自动启用不得触碰 GA 候选");
+        let active = active_for_regime(&conn, "range").unwrap().unwrap();
+        assert_eq!(active.id, parent.id, "GA 候选不得替换 active");
     }
 
     #[test]

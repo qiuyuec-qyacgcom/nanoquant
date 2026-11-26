@@ -171,7 +171,7 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         .lock()
         .map_err(|_| "数据库连接锁不可用".to_string())?;
     let candidate = ai_tuning::load_set(&conn, candidate_id)?;
-    if candidate.source != "ai" || candidate.status != "candidate" {
+    if !matches!(candidate.source.as_str(), "ai" | "ga") || candidate.status != "candidate" {
         return Ok(None);
     }
     let strategy = group_json(&conn, "strategy")?;
@@ -238,7 +238,7 @@ fn parse_timeframes(ai_tuning: &Value) -> Result<Vec<String>, String> {
     Ok(frames)
 }
 
-fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
+pub(crate) fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
             "SELECT symbol FROM trading_symbols WHERE enabled=1 \
@@ -253,7 +253,7 @@ fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
 }
 
 /// 请求窗口：结束时间对齐到上一根已收盘 bar，起点额外覆盖 2 段 warmup。
-fn aligned_window(now_ms: i64, step_ms: i64) -> (i64, i64) {
+pub(crate) fn aligned_window(now_ms: i64, step_ms: i64) -> (i64, i64) {
     let step = step_ms.max(1);
     let end = (now_ms / step) * step - step;
     let requested = BARS_LIMIT + 2 * backtest_engine::WARMUP as i64;
@@ -269,7 +269,7 @@ fn trim_bars(bars: Vec<HistoryBar>) -> Vec<HistoryBar> {
     bars[bars.len() - keep..].to_vec()
 }
 
-async fn load_basket(
+pub(crate) async fn load_basket(
     source: &dyn HistorySource,
     symbols: &[String],
     timeframe: &str,
@@ -558,7 +558,7 @@ fn select_pending(conn: &Connection, limit: usize, now: i64) -> Result<Vec<i64>,
             "SELECT p.id FROM ai_tuning_sets p \
              LEFT JOIN engine_state e \
                ON e.key = 'ai_tuning.evidence_attempt.' || p.id \
-             WHERE p.source='ai' AND p.status='candidate' AND p.created_at > ?1 \
+             WHERE p.source IN ('ai','ga') AND p.status='candidate' AND p.created_at > ?1 \
                AND (e.value IS NULL OR CAST(e.value AS INTEGER) <= ?2) \
              ORDER BY p.id ASC LIMIT ?3",
         )

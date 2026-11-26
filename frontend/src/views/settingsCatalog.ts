@@ -74,6 +74,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
     { title: 'regime 与回滚', fields: ['regime_confirm_sec', 'regime_cooldown_sec', 'no_candidate_rollback_sec'] },
     { title: '证据门', fields: ['min_oos_trades'] },
+    {
+      title: 'GA 离线搜索',
+      hint: '只生成候选参数集并走证据门，不自动应用；关闭时不影响手动触发',
+      fields: ['ga_enabled', 'ga_population', 'ga_generations', 'ga_mutation_rate', 'ga_seed'],
+    },
   ],
   rl_exec: [
     {
