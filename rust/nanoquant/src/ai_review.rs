@@ -193,6 +193,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     crate::ai_analysis::gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
     let messages = crate::ai_analysis::decision_messages_with_personas(&context, &cfg.personas);
     let mut call = ChatCall::new(&messages, "engine_review");
+    call.max_tokens = Some(call.max_tokens.unwrap_or(0).max(16000));
     call.temperature = Some(cfg.temperature);
     let outcome =
         ai_client::chat_with_fallback(state.transport.as_ref(), &state.db, &chain, call, &cfg)
