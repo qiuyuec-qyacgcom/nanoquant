@@ -216,7 +216,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .and_then(Value::as_f64)
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
     // 由开关决定是否把 AI 新协议字段透传给下游：关闭时保持旧行为。
-    let mut reviewed = decision_to_review(
+    let reviewed = decision_to_review(
         &proposal,
         side_lock,
         &decision,
@@ -225,13 +225,18 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.allow_ai_override,
         min_entry_rr,
     )?;
+    Ok(apply_ai_switches(reviewed, &cfg))
+}
+
+/// 复核出口统一应用 AI 新协议开关：关闭时清空对应字段，保持旧行为。
+fn apply_ai_switches(mut reviewed: ReviewDecision, cfg: &ai_client::AiConfig) -> ReviewDecision {
     if !cfg.use_invalidation_price {
         reviewed.invalidation_price = None;
     }
     if !cfg.use_entry_price {
         reviewed.entry_price = None;
     }
-    Ok(reviewed)
+    reviewed
 }
 
 const DEFAULT_MIN_ENTRY_RR: f64 = 0.8;
@@ -1278,5 +1283,34 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
         let on = review_context_with(true, "on").await;
         assert!(on.get("news").is_some(), "打开时复核 prompt 含 news");
         assert!(on.get("mantras").is_some(), "打开时复核 prompt 含 mantras");
+    }
+
+    fn reviewed_with_new_fields() -> ReviewDecision {
+        let mut reviewed = reject("测试用复核结果");
+        reviewed.invalidation_price = Some(97.0);
+        reviewed.entry_price = Some(101.0);
+        reviewed
+    }
+
+    #[test]
+    fn switches_off_clear_invalidation_and_entry() {
+        // 两个开关默认关闭时，复核出口必须清空新协议字段，保持旧行为。
+        let cfg = ai_client::AiConfig::default();
+        let reviewed = apply_ai_switches(reviewed_with_new_fields(), &cfg);
+        assert_eq!(reviewed.invalidation_price, None);
+        assert_eq!(reviewed.entry_price, None);
+    }
+
+    #[test]
+    fn switches_on_keep_invalidation_and_entry() {
+        // 两个开关打开时，复核出口原样保留 AI 给出的失效价与入场价。
+        let cfg = ai_client::AiConfig {
+            use_invalidation_price: true,
+            use_entry_price: true,
+            ..ai_client::AiConfig::default()
+        };
+        let reviewed = apply_ai_switches(reviewed_with_new_fields(), &cfg);
+        assert_eq!(reviewed.invalidation_price, Some(97.0));
+        assert_eq!(reviewed.entry_price, Some(101.0));
     }
 }

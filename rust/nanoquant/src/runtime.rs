@@ -5406,36 +5406,58 @@ pub(crate) async fn run_fast_risk_task(
     }
 }
 
-/// 快速风控裁决：先看全局止盈止损（保证金收益率），再看单仓价格、
-/// AI 失效价，最后看单仓止盈止损。返回 None 表示继续持仓。
-fn fast_risk_reason(
-    side: &str,
+/// 快速风控判定输入：9 个量具名化，避免调用点位置参数错位。
+struct FastRiskInput<'a> {
+    side: &'a str,
     entry: f64,
     mark: f64,
     sl: f64,
     tp: f64,
     leverage: f64,
     invalidation_price: Option<f64>,
-    global_stop: f64,
-    global_tp: f64,
-) -> Option<&'static str> {
-    let direction = if side == "long" { 1.0 } else { -1.0 };
-    let margin_pct = (mark - entry) * direction / entry * 100.0 * leverage.max(1.0);
-    if global_stop > 0.0 && margin_pct <= -global_stop {
+    global_stop_pct: f64,
+    global_tp_pct: f64,
+}
+
+/// 快速风控裁决：先看全局止盈止损（保证金收益率），再看 AI 失效价，
+/// 最后看单仓止盈止损。返回 None 表示继续持仓。
+fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
+    // 价格非法时直接放行，避免除零或 NaN 比较导致误平仓。
+    if !input.entry.is_finite()
+        || input.entry <= 0.0
+        || !input.mark.is_finite()
+        || input.mark <= 0.0
+    {
+        return None;
+    }
+    // 非 "long" 一律按空单处理（沿用旧行为）。
+    let direction = if input.side == "long" { 1.0 } else { -1.0 };
+    let margin_pct = (input.mark - input.entry) * direction / input.entry * 100.0
+        * input.leverage.max(1.0);
+    if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
         return Some("global_stop_loss");
     }
-    if global_tp > 0.0 && margin_pct >= global_tp {
+    if input.global_tp_pct > 0.0 && margin_pct >= input.global_tp_pct {
         return Some("global_take_profit");
     }
-    if let Some(ip) = invalidation_price.filter(|v| *v > 0.0 && v.is_finite()) {
-        if (direction > 0.0 && mark <= ip) || (direction < 0.0 && mark >= ip) {
+    if let Some(ip) = input
+        .invalidation_price
+        .filter(|v| *v > 0.0 && v.is_finite())
+    {
+        if (direction > 0.0 && input.mark <= ip) || (direction < 0.0 && input.mark >= ip) {
             return Some("invalidation");
         }
     }
-    if sl > 0.0 && ((direction > 0.0 && mark <= sl) || (direction < 0.0 && mark >= sl)) {
+    if input.sl > 0.0
+        && ((direction > 0.0 && input.mark <= input.sl)
+            || (direction < 0.0 && input.mark >= input.sl))
+    {
         return Some("stop_loss");
     }
-    if tp > 0.0 && ((direction > 0.0 && mark >= tp) || (direction < 0.0 && mark <= tp)) {
+    if input.tp > 0.0
+        && ((direction > 0.0 && input.mark >= input.tp)
+            || (direction < 0.0 && input.mark <= input.tp))
+    {
         return Some("take_profit");
     }
     None
@@ -5519,9 +5541,17 @@ async fn fast_risk_cycle(
                 (mark, (mark - entry) * qty * direction, crate::now(), id),
             );
         }
-        let reason = fast_risk_reason(
-            &side, entry, mark, sl, tp, leverage, invalidation_price, global_stop, global_tp,
-        );
+        let reason = fast_risk_reason(&FastRiskInput {
+            side: &side,
+            entry,
+            mark,
+            sl,
+            tp,
+            leverage,
+            invalidation_price,
+            global_stop_pct: global_stop,
+            global_tp_pct: global_tp,
+        });
         let Some(reason) = reason else {
             continue;
         };
@@ -5596,6 +5626,31 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[allow(clippy::too_many_arguments)]
+    fn risk_input<'a>(
+        side: &'a str,
+        entry: f64,
+        mark: f64,
+        sl: f64,
+        tp: f64,
+        leverage: f64,
+        invalidation_price: Option<f64>,
+        global_stop_pct: f64,
+        global_tp_pct: f64,
+    ) -> FastRiskInput<'a> {
+        FastRiskInput {
+            side,
+            entry,
+            mark,
+            sl,
+            tp,
+            leverage,
+            invalidation_price,
+            global_stop_pct,
+            global_tp_pct,
+        }
+    }
+
     #[test]
     fn invalidation_price_triggers_fast_close() {
         // 快速风控需在 AI 失效价被触及时立即返回 invalidation：
@@ -5603,17 +5658,50 @@ mod tests {
         // 全局止损阈值需高于杠杆放大后的浮亏（-4% × 5 = -20%），
         // 否则会先命中 global_stop_loss，无法验证失效价分支。
         assert_eq!(
-            fast_risk_reason("long", 100.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0),
+            fast_risk_reason(&risk_input("long", 100.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
             Some("invalidation")
         );
         assert_eq!(
-            fast_risk_reason("short", 100.0, 104.0, 105.0, 90.0, 5.0, Some(103.0), 30.0, 15.0),
+            fast_risk_reason(&risk_input("short", 100.0, 104.0, 105.0, 90.0, 5.0, Some(103.0), 30.0, 15.0)),
             Some("invalidation")
         );
         assert_eq!(
-            fast_risk_reason("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0),
+            fast_risk_reason(&risk_input("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
             None
         );
+    }
+
+    #[test]
+    fn global_stop_wins_over_invalidation() {
+        // 5 倍杠杆下 -10% 价格即 -50% 保证金，全局止损应先于失效价命中。
+        assert_eq!(
+            fast_risk_reason(&risk_input("long", 100.0, 90.0, 0.0, 0.0, 5.0, Some(95.0), 10.0, 0.0)),
+            Some("global_stop_loss")
+        );
+    }
+
+    #[test]
+    fn fast_risk_reason_ignores_invalid_prices() {
+        // entry/mark 非法时不得触发任何平仓，避免除零或脏数据误杀持仓。
+        assert_eq!(
+            fast_risk_reason(&risk_input("long", 0.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
+            None
+        );
+        assert_eq!(
+            fast_risk_reason(&risk_input("long", 100.0, 0.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn fast_risk_reason_ignores_negative_and_nonfinite_invalidation() {
+        // 失效价仅在有限正数时才参与判定。
+        for ip in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                fast_risk_reason(&risk_input("long", 100.0, 99.0, 0.0, 0.0, 5.0, Some(ip), 0.0, 0.0)),
+                None
+            );
+        }
     }
 
     #[test]
