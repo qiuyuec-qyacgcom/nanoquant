@@ -328,6 +328,7 @@ const INTEGER_STRATEGY_KEYS: &[&str] = &[
     "rsi_period",
     "atr_period",
     "max_data_gaps",
+    "valid_bars",
 ];
 
 /// 只暴露 strategy 组里 AI 可写的数字字段，并附带当前值与人工范围/专用边界。
@@ -944,6 +945,7 @@ mod tests {
         active["rsi_period"] = json!(14);
         active["atr_period"] = json!(14);
         active["max_data_gaps"] = json!(1);
+        active["valid_bars"] = json!(6);
         let writable = writable_strategy_parameters(&active);
         let fields = writable.as_object().unwrap();
         for key in [
@@ -961,6 +963,7 @@ mod tests {
             "rsi_period",
             "atr_period",
             "max_data_gaps",
+            "valid_bars",
         ] {
             assert!(
                 !fields.contains_key(key),

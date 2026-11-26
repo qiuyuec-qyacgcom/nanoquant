@@ -21,12 +21,15 @@ pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
 const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk", "symbol_scan"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
+/// v2 业务门槛同理：盈亏比门槛与信号有效期由人工配置，AI 不得自行放宽。
 const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("engine", "mode"),
     ("engine", "enabled"),
     ("engine", "close_on_halt"),
     ("signal_follow", "enabled"),
     ("backup", "encrypt"),
+    ("strategy", "min_entry_rr"),
+    ("strategy", "valid_bars"),
 ];
 
 pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
@@ -76,7 +79,9 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "partial_tp_at_r", 0.0, 20.0, 0.1),
     ("strategy", "partial_tp_ratio", 0.0, 1.0, 0.01),
     ("strategy", "max_spread_bps", 0.0, 1000.0, 0.5),
+    // v2 开仓盈亏比门槛：默认 0.8，低于此值的信号不开仓；1 步 = 0.1 R。
     ("strategy", "min_entry_rr", 0.0, 10.0, 0.1),
+    // v2 信号有效期：AI 未给出有效期时使用的 K 线根数，默认 6；整数语义。
     ("strategy", "valid_bars", 1.0, 24.0, 1.0),
     ("ai_tuning", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
     (
@@ -189,10 +194,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
         "symbol_scan",
         &["enabled", "interval_hours", "market_limit"],
     ),
-    (
-        "ai",
-        &["use_invalidation_price", "use_entry_price"],
-    ),
+    ("ai", &["use_invalidation_price", "use_entry_price"]),
     (
         "risk",
         &[
@@ -658,6 +660,8 @@ mod tests {
         assert!(is_visible("strategy", "min_entry_rr"));
         assert!(is_visible("ai", "use_invalidation_price"));
         assert!(is_visible("ai", "use_entry_price"));
+        assert!(!find("strategy", "min_entry_rr").unwrap().ai_writable);
+        assert!(!find("strategy", "valid_bars").unwrap().ai_writable);
     }
 
     #[test]
