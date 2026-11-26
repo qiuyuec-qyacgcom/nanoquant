@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use crate::ai_client::{self, ChatCall};
 use crate::ai_providers::{provider_chain, AiState};
-use crate::review::{AiReviewer, EntryProposal, ReviewAction, ReviewDecision};
+use crate::review::{AiLatency, AiReviewer, EntryProposal, ReviewAction, ReviewDecision};
 
 pub(crate) struct EngineAiReviewer {
     state: AiState,
@@ -268,8 +268,10 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
     if !outcome.ok {
         return Err(format!("AI 复核失败: {}", outcome.error));
     }
+    let parse_started = std::time::Instant::now();
     let decision = ai_client::parse_decision(&outcome.text, Some(&context))
         .map_err(|error| format!("AI 复核结果无效: {error}"))?;
+    let parse_ms = parse_started.elapsed().as_millis().min(i64::MAX as u128) as i64;
     let side_lock = profile
         .as_ref()
         .and_then(|profile| profile.get("filters"))
@@ -283,7 +285,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
     // AI 新协议字段照常落在审计里；`use_invalidation_price` / `use_entry_price`
     // 只在消费点（快速风控、限价开仓）决定是否采用，复核出口不得清空。
-    let reviewed = decision_to_review_mode(
+    let mut reviewed = decision_to_review_mode(
         &proposal,
         side_lock,
         &decision,
@@ -294,6 +296,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.veto_only,
         cfg.scale_on_confidence,
     )?;
+    reviewed.latency = AiLatency {
+        provider_ms: Some(outcome.latency_ms),
+        parse_ms: Some(parse_ms),
+        wall_ms: None,
+    };
     Ok(fill_default_valid_bars(reviewed, &strategy_cfg))
 }
 
@@ -329,6 +336,7 @@ fn reject(reason: impl Into<String>) -> ReviewDecision {
         invalidation_text: None,
         risk_text: None,
         scale: None,
+        latency: AiLatency::default(),
     }
 }
 
@@ -441,6 +449,7 @@ fn decision_to_review_mode(
                 invalidation_text,
                 risk_text,
                 scale: None,
+                latency: AiLatency::default(),
             });
         }
     };
@@ -501,6 +510,7 @@ fn decision_to_review_mode(
             invalidation_text,
             risk_text,
             scale,
+            latency: AiLatency::default(),
         });
     }
     if let Some(quant_side) = proposal.quant_side.as_deref() {
@@ -596,6 +606,7 @@ fn decision_to_review_mode(
         invalidation_text,
         risk_text,
         scale,
+        latency: AiLatency::default(),
     })
 }
 

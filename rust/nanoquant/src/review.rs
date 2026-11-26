@@ -6,6 +6,24 @@ pub(crate) enum ReviewAction {
     Tighten,
 }
 
+/// 一次 AI 复核的分段耗时（毫秒）。
+/// `wall_ms` 由 runtime 在复核返回后补齐；`provider_ms` 来自供应商 HTTP 耗时，
+/// `parse_ms` 来自解析响应文本的耗时。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AiLatency {
+    pub provider_ms: Option<i64>,
+    pub parse_ms: Option<i64>,
+    pub wall_ms: Option<i64>,
+}
+
+impl AiLatency {
+    /// 排队耗时 = 总耗时 - 供应商耗时 - 解析耗时，下限 0。
+    pub fn queue_ms(&self) -> Option<i64> {
+        let wall = self.wall_ms?;
+        Some((wall - self.provider_ms.unwrap_or(0) - self.parse_ms.unwrap_or(0)).max(0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReviewDecision {
     pub action: ReviewAction,
@@ -34,6 +52,8 @@ pub(crate) struct ReviewDecision {
     pub risk_text: Option<String>,
     /// 下单数量缩放系数（0~1）；None 表示不缩放。
     pub scale: Option<f64>,
+    /// 复核分段耗时；wall_ms 由 runtime 补齐。
+    pub latency: AiLatency,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +104,8 @@ pub(crate) struct ReviewedEntry {
     pub risk_text: Option<String>,
     /// 下单数量缩放系数（0~1）；None 表示不缩放。
     pub scale: Option<f64>,
+    /// 复核分段耗时；wall_ms 由 runtime 补齐。
+    pub latency: AiLatency,
 }
 
 /// AI 自评字段的载体：拒单/观望也要把 dq、rr 等落进审计。
@@ -98,6 +120,8 @@ pub(crate) struct AiMeta {
     pub risk_text: Option<String>,
     /// 下单数量缩放系数（0~1）；None 表示不缩放。
     pub scale: Option<f64>,
+    /// 复核分段耗时；wall_ms 由 runtime 补齐。
+    pub latency: AiLatency,
 }
 
 impl From<&ReviewedEntry> for AiMeta {
@@ -111,6 +135,7 @@ impl From<&ReviewedEntry> for AiMeta {
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
             scale: value.scale,
+            latency: value.latency,
         }
     }
 }
@@ -126,6 +151,7 @@ impl From<&ReviewDecision> for AiMeta {
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
             scale: value.scale,
+            latency: value.latency,
         }
     }
 }
@@ -141,6 +167,7 @@ impl From<&ReviewError> for AiMeta {
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
             scale: value.scale,
+            latency: value.latency,
         }
     }
 }
@@ -164,6 +191,8 @@ pub(crate) struct ReviewError {
     pub risk_text: Option<String>,
     /// 下单数量缩放系数（0~1）；拒绝/观望时也留痕。
     pub scale: Option<f64>,
+    /// 复核分段耗时；wall_ms 由 runtime 补齐。
+    pub latency: AiLatency,
 }
 
 impl ReviewError {
@@ -180,6 +209,7 @@ impl ReviewError {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }
     }
 
@@ -197,6 +227,7 @@ impl ReviewError {
             .scale
             .filter(|value| value.is_finite() && *value > 0.0)
             .map(|value| value.clamp(0.0, 1.0));
+        self.latency = decision.latency;
         self
     }
 }
@@ -254,6 +285,7 @@ pub(crate) fn apply_review(
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
@@ -286,6 +318,7 @@ fn apply_decision(
 ) -> Result<ReviewedEntry, ReviewError> {
     let confidence = decision.confidence;
     let meta = AiMeta::from(&decision);
+    let latency = decision.latency;
     let scale = decision
         .scale
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -321,6 +354,7 @@ fn apply_decision(
                     action,
                     confidence,
                     scale,
+                    latency,
                 });
             }
             ReviewAction::Hold => {
@@ -340,6 +374,7 @@ fn apply_decision(
                     invalidation_text: meta.invalidation_text,
                     risk_text: meta.risk_text,
                     scale,
+                    latency,
                 })
             }
             ReviewAction::Reject => {
@@ -359,6 +394,7 @@ fn apply_decision(
                     invalidation_text: meta.invalidation_text,
                     risk_text: meta.risk_text,
                     scale,
+                    latency,
                 })
             }
         }
@@ -415,6 +451,7 @@ fn apply_decision(
             action: action_for(&side),
             confidence,
             scale,
+            latency,
         }),
         ReviewAction::Hold => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -432,6 +469,7 @@ fn apply_decision(
             invalidation_text: meta.invalidation_text,
             risk_text: meta.risk_text,
             scale,
+            latency,
         }),
         ReviewAction::Reject => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -449,6 +487,7 @@ fn apply_decision(
             invalidation_text: meta.invalidation_text,
             risk_text: meta.risk_text,
             scale,
+            latency,
         }),
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
@@ -470,6 +509,7 @@ fn apply_decision(
                 action: "tighten".to_string(),
                 confidence,
                 scale,
+                latency,
             })
         }
     }
@@ -522,6 +562,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }
     }
 
@@ -552,6 +593,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: Some(0.7),
+            latency: AiLatency::default(),
         }));
         let reviewed = apply_review(&proposal(), Some(&reviewer), true, true).unwrap();
         assert_eq!(reviewed.side, "long", "否决模式必须保留量化方向");
@@ -611,6 +653,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         let reviewed = apply_review(&proposal(), Some(&too_high), true, false).unwrap();
         assert_eq!(reviewed.leverage, 20.0, "超过全局上限必须压回上限");
@@ -633,6 +676,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         let reviewed = apply_review(&proposal(), Some(&raised), true, false).unwrap();
         assert_eq!(reviewed.leverage, 18.0, "区间内 AI 可以上调杠杆");
@@ -654,6 +698,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         let reviewed = apply_review(&proposal(), Some(&too_low), true, false).unwrap();
         assert_eq!(reviewed.leverage, 10.0, "低于下限必须抬回下限");
@@ -687,6 +732,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         assert!(apply_review(&proposal(), Some(&reject), false, false).is_err());
         let timeout = FakeReviewer(Err("timeout".to_string()));
@@ -714,6 +760,7 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         let error = apply_review(&proposal(), Some(&hold), true, false).unwrap_err();
         assert_eq!(error.action, "hold");
@@ -740,8 +787,32 @@ mod tests {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            latency: AiLatency::default(),
         }));
         assert!(apply_review(&proposal(), Some(&invalid), true, false).is_err());
+    }
+
+    #[test]
+    fn queue_ms_never_negative() {
+        let latency = AiLatency {
+            provider_ms: Some(120),
+            parse_ms: Some(10),
+            wall_ms: Some(100),
+        };
+        assert_eq!(latency.queue_ms(), Some(0), "扣减超过总耗时时必须夹到 0");
+
+        let normal = AiLatency {
+            provider_ms: Some(60),
+            parse_ms: Some(10),
+            wall_ms: Some(100),
+        };
+        assert_eq!(normal.queue_ms(), Some(30), "排队 = 总耗时 - 供应商 - 解析");
+
+        assert_eq!(
+            AiLatency::default().queue_ms(),
+            None,
+            "无总耗时不产出排队值"
+        );
     }
 
     #[test]

@@ -196,6 +196,9 @@ const halfAi = computed(() => {
     p99: Number(h.ai_latency_p99_ms || 0),
     max: Number(h.ai_latency_max_ms || 0),
     samples: Number(h.ai_latency_samples || 0),
+    providerP95: Number(h.ai_latency_p95_ms || 0),
+    wallP95: Number(h.ai_wall_p95_ms || 0),
+    queueP95: Number(h.ai_queue_p95_ms || 0),
     topProviders,
     bookStale: Number(h.book_stale_pct || 0),
     bookQueries: Number(h.book?.queries || 0),
@@ -559,6 +562,20 @@ useSilentRefresh(refreshQuotes, 3000)
             <span class="mono" :class="halfAi.max > 3000 ? 'down' : 'flat'">{{ halfAi.max ? halfAi.max + 'ms' : '--' }}</span>
           </div>
         </div>
+        <div class="grid g3" style="gap: 10px">
+          <div class="metric">
+            <span title="候选进入复核到真正开始调用的等待，含线程调度与锁竞争">排队 P95</span>
+            <span class="mono" :class="halfAi.queueP95 > 3000 ? 'down' : 'flat'">{{ halfAi.queueP95 ? halfAi.queueP95 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span title="整次复核总耗时，含排队、供应商调用与解析">总耗时 P95</span>
+            <span class="mono" :class="halfAi.wallP95 > 3000 ? 'down' : 'flat'">{{ halfAi.wallP95 ? halfAi.wallP95 + 'ms' : '--' }}</span>
+          </div>
+          <div class="metric">
+            <span title="供应商 HTTP 耗时 P95，全环境样本">供应商 P95</span>
+            <span class="mono" :class="halfAi.providerP95 > 3000 ? 'down' : 'flat'">{{ halfAi.providerP95 ? halfAi.providerP95 + 'ms' : '--' }}</span>
+          </div>
+        </div>
         <div class="grid g2" style="gap: 10px">
           <div class="metric">
             <span>{{ halfAi.topProviders[0] ? halfAi.topProviders[0].name + ' P95' : '供应商 P95' }}</span>
@@ -590,6 +607,7 @@ useSilentRefresh(refreshQuotes, 3000)
         <div class="hint">
           最近 24 小时口径：AI 否决率 = AI 复核信号中否决占比（数据质量、盈亏比、置信度、方向，
           或 AI 明确 reject/hold）；fail-open 为 AI 复核失败后放行；
+          排队 = 总耗时 - 供应商耗时 - 解析耗时，下限 0；
           盘口 stale 为本地 WebSocket 盘口过期并回退 REST 的进程累计比例。
         </div>
       </div>

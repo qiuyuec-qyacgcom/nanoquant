@@ -262,6 +262,9 @@ impl EntryDraft {
             row.invalidation_text = meta.invalidation_text.clone();
             row.risk_text = meta.risk_text.clone();
             row.scale = meta.scale;
+            row.provider_ms = meta.latency.provider_ms;
+            row.queue_ms = meta.latency.queue_ms();
+            row.wall_ms = meta.latency.wall_ms;
         }
         if !self.quant_passed
             && self.preview_side.as_deref() == Some(direction)
@@ -3323,25 +3326,34 @@ impl EngineRuntime {
         // 中间区统一出口：AI 明确拒绝/观望仍然否决，其它失败按 fail-open 降仓。
         let resolve = |draft: &EntryDraft, active: Option<&dyn crate::review::AiReviewer>| {
             let proposal = draft.proposal();
-            match crate::review::apply_review(&proposal, active, required, veto_only) {
-                Ok(mut entry) => {
-                    if !required {
-                        entry.scale = Some(fail_open_scale);
+            let started = std::time::Instant::now();
+            let mut result =
+                match crate::review::apply_review(&proposal, active, required, veto_only) {
+                    Ok(mut entry) => {
+                        if !required {
+                            entry.scale = Some(fail_open_scale);
+                        }
+                        Ok(entry)
                     }
-                    Ok(entry)
-                }
-                Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
-                Err(error) => {
-                    crate::review::apply_review(&proposal, None, false, false).map(|mut entry| {
-                        entry.reason = format!(
-                            "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
-                            error.reason
-                        );
-                        entry.scale = Some(fail_open_scale);
-                        entry
-                    })
-                }
+                    Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
+                    Err(error) => crate::review::apply_review(&proposal, None, false, false).map(
+                        |mut entry| {
+                            entry.reason = format!(
+                                "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
+                                error.reason
+                            );
+                            entry.scale = Some(fail_open_scale);
+                            entry
+                        },
+                    ),
+                };
+            // 总耗时覆盖排队、供应商调用与解析；provider/parse 由复核层带出。
+            let wall_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            match &mut result {
+                Ok(entry) => entry.latency.wall_ms = Some(wall_ms),
+                Err(error) => error.latency.wall_ms = Some(wall_ms),
             }
+            result
         };
 
         let mut results: Vec<Option<ReviewedDraft>> = drafts.iter().map(|_| None).collect();
@@ -3381,6 +3393,7 @@ impl EngineRuntime {
                         invalidation_text: None,
                         risk_text: None,
                         scale: None,
+                        latency: crate::review::AiLatency::default(),
                     }),
                 });
             } else {
@@ -6459,6 +6472,7 @@ mod tests {
                     invalidation_text: None,
                     risk_text: None,
                     scale: None,
+                    latency: Default::default(),
                 });
             };
             Ok(crate::review::ReviewDecision {
@@ -6478,6 +6492,7 @@ mod tests {
                 invalidation_text: None,
                 risk_text: None,
                 scale: None,
+                latency: Default::default(),
             })
         }
     }
@@ -6833,6 +6848,7 @@ mod tests {
                 invalidation_text: None,
                 risk_text: None,
                 scale: None,
+                latency: Default::default(),
             })
         }
     }
@@ -7539,6 +7555,7 @@ mod tests {
                 invalidation_text: Some("跌破 97.5 失效".to_string()),
                 risk_text: Some("高位放量；资金费率抬升".to_string()),
                 scale: None,
+                latency: Default::default(),
             })
         }
     }
@@ -8051,6 +8068,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 invalidation_text: None,
                 risk_text: None,
                 scale: None,
+                latency: Default::default(),
             })
         }
     }
@@ -8177,6 +8195,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 invalidation_text: None,
                 risk_text: None,
                 scale: None,
+                latency: Default::default(),
             })
         }
     }
@@ -8361,6 +8380,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 invalidation_text: None,
                 risk_text: None,
                 scale: self.scale,
+                latency: Default::default(),
             })
         }
     }

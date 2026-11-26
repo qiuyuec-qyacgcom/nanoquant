@@ -46,6 +46,12 @@ pub struct AuditSignal {
     pub risk_text: Option<String>,
     /// AI 给出的下单数量缩放系数（0~1）。
     pub scale: Option<f64>,
+    /// 供应商 HTTP 耗时（毫秒）。
+    pub provider_ms: Option<i64>,
+    /// 排队等待耗时（毫秒）：总耗时扣除供应商与解析。
+    pub queue_ms: Option<i64>,
+    /// 整次复核总耗时（毫秒）。
+    pub wall_ms: Option<i64>,
 }
 
 impl AuditSignal {
@@ -69,6 +75,9 @@ impl AuditSignal {
             invalidation_text: None,
             risk_text: None,
             scale: None,
+            provider_ms: None,
+            queue_ms: None,
+            wall_ms: None,
         }
     }
 
@@ -151,6 +160,16 @@ impl AuditSignal {
             if let Some(v) = self.scale {
                 object.insert("ai_scale".into(), json!(v));
             }
+            if let Some(wall) = self.wall_ms {
+                object.insert(
+                    "ai_latency".into(),
+                    json!({
+                        "wall_ms": wall,
+                        "provider_ms": self.provider_ms,
+                        "queue_ms": self.queue_ms.unwrap_or(0),
+                    }),
+                );
+            }
             // 统一决策追踪：一层一行就能看清走到哪、被谁拦、AI 想做什么。
             let mut trace = json!({
                 "stage": self.stage,
@@ -228,8 +247,9 @@ fn stored_key(features: &str) -> Option<String> {
 const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
 
 /// 按轮次生效的 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧值。
-/// ai_scale 只代表当前轮的下单缩放，跨轮沿用会与 filter_trace.scale 口径不一致。
-const AI_ROUND_META_KEYS: [&str; 3] = ["ai_inv", "ai_risk", "ai_scale"];
+/// ai_scale 只代表当前轮的下单缩放，跨轮沿用会与 filter_trace.scale 口径不一致；
+/// ai_latency 同理，跨轮沿用会让延迟样本被旧值污染。
+const AI_ROUND_META_KEYS: [&str; 4] = ["ai_inv", "ai_risk", "ai_scale", "ai_latency"];
 
 /// 写入 signals.features 的 AI 自评字段键（数值 + 按轮次）。
 const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_ROUND_META_KEYS.len()] = {
@@ -417,6 +437,10 @@ struct SignalMetricRow {
     gate: Option<String>,
     skip: bool,
     scale: Option<f64>,
+    /// 整次复核总耗时（毫秒），来自 features.ai_latency.wall_ms。
+    wall_ms: Option<f64>,
+    /// 复核排队耗时（毫秒），来自 features.ai_latency.queue_ms。
+    queue_ms: Option<f64>,
 }
 
 fn round2(value: f64) -> f64 {
@@ -444,9 +468,17 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
     let mut scales = [0_i64; 4];
     let mut gates: BTreeMap<&'static str, i64> =
         GATE_KEYS.iter().map(|key| (*key, 0_i64)).collect();
+    let mut walls: Vec<f64> = Vec::new();
+    let mut queues: Vec<f64> = Vec::new();
 
     for row in signal_metric_rows(conn, mode, since) {
         signals_total += 1;
+        if let Some(ms) = row.wall_ms {
+            walls.push(ms);
+        }
+        if let Some(ms) = row.queue_ms {
+            queues.push(ms);
+        }
         match row.decision.as_str() {
             "opened" => opened += 1,
             "rejected" => rejected += 1,
@@ -486,8 +518,8 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
 
     let mut latencies: Vec<f64> = Vec::new();
     let mut by_provider: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT latency_ms, provider FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT latency_ms, provider FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
     {
         if let Ok(rows) = stmt.query_map([since], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
@@ -504,6 +536,8 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         }
     }
     latencies.sort_by(f64::total_cmp);
+    walls.sort_by(f64::total_cmp);
+    queues.sort_by(f64::total_cmp);
     let max_latency = latencies.last().map(|ms| round2(*ms)).unwrap_or(0.0);
     let mut provider_stats = serde_json::Map::new();
     for (provider, samples) in by_provider.iter_mut() {
@@ -542,6 +576,14 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "ai_latency_percentile_method": "nearest_rank",
         "ai_latency_by_provider": provider_stats,
         "ai_latency_scope": "all_modes",
+        "ai_wall_samples": walls.len(),
+        "ai_wall_p50_ms": percentile(&walls, 0.50),
+        "ai_wall_p95_ms": percentile(&walls, 0.95),
+        "ai_wall_p99_ms": percentile(&walls, 0.99),
+        "ai_queue_samples": queues.len(),
+        "ai_queue_p50_ms": percentile(&queues, 0.50),
+        "ai_queue_p95_ms": percentile(&queues, 0.95),
+        "ai_queue_p99_ms": percentile(&queues, 0.99),
         "book_stale_pct": book_stale_pct,
         "book": book,
     })
@@ -593,7 +635,9 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
             "SELECT decision, ai_action, \
              json_extract(features, '$.filter_trace.gate'), \
              json_extract(features, '$.filter_trace.skip'), \
-             json_extract(features, '$.ai_scale') \
+             json_extract(features, '$.ai_scale'), \
+             json_extract(features, '$.ai_latency.wall_ms'), \
+             json_extract(features, '$.ai_latency.queue_ms') \
              FROM signals WHERE ts >= ?1 AND mode = ?2",
         )
         .ok()?;
@@ -608,6 +652,8 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
                     .map(|flag| flag != 0)
                     .unwrap_or(false),
                 scale: r.get(4)?,
+                wall_ms: r.get(5)?,
+                queue_ms: r.get(6)?,
             })
         })
         .ok()?;
@@ -643,6 +689,8 @@ fn features_rows(conn: &Connection, mode: &str, since: i64) -> Vec<SignalMetricR
                 gate: trace["gate"].as_str().map(str::to_string),
                 skip: trace["skip"].as_bool().unwrap_or(false),
                 scale: value["ai_scale"].as_f64(),
+                wall_ms: value["ai_latency"]["wall_ms"].as_f64(),
+                queue_ms: value["ai_latency"]["queue_ms"].as_f64(),
             }
         })
         .collect()
@@ -900,7 +948,10 @@ mod tests {
 
         let value = half_ai_stats(&conn, "demo", now, 86_400);
         assert_eq!(value["ai_latency_samples"], 100, "只统计窗口内正延迟样本");
-        assert_eq!(value["ai_latency_p50_ms"], 51.0, "nearest-rank: floor(100*0.5)");
+        assert_eq!(
+            value["ai_latency_p50_ms"], 51.0,
+            "nearest-rank: floor(100*0.5)"
+        );
         assert_eq!(value["ai_latency_p95_ms"], 96.0);
         assert_eq!(value["ai_latency_p99_ms"], 100.0);
         assert_eq!(value["ai_latency_max_ms"], 100.0);
@@ -935,6 +986,57 @@ mod tests {
             "空 provider 归入 unknown"
         );
         assert_eq!(by_provider["unknown"]["p50_ms"], 10.0);
+    }
+
+    #[test]
+    fn half_ai_stats_reports_wall_and_queue_percentiles() {
+        let conn = table();
+        let now = 700_000;
+        for (index, (wall, queue)) in [(100, 10), (200, 20), (300, 30), (400, 40), (500, 50)]
+            .into_iter()
+            .enumerate()
+        {
+            let features = json!({
+                "ai_latency": {"wall_ms": wall, "provider_ms": 80, "queue_ms": queue},
+                "filter_trace": {"gate": "none"},
+            })
+            .to_string();
+            insert_signal_in(
+                &conn,
+                "demo",
+                now - 10 - index as i64,
+                "opened",
+                "open_long",
+                &features,
+            );
+        }
+
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["ai_wall_samples"], 5);
+        assert_eq!(value["ai_wall_p50_ms"], 300.0, "nearest-rank: floor(5*0.5)");
+        assert_eq!(value["ai_wall_p95_ms"], 500.0);
+        assert_eq!(value["ai_wall_p99_ms"], 500.0);
+        assert_eq!(value["ai_queue_samples"], 5);
+        assert_eq!(value["ai_queue_p50_ms"], 30.0);
+        assert_eq!(value["ai_queue_p95_ms"], 50.0);
+        assert_eq!(value["ai_queue_p99_ms"], 50.0);
+    }
+
+    #[test]
+    fn half_ai_stats_reports_zero_when_latency_missing() {
+        let conn = table();
+        insert_signal(
+            &conn,
+            800_000,
+            "opened",
+            "open_long",
+            r#"{"filter_trace":{"gate":"none"}}"#,
+        );
+        let value = half_ai_stats(&conn, "demo", 800_000, 86_400);
+        assert_eq!(value["ai_wall_samples"], 0);
+        assert_eq!(value["ai_wall_p95_ms"], 0.0);
+        assert_eq!(value["ai_queue_samples"], 0);
+        assert_eq!(value["ai_queue_p95_ms"], 0.0);
     }
 
     #[test]
@@ -1061,6 +1163,37 @@ mod tests {
         assert_eq!(features["ai_vb"], 6);
         assert_eq!(features["ai_ip"], 97.5);
         assert_eq!(features["ai_ep"], 99.8);
+    }
+
+    #[test]
+    fn audit_signal_persists_ai_latency_in_features() {
+        let mut row = AuditSignal::new("BTCUSDT");
+        row.provider_ms = Some(120);
+        row.queue_ms = Some(30);
+        row.wall_ms = Some(180);
+        let features = row.features_with_meta();
+        assert_eq!(features["ai_latency"]["wall_ms"], 180);
+        assert_eq!(features["ai_latency"]["provider_ms"], 120);
+        assert_eq!(features["ai_latency"]["queue_ms"], 30);
+    }
+
+    #[test]
+    fn review_latency_is_persisted_in_features() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        let mut row = AuditSignal::new("ETHUSDT").with_decision("opened");
+        row.provider_ms = Some(120);
+        row.queue_ms = Some(30);
+        row.wall_ms = Some(180);
+        record(&tx, "demo", 1000, &[row]).unwrap();
+        tx.commit().unwrap();
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["ai_latency"]["wall_ms"], 180);
+        assert_eq!(value["ai_latency"]["provider_ms"], 120);
+        assert_eq!(value["ai_latency"]["queue_ms"], 30);
     }
 
     #[test]
