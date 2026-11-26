@@ -249,6 +249,9 @@ pub(crate) fn record_decision(
     {
         return None;
     }
+    if confidence < journal_min_record_confidence(conn) {
+        return None;
+    }
     conn.execute(
         "INSERT INTO decision_journal(ts, symbol, direction, confidence, entry_price, target_pct, \
          reason, snapshot, decision, signal_id, injected_experience_ids, status, outcome, \
@@ -591,9 +594,27 @@ fn experience_capacity(conn: &Connection) -> usize {
     )
     .ok()
     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    .and_then(|value| value.get("experience_capacity").and_then(Value::as_i64))
+    .and_then(|value| value.get("max_experiences").and_then(Value::as_i64))
     .unwrap_or(200)
     .clamp(1, 5_000) as usize
+}
+
+fn journal_min_record_confidence(conn: &Connection) -> f64 {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'journal'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|value| {
+        value
+            .get("min_record_confidence")
+            .and_then(Value::as_f64)
+    })
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.45)
+    .clamp(0.0, 1.0)
 }
 
 /// 超容量按健康度（胜率，样本不足取先验 0.5）与时间淘汰；手动停用的最先出局。
@@ -1209,6 +1230,55 @@ mod tests {
             };
             assert_eq!(kept, vec![1, 4], "保留胜率最高、时间最新的两条");
             assert_eq!(prune_experiences(&conn, 2), 0, "再次清理无变化");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn experience_capacity_reads_max_experiences() {
+        let path = std::env::temp_dir().join("nq-journal-max-experiences.db");
+        let db = seed(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('journal','{\"max_experiences\":37}',0)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(experience_capacity(&conn), 37);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_decision_skips_entries_below_min_confidence() {
+        let path = std::env::temp_dir().join("nq-journal-min-confidence.db");
+        let db = seed(&path);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE decision_journal ADD COLUMN entry_price REAL; \
+                 ALTER TABLE decision_journal ADD COLUMN reason TEXT; \
+                 ALTER TABLE decision_journal ADD COLUMN signal_id INTEGER; \
+                 ALTER TABLE decision_journal ADD COLUMN injected_experience_ids TEXT; \
+                 ALTER TABLE decision_journal ADD COLUMN actual_price REAL;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('journal','{\"min_record_confidence\":0.6}',0)",
+                [],
+            )
+            .unwrap();
+            assert!(
+                record_decision(&conn, "demo", "BTCUSDT", "long", 0.5, 100.0, 3.0, "", &json!({}))
+                    .is_none(),
+                "低于阈值的方向判断不应写入决策日志"
+            );
+            assert!(
+                record_decision(&conn, "demo", "BTCUSDT", "long", 0.7, 100.0, 3.0, "", &json!({}))
+                    .is_some(),
+                "达到阈值应正常写入"
+            );
         }
         let _ = std::fs::remove_file(&path);
     }

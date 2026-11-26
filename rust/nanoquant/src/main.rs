@@ -143,9 +143,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
 }
 
 /// 装好日志订阅器：文件写不进去就退回 stdout，不能因为日志把服务拖垮。
-fn init_tracing(home: &std::path::Path) {
+fn init_tracing(home: &std::path::Path, level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "nanoquant=info,tower_http=info".into());
+        .unwrap_or_else(|_| format!("nanoquant={level},tower_http=info").into());
     let logs_dir = std::env::var_os("NANOQUANT_LOG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| home.join("logs"));
@@ -187,7 +187,8 @@ fn set_runtime_task(db: Option<&crate::db::Db>, value: &str) {
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let config = config::Config::from_env(&args);
-    init_tracing(&config.home);
+    let log_level = config::resolve_log_level(std::path::Path::new(&config.db_path));
+    init_tracing(&config.home, &log_level);
     if let Some(index) = args.iter().position(|arg| arg == "ops") {
         let cli_args = args[index + 1..].to_vec();
         std::process::exit(cli::run(&cli_args, &config));

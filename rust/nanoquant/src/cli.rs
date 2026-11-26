@@ -23,6 +23,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("backup-drill", "创建 → 校验 → 还原 → 失败回滚演练"),
     ("archive-replay", "回放归档 JSONL 到临时库"),
     ("cleanup-history", "清理历史事件/信号（默认 dry-run）"),
+    (
+        "config-audit",
+        "配置消费审计：列出未被 Rust 源码引用的默认配置叶子键 [--fail]",
+    ),
     ("final-verdict", "策略判定"),
     ("bench-exec", "执行侧压测"),
     ("p99-bench", "签名 p99 基准"),
@@ -61,6 +65,7 @@ struct Options {
     apply: bool,
     vacuum: bool,
     force: bool,
+    fail: bool,
     self_test: bool,
     keep: bool,
     plain: bool,
@@ -110,6 +115,7 @@ fn parse(argv: &[String], config: &Config) -> Options {
     let mut apply = false;
     let mut vacuum = false;
     let mut force = false;
+    let mut fail = false;
     let mut self_test = false;
     let mut keep = false;
     let mut plain = false;
@@ -170,6 +176,7 @@ fn parse(argv: &[String], config: &Config) -> Options {
             "--apply" => apply = true,
             "--vacuum" => vacuum = true,
             "--force" => force = true,
+            "--fail" => fail = true,
             "--self-test" => self_test = true,
             "--keep" => keep = true,
             "--plain" => plain = true,
@@ -330,6 +337,7 @@ fn parse(argv: &[String], config: &Config) -> Options {
         apply,
         vacuum,
         force,
+        fail,
         self_test,
         keep,
         plain,
@@ -399,6 +407,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "reconcile" => reconcile(&options),
         "reset-password" => reset_password(&options),
         "cleanup-history" => cleanup_history(&options),
+        "config-audit" => config_audit_command(&options),
         "archive-replay" => archive_replay(&options),
         "backup-create" => backup_create(&options),
         "backup-drill" => backup_drill(&options),
@@ -702,6 +711,13 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
         (strategy, risk, ai_tuning, symbols, live, (orders, trades))
     };
 
+    let mut cfg = crate::ga_tune::GaConfig::from_ai_tuning(&ai_tuning);
+    if !cfg.enabled && !options.force {
+        return Err((
+            2,
+            "ai_tuning.ga_enabled=false：GA 已禁用，确需运行请加 --force".to_string(),
+        ));
+    }
     if symbols.is_empty() {
         return Err((2, "缺少可用标的（--symbols 或 trading_symbols）".to_string()));
     }
@@ -741,7 +757,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
     let regime = crate::regime::Regime::from_str(regime_name)
         .ok_or_else(|| (2, format!("未知 regime: {regime_name}")))?;
 
-    let mut cfg = crate::ga_tune::GaConfig::from_ai_tuning(&ai_tuning);
+
     if let Some(population) = options.population {
         cfg.population = population.clamp(10, 100);
     }
@@ -1084,6 +1100,21 @@ fn reset_password(options: &Options) -> Result<(i32, Value), (i32, String)> {
     ))
 }
 
+fn config_audit_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let report = crate::ops_tools::config_audit(&source, crate::ops_tools::CONFIG_AUDIT_ALLOWLIST)
+        .map_err(|error| (1, error))?;
+    if report["source_available"] != true {
+        return Ok((if options.fail { 1 } else { 0 }, report));
+    }
+    let unreferenced = report["unreferenced"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let code = if options.fail && unreferenced > 0 { 1 } else { 0 };
+    Ok((code, report))
+}
+
 fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
     let db = open_db(&options.db_path)?;
     let system = db.setting("system").ok().flatten().unwrap_or(Value::Null);
@@ -1096,9 +1127,14 @@ fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
         .as_i64()
         .unwrap_or(14)
         .max(1);
+    let equity_days = system["equity_retention_days"]
+        .as_i64()
+        .unwrap_or(30)
+        .max(1);
     let now = crate::now();
     let event_cutoff = now - event_days * 86_400;
     let signal_cutoff = now - signal_days * 86_400;
+    let equity_cutoff = now - equity_days * 86_400;
     let events: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM engine_events WHERE ts < ?1",
@@ -1113,7 +1149,14 @@ fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let mut deleted = json!({"engine_events": 0, "signals": 0});
+    let equity: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM equity_points WHERE ts < ?1",
+            [equity_cutoff],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let mut deleted = json!({"engine_events": 0, "signals": 0, "equity_points": 0});
     if options.apply {
         if options.vacuum && !options.force && service_reachable() {
             return Err((
@@ -1127,6 +1170,9 @@ fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
         deleted["signals"] = json!(conn
             .execute("DELETE FROM signals WHERE ts < ?1", [signal_cutoff])
             .unwrap_or(0));
+        deleted["equity_points"] = json!(conn
+            .execute("DELETE FROM equity_points WHERE ts < ?1", [equity_cutoff])
+            .unwrap_or(0));
         if options.vacuum {
             let _ = conn.execute_batch("VACUUM;");
         }
@@ -1137,8 +1183,16 @@ fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
             "ok": true,
             "apply": options.apply,
             "dry_run": !options.apply,
-            "cutoff": {"engine_events": event_cutoff, "signals": signal_cutoff},
-            "matched": {"engine_events": events, "signals": signals},
+            "cutoff": {
+                "engine_events": event_cutoff,
+                "signals": signal_cutoff,
+                "equity_points": equity_cutoff
+            },
+            "matched": {
+                "engine_events": events,
+                "signals": signals,
+                "equity_points": equity
+            },
             "deleted": deleted,
             "vacuum": options.vacuum && options.apply,
         }),
@@ -2116,7 +2170,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 22);
+        assert_eq!(text.len(), 23);
         for name in [
             "preflight",
             "reconcile",
@@ -2125,6 +2179,7 @@ mod tests {
             "backup-drill",
             "archive-replay",
             "cleanup-history",
+            "config-audit",
             "final-verdict",
             "bench-exec",
             "p99-bench",

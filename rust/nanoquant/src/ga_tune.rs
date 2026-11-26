@@ -70,6 +70,7 @@ pub(crate) fn default_genes() -> Vec<Gene> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GaConfig {
+    pub enabled: bool,
     pub population: usize,
     pub generations: usize,
     pub mutation_rate: f64,
@@ -79,6 +80,7 @@ pub(crate) struct GaConfig {
 impl Default for GaConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             population: 30,
             generations: 20,
             mutation_rate: 0.1,
@@ -93,6 +95,10 @@ impl GaConfig {
         let defaults = Self::default();
         let number = |key: &str| config.get(key).and_then(Value::as_f64);
         Self {
+            enabled: config
+                .get("ga_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.enabled),
             population: number("ga_population")
                 .map(|value| value as usize)
                 .unwrap_or(defaults.population)
@@ -434,6 +440,7 @@ mod tests {
     #[test]
     fn ga_is_deterministic_with_seed() {
         let cfg = GaConfig {
+            enabled: true,
             population: 6,
             generations: 3,
             mutation_rate: 0.2,
@@ -487,6 +494,7 @@ mod tests {
             Regime::from_str("range").unwrap(),
             "1h",
             &GaConfig {
+                enabled: true,
                 population: 3,
                 generations: 1,
                 mutation_rate: 0.1,
@@ -494,5 +502,12 @@ mod tests {
             },
         );
         assert!(result.best_fitness.is_infinite() && result.best_fitness.is_sign_negative());
+    }
+
+    #[test]
+    fn config_reads_ga_enabled_and_defaults_to_disabled() {
+        assert!(!GaConfig::from_ai_tuning(&json!({})).enabled);
+        assert!(GaConfig::from_ai_tuning(&json!({"ga_enabled": true})).enabled);
+        assert!(!GaConfig::from_ai_tuning(&json!({"ga_enabled": false})).enabled);
     }
 }

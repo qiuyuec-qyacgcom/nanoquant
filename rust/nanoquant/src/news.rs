@@ -74,7 +74,8 @@ pub struct NewsState {
 
 impl NewsState {
     pub fn new(db: Db) -> Self {
-        Self::with_sources(db, http_sources())
+        let rsshub_base = news_cfg(&db).rsshub_base;
+        Self::with_sources(db, http_sources(&rsshub_base))
     }
 
     pub fn with_sources(db: Db, sources: Vec<Arc<dyn NewsSource>>) -> Self {
@@ -471,6 +472,7 @@ struct NewsCfg {
     max_items_per_source: usize,
     keep_days: i64,
     request_timeout_sec: u64,
+    rsshub_base: String,
     sources: Vec<String>,
 }
 
@@ -495,6 +497,12 @@ fn news_cfg(db: &Db) -> NewsCfg {
         max_items_per_source: num("max_items_per_source", 20).clamp(1, 100) as usize,
         keep_days: num("keep_days", 7).clamp(1, 365),
         request_timeout_sec: num("request_timeout_sec", 8).clamp(3, 60) as u64,
+        rsshub_base: raw
+            .get("rsshub_base")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
         sources,
     }
 }
@@ -1416,7 +1424,7 @@ enum SourceKind {
 
 struct HttpSource {
     name: &'static str,
-    url: &'static str,
+    url: String,
     params: Vec<(&'static str, &'static str)>,
     kind: SourceKind,
 }
@@ -1436,7 +1444,7 @@ impl NewsSource for HttpSource {
                     message: error.to_string(),
                     url: self.url.to_string(),
                 })?;
-            let mut request = client.get(self.url).header(
+            let mut request = client.get(self.url.as_str()).header(
                 "Accept",
                 "application/rss+xml, application/xml;q=0.9, application/json;q=0.8, text/html;q=0.7, */*;q=0.5",
             );
@@ -1480,25 +1488,26 @@ impl NewsSource for HttpSource {
     }
 }
 
-fn http_sources() -> Vec<Arc<dyn NewsSource>> {
+fn http_sources(rsshub_base: &str) -> Vec<Arc<dyn NewsSource>> {
     let rss = |name: &'static str, url: &'static str| -> Arc<dyn NewsSource> {
         Arc::new(HttpSource {
             name,
-            url,
+            url: url.to_string(),
             params: Vec::new(),
             kind: SourceKind::Rss,
         })
     };
-    vec![
+    let mut sources = vec![
         Arc::new(HttpSource {
             name: "binance_square",
-            url: "https://www.binance.com/bapi/composite/v1/public/content/square/feed",
+            url: "https://www.binance.com/bapi/composite/v1/public/content/square/feed".to_string(),
             params: vec![("page", "1")],
             kind: SourceKind::Json,
         }),
         Arc::new(HttpSource {
             name: "binance_announcement",
-            url: "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query",
+            url: "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
+                .to_string(),
             params: vec![("type", "1"), ("pageNo", "1")],
             kind: SourceKind::Json,
         }),
@@ -1513,7 +1522,17 @@ fn http_sources() -> Vec<Arc<dyn NewsSource>> {
             "coindesk",
             "https://www.coindesk.com/arc/outboundfeeds/rss/",
         ),
-    ]
+    ];
+    let base = rsshub_base.trim().trim_end_matches('/');
+    if !base.is_empty() {
+        sources.push(Arc::new(HttpSource {
+            name: "binance_announcement_rsshub",
+            url: format!("{base}/binance/announcement"),
+            params: Vec::new(),
+            kind: SourceKind::Rss,
+        }));
+    }
+    sources
 }
 
 #[cfg(test)]
@@ -1924,5 +1943,35 @@ mod tests {
         let cfg = veto_setting(r#"{"veto_enabled":true,"veto_window_min":30,"veto_max_items":2}"#);
         let hit = veto_reason(&conn, &cfg, "BTCUSDT", "long").expect("应有命中");
         assert_eq!(hit.matches("下架公告").count(), 2, "{hit}");
+    }
+
+    #[test]
+    fn rsshub_base_adds_announcement_source_only_when_configured() {
+        let path = std::env::temp_dir().join("nq-news-rsshub.db");
+        let db = seed(&path);
+        let names = |state: &NewsState| {
+            state
+                .sources
+                .iter()
+                .map(|source| source.name())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !names(&NewsState::new(db.clone())).contains(&"binance_announcement_rsshub"),
+            "rsshub_base 为空时不启用 RSSHub 源"
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES('news','{\"rsshub_base\":\"https://rss.example.com/\"}',0)",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            names(&NewsState::new(db.clone())).contains(&"binance_announcement_rsshub"),
+            "配置 rsshub_base 后应启用 RSSHub 公告源"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

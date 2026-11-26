@@ -331,6 +331,7 @@ async fn klines(
         &query.interval,
         query.limit,
         query.fresh,
+        data_ttl_sec(&db, "kline_ttl_sec", 20),
     )
     .await?;
     let last = items.last().and_then(|v| v["t"].as_i64());
@@ -469,7 +470,15 @@ async fn oi_signal(
         .await
         .map_err(|_| market_unavailable())?;
     let (open_interest, oi_change_pct) = parse_oi_series(&rows).ok_or_else(market_unavailable)?;
-    let klines = fetch_klines(live, &symbol, &query.interval, 2, false).await?;
+    let klines = fetch_klines(
+        live,
+        &symbol,
+        &query.interval,
+        2,
+        false,
+        data_ttl_sec(&db, "kline_ttl_sec", 20),
+    )
+    .await?;
     let price_change_pct = parse_price_change(&klines).unwrap_or(0.0);
     let regime = crate::oi_regime::payload(price_change_pct, oi_change_pct);
     Ok(Json(json!({
@@ -489,9 +498,14 @@ async fn fetch_klines(
     interval: &str,
     limit: usize,
     fresh: bool,
+    ttl_sec: u64,
 ) -> Result<Vec<Value>, MarketError> {
     let key = (live, symbol.to_owned(), interval.to_owned(), limit);
-    let ttl = std::time::Duration::from_millis(if fresh { 1500 } else { 20_000 });
+    let ttl = std::time::Duration::from_millis(if fresh {
+        1500
+    } else {
+        ttl_sec.saturating_mul(1000)
+    });
     let cached = KLINE_CACHE
         .lock()
         .expect("kline cache")
@@ -518,7 +532,7 @@ async fn fetch_klines(
             .map_err(|_| market_unavailable())?;
         let items = parse_klines(&rows).ok_or_else(market_unavailable)?;
         let mut cache = KLINE_CACHE.lock().expect("kline cache");
-        cache.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(20));
+        cache.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(ttl_sec.max(1)));
         if cache.len() < 64 {
             cache.insert(key, (std::time::Instant::now(), items.clone()));
         }
@@ -527,10 +541,33 @@ async fn fetch_klines(
     Ok(items)
 }
 
+/// `data.*_ttl_sec` 读取：0 表示禁用缓存，上限一小时。
+fn data_ttl_sec(db: &Db, key: &str, default: i64) -> u64 {
+    db.setting("data")
+        .ok()
+        .flatten()
+        .and_then(|value| value.get(key).and_then(Value::as_i64))
+        .unwrap_or(default)
+        .clamp(0, 3_600) as u64
+}
+
 pub(crate) async fn fetch_tickers(
     live: bool,
     symbols: &[String],
+    ttl_sec: u64,
 ) -> Result<serde_json::Map<String, Value>, MarketError> {
+    let key = (live, symbols.join(","));
+    if ttl_sec > 0 {
+        let cached = TICKER_CACHE
+            .lock()
+            .expect("ticker cache")
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(ttl_sec))
+            .map(|(_, rows)| rows.clone());
+        if let Some(rows) = cached {
+            return Ok(rows);
+        }
+    }
     let rows = MARKET_CLIENT
         .as_ref()
         .map_err(|_| market_unavailable())?
@@ -552,6 +589,13 @@ pub(crate) async fn fetch_tickers(
             symbol.clone(),
             parse_ticker(symbol, row).ok_or_else(market_unavailable)?,
         );
+    }
+    if ttl_sec > 0 {
+        let mut cache = TICKER_CACHE.lock().expect("ticker cache");
+        cache.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(ttl_sec));
+        if cache.len() < 64 {
+            cache.insert(key, (std::time::Instant::now(), result.clone()));
+        }
     }
     Ok(result)
 }
@@ -580,7 +624,7 @@ async fn quotes(State(db): State<Db>) -> Result<Json<Value>, MarketError> {
     let rows = if symbols.is_empty() {
         serde_json::Map::new()
     } else {
-        fetch_tickers(market_live(&db)?, &symbols).await?
+        fetch_tickers(market_live(&db)?, &symbols, data_ttl_sec(&db, "ticker_ttl_sec", 5)).await?
     };
     Ok(Json(
         json!({"symbols":symbols,"tickers":rows,"updated_at":crate::now()}),
@@ -614,7 +658,16 @@ async fn klines_batch(
     if !symbols.is_empty() {
         let live = market_live(&db)?;
         for symbol in &symbols {
-            match fetch_klines(live, symbol, &query.interval, query.limit, query.fresh).await {
+            match fetch_klines(
+                live,
+                symbol,
+                &query.interval,
+                query.limit,
+                query.fresh,
+                data_ttl_sec(&db, "kline_ttl_sec", 20),
+            )
+            .await
+            {
                 Ok(rows) => {
                     items.insert(symbol.clone(), Value::Array(rows));
                 }
@@ -623,7 +676,9 @@ async fn klines_batch(
                 }
             }
         }
-        tickers = fetch_tickers(live, &symbols).await.unwrap_or_default();
+        tickers = fetch_tickers(live, &symbols, data_ttl_sec(&db, "ticker_ttl_sec", 5))
+            .await
+            .unwrap_or_default();
     }
     Ok(Json(
         json!({"symbols":symbols,"items":items,"tickers":tickers,"errors":errors,
@@ -668,6 +723,13 @@ type KlineCache =
     std::collections::HashMap<(bool, String, String, usize), (std::time::Instant, Vec<Value>)>;
 static KLINE_CACHE: std::sync::LazyLock<std::sync::Mutex<KlineCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(KlineCache::new()));
+
+type TickerCache = std::collections::HashMap<
+    (bool, String),
+    (std::time::Instant, serde_json::Map<String, Value>),
+>;
+static TICKER_CACHE: std::sync::LazyLock<std::sync::Mutex<TickerCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(TickerCache::new()));
 
 async fn config(State(db): State<Db>) -> Json<Value> {
     let public = db.setting("public").ok().flatten().unwrap_or(Value::Null);

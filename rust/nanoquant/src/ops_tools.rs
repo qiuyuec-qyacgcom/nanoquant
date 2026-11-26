@@ -3,9 +3,10 @@
 //! 全部命令只在本机运行，不需要外部服务；涉及真实测试网凭证的 `p99-real`
 //! 在缺少凭证时明确失败，不伪造采样。
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1159,6 +1160,188 @@ fn first_string_literal(call: &str) -> Option<String> {
     Some(call[start..end].to_string())
 }
 
+// ---------------------------------------------------------------- config-audit
+
+/// 允许保留但暂未接线的键（P1 补齐）。`ai_summary` 是新闻接口名误报，
+/// `risk_disclaimer_accepted` 是前端展示状态。
+pub const CONFIG_AUDIT_ALLOWLIST: &[&str] = &[
+    "ai_summary",
+    "risk_disclaimer_accepted",
+    "api_rate_limit_per_min",
+    "alert_digest_enabled",
+    "alert_digest_minutes",
+    "backup_base_urls",
+    "demo_backup_urls",
+    "archive_health_threshold",
+    "auto_disable_negative",
+    "global_review_every_trades",
+];
+
+/// 配置键来源：编译期嵌入，发布环境没有源码也能列出全部键。
+const DEFAULT_SETTINGS: &str = include_str!("default_settings.json");
+
+/// 递归收集 JSON 对象键名；数组展开，键名去重。
+fn collect_leaf_keys(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                match child {
+                    Value::Object(_) => collect_leaf_keys(child, out),
+                    Value::Array(items) => {
+                        // 数组本身是叶子配置项；对象元素里的键继续展开。
+                        out.insert(key.clone());
+                        for item in items {
+                            collect_leaf_keys(item, out);
+                        }
+                    }
+                    _ => {
+                        out.insert(key.clone());
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_leaf_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 提取 Rust 源码里的字符串字面量（含 raw string），跳过行/块注释。
+fn collect_string_literals(source: &str, out: &mut BTreeSet<String>) {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut index = 0;
+    while index < len {
+        if bytes[index] == b'/' && index + 1 < len && bytes[index + 1] == b'/' {
+            index += 2;
+            while index < len && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'/' && index + 1 < len && bytes[index + 1] == b'*' {
+            index += 2;
+            while index + 1 < len && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = (index + 2).min(len);
+            continue;
+        }
+        if bytes[index] == b'r' && (index == 0 || !is_ident(bytes[index - 1])) {
+            let mut cursor = index + 1;
+            let mut hashes = 0;
+            while cursor < len && bytes[cursor] == b'#' {
+                hashes += 1;
+                cursor += 1;
+            }
+            if cursor < len && bytes[cursor] == b'"' {
+                let content_start = cursor + 1;
+                let closing = format!("\"{}", "#".repeat(hashes));
+                if let Some(rest) = source.get(content_start..) {
+                    if let Some(position) = rest.find(&closing) {
+                        out.insert(rest[..position].to_string());
+                        index = content_start + position + closing.len();
+                        continue;
+                    }
+                }
+            }
+        }
+        if bytes[index] == b'"' {
+            let mut cursor = index + 1;
+            let mut literal = String::new();
+            while cursor < len {
+                match bytes[cursor] {
+                    b'\\' => {
+                        cursor += 1;
+                        if cursor < len {
+                            literal.push(bytes[cursor] as char);
+                            cursor += 1;
+                        }
+                    }
+                    b'"' => break,
+                    byte => {
+                        literal.push(byte as char);
+                        cursor += 1;
+                    }
+                }
+            }
+            out.insert(literal);
+            index = (cursor + 1).min(len);
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+            && path.file_name().and_then(|name| name.to_str()) != Some("param_registry.rs")
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn scan_source_literals(source_dir: &Path) -> Result<(BTreeSet<String>, usize), String> {
+    let mut files = Vec::new();
+    collect_rust_sources(source_dir, &mut files).map_err(|error| error.to_string())?;
+    let mut literals = BTreeSet::new();
+    for file in &files {
+        let source = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
+        collect_string_literals(&source, &mut literals);
+    }
+    Ok((literals, files.len()))
+}
+
+/// 配置消费审计：列出 `default_settings.json` 中未被 Rust 源码字符串字面量
+/// 引用的叶子键（白名单除外）。源码目录缺失时返回 `source_available=false`。
+pub fn config_audit(source_dir: &Path, allowlist: &[&str]) -> Result<Value, String> {
+    let parsed: Value =
+        serde_json::from_str(DEFAULT_SETTINGS).map_err(|error| error.to_string())?;
+    let mut keys = BTreeSet::new();
+    collect_leaf_keys(&parsed, &mut keys);
+    if !source_dir.is_dir() {
+        return Ok(json!({
+            "ok": false,
+            "source_available": false,
+            "message": format!("源码不可用: {}", source_dir.display()),
+            "total_keys": keys.len(),
+            "unreferenced": [],
+        }));
+    }
+    let (literals, files) = scan_source_literals(source_dir)?;
+    let unreferenced: Vec<String> = keys
+        .iter()
+        .filter(|key| !literals.contains(*key) && !allowlist.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    let allowlisted: Vec<String> = keys
+        .iter()
+        .filter(|key| allowlist.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    Ok(json!({
+        "ok": unreferenced.is_empty(),
+        "source_available": true,
+        "source_dir": source_dir,
+        "files": files,
+        "total_keys": keys.len(),
+        "unreferenced_count": unreferenced.len(),
+        "unreferenced": unreferenced,
+        "allowlisted": allowlisted,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,5 +1427,32 @@ mod tests {
         assert_eq!(value["extra_count"], 1, "DELETE 路由不在基线中");
         assert_eq!(value["extra"][0]["method"], "DELETE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_audit_reports_unreferenced_keys() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let report = config_audit(&source, CONFIG_AUDIT_ALLOWLIST).unwrap();
+        assert_eq!(report["source_available"], true, "源码目录不可用: {report}");
+        let unreferenced = report["unreferenced"].as_array().unwrap();
+        assert!(
+            unreferenced.is_empty(),
+            "存在白名单之外的未接线参数: {unreferenced:?}"
+        );
+        let allowlisted = report["allowlisted"].as_array().unwrap();
+        assert!(allowlisted.iter().any(|key| key == "api_rate_limit_per_min"));
+        assert!(allowlisted.iter().any(|key| key == "risk_disclaimer_accepted"));
+        assert!(allowlisted.iter().any(|key| key == "ai_summary"));
+    }
+
+    #[test]
+    fn config_audit_reports_source_unavailable_instead_of_panicking() {
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("src-does-not-exist");
+        let report = config_audit(&missing, CONFIG_AUDIT_ALLOWLIST).unwrap();
+        assert_eq!(report["source_available"], false);
+        assert_eq!(
+            report["message"],
+            format!("源码不可用: {}", missing.display())
+        );
     }
 }
