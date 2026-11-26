@@ -122,6 +122,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   news: [
     { title: '抓取', fields: ['enabled', 'refresh_minutes', 'keep_days', 'sources', 'max_items_per_source', 'rsshub_base'] },
     { title: '情绪', fields: ['ai_summary', 'sentiment_threshold'] },
+    { title: '事件否决', hint: '最近窗口内出现标的负面事件时否决同向开仓', fields: ['veto_enabled', 'veto_window_min', 'veto_max_items'] },
     { title: '网络', hint: '留空则复用「交易所 → HTTP 代理」', fields: ['proxy', 'request_timeout_sec'] },
   ],
   system: [

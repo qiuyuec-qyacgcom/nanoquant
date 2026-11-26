@@ -212,6 +212,9 @@ const BASE_META: Record<string, FieldMeta> = {
   ai_summary: { label: 'AI 摘要', hint: '开启后对新资讯生成情绪摘要' },
   sentiment_threshold: { label: '情绪阈值', hint: '绝对值超过该值才标记为显著情绪' },
   max_items_per_source: { label: '单源最多条数', unit: '条' },
+  veto_enabled: { label: '事件否决', hint: '开启后，最近窗口内的标的负面事件会否决同向开仓' },
+  veto_window_min: { label: '事件回看窗口', unit: '分钟', hint: '只统计最近多少分钟内的资讯；范围 5–240' },
+  veto_max_items: { label: '否决引用条数', unit: '条', hint: '拒绝原因里最多引用几条命中资讯；范围 1–10' },
   rsshub_base: { label: 'RSSHub 地址', hint: '可选，自建实例用于抓取币安公告' },
 
   review_on_close: { label: '平仓即复盘', hint: '每笔平仓后自动做一次复盘' },

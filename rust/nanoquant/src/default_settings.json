@@ -185,7 +185,10 @@
     "max_items_per_source": 30,
     "proxy": "",
     "request_timeout_sec": 8,
-    "rsshub_base": ""
+    "rsshub_base": "",
+    "veto_enabled": true,
+    "veto_window_min": 30,
+    "veto_max_items": 3
   },
   "evolution": {
     "enabled": true,

@@ -1672,6 +1672,8 @@ impl EngineRuntime {
         } else {
             Vec::new()
         };
+        // 事件否决在 AI 复核之前执行：命中就不必再花一次 AI 调用。
+        let drafts = Self::filter_news_vetoes(&tx, mode, drafts)?;
         // 实盘订单要离线发送：这里只给出计划，网络请求留给调用方在事务外做。
         let mut plans = if mode == "live" && engine_is_enabled {
             // 上一轮没拿到结论的平仓单还挂着：再发一张就是重复平仓。
@@ -2969,6 +2971,58 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             });
         }
         Ok(drafts)
+    }
+
+    /// 按 `news.veto_*` 过滤候选：最近窗口内出现标的的负面事件时，
+    /// 否决同向（做多）候选并写入信号审计；反向候选原样保留。
+    fn filter_news_vetoes(
+        tx: &rusqlite::Transaction<'_>,
+        mode: &str,
+        drafts: Vec<EntryDraft>,
+    ) -> Result<Vec<EntryDraft>, String> {
+        if drafts.is_empty() {
+            return Ok(drafts);
+        }
+        let news = tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'news'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null);
+        let mut kept = Vec::with_capacity(drafts.len());
+        let mut vetoed = Vec::new();
+        for draft in drafts {
+            let reason = draft
+                .signal_side()
+                .and_then(|side| crate::news::veto_reason(tx, &news, &draft.symbol, side));
+            let Some(reason) = reason else {
+                kept.push(draft);
+                continue;
+            };
+            vetoed.push(
+                draft
+                    .audit_row(
+                        "rejected",
+                        draft.signal_side().unwrap_or("flat"),
+                        &reason,
+                        "reject",
+                        0.0,
+                        &reason,
+                        None,
+                    )
+                    .with_stage("gate"),
+            );
+        }
+        if !vetoed.is_empty() {
+            if let Err(error) = crate::signal_audit::record(tx, mode, crate::now(), &vetoed) {
+                tracing::warn!(%error, "负面事件否决审计写入失败，不影响本轮下单");
+            }
+        }
+        Ok(kept)
     }
 
     fn review_drafts(

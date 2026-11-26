@@ -259,6 +259,135 @@ pub(crate) fn sentiment_overview(db: &Db) -> Value {
     })
 }
 
+/// 负面事件关键词。命中任一即视为与标的相关的利空。
+const NEGATIVE_EVENT_KEYWORDS: &[&str] = &[
+    "下架", "暂停", "黑客", "清算", "监管", "诉讼", "退市", "delist", "suspend", "hack", "liquidat",
+];
+
+/// 事件否决参数：只关心开关、回看窗口与最多返回几条命中。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewsVetoCfg {
+    pub enabled: bool,
+    pub window_min: i64,
+    pub max_items: i64,
+}
+
+pub(crate) fn veto_cfg(news: &Value) -> NewsVetoCfg {
+    NewsVetoCfg {
+        enabled: news
+            .get("veto_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        window_min: news
+            .get("veto_window_min")
+            .and_then(Value::as_i64)
+            .unwrap_or(30)
+            .clamp(5, 240),
+        max_items: news
+            .get("veto_max_items")
+            .and_then(Value::as_i64)
+            .unwrap_or(3)
+            .clamp(1, 10),
+    }
+}
+
+/// 查询最近 `window_min` 分钟内与 `symbol` 相关的负面事件。
+///
+/// 匹配规则：`symbols` 字段包含该标的，或标题/摘要包含去掉 `USDT` 后的币种词；
+/// 命中关键词后按时间倒序取最多 `max_items` 条，返回「标题 摘要」的拼接文本。
+pub(crate) fn negative_event_hit(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    window_min: i64,
+    max_items: i64,
+) -> Option<String> {
+    let upper = symbol.trim().to_uppercase();
+    let base = upper.strip_suffix("USDT").unwrap_or(upper.as_str());
+    if base.is_empty() {
+        return None;
+    }
+    let since = crate::now() - window_min.clamp(1, 10_080) * 60;
+    let limit = max_items.clamp(1, 10) as usize;
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, summary, symbols FROM news_items WHERE ts >= ?1 ORDER BY ts DESC \
+             LIMIT 500",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([since], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })
+        .ok()?;
+    let mut hits = Vec::with_capacity(limit);
+    for (title, summary, symbols_raw) in rows.flatten() {
+        let related = news_row_matches(&upper, base, &symbols_raw, &title, &summary);
+        if !related {
+            continue;
+        }
+        let text = format!("{title} {summary}").to_lowercase();
+        if !NEGATIVE_EVENT_KEYWORDS
+            .iter()
+            .any(|keyword| text.contains(keyword))
+        {
+            continue;
+        }
+        let title = title.trim();
+        let summary = summary.trim();
+        hits.push(if summary.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} {summary}")
+        });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    (!hits.is_empty()).then(|| hits.join("；"))
+}
+
+/// 一条资讯是否与标的相关：`symbols` 里有完整标的，或文本里出现币种词。
+fn news_row_matches(
+    symbol: &str,
+    base: &str,
+    symbols_raw: &str,
+    title: &str,
+    summary: &str,
+) -> bool {
+    let symbols: Value = serde_json::from_str(symbols_raw).unwrap_or(json!([]));
+    if symbols.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+        })
+    }) {
+        return true;
+    }
+    format!("{title} {summary}").to_uppercase().contains(base)
+}
+
+/// 事件否决理由：只在候选方向存在时判断。
+///
+/// 负面事件方向向下，做多与事件冲击同向、最容易吃到急跌，因此否决多头；
+/// 做空属于反向，不受影响。
+pub(crate) fn veto_reason(
+    conn: &rusqlite::Connection,
+    news: &Value,
+    symbol: &str,
+    side: &str,
+) -> Option<String> {
+    let cfg = veto_cfg(news);
+    if !cfg.enabled || side != "long" {
+        return None;
+    }
+    negative_event_hit(conn, symbol, cfg.window_min, cfg.max_items)
+        .map(|hit| format!("负面事件否决: {hit}"))
+}
+
 /// 一条待入库的资讯。
 #[derive(Debug, Clone)]
 pub struct Incoming {
@@ -1699,5 +1828,101 @@ mod tests {
             vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         );
         assert_eq!(clean_text("<p>hello   world</p>"), "hello world");
+    }
+
+    fn veto_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE news_items(id INTEGER PRIMARY KEY, ts INTEGER, source TEXT, title TEXT, \
+             url TEXT, summary TEXT, sentiment REAL, symbols TEXT, dedupe TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_veto_news(conn: &Connection, ts: i64, title: &str, symbols: &str) {
+        conn.execute(
+            "INSERT INTO news_items(ts, source, title, url, summary, sentiment, symbols, dedupe) \
+             VALUES(?1,'test',?2,'','',0,?3,'veto')",
+            rusqlite::params![ts, title, symbols],
+        )
+        .unwrap();
+    }
+
+    fn veto_setting(raw: &str) -> Value {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn negative_news_blocks_same_direction() {
+        let conn = veto_conn();
+        insert_veto_news(&conn, crate::now() - 60, "BTC 永续被交易所下架", "[]");
+        let cfg = veto_setting(r#"{"veto_enabled":true,"veto_window_min":30,"veto_max_items":3}"#);
+        let long = veto_reason(&conn, &cfg, "BTCUSDT", "long").expect("利空消息应否决多头");
+        assert!(long.starts_with("负面事件否决: "), "{long}");
+        assert!(long.contains("下架"), "{long}");
+        assert!(
+            veto_reason(&conn, &cfg, "BTCUSDT", "short").is_none(),
+            "反向做空不受影响"
+        );
+    }
+
+    #[test]
+    fn negative_news_ignores_unrelated_symbol() {
+        let conn = veto_conn();
+        insert_veto_news(
+            &conn,
+            crate::now() - 60,
+            "ETH 交易对暂停充值",
+            "[\"ETHUSDT\"]",
+        );
+        let cfg = veto_setting(r#"{"veto_enabled":true,"veto_window_min":30,"veto_max_items":3}"#);
+        assert!(
+            veto_reason(&conn, &cfg, "BTCUSDT", "long").is_none(),
+            "其他标的的负面事件不能误伤"
+        );
+        assert!(veto_reason(&conn, &cfg, "ETHUSDT", "long").is_some());
+    }
+
+    #[test]
+    fn news_veto_disabled_allows_entry() {
+        let conn = veto_conn();
+        insert_veto_news(
+            &conn,
+            crate::now() - 60,
+            "BTC 永续被交易所下架",
+            "[\"BTCUSDT\"]",
+        );
+        let cfg = veto_setting(r#"{"veto_enabled":false,"veto_window_min":30,"veto_max_items":3}"#);
+        assert!(veto_reason(&conn, &cfg, "BTCUSDT", "long").is_none());
+    }
+
+    #[test]
+    fn negative_news_window_excludes_old_items() {
+        let conn = veto_conn();
+        let cfg = veto_setting(r#"{"veto_enabled":true,"veto_window_min":30,"veto_max_items":3}"#);
+        insert_veto_news(&conn, crate::now() - 31 * 60, "BTC 永续被下架", "[]");
+        assert!(
+            veto_reason(&conn, &cfg, "BTCUSDT", "long").is_none(),
+            "超出窗口的旧闻不参与否决"
+        );
+        insert_veto_news(&conn, crate::now() - 5 * 60, "BTC 交易对暂停", "[]");
+        assert!(veto_reason(&conn, &cfg, "BTCUSDT", "long").is_some());
+    }
+
+    #[test]
+    fn negative_news_caps_returned_items() {
+        let conn = veto_conn();
+        for i in 0..5 {
+            insert_veto_news(
+                &conn,
+                crate::now() - 60 * (i + 1),
+                &format!("BTC 下架公告 {i}"),
+                "[]",
+            );
+        }
+        let cfg = veto_setting(r#"{"veto_enabled":true,"veto_window_min":30,"veto_max_items":2}"#);
+        let hit = veto_reason(&conn, &cfg, "BTCUSDT", "long").expect("应有命中");
+        assert_eq!(hit.matches("下架公告").count(), 2, "{hit}");
     }
 }

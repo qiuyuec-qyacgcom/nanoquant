@@ -114,6 +114,8 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("news", "sentiment_threshold", -1.0, 1.0, 0.01),
     ("news", "max_items_per_source", 1.0, 200.0, 1.0),
     ("news", "request_timeout_sec", 1.0, 300.0, 1.0),
+    ("news", "veto_window_min", 5.0, 240.0, 1.0),
+    ("news", "veto_max_items", 1.0, 10.0, 1.0),
     ("evolution", "max_injected", 0.0, 100.0, 1.0),
     ("evolution", "ttl_days", 1.0, 365.0, 1.0),
     ("evolution", "min_confidence", 0.0, 1.0, 0.01),
@@ -241,6 +243,9 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "sources",
             "ai_summary",
             "sentiment_threshold",
+            "veto_enabled",
+            "veto_window_min",
+            "veto_max_items",
         ],
     ),
     (
