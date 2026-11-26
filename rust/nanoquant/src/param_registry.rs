@@ -26,7 +26,6 @@ const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("engine", "mode"),
     ("engine", "enabled"),
     ("engine", "close_on_halt"),
-
     ("backup", "encrypt"),
     ("strategy", "min_entry_rr"),
     ("strategy", "valid_bars"),
@@ -41,7 +40,6 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("engine", "scan_concurrency", 1.0, 20.0, 1.0),
     ("engine", "timezone_offset", -12.0, 14.0, 1.0),
     ("engine", "recv_window_ms", 1000.0, 60000.0, 1000.0),
-
     ("risk", "max_leverage", 1.0, 100.0, 1.0),
     ("risk", "min_leverage", 1.0, 100.0, 1.0),
     ("risk", "local_leverage_base", 1.0, 25.0, 1.0),
@@ -76,7 +74,6 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "atr_pct_min", 0.0, 10.0, 0.01),
     ("strategy", "atr_pct_max", 0.1, 20.0, 0.1),
     ("strategy", "min_24h_quote_volume", 0.0, 1.0e12, 100000.0),
-
     ("strategy", "roi_min_r", 0.0, 20.0, 0.1),
     ("strategy", "trailing_pct", 0.0, 200.0, 0.1),
     ("strategy", "trailing_arm_r", 0.0, 20.0, 0.1),
@@ -162,7 +159,6 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("system", "alert_cooldown_sec", 0.0, 86400.0, 1.0),
     ("system", "alert_digest_minutes", 1.0, 1440.0, 1.0),
     ("system", "api_rate_limit_per_min", 0.0, 100000.0, 1.0),
-
     ("journal", "min_record_confidence", 0.0, 1.0, 0.01),
     ("journal", "label_after_sec", 1.0, 2592000.0, 3600.0),
     ("journal", "correct_threshold_pct", 0.0, 100.0, 0.01),
@@ -195,7 +191,6 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "atr_pct_min",
             "atr_pct_max",
             "min_24h_quote_volume",
-
             "trailing_pct",
             "breakeven_at_r",
             "partial_tp_at_r",
@@ -255,7 +250,6 @@ const VISIBLE: &[(&str, &[&str])] = &[
     (
         "risk",
         &[
-
             "margin_pct",
             "min_leverage",
             "max_leverage",
@@ -692,10 +686,7 @@ mod tests {
             find("symbol_scan", "interval_hours").unwrap().max,
             Some(24.0)
         );
-        assert_eq!(
-            find("symbol_scan", "market_limit").unwrap().min,
-            Some(50.0)
-        );
+        assert_eq!(find("symbol_scan", "market_limit").unwrap().min, Some(50.0));
         assert_eq!(
             find("symbol_scan", "market_limit").unwrap().max,
             Some(500.0)

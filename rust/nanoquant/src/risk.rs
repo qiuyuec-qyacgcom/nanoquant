@@ -237,7 +237,6 @@ mod tests {
 
     fn params() -> SizeParams {
         SizeParams {
-
             margin_pct: 50.0,
             min_notional_buffer: 1.05,
         }
@@ -274,14 +273,7 @@ mod tests {
     #[test]
     fn sizing_respects_available_balance_with_safety_margin() {
         // 可用 1 USDT、10x、安全垫 0.9 → 最多 9 USDT 名义额。
-        let (qty, _) = estimate_qty(
-            100.0,
-            100.0,
-            10.0,
-            &params(),
-            &filter(),
-            Some(1.0),
-        );
+        let (qty, _) = estimate_qty(100.0, 100.0, 10.0, &params(), &filter(), Some(1.0));
         assert!((qty - 0.09).abs() < 1e-9, "实际 {qty}");
     }
 
@@ -376,28 +368,14 @@ mod tests {
     #[test]
     fn sizing_is_capped_by_available_margin_not_equity() {
         // 权益 1000 但可用只剩 10：按权益能开很大，按可用余额只能开 10×0.9×10 = 90 名义额
-        let (qty, note) = estimate_qty(
-            1000.0,
-            100.0,
-            10.0,
-            &params(),
-            &filter(),
-            Some(10.0),
-        );
+        let (qty, note) = estimate_qty(1000.0, 100.0, 10.0, &params(), &filter(), Some(10.0));
         assert_eq!(note, "ok");
         assert!(
             qty <= 0.9 + 1e-9,
             "数量必须受可用余额限制，否则会被 -2019 拒绝"
         );
 
-        let (zero, why) = estimate_qty(
-            1000.0,
-            100.0,
-            10.0,
-            &params(),
-            &filter(),
-            Some(0.2),
-        );
+        let (zero, why) = estimate_qty(1000.0, 100.0, 10.0, &params(), &filter(), Some(0.2));
         assert_eq!(zero, 0.0);
         assert!(why.contains("可用保证金不足"), "{why}");
     }

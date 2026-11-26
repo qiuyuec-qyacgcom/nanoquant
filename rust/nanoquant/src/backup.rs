@@ -31,7 +31,6 @@ const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_LISTED_FILES: usize = 200;
 
-
 const DEFAULT_TABLES: [&str; 6] = [
     "app_settings",
     "ai_providers",
@@ -380,12 +379,7 @@ fn create_backup_inner(
     let created_by = input.created_by.as_deref().unwrap_or("manual").to_string();
     let groups: Vec<String> = input
         .settings_groups
-        .unwrap_or_else(|| {
-            GROUPS
-                .iter()
-                .map(|value| value.to_string())
-                .collect()
-        })
+        .unwrap_or_else(|| GROUPS.iter().map(|value| value.to_string()).collect())
         .into_iter()
         .filter(|group| GROUPS.contains(&group.as_str()))
         .collect();
@@ -1761,11 +1755,9 @@ mod tests {
             .unwrap();
         assert!(engine.contains("\"enabled\":false"), "合法表应被还原");
         let payload: String = conn
-            .query_row(
-                "SELECT payload FROM evil_table WHERE id=1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT payload FROM evil_table WHERE id=1", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(payload, "original", "非法表必须被白名单跳过");
         drop(conn);

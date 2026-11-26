@@ -116,7 +116,6 @@ struct BacktestGridIn {
     #[serde(default)]
     entry_threshold: Vec<f64>,
     #[serde(default)]
-
     trailing_pct: Vec<f64>,
     #[serde(default = "default_folds")]
     folds: i64,
@@ -220,7 +219,6 @@ fn validate_base(
 fn validate_grid(input: &BacktestGridIn) -> Result<(), (StatusCode, Json<Value>)> {
     let entries = [
         ("entry_threshold", &input.entry_threshold),
-
         ("trailing_pct", &input.trailing_pct),
     ];
     let mut any = false;
@@ -256,7 +254,6 @@ fn grid_spec(
 ) {
     let grid = vec![
         ("entry_threshold", input.entry_threshold.clone()),
-
         ("trailing_pct", input.trailing_pct.clone()),
     ];
     let checked = backtest_engine::grid_combinations(&grid)
@@ -656,7 +653,6 @@ pub async fn final_verdict(
         let config = engine_config(&prepared, &input);
         let grid: Vec<(&'static str, Vec<f64>)> = vec![
             ("entry_threshold", vec![0.45, 0.50, 0.55]),
-
             ("trailing_pct", vec![0.0]),
         ];
         let bars_vec = series.bars.clone();

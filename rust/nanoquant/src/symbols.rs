@@ -283,9 +283,7 @@ fn add_with_contracts(
         Err(message) if message.contains("已在交易池中") => {
             return Err(pool_error(StatusCode::CONFLICT, &message))
         }
-        Err(message) => {
-            return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message))
-        }
+        Err(message) => return Err(pool_error(StatusCode::INTERNAL_SERVER_ERROR, &message)),
     };
     Ok(json!({"ok":true,"added":added,"count":count + 1,"custom":false}))
 }

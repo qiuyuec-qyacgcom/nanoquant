@@ -737,7 +737,11 @@ fn sane_available(equity: f64, available: f64, has_positions: bool) -> f64 {
         return equity.max(0.0);
     }
     if !has_positions && equity > 0.0 && available < equity * 0.1 {
-        tracing::warn!(equity, available, "可用余额显著低于权益且无持仓，按快照异常回退到权益");
+        tracing::warn!(
+            equity,
+            available,
+            "可用余额显著低于权益且无持仓，按快照异常回退到权益"
+        );
         return equity;
     }
     available
@@ -854,17 +858,12 @@ pub fn parse_tickers_24h(value: &Value) -> Result<Vec<ExchangeTicker>, ProviderE
         .as_array()
         .ok_or_else(|| ProviderError::InvalidData("全市场 24 小时行情响应不是数组".into()))?;
     if rows.is_empty() {
-        return Err(ProviderError::InvalidData(
-            "全市场行情无有效行".into(),
-        ));
+        return Err(ProviderError::InvalidData("全市场行情无有效行".into()));
     }
     let mut tickers = Vec::with_capacity(rows.len());
     let mut skipped = 0_usize;
     for row in rows {
-        let Some(symbol) = row["symbol"]
-            .as_str()
-            .filter(|symbol| !symbol.is_empty())
-        else {
+        let Some(symbol) = row["symbol"].as_str().filter(|symbol| !symbol.is_empty()) else {
             skipped += 1;
             continue;
         };
@@ -883,9 +882,7 @@ pub fn parse_tickers_24h(value: &Value) -> Result<Vec<ExchangeTicker>, ProviderE
         });
     }
     if tickers.is_empty() {
-        return Err(ProviderError::InvalidData(
-            "全市场行情无有效行".into(),
-        ));
+        return Err(ProviderError::InvalidData("全市场行情无有效行".into()));
     }
     if skipped > 0 {
         tracing::warn!(skipped, "24 小时行情存在非法行，已跳过");
@@ -898,17 +895,12 @@ pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
         .as_array()
         .ok_or_else(|| ProviderError::InvalidData("全市场盘口响应不是数组".into()))?;
     if rows.is_empty() {
-        return Err(ProviderError::InvalidData(
-            "全市场行情无有效行".into(),
-        ));
+        return Err(ProviderError::InvalidData("全市场行情无有效行".into()));
     }
     let mut tops = Vec::with_capacity(rows.len());
     let mut skipped = 0_usize;
     for row in rows {
-        let Some(symbol) = row["symbol"]
-            .as_str()
-            .filter(|symbol| !symbol.is_empty())
-        else {
+        let Some(symbol) = row["symbol"].as_str().filter(|symbol| !symbol.is_empty()) else {
             skipped += 1;
             continue;
         };
@@ -917,12 +909,7 @@ pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
             skipped += 1;
             continue;
         };
-        if !bid.is_finite()
-            || !ask.is_finite()
-            || bid <= 0.0
-            || ask <= 0.0
-            || ask < bid
-        {
+        if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
             skipped += 1;
             continue;
         }
@@ -936,9 +923,7 @@ pub fn parse_book_tops(value: &Value) -> Result<Vec<BookTop>, ProviderError> {
         });
     }
     if tops.is_empty() {
-        return Err(ProviderError::InvalidData(
-            "全市场行情无有效行".into(),
-        ));
+        return Err(ProviderError::InvalidData("全市场行情无有效行".into()));
     }
     if skipped > 0 {
         tracing::warn!(skipped, "全市场盘口存在非法行，已跳过");
@@ -1407,12 +1392,18 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(tops[0].symbol, "BTCUSDT");
-        assert!((tops[0].spread_bps - 99.0).abs() < 1.0, "spread 应为约 99bp");
+        assert!(
+            (tops[0].spread_bps - 99.0).abs() < 1.0,
+            "spread 应为约 99bp"
+        );
     }
 
     #[test]
     fn full_market_parsers_reject_non_array_payloads() {
-        for payload in [serde_json::json!({"symbol": "BTCUSDT"}), serde_json::json!("oops")] {
+        for payload in [
+            serde_json::json!({"symbol": "BTCUSDT"}),
+            serde_json::json!("oops"),
+        ] {
             assert!(
                 matches!(
                     parse_tickers_24h(&payload),
@@ -1455,7 +1446,10 @@ mod tests {
         .unwrap();
         assert_eq!(tops.len(), 1, "非法盘口应跳过，仅保留合法行");
         assert_eq!(tops[0].symbol, "BTCUSDT");
-        assert!((tops[0].spread_bps - 99.0).abs() < 1.0, "spread 应为约 99bp");
+        assert!(
+            (tops[0].spread_bps - 99.0).abs() < 1.0,
+            "spread 应为约 99bp"
+        );
     }
 
     #[test]

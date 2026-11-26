@@ -296,7 +296,10 @@ mod tests {
     #[test]
     fn mean_reversion_uses_independent_stop_take_profit() {
         let (stop, take_profit) = mean_reversion_stops("long", 100.0, 10.0, &cfg());
-        assert!((stop - 98.0).abs() < 1e-9, "20% 保证金止损 / 10x = 2% 价格距离");
+        assert!(
+            (stop - 98.0).abs() < 1e-9,
+            "20% 保证金止损 / 10x = 2% 价格距离"
+        );
         assert!((take_profit - 103.0).abs() < 1e-9);
         let (short_stop, short_tp) = mean_reversion_stops("short", 100.0, 10.0, &cfg());
         assert!((short_stop - 102.0).abs() < 1e-9);

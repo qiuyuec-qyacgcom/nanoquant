@@ -491,7 +491,9 @@ fn truncate(value: &str, limit: usize) -> String {
 
 /// 请求预算按 provider 上限取大：显式预算只作为下限，避免推理模型被小预算截断。
 fn effective_max_tokens(call_max: Option<i64>, provider_max: i64) -> i64 {
-    call_max.map_or(provider_max, |v| v.max(provider_max)).max(1)
+    call_max
+        .map_or(provider_max, |v| v.max(provider_max))
+        .max(1)
 }
 
 /// 通用预算解析：只有显式声明 `min_max_tokens` 的调用才把 provider 上限当下限。
@@ -524,11 +526,7 @@ pub async fn chat(
     };
     let json_mode = call.json_mode.unwrap_or(provider.json_mode);
     let temperature = call.temperature.unwrap_or(provider.temperature);
-    let max_tokens = resolve_max_tokens(
-        call.max_tokens,
-        provider.max_tokens,
-        call.min_max_tokens,
-    );
+    let max_tokens = resolve_max_tokens(call.max_tokens, provider.max_tokens, call.min_max_tokens);
     let mut payload = build_payload(provider, call.messages, json_mode, temperature, max_tokens);
     let effort = call
         .reasoning_effort
@@ -909,10 +907,7 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
-                    enabled: item
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
+                    enabled: item.get("enabled").and_then(Value::as_bool).unwrap_or(true),
                 })
             })
             .collect();

@@ -1856,10 +1856,7 @@ mod tests {
 
         let empty_path = std::env::temp_dir().join("nq-evo-global-empty.db");
         let empty = fixture(&empty_path, false);
-        empty
-            .lock()
-            .execute("DELETE FROM trades", [])
-            .unwrap();
+        empty.lock().execute("DELETE FROM trades", []).unwrap();
         let router = app(
             empty.clone(),
             Arc::new(FakeTransport {

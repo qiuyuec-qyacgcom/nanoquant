@@ -453,7 +453,11 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
             _ => {}
         }
         let gate = row.gate.as_deref().unwrap_or("none");
-        let gate_key = if gates.contains_key(gate) { gate } else { "other" };
+        let gate_key = if gates.contains_key(gate) {
+            gate
+        } else {
+            "other"
+        };
         if let Some(slot) = gates.get_mut(gate_key) {
             *slot += 1;
         }
@@ -481,9 +485,9 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
     };
 
     let mut latencies: Vec<f64> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT latency_ms FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0",
-    ) {
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT latency_ms FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
+    {
         if let Ok(rows) = stmt.query_map([since], |r| r.get::<_, i64>(0)) {
             for latency in rows.flatten() {
                 latencies.push(latency as f64);
@@ -569,7 +573,10 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
                 decision: r.get(0)?,
                 ai_action: r.get(1)?,
                 gate: r.get(2)?,
-                skip: r.get::<_, Option<i64>>(3)?.map(|flag| flag != 0).unwrap_or(false),
+                skip: r
+                    .get::<_, Option<i64>>(3)?
+                    .map(|flag| flag != 0)
+                    .unwrap_or(false),
                 scale: r.get(4)?,
             })
         })
@@ -637,13 +644,7 @@ mod tests {
             .unwrap()
     }
 
-    fn insert_signal(
-        conn: &Connection,
-        ts: i64,
-        decision: &str,
-        ai_action: &str,
-        features: &str,
-    ) {
+    fn insert_signal(conn: &Connection, ts: i64, decision: &str, ai_action: &str, features: &str) {
         insert_signal_in(conn, "demo", ts, decision, ai_action, features);
     }
 

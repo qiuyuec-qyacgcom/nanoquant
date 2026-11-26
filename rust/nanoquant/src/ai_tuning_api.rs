@@ -9,10 +9,8 @@ use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::ai_tuning::{activate, active_for_regime, load_set, rollback, row_to_set, AiTuningSet};
 use crate::db::Db;
-use crate::ai_tuning::{
-    activate, active_for_regime, load_set, rollback, row_to_set, AiTuningSet,
-};
 
 const SET_COLUMNS: &str = "id,name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at";
 const LIST_LIMIT: i64 = 100;
@@ -84,9 +82,7 @@ fn ensure_set_exists(conn: &Connection, id: i64) -> Result<(), ApiError> {
 }
 
 fn lock(db: &Db) -> Result<std::sync::MutexGuard<'_, Connection>, ApiError> {
-    db.conn
-        .lock()
-        .map_err(|_| server_error("数据库锁不可用"))
+    db.conn.lock().map_err(|_| server_error("数据库锁不可用"))
 }
 
 #[derive(Deserialize)]
@@ -250,10 +246,7 @@ async fn rollback_set(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<
     Ok(json!({ "ok": true, "id": id }).into())
 }
 
-async fn set_evidence(
-    State(db): State<Db>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, ApiError> {
+async fn set_evidence(State(db): State<Db>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
     let raw = conn.query_row(
         "SELECT evidence FROM ai_tuning_sets WHERE id=?1",
@@ -288,7 +281,11 @@ mod tests {
 
     fn insert_set(db: &Db, name: &str, regime: &str, status: &str, evidence: &str) -> i64 {
         let conn = db.lock();
-        let activated_at = if status == "active" { Some(1000i64) } else { None };
+        let activated_at = if status == "active" {
+            Some(1000i64)
+        } else {
+            None
+        };
         conn.execute(
             "INSERT INTO ai_tuning_sets(name,regime,timeframe,version,params,status,source,evidence,parent_id,created_at,activated_at) \
              VALUES(?1,?2,'1h',1,'{\"timeframe\":\"1h\"}',?3,'bootstrap',?4,NULL,1000,?5)",
@@ -339,9 +336,11 @@ mod tests {
     fn strategy_value(db: &Db) -> Value {
         let conn = db.lock();
         let raw: String = conn
-            .query_row("SELECT value FROM app_settings WHERE key='strategy'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         serde_json::from_str(&raw).unwrap()
     }
@@ -361,7 +360,10 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     fn params_with_threshold(threshold: f64) -> Value {
@@ -396,19 +398,17 @@ mod tests {
 
     async fn get(app: Router, uri: &str) -> (StatusCode, Value) {
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     fn app(db: Db) -> Router {
@@ -418,8 +418,20 @@ mod tests {
     #[tokio::test]
     async fn list_returns_items_newest_first_with_evidence_json() {
         let db = memory_db();
-        let range_id = insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
-        let chaos_id = insert_set(&db, "chaos-bootstrap", "chaos", "active", "{\"kind\":\"bootstrap\"}");
+        let range_id = insert_set(
+            &db,
+            "range-bootstrap",
+            "range",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
+        let chaos_id = insert_set(
+            &db,
+            "chaos-bootstrap",
+            "chaos",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
         let candidate_id = insert_set(
             &db,
             "range-ai-1",
@@ -450,15 +462,21 @@ mod tests {
     #[tokio::test]
     async fn list_filters_by_regime_and_status() {
         let db = memory_db();
-        insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
-        let chaos_id = insert_set(&db, "chaos-bootstrap", "chaos", "active", "{\"kind\":\"bootstrap\"}");
         insert_set(
             &db,
-            "range-ai-1",
+            "range-bootstrap",
             "range",
-            "candidate",
-            "{\"kind\":\"ai\"}",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
         );
+        let chaos_id = insert_set(
+            &db,
+            "chaos-bootstrap",
+            "chaos",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
+        insert_set(&db, "range-ai-1", "range", "candidate", "{\"kind\":\"ai\"}");
 
         let (status, body) = get(app(db), "/api/v1/ai-tuning?regime=chaos&status=active").await;
         assert_eq!(status, StatusCode::OK);
@@ -471,8 +489,20 @@ mod tests {
     #[tokio::test]
     async fn current_reads_market_regime_and_nulls_missing_trend() {
         let db = memory_db();
-        let range_id = insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
-        let chaos_id = insert_set(&db, "chaos-bootstrap", "chaos", "active", "{\"kind\":\"bootstrap\"}");
+        let range_id = insert_set(
+            &db,
+            "range-bootstrap",
+            "range",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
+        let chaos_id = insert_set(
+            &db,
+            "chaos-bootstrap",
+            "chaos",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
         set_engine_state(&db, "mode", "demo");
         set_engine_state(&db, "market_regime.demo", "range");
 
@@ -482,26 +512,41 @@ mod tests {
         let active = body["active"].as_array().unwrap();
         assert_eq!(active.len(), 3, "trend/range/chaos 各一项");
 
-        let trend = active.iter().find(|item| item["regime"] == "trend").unwrap();
+        let trend = active
+            .iter()
+            .find(|item| item["regime"] == "trend")
+            .unwrap();
         assert!(trend["set_id"].is_null(), "trend 无 active 应为 null");
         assert!(trend["name"].is_null());
         assert!(trend["timeframe"].is_null());
         assert!(trend["params"].is_null());
 
-        let range = active.iter().find(|item| item["regime"] == "range").unwrap();
+        let range = active
+            .iter()
+            .find(|item| item["regime"] == "range")
+            .unwrap();
         assert_eq!(range["set_id"], range_id);
         assert_eq!(range["name"], "range-bootstrap");
         assert_eq!(range["timeframe"], "1h");
         assert_eq!(range["params"]["timeframe"], "1h");
 
-        let chaos = active.iter().find(|item| item["regime"] == "chaos").unwrap();
+        let chaos = active
+            .iter()
+            .find(|item| item["regime"] == "chaos")
+            .unwrap();
         assert_eq!(chaos["set_id"], chaos_id);
     }
 
     #[tokio::test]
     async fn current_without_market_regime_returns_null() {
         let db = memory_db();
-        insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
+        insert_set(
+            &db,
+            "range-bootstrap",
+            "range",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
         set_engine_state(&db, "mode", "demo");
 
         let (status, body) = get(app(db), "/api/v1/ai-tuning/current").await;
@@ -520,7 +565,8 @@ mod tests {
             "{\"kind\":\"ai\",\"gate\":{\"pass\":true,\"reasons\":[]}}",
         );
 
-        let (status, body) = get(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/evidence")).await;
+        let (status, body) =
+            get(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/evidence")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["id"], id);
         assert_eq!(
@@ -537,7 +583,13 @@ mod tests {
     #[tokio::test]
     async fn current_includes_guard_and_auto_apply_since() {
         let db = memory_db();
-        insert_set(&db, "range-bootstrap", "range", "active", "{\"kind\":\"bootstrap\"}");
+        insert_set(
+            &db,
+            "range-bootstrap",
+            "range",
+            "active",
+            "{\"kind\":\"bootstrap\"}",
+        );
         set_engine_state(&db, "mode", "demo");
         set_engine_state(&db, "market_regime.demo", "range");
         set_engine_state(
@@ -559,15 +611,29 @@ mod tests {
         let db = memory_db();
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
-        let id = insert_set_with_params(&db, "range-manual", "range", "manual", params_with_threshold(0.50));
+        let id = insert_set_with_params(
+            &db,
+            "range-manual",
+            "range",
+            "manual",
+            params_with_threshold(0.50),
+        );
 
-        let (status, body) = post(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/activate")).await;
+        let (status, body) =
+            post(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/activate")).await;
         assert_eq!(status, StatusCode::OK, "手动启用应成功: {body}");
         assert_eq!(body["ok"], true);
         assert_eq!(body["id"], id);
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.50);
-        assert!(count_changes(&db, "ai_tuning", id) > 0, "应写AI 调参切换审计");
-        assert_eq!(count_activations(&db, "manual", id), 1, "trigger 应为 manual");
+        assert!(
+            count_changes(&db, "ai_tuning", id) > 0,
+            "应写AI 调参切换审计"
+        );
+        assert_eq!(
+            count_activations(&db, "manual", id),
+            1,
+            "trigger 应为 manual"
+        );
     }
 
     #[tokio::test]
@@ -576,26 +642,59 @@ mod tests {
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
         set_engine_state(&db, "market_regime.demo", "range");
-        let first = insert_set_with_params(&db, "range-first", "range", "manual", params_with_threshold(0.50));
-        let second = insert_set_with_params(&db, "range-second", "range", "manual", params_with_threshold(0.52));
+        let first = insert_set_with_params(
+            &db,
+            "range-first",
+            "range",
+            "manual",
+            params_with_threshold(0.50),
+        );
+        let second = insert_set_with_params(
+            &db,
+            "range-second",
+            "range",
+            "manual",
+            params_with_threshold(0.52),
+        );
 
-        let (activate_first, _) =
-            post(app(db.clone()), &format!("/api/v1/ai-tuning/{first}/activate")).await;
+        let (activate_first, _) = post(
+            app(db.clone()),
+            &format!("/api/v1/ai-tuning/{first}/activate"),
+        )
+        .await;
         assert_eq!(activate_first, StatusCode::OK);
-        let (activate_second, activate_body) =
-            post(app(db.clone()), &format!("/api/v1/ai-tuning/{second}/activate")).await;
-        assert_eq!(activate_second, StatusCode::OK, "第二套应可启用: {activate_body}");
+        let (activate_second, activate_body) = post(
+            app(db.clone()),
+            &format!("/api/v1/ai-tuning/{second}/activate"),
+        )
+        .await;
+        assert_eq!(
+            activate_second,
+            StatusCode::OK,
+            "第二套应可启用: {activate_body}"
+        );
         assert_eq!(strategy_value(&db)["entry_threshold"], 0.52);
 
-        let (status, body) =
-            post(app(db.clone()), &format!("/api/v1/ai-tuning/{second}/rollback")).await;
+        let (status, body) = post(
+            app(db.clone()),
+            &format!("/api/v1/ai-tuning/{second}/rollback"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "手动回滚应成功: {body}");
-        assert_eq!(strategy_value(&db)["entry_threshold"], 0.50, "应恢复上一套参数");
+        assert_eq!(
+            strategy_value(&db)["entry_threshold"],
+            0.50,
+            "应恢复上一套参数"
+        );
         assert!(
             count_changes(&db, "ai_tuning_rollback", first) > 0,
             "应写回滚审计"
         );
-        assert_eq!(count_activations(&db, "rollback", first), 1, "trigger 应为 rollback");
+        assert_eq!(
+            count_activations(&db, "rollback", first),
+            1,
+            "trigger 应为 rollback"
+        );
 
         let conn = db.lock();
         let statuses: Vec<(i64, String)> = conn
@@ -605,7 +704,13 @@ mod tests {
             .unwrap()
             .flatten()
             .collect();
-        assert_eq!(statuses, vec![(first, "active".to_string()), (second, "retired".to_string())]);
+        assert_eq!(
+            statuses,
+            vec![
+                (first, "active".to_string()),
+                (second, "retired".to_string())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -613,8 +718,20 @@ mod tests {
         let db = memory_db();
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
-        let pending = insert_set_with_params(&db, "range-candidate", "range", "candidate", params_with_threshold(0.5));
-        let no_history = insert_set_with_params(&db, "range-manual", "range", "active", params_with_threshold(0.5));
+        let pending = insert_set_with_params(
+            &db,
+            "range-candidate",
+            "range",
+            "candidate",
+            params_with_threshold(0.5),
+        );
+        let no_history = insert_set_with_params(
+            &db,
+            "range-manual",
+            "range",
+            "active",
+            params_with_threshold(0.5),
+        );
 
         let (missing_activate, missing_activate_body) =
             post(app(db.clone()), "/api/v1/ai-tuning/999999/activate").await;
@@ -625,11 +742,17 @@ mod tests {
             post(app(db.clone()), "/api/v1/ai-tuning/999999/rollback").await;
         assert_eq!(missing_rollback, StatusCode::NOT_FOUND);
 
-        let (bad_status, bad_body) =
-            post(app(db.clone()), &format!("/api/v1/ai-tuning/{pending}/activate")).await;
+        let (bad_status, bad_body) = post(
+            app(db.clone()),
+            &format!("/api/v1/ai-tuning/{pending}/activate"),
+        )
+        .await;
         assert_eq!(bad_status, StatusCode::BAD_REQUEST);
         assert!(
-            bad_body["detail"].as_str().unwrap_or("").contains("不允许激活"),
+            bad_body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("不允许激活"),
             "候选状态不可手动启用: {bad_body}"
         );
 
@@ -637,7 +760,10 @@ mod tests {
             post(app(db), &format!("/api/v1/ai-tuning/{no_history}/rollback")).await;
         assert_eq!(no_previous, StatusCode::BAD_REQUEST);
         assert!(
-            no_previous_body["detail"].as_str().unwrap_or("").contains("没有上一套"),
+            no_previous_body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("没有上一套"),
             "无历史不可回滚: {no_previous_body}"
         );
     }
@@ -648,11 +774,20 @@ mod tests {
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
         set_engine_state(&db, "market_regime.demo", "range");
-        let trend_id = insert_set_with_params(&db, "trend-manual", "trend", "manual", params_with_threshold(0.50));
+        let trend_id = insert_set_with_params(
+            &db,
+            "trend-manual",
+            "trend",
+            "manual",
+            params_with_threshold(0.50),
+        );
         let before = strategy_value(&db);
 
-        let (status, body) =
-            post(app(db.clone()), &format!("/api/v1/ai-tuning/{trend_id}/activate")).await;
+        let (status, body) = post(
+            app(db.clone()),
+            &format!("/api/v1/ai-tuning/{trend_id}/activate"),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "跨 regime 应拒绝: {body}");
         assert!(
             body["detail"]
@@ -662,8 +797,16 @@ mod tests {
             "文案应说明仅当前 regime 可启用: {body}"
         );
         assert_eq!(strategy_value(&db), before, "拒绝时不得物化 strategy");
-        assert_eq!(count_changes(&db, "ai_tuning", trend_id), 0, "不得写切换审计");
-        assert_eq!(count_activations(&db, "manual", trend_id), 0, "不得写激活记录");
+        assert_eq!(
+            count_changes(&db, "ai_tuning", trend_id),
+            0,
+            "不得写切换审计"
+        );
+        assert_eq!(
+            count_activations(&db, "manual", trend_id),
+            0,
+            "不得写激活记录"
+        );
     }
 
     #[tokio::test]
@@ -671,16 +814,30 @@ mod tests {
         let db = memory_db();
         seed_strategy(&db, params_with_threshold(0.55));
         set_engine_state(&db, "mode", "demo");
-        let retired =
-            insert_set_with_params(&db, "range-retired", "range", "retired", params_with_threshold(0.50));
-        let approved =
-            insert_set_with_params(&db, "range-approved", "range", "approved", params_with_threshold(0.50));
+        let retired = insert_set_with_params(
+            &db,
+            "range-retired",
+            "range",
+            "retired",
+            params_with_threshold(0.50),
+        );
+        let approved = insert_set_with_params(
+            &db,
+            "range-approved",
+            "range",
+            "approved",
+            params_with_threshold(0.50),
+        );
         let before = strategy_value(&db);
 
         for id in [retired, approved] {
             let (status, body) =
                 post(app(db.clone()), &format!("/api/v1/ai-tuning/{id}/rollback")).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "非 active 不可回滚: {body}");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "非 active 不可回滚: {body}"
+            );
             assert!(
                 body["detail"]
                     .as_str()

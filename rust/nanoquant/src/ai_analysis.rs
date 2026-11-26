@@ -143,7 +143,11 @@ pub(crate) fn rsi_period_of(strategy: &Value) -> usize {
         .map_or(14, |period| period as usize)
 }
 
-pub(crate) fn feature_snapshot(market: &MarketSnapshot, interval: &str, rsi_period: usize) -> Value {
+pub(crate) fn feature_snapshot(
+    market: &MarketSnapshot,
+    interval: &str,
+    rsi_period: usize,
+) -> Value {
     let candles = &market.candles;
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
     let metrics = candle_metrics(candles, 14);
@@ -424,11 +428,7 @@ pub(crate) fn persona_system_hint(personas: &[AiPersona]) -> Option<String> {
 }
 
 /// 按开关移除上下文中不应注入的资讯/心法字段；字段缺失时保持原样。
-pub(crate) fn gate_injected_context(
-    context: &mut Value,
-    inject_news: bool,
-    inject_mantras: bool,
-) {
+pub(crate) fn gate_injected_context(context: &mut Value, inject_news: bool, inject_mantras: bool) {
     let Some(map) = context.as_object_mut() else {
         return;
     };
@@ -770,13 +770,21 @@ mod tests {
     fn rsi_period_setting_drives_the_feature_snapshot() {
         assert_eq!(rsi_period_of(&json!({})), 14, "缺省 RSI 周期是 14");
         assert_eq!(rsi_period_of(&json!({"rsi_period": 7})), 7);
-        assert_eq!(rsi_period_of(&json!({"rsi_period": 0})), 14, "非法周期回退 14");
+        assert_eq!(
+            rsi_period_of(&json!({"rsi_period": 0})),
+            14,
+            "非法周期回退 14"
+        );
         assert_eq!(rsi_period_of(&json!({"rsi_period": 999})), 14);
 
         let mut closes = vec![100.0; 20];
         for index in 0..7 {
             let last = *closes.last().unwrap();
-            closes.push(if index % 2 == 0 { last + 1.0 } else { last - 1.0 });
+            closes.push(if index % 2 == 0 {
+                last + 1.0
+            } else {
+                last - 1.0
+            });
         }
         for _ in 0..7 {
             let last = *closes.last().unwrap();
@@ -850,7 +858,10 @@ mod tests {
             "s=stop%",
             "t=tp%",
         ] {
-            assert!(system.contains(key), "非否决模式 prompt 缺少杠杆/止损字段 {key}");
+            assert!(
+                system.contains(key),
+                "非否决模式 prompt 缺少杠杆/止损字段 {key}"
+            );
         }
 
         let veto = decision_messages_for_mode(&context, &[], true);
@@ -935,7 +946,10 @@ mod tests {
         });
         gate_injected_context(&mut context, false, false);
         assert!(context.get("news").is_none(), "关闭后 context 不含 news");
-        assert!(context.get("mantras").is_none(), "关闭后 context 不含 mantras");
+        assert!(
+            context.get("mantras").is_none(),
+            "关闭后 context 不含 mantras"
+        );
         assert_eq!(context["symbol"], json!("BTCUSDT"));
 
         let mut both = json!({

@@ -241,10 +241,7 @@ pub fn resolve_quote_source(
             } else {
                 QuoteSource::Rest
             };
-            (
-                (rest_bid, rest_ask, spread_bps(rest_bid, rest_ask)),
-                source,
-            )
+            ((rest_bid, rest_ask, spread_bps(rest_bid, rest_ask)), source)
         }
     }
 }
@@ -519,8 +516,7 @@ mod tests {
     fn book_counters_track_stale_and_fallback() {
         let counters = BookCounters::default();
         let state = book(1_000);
-        let (_, fresh) =
-            resolve_quote_source(true, Some(&state), 90.0, 110.0, 2_500, 3_000);
+        let (_, fresh) = resolve_quote_source(true, Some(&state), 90.0, 110.0, 2_500, 3_000);
         counters.record(fresh);
         let (_, stale) = resolve_quote_source(true, Some(&state), 90.0, 110.0, 10_000, 3_000);
         counters.record(stale);

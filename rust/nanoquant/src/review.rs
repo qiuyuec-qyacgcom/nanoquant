@@ -235,10 +235,7 @@ pub(crate) fn apply_review(
             ));
         }
         if proposal.stop_price <= 0.0 || proposal.take_profit <= 0.0 {
-            return Err(ReviewError::new(
-                "缺少有效止损/止盈价，无法开仓",
-                "reject",
-            ));
+            return Err(ReviewError::new("缺少有效止损/止盈价，无法开仓", "reject"));
         }
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
@@ -260,10 +257,7 @@ pub(crate) fn apply_review(
         });
     };
     let decision = reviewer.review(proposal).map_err(|error| {
-        ReviewError::new(
-            format!("AI 复核失败，按 fail-open 降仓: {error}"),
-            "error",
-        )
+        ReviewError::new(format!("AI 复核失败，按 fail-open 降仓: {error}"), "error")
     })?;
     apply_decision(proposal, decision, veto_only)
 }
@@ -393,9 +387,7 @@ fn apply_decision(
             }
         }
         None => {
-            return Err(
-                ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision)
-            )
+            return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision))
         }
     };
     if !stop_price.is_finite() || stop_price <= 0.0 {
@@ -581,17 +573,23 @@ mod tests {
     fn ai_margin_is_clamped_to_the_configured_center_band() {
         let mut low = decision(ReviewAction::Agree);
         low.margin_pct = Some(12.0);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(low))), true, false).unwrap();
+        let reviewed =
+            apply_review(&proposal(), Some(&FakeReviewer(Ok(low))), true, false).unwrap();
         assert_eq!(reviewed.margin_pct, Some(15.0), "低于中枢-5% 必须抬回 15%");
 
         let mut high = decision(ReviewAction::Agree);
         high.margin_pct = Some(28.0);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(high))), true, false).unwrap();
+        let reviewed =
+            apply_review(&proposal(), Some(&FakeReviewer(Ok(high))), true, false).unwrap();
         assert_eq!(reviewed.margin_pct, Some(25.0), "高于中枢+5% 必须压回 25%");
 
         let missing = decision(ReviewAction::Agree);
-        let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(missing))), true, false).unwrap();
-        assert_eq!(reviewed.margin_pct, None, "未给 margin 时交给 runtime 走 ATR 回退");
+        let reviewed =
+            apply_review(&proposal(), Some(&FakeReviewer(Ok(missing))), true, false).unwrap();
+        assert_eq!(
+            reviewed.margin_pct, None,
+            "未给 margin 时交给 runtime 走 ATR 回退"
+        );
     }
 
     #[test]
@@ -799,5 +797,4 @@ mod tests {
         assert_eq!(features["ai_dq"], 0.3);
         assert_eq!(features["ai_rr"], 0.5);
     }
-
 }

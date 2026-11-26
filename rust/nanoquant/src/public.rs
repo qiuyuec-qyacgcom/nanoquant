@@ -624,7 +624,12 @@ async fn quotes(State(db): State<Db>) -> Result<Json<Value>, MarketError> {
     let rows = if symbols.is_empty() {
         serde_json::Map::new()
     } else {
-        fetch_tickers(market_live(&db)?, &symbols, data_ttl_sec(&db, "ticker_ttl_sec", 5)).await?
+        fetch_tickers(
+            market_live(&db)?,
+            &symbols,
+            data_ttl_sec(&db, "ticker_ttl_sec", 5),
+        )
+        .await?
     };
     Ok(Json(
         json!({"symbols":symbols,"tickers":rows,"updated_at":crate::now()}),
@@ -724,10 +729,8 @@ type KlineCache =
 static KLINE_CACHE: std::sync::LazyLock<std::sync::Mutex<KlineCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(KlineCache::new()));
 
-type TickerCache = std::collections::HashMap<
-    (bool, String),
-    (std::time::Instant, serde_json::Map<String, Value>),
->;
+type TickerCache =
+    std::collections::HashMap<(bool, String), (std::time::Instant, serde_json::Map<String, Value>)>;
 static TICKER_CACHE: std::sync::LazyLock<std::sync::Mutex<TickerCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(TickerCache::new()));
 

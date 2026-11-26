@@ -156,10 +156,6 @@ pub(crate) fn ensure_parameter_changes(conn: &Connection) -> Result<(), String> 
     .map_err(|e| format!("建表 parameter_changes 失败: {e}"))
 }
 
-
-
-
-
 pub(crate) fn ensure_ai_tuning(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ai_tuning_sets(\
@@ -363,8 +359,6 @@ mod tests {
         assert_eq!(table_count(&conn), 25);
     }
 
-    
-
     #[test]
     fn migrate_adds_invalidation_price_to_positions() {
         let conn = Connection::open_in_memory().unwrap();
@@ -484,9 +478,11 @@ mod tests {
             )
             .unwrap();
         let risk: String = conn
-            .query_row("SELECT value FROM app_settings WHERE key='risk'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='risk'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         for removed in ["sl_atr_mult", "tp_atr_mult", "min_risk_reward"] {
             assert!(!strategy.contains(removed), "strategy 仍残留 {removed}");

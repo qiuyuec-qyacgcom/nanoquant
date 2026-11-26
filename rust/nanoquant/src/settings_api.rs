@@ -46,7 +46,6 @@ pub(crate) const GROUPS: [&str; 15] = [
     "security",
     "system",
     "public",
-
     "journal",
 ];
 
@@ -847,12 +846,8 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}: {body}");
         }
 
-        let (status, body) = put_settings(
-            app.clone(),
-            "ai_tuning",
-            r#"{"auto_apply_timeframes":""}"#,
-        )
-        .await;
+        let (status, body) =
+            put_settings(app.clone(), "ai_tuning", r#"{"auto_apply_timeframes":""}"#).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["auto_apply_timeframes"], "");
         let stored: String = db

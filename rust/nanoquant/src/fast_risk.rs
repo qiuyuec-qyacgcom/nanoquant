@@ -84,8 +84,8 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
     }
     // 非 "long" 一律按空单处理（沿用旧行为）。
     let direction = if input.side == "long" { 1.0 } else { -1.0 };
-    let margin_pct = (input.mark - input.entry) * direction / input.entry * 100.0
-        * input.leverage.max(1.0);
+    let margin_pct =
+        (input.mark - input.entry) * direction / input.entry * 100.0 * input.leverage.max(1.0);
     if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
         return Some("global_stop_loss");
     }
@@ -121,15 +121,14 @@ async fn fast_risk_cycle(
     closing: &mut std::collections::HashSet<i64>,
 ) -> Result<(), String> {
     let (rows, global_stop, global_tp, ai_cfg) = {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())?;
+        let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
         let ai_cfg = crate::ai_client::read_ai_config_conn(&conn);
         let mode: String = conn
-            .query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='mode'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or_else(|_| "demo".to_string());
         if mode != "live" {
             return Ok(());
@@ -251,15 +250,45 @@ mod tests {
         // 全局止损阈值需高于杠杆放大后的浮亏（-4% × 5 = -20%），
         // 否则会先命中 global_stop_loss，无法验证失效价分支。
         assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                96.0,
+                95.0,
+                110.0,
+                5.0,
+                Some(97.0),
+                30.0,
+                15.0
+            )),
             Some("invalidation")
         );
         assert_eq!(
-            fast_risk_reason(&risk_input("short", 100.0, 104.0, 105.0, 90.0, 5.0, Some(103.0), 30.0, 15.0)),
+            fast_risk_reason(&risk_input(
+                "short",
+                100.0,
+                104.0,
+                105.0,
+                90.0,
+                5.0,
+                Some(103.0),
+                30.0,
+                15.0
+            )),
             Some("invalidation")
         );
         assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 99.0, 95.0, 110.0, 5.0, Some(97.0), 30.0, 15.0)),
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                99.0,
+                95.0,
+                110.0,
+                5.0,
+                Some(97.0),
+                30.0,
+                15.0
+            )),
             None
         );
     }
@@ -302,7 +331,17 @@ mod tests {
     fn global_stop_wins_over_invalidation() {
         // 5 倍杠杆下 -10% 价格即 -50% 保证金，全局止损应先于失效价命中。
         assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 90.0, 0.0, 0.0, 5.0, Some(95.0), 10.0, 0.0)),
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                90.0,
+                0.0,
+                0.0,
+                5.0,
+                Some(95.0),
+                10.0,
+                0.0
+            )),
             Some("global_stop_loss")
         );
     }
@@ -311,11 +350,31 @@ mod tests {
     fn fast_risk_reason_ignores_invalid_prices() {
         // entry/mark 非法时不得触发任何平仓，避免除零或脏数据误杀持仓。
         assert_eq!(
-            fast_risk_reason(&risk_input("long", 0.0, 96.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
+            fast_risk_reason(&risk_input(
+                "long",
+                0.0,
+                96.0,
+                95.0,
+                110.0,
+                5.0,
+                Some(97.0),
+                10.0,
+                15.0
+            )),
             None
         );
         assert_eq!(
-            fast_risk_reason(&risk_input("long", 100.0, 0.0, 95.0, 110.0, 5.0, Some(97.0), 10.0, 15.0)),
+            fast_risk_reason(&risk_input(
+                "long",
+                100.0,
+                0.0,
+                95.0,
+                110.0,
+                5.0,
+                Some(97.0),
+                10.0,
+                15.0
+            )),
             None
         );
     }
@@ -325,7 +384,17 @@ mod tests {
         // 失效价仅在有限正数时才参与判定。
         for ip in [-1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
-                fast_risk_reason(&risk_input("long", 100.0, 99.0, 0.0, 0.0, 5.0, Some(ip), 0.0, 0.0)),
+                fast_risk_reason(&risk_input(
+                    "long",
+                    100.0,
+                    99.0,
+                    0.0,
+                    0.0,
+                    5.0,
+                    Some(ip),
+                    0.0,
+                    0.0
+                )),
                 None
             );
         }

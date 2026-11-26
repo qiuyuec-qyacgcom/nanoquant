@@ -3,7 +3,6 @@
 //! `plan` 根据当前池、持仓、扫描特征与闸门，输出「保留 / 删除 / 新增 / 持仓 / 候选」，
 //! 不访问外部资源；`run` 负责拉取合约表与行情，并在单事务内落库。
 
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -142,8 +141,12 @@ pub fn plan(
         plan.delete.push(symbol.clone());
         plan.delete_reasons.push((symbol.clone(), reason.clone()));
     }
-    plan.add
-        .extend(candidates.iter().take(replace_count).map(|s| s.symbol.clone()));
+    plan.add.extend(
+        candidates
+            .iter()
+            .take(replace_count)
+            .map(|s| s.symbol.clone()),
+    );
 
     // 先按「合格 keep + 已替换数量」算空位，再把未被替换的标的并入 keep，
     // 否则剩余标的会先撑大 keep，导致 target 补足算少。
@@ -328,10 +331,7 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
         _ => "4h".to_string(),
     };
     // 目标池大小同时受每轮上限与手动添加池上限约束，前后端 full 判定必须一致。
-    let pool_max = data["max_pool_size"]
-        .as_i64()
-        .unwrap_or(20)
-        .clamp(1, 200) as usize;
+    let pool_max = data["max_pool_size"].as_i64().unwrap_or(20).clamp(1, 200) as usize;
     let target = (engine["max_symbols_per_cycle"]
         .as_i64()
         .unwrap_or(12)
@@ -348,10 +348,7 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
             .as_i64()
             .unwrap_or(3)
             .clamp(1, 20) as usize,
-        kline_limit: data["kline_limit"]
-            .as_i64()
-            .unwrap_or(200)
-            .clamp(20, 500) as usize,
+        kline_limit: data["kline_limit"].as_i64().unwrap_or(200).clamp(20, 500) as usize,
         atr_period: strategy["atr_period"].as_i64().unwrap_or(14).max(1) as usize,
         timeframe,
         gates,
@@ -420,8 +417,7 @@ fn set_last_run_ts(db: &crate::db::Db, ts: i64) -> Result<(), String> {
 
 /// 是否到期换池。`last_run_ts <= 0` 表示尚未建立基线（含历史负值），不能算到期。
 pub fn due(last_run_ts: i64, now: i64, interval_hours: i64) -> bool {
-    last_run_ts > 0
-        && now.saturating_sub(last_run_ts) >= interval_hours.max(1).saturating_mul(3600)
+    last_run_ts > 0 && now.saturating_sub(last_run_ts) >= interval_hours.max(1).saturating_mul(3600)
 }
 
 fn record_event(db: &crate::db::Db, level: &str, message: &str, payload: Value) {
@@ -793,7 +789,9 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
     let scanned = exclude_blocked(scanned, &blocked);
 
     let held = held_symbols(db, &mode)?;
-    let plan = plan(&current, &held, &suspended, &scanned, &cfg.gates, cfg.target);
+    let plan = plan(
+        &current, &held, &suspended, &scanned, &cfg.gates, cfg.target,
+    );
 
     if !apply {
         return Ok(plan_result(&plan, scanned.len(), false));
@@ -810,8 +808,7 @@ pub async fn run(db: &crate::db::Db, apply: bool) -> Result<Value, String> {
         let applied = apply_plan(&tx, &mode, &plan, &contracts)?;
         let replaced = applied.deleted.len();
         let added = applied.added.len();
-        let result =
-            merge_applied_result(plan_result(&plan, scanned.len(), true), &plan, &applied);
+        let result = merge_applied_result(plan_result(&plan, scanned.len(), true), &plan, &applied);
         let message = format!("自动换池：替换 {replaced} 个，新增 {added} 个");
         // last_result 保留完整结果供前端读取；事件表只存精简版，避免候选数组累积膨胀。
         let payload = result.to_string();
@@ -1069,10 +1066,7 @@ mod tests {
         let applied = apply_plan(&conn, "live", &plan, &[]).unwrap();
         assert!(applied.deleted.is_empty(), "有持仓的标的实际未删除");
         assert_eq!(applied.skipped, vec!["AAAUSDT"]);
-        assert!(
-            applied.add_skipped.is_empty(),
-            "删除跳过与新增跳过不能混用"
-        );
+        assert!(applied.add_skipped.is_empty(), "删除跳过与新增跳过不能混用");
         let symbols: Vec<String> = conn
             .prepare("SELECT symbol FROM trading_symbols ORDER BY symbol")
             .unwrap()
@@ -1216,14 +1210,7 @@ mod tests {
         // 休市标的没有 K 线，但 suspended 优先保留，不依赖 held。
         let current = vec!["NVDAUSDT".to_string()];
         let suspended_set: HashSet<String> = suspended.clone();
-        let no_data = plan(
-            &current,
-            &HashSet::new(),
-            &suspended_set,
-            &[],
-            &gates(),
-            12,
-        );
+        let no_data = plan(&current, &HashSet::new(), &suspended_set, &[], &gates(), 12);
         assert_eq!(no_data.keep, vec!["NVDAUSDT"]);
         assert_eq!(no_data.suspended, vec!["NVDAUSDT"]);
         assert!(no_data.held.is_empty(), "休市不等于持仓");
@@ -1413,7 +1400,14 @@ mod tests {
     fn all_current_pass_keeps_everything_without_replacements() {
         let current = owned(&["AAAUSDT", "BBBUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.5), scanned("BBBUSDT", 2.0)];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            2,
+        );
 
         assert_eq!(plan.keep, owned(&["AAAUSDT", "BBBUSDT"]));
         assert!(plan.delete.is_empty(), "全部通过不应删除任何标的");
@@ -1431,7 +1425,14 @@ mod tests {
             scanned("CCCUSDT", 1.0),
             scanned("DDDUSDT", 2.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            2,
+        );
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert_eq!(plan.delete, owned(&["BBBUSDT"]));
@@ -1476,7 +1477,14 @@ mod tests {
             scanned("BBBUSDT", 2.0),
             scanned("CCCUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            3,
+        );
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert!(plan.delete.is_empty());
@@ -1493,7 +1501,14 @@ mod tests {
             scanned("CCCUSDT", 0.5),
             scanned("DDDUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            3,
+        );
 
         assert_eq!(plan.keep, owned(&["BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
@@ -1514,7 +1529,14 @@ mod tests {
             scanned("BBBUSDT", 1.0),
             scanned("CCCUSDT", 1.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            2,
+        );
 
         assert_eq!(plan.keep, owned(&["AAAUSDT", "BBBUSDT", "CCCUSDT"]));
         assert!(plan.delete.is_empty());
@@ -1533,19 +1555,37 @@ mod tests {
         let mut bad_candidate = scanned("EEEUSDT", 5.0);
         bad_candidate.spread_bps = 9.0;
         let rows = vec![high_atr, thin, wide, scanned("DDDUSDT", 1.0), bad_candidate];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            3,
+        );
 
         assert_eq!(plan.keep, owned(&["BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
         assert_eq!(plan.add, owned(&["DDDUSDT"]));
-        assert_eq!(plan.candidates, owned(&["DDDUSDT"]), "点差过大的候选必须被剔除");
+        assert_eq!(
+            plan.candidates,
+            owned(&["DDDUSDT"]),
+            "点差过大的候选必须被剔除"
+        );
     }
 
     #[test]
     fn missing_scanned_symbol_is_deleted_with_reason() {
         let current = owned(&["AAAUSDT"]);
         let rows = vec![scanned("DDDUSDT", 1.0)];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 1);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            1,
+        );
 
         assert!(plan.keep.is_empty());
         assert_eq!(plan.delete, owned(&["AAAUSDT"]));
@@ -1573,7 +1613,14 @@ mod tests {
             scanned("EEEUSDT", 2.0),
             scanned("FFFUSDT", 1.5),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            3,
+        );
 
         assert_eq!(plan.delete, owned(&["AAAUSDT", "BBBUSDT", "CCCUSDT"]));
         assert_eq!(plan.delete_reasons.len(), 3);
@@ -1599,7 +1646,14 @@ mod tests {
             scanned("BBBUSDT", 2.0),
             scanned("CCCUSDT", 3.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 3);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            3,
+        );
 
         assert_eq!(plan.candidates, owned(&["CCCUSDT", "BBBUSDT"]));
         assert_eq!(plan.add, owned(&["CCCUSDT", "BBBUSDT"]));
@@ -1616,7 +1670,14 @@ mod tests {
             scanned("CCCUSDT", 1.8),
             scanned("DDDUSDT", 2.0),
         ];
-        let deduped = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 2);
+        let deduped = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            2,
+        );
 
         assert_eq!(deduped.keep, owned(&["BBBUSDT"]));
         assert_eq!(deduped.delete, owned(&["AAAUSDT"]), "AAA 只能删除一次");
@@ -1627,7 +1688,14 @@ mod tests {
         // 全部通过时，重复的原池标的在 keep 中同样只出现一次。
         let current = owned(&["AAAUSDT", "AAAUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.0)];
-        let all_pass = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 1);
+        let all_pass = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            1,
+        );
         assert_eq!(all_pass.keep, owned(&["AAAUSDT"]));
     }
 
@@ -1640,7 +1708,14 @@ mod tests {
             scanned("CCCUSDT", 3.0),
             scanned("DDDUSDT", 2.0),
         ];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 5);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            5,
+        );
 
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert_eq!(plan.candidates, owned(&["CCCUSDT", "DDDUSDT", "BBBUSDT"]));
@@ -1660,7 +1735,14 @@ mod tests {
         // target = 0 且全部通过时不裁减合格标的。
         let current = owned(&["AAAUSDT"]);
         let rows = vec![scanned("AAAUSDT", 1.0)];
-        let plan = plan(&current, &HashSet::new(), &HashSet::new(), &rows, &gates(), 0);
+        let plan = plan(
+            &current,
+            &HashSet::new(),
+            &HashSet::new(),
+            &rows,
+            &gates(),
+            0,
+        );
         assert_eq!(plan.keep, owned(&["AAAUSDT"]));
         assert!(plan.delete.is_empty());
         assert!(plan.add.is_empty());

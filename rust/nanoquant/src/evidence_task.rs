@@ -10,10 +10,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::ai_providers::AiState;
+use crate::ai_tuning::{self, AiTuningSet};
 use crate::backtest_engine::{self, BasketMetrics, EngineConfig};
 use crate::evidence::{self, EvidenceReport};
 use crate::history::{self, BinanceHistory, HistoryBar, HistorySource};
-use crate::ai_tuning::{self, AiTuningSet};
 use crate::regime::Regime;
 use crate::runtime::EngineRuntime;
 
@@ -577,10 +577,7 @@ fn write_attempt(conn: &Connection, id: i64, now: i64) -> Result<(), String> {
     conn.execute(
         "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,?2) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        params![
-            format!("ai_tuning.evidence_attempt.{id}"),
-            now.to_string()
-        ],
+        params![format!("ai_tuning.evidence_attempt.{id}"), now.to_string()],
     )
     .map_err(|error| format!("写入证据门尝试时间失败: {error}"))?;
     Ok(())

@@ -311,8 +311,7 @@ impl<'a> Sim<'a> {
 
                 // 全局止盈止损按保证金收益率，优先于 ATR 止损/止盈（与实盘 manage 同序）。
                 let bar_margin_pct = if entry > 0.0 {
-                    (bar.close - entry) * direction / entry * 100.0
-                        * self.config.leverage.max(1.0)
+                    (bar.close - entry) * direction / entry * 100.0 * self.config.leverage.max(1.0)
                 } else {
                     0.0
                 };
@@ -960,14 +959,14 @@ pub fn run_walkforward(
             continue;
         };
         let params: Vec<(&'static str, f64)> = ["entry_threshold", "trailing_pct"]
-        .iter()
-        .filter_map(|key| {
-            best["params"]
-                .get(*key)
-                .and_then(Value::as_f64)
-                .map(|value| (*key, value))
-        })
-        .collect();
+            .iter()
+            .filter_map(|key| {
+                best["params"]
+                    .get(*key)
+                    .and_then(Value::as_f64)
+                    .map(|value| (*key, value))
+            })
+            .collect();
         let mut config = base.clone();
         apply_params(&mut config, &params);
         let out = run(test, &config)?;
@@ -1440,7 +1439,6 @@ mod tests {
                 volume_ratio_min: 0.0,
                 atr_pct_min: 0.05,
                 atr_pct_max: 4.0,
-
             },
             manage: ManageConfig {
                 partial_tp_at_r: 1.0,
@@ -1630,7 +1628,7 @@ mod tests {
 
     #[test]
     fn walkforward_exposes_in_sample_out_sample_and_gap() {
-let bars = trending_bars(1200);
+        let bars = trending_bars(1200);
         let mut cfg = config();
         cfg.manage.partial_tp_at_r = 0.0;
         let result = run_walkforward(

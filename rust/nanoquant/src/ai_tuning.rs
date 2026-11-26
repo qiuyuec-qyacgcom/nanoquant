@@ -384,9 +384,8 @@ pub(crate) fn activate(
             .execute_batch("RELEASE ai_tuning_activate")
             .map_err(|e| format!("提交AI 调参激活事务失败: {e}")),
         Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO ai_tuning_activate; RELEASE ai_tuning_activate",
-            );
+            let _ =
+                conn.execute_batch("ROLLBACK TO ai_tuning_activate; RELEASE ai_tuning_activate");
             Err(error)
         }
     }
@@ -643,14 +642,7 @@ fn activate_without_materializing(
             params![now, set.id],
         )
         .map_err(|error| format!("激活AI 调参 {} 失败: {error}", set.id))?;
-        insert_activation(
-            conn,
-            set.id,
-            &set.regime,
-            previous_id,
-            "auto_apply",
-            now,
-        )?;
+        insert_activation(conn, set.id, &set.regime, previous_id, "auto_apply", now)?;
         record_event(
             conn,
             "info",
@@ -671,9 +663,8 @@ fn activate_without_materializing(
             .execute_batch("RELEASE ai_tuning_auto_apply")
             .map_err(|error| format!("提交自动启用事务失败: {error}")),
         Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO ai_tuning_auto_apply; RELEASE ai_tuning_auto_apply",
-            );
+            let _ = conn
+                .execute_batch("ROLLBACK TO ai_tuning_auto_apply; RELEASE ai_tuning_auto_apply");
             Err(error)
         }
     }
@@ -852,9 +843,11 @@ fn record_guard_event(
 }
 
 fn engine_state(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row("SELECT value FROM engine_state WHERE key=?1", [key], |row| {
-        row.get::<_, String>(0)
-    })
+    conn.query_row(
+        "SELECT value FROM engine_state WHERE key=?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    )
     .ok()
 }
 
@@ -919,9 +912,8 @@ pub(crate) fn rollback_with_trigger(
             .execute_batch("RELEASE ai_tuning_rollback")
             .map_err(|e| format!("提交AI 调参回滚事务失败: {e}")),
         Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO ai_tuning_rollback; RELEASE ai_tuning_rollback",
-            );
+            let _ =
+                conn.execute_batch("ROLLBACK TO ai_tuning_rollback; RELEASE ai_tuning_rollback");
             Err(error)
         }
     }
@@ -1019,15 +1011,7 @@ pub(crate) fn insert_candidate(
     params_value: &Value,
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
-    insert_candidate_with_source(
-        conn,
-        name,
-        regime,
-        timeframe,
-        params_value,
-        "ai",
-        parent_id,
-    )
+    insert_candidate_with_source(conn, name, regime, timeframe, params_value, "ai", parent_id)
 }
 
 /// GA 离线搜索结果同样只写候选：`source='ga'`，证据字段留空，待证据门评估。
@@ -1040,15 +1024,7 @@ pub(crate) fn insert_ga_candidate(
     params_value: &Value,
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
-    insert_candidate_with_source(
-        conn,
-        name,
-        regime,
-        timeframe,
-        params_value,
-        "ga",
-        parent_id,
-    )
+    insert_candidate_with_source(conn, name, regime, timeframe, params_value, "ga", parent_id)
 }
 
 fn insert_candidate_with_source(
@@ -2321,7 +2297,9 @@ mod tests {
             })
             .unwrap();
         let before_changes: i64 = conn
-            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         let error = rollback(&conn, candidate_id, "demo").unwrap_err();
@@ -2334,7 +2312,11 @@ mod tests {
             "approved",
             "拒绝回滚不得改状态"
         );
-        assert_eq!(strategy_value(&conn), before_strategy, "拒绝回滚不得改 strategy");
+        assert_eq!(
+            strategy_value(&conn),
+            before_strategy,
+            "拒绝回滚不得改 strategy"
+        );
         let activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |row| {
                 row.get(0)
@@ -2342,7 +2324,9 @@ mod tests {
             .unwrap();
         assert_eq!(activations, before_activations, "拒绝回滚不得写激活记录");
         let changes: i64 = conn
-            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(changes, before_changes, "拒绝回滚不得写变更记录");
     }
@@ -2705,9 +2689,11 @@ mod tests {
     }
 
     fn state_value(conn: &Connection, key: &str) -> Option<String> {
-        conn.query_row("SELECT value FROM engine_state WHERE key=?1", [key], |row| {
-            row.get::<_, String>(0)
-        })
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
         .optional()
         .unwrap()
     }
@@ -2743,7 +2729,11 @@ mod tests {
         assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
         assert_eq!(load_set(&conn, bootstrap_id).unwrap().status, "retired");
         let strategy = strategy_value(&conn);
-        assert_eq!(strategy["entry_threshold"], json!(0.40), "当前 regime 必须物化");
+        assert_eq!(
+            strategy["entry_threshold"],
+            json!(0.40),
+            "当前 regime 必须物化"
+        );
         assert_eq!(auto_apply_activations(&conn), 1);
         let previous_id: Option<i64> = conn
             .query_row(
@@ -2768,7 +2758,10 @@ mod tests {
         assert_eq!(applied, Some(candidate_id));
         assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
         assert!(
-            load_set(&conn, candidate_id).unwrap().activated_at.is_some(),
+            load_set(&conn, candidate_id)
+                .unwrap()
+                .activated_at
+                .is_some(),
             "非当前 regime 仍要记录激活时刻"
         );
         assert_eq!(
@@ -2778,7 +2771,9 @@ mod tests {
         );
         assert_eq!(auto_apply_activations(&conn), 1);
         let changes: i64 = conn
-            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(changes, 0, "非当前 regime 不得写 strategy 变更记录");
     }
@@ -2902,13 +2897,7 @@ mod tests {
         assert_eq!(auto_apply_activations(&conn), 1);
     }
 
-    fn insert_activation_row(
-        conn: &Connection,
-        set_id: i64,
-        regime: &str,
-        trigger: &str,
-        ts: i64,
-    ) {
+    fn insert_activation_row(conn: &Connection, set_id: i64, regime: &str, trigger: &str, ts: i64) {
         conn.execute(
             "INSERT INTO ai_tuning_activations(set_id,regime,previous_set_id,ts,trigger) \
              VALUES(?1,?2,NULL,?3,?4)",
@@ -2966,14 +2955,18 @@ mod tests {
         set_guard(&conn, "range", candidate_id, 1_000).unwrap();
 
         assert!(!update_guard(&conn, "range", candidate_id, false, true, 1_100).unwrap());
-        let guard: Value = serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap())
-            .unwrap();
+        let guard: Value =
+            serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap()).unwrap();
         assert_eq!(guard["last_candidate_at"], json!(1_100), "熔断轮暂停计时");
 
         assert!(!update_guard(&conn, "range", candidate_id, true, false, 1_200).unwrap());
-        let guard: Value = serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap())
-            .unwrap();
-        assert_eq!(guard["last_candidate_at"], json!(1_200), "有候选必须重置计时");
+        let guard: Value =
+            serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap()).unwrap();
+        assert_eq!(
+            guard["last_candidate_at"],
+            json!(1_200),
+            "有候选必须重置计时"
+        );
 
         assert!(!update_guard(&conn, "range", candidate_id, false, false, 2_900).unwrap());
         assert_eq!(
@@ -2996,10 +2989,18 @@ mod tests {
             bootstrap_id,
             "超时后必须回滚到上一套 active"
         );
-        let guard: Value = serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap())
-            .unwrap();
-        assert_eq!(guard["set_id"], json!(bootstrap_id), "守卫重置到回滚后的 active 集");
-        assert_eq!(guard["rollback_done"], json!(true), "回滚后必须打标记防止抖动");
+        let guard: Value =
+            serde_json::from_str(&state_value(&conn, "ai_tuning.guard.range").unwrap()).unwrap();
+        assert_eq!(
+            guard["set_id"],
+            json!(bootstrap_id),
+            "守卫重置到回滚后的 active 集"
+        );
+        assert_eq!(
+            guard["rollback_done"],
+            json!(true),
+            "回滚后必须打标记防止抖动"
+        );
         let trigger: String = conn
             .query_row(
                 "SELECT trigger FROM ai_tuning_activations WHERE set_id=?1 \

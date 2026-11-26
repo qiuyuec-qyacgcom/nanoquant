@@ -237,9 +237,7 @@ pub(crate) fn resolve_timeframe(
 
 /// 适应度：样本外平均收益 - 0.5 × 最大回撤 - 0.01 × 交易次数。
 pub(crate) fn score_metrics(metrics: &BasketMetrics) -> f64 {
-    metrics.oos_avg_return_pct
-        - 0.5 * metrics.max_drawdown_pct
-        - 0.01 * metrics.oos_trades as f64
+    metrics.oos_avg_return_pct - 0.5 * metrics.max_drawdown_pct - 0.01 * metrics.oos_trades as f64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,13 +261,7 @@ pub(crate) fn fitness(
     };
     let cancel = AtomicBool::new(false);
     match backtest_engine::run_walkforward_basket_fixed(
-        basket,
-        &config,
-        folds,
-        train_bars,
-        regime,
-        timeframe,
-        &cancel,
+        basket, &config, folds, train_bars, regime, timeframe, &cancel,
     ) {
         Ok(metrics) => score_metrics(&metrics),
         Err(error) => {
@@ -451,12 +443,8 @@ mod tests {
         let basket: Vec<(String, Vec<HistoryBar>)> = Vec::new();
         let regime = Regime::from_str("range").unwrap();
         let genes = default_genes();
-        let first = run_ga(
-            &genes, &params, &risk, &basket, 3, 800, regime, "1h", &cfg,
-        );
-        let second = run_ga(
-            &genes, &params, &risk, &basket, 3, 800, regime, "1h", &cfg,
-        );
+        let first = run_ga(&genes, &params, &risk, &basket, 3, 800, regime, "1h", &cfg);
+        let second = run_ga(&genes, &params, &risk, &basket, 3, 800, regime, "1h", &cfg);
         assert_eq!(first.best, second.best);
         assert_eq!(first.best_fitness, second.best_fitness);
         assert_eq!(first.history, second.history);

@@ -4,7 +4,6 @@ pub(crate) struct TradePolicy {
     pub volume_ratio_min: f64,
     pub atr_pct_min: f64,
     pub atr_pct_max: f64,
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -274,7 +273,6 @@ mod tests {
             volume_ratio_min: 0.5,
             atr_pct_min: 0.05,
             atr_pct_max: 4.0,
-
         }
     }
 

@@ -46,7 +46,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "ga-tune",
         "GA 离线参数搜索：只写候选参数集并走证据门，不自动应用",
     ),
-
     ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
     ("verify-partial-tp", "部分止盈复核"),
@@ -558,7 +557,6 @@ fn print_zero_python_human(value: &Value) {
     }
 }
 
-
 /// 为既有数据库补默认标的池。
 ///
 /// bootstrap 只在「新建数据库」时写默认标的池，老库的池一直是空的：
@@ -719,7 +717,10 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
         ));
     }
     if symbols.is_empty() {
-        return Err((2, "缺少可用标的（--symbols 或 trading_symbols）".to_string()));
+        return Err((
+            2,
+            "缺少可用标的（--symbols 或 trading_symbols）".to_string(),
+        ));
     }
     if symbols.len() < 6 {
         return Err((
@@ -749,14 +750,13 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
         &gate_timeframes,
         options.interval.as_deref(),
     );
-    let evidence_gate_compatible = timeframe == live_timeframe
-        && gate_timeframes.iter().any(|frame| frame == &timeframe);
+    let evidence_gate_compatible =
+        timeframe == live_timeframe && gate_timeframes.iter().any(|frame| frame == &timeframe);
     let interval_ms = crate::history::interval_ms(&timeframe)
         .ok_or_else(|| (2, format!("不支持的回测周期: {timeframe}")))?;
     let regime_name = options.regime.as_deref().unwrap_or(GA_REGIME);
     let regime = crate::regime::Regime::from_str(regime_name)
         .ok_or_else(|| (2, format!("未知 regime: {regime_name}")))?;
-
 
     if let Some(population) = options.population {
         cfg.population = population.clamp(10, 100);
@@ -1111,7 +1111,11 @@ fn config_audit_command(options: &Options) -> Result<(i32, Value), (i32, String)
         .as_array()
         .map(|items| items.len())
         .unwrap_or(0);
-    let code = if options.fail && unreferenced > 0 { 1 } else { 0 };
+    let code = if options.fail && unreferenced > 0 {
+        1
+    } else {
+        0
+    };
     Ok((code, report))
 }
 
@@ -1526,8 +1530,8 @@ fn mock_service(options: &Options, exchange: bool) -> Result<(i32, Value), (i32,
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or((2, "缺少 --secret".to_string()))?;
-        let output = crate::ops_tools::mock_exec_core(port, &secret, running)
-            .map_err(|error| (1, error))?;
+        let output =
+            crate::ops_tools::mock_exec_core(port, &secret, running).map_err(|error| (1, error))?;
         Ok((0, output))
     }
 }
@@ -2195,7 +2199,6 @@ mod tests {
             "verify-partial-tp",
             "contract-diff",
             "zero-python",
-
         ] {
             assert!(text.contains(&name), "缺少命令 {name}");
         }

@@ -102,7 +102,6 @@ impl QTable {
         self.q.len()
     }
 
-
     pub(crate) fn get(&self, state: &RlState, action: RlAction) -> f64 {
         self.q
             .get(&(state.key(), action.key()))
@@ -221,11 +220,7 @@ fn sanitize(value: f64, min: f64, max: f64) -> f64 {
 
 /// 盘口不平衡：买一量/卖一量比。
 pub(crate) fn imbalance_bucket(bid_qty: f64, ask_qty: f64) -> i8 {
-    if !bid_qty.is_finite()
-        || !ask_qty.is_finite()
-        || bid_qty <= 0.0
-        || ask_qty <= 0.0
-    {
+    if !bid_qty.is_finite() || !ask_qty.is_finite() || bid_qty <= 0.0 || ask_qty <= 0.0 {
         return 0;
     }
     let ratio = bid_qty / ask_qty;
@@ -276,11 +271,7 @@ pub(crate) fn vol_bucket(atr_pct: f64) -> i8 {
 
 /// 订单大小分桶：名义额/权益，0=<10%、1=10–25%、2=25–50%、3=>=50%。
 pub(crate) fn size_bucket(notional: f64, equity: f64) -> i8 {
-    if !notional.is_finite()
-        || !equity.is_finite()
-        || notional <= 0.0
-        || equity <= 0.0
-    {
+    if !notional.is_finite() || !equity.is_finite() || notional <= 0.0 || equity <= 0.0 {
         return 0;
     }
     let ratio = notional / equity;
@@ -504,9 +495,7 @@ pub(crate) fn resolve_execution(
                     price: None,
                     action_key: "wait".to_string(),
                     degraded: false,
-                    note: Some(format!(
-                        "本轮等待 {ms}ms，候选留待下一轮重新评估"
-                    )),
+                    note: Some(format!("本轮等待 {ms}ms，候选留待下一轮重新评估")),
                     parts: 1,
                 };
             }
@@ -619,12 +608,14 @@ pub(crate) struct ReplayStats {
     pub insufficient: bool,
 }
 
-const REPLAY_SQL_FULL: &str = "SELECT t.symbol, t.side, t.notional, t.fees, t.slippage_bps, t.features, \
+const REPLAY_SQL_FULL: &str =
+    "SELECT t.symbol, t.side, t.notional, t.fees, t.slippage_bps, t.features, \
      COALESCE((SELECT o.order_type FROM orders o WHERE o.symbol=t.symbol AND o.mode=t.mode \
        AND o.purpose='entry' AND o.ts<=t.opened_at ORDER BY o.ts DESC LIMIT 1), 'MARKET') \
      FROM (SELECT * FROM trades ORDER BY closed_at DESC LIMIT ?1) t ORDER BY t.closed_at ASC";
 
-const REPLAY_SQL_BASIC: &str = "SELECT t.symbol, t.side, t.notional, t.fees, t.slippage_bps, NULL, \
+const REPLAY_SQL_BASIC: &str =
+    "SELECT t.symbol, t.side, t.notional, t.fees, t.slippage_bps, NULL, \
      COALESCE((SELECT o.order_type FROM orders o WHERE o.symbol=t.symbol AND o.mode=t.mode \
        AND o.purpose='entry' AND o.ts<=t.opened_at ORDER BY o.ts DESC LIMIT 1), 'MARKET') \
      FROM (SELECT * FROM trades ORDER BY closed_at DESC LIMIT ?1) t ORDER BY t.closed_at ASC";
@@ -638,7 +629,11 @@ struct ReplaySample {
 }
 
 fn replay_samples(conn: &Connection, episodes: u32) -> Result<Vec<ReplaySample>, String> {
-    let limit = if episodes == 0 { 10_000 } else { episodes as i64 };
+    let limit = if episodes == 0 {
+        10_000
+    } else {
+        episodes as i64
+    };
 
     let collect = |stmt: &mut rusqlite::Statement<'_>| -> Result<Vec<ReplaySample>, String> {
         let mapped = stmt
@@ -671,14 +666,7 @@ fn replay_samples(conn: &Connection, episodes: u32) -> Result<Vec<ReplaySample>,
                 .and_then(Value::as_f64)
                 .filter(|value| value.is_finite())
                 .unwrap_or(0.0);
-            let state = state_from_market(
-                0.0,
-                0.0,
-                spread_bps,
-                atr_pct,
-                notional.abs(),
-                1_000.0,
-            );
+            let state = state_from_market(0.0, 0.0, spread_bps, atr_pct, notional.abs(), 1_000.0);
             let action = if order_type.eq_ignore_ascii_case("LIMIT") {
                 RlAction::Limit(0)
             } else {
@@ -747,7 +735,8 @@ pub(crate) fn run_replay(
             .unwrap_or(sample.state);
         for action in ACTIONS {
             let reward = if action == sample.action {
-                -(sample.actual_slippage_bps + sample.fee_bps
+                -(sample.actual_slippage_bps
+                    + sample.fee_bps
                     + estimate_opportunity_bps(action, sample.spread_bps))
             } else {
                 -(estimate_slippage_bps(action, sample.spread_bps)
@@ -955,7 +944,10 @@ mod tests {
         assert!((qtys[0] - 0.33).abs() < 1e-9);
         assert!((qtys[1] - 0.33).abs() < 1e-9);
         assert!((qtys[2] - 0.34).abs() < 1e-9, "余量并入最后一笔");
-        assert!((qtys.iter().sum::<f64>() - 1.0).abs() < 1e-9, "总量必须等于原 qty");
+        assert!(
+            (qtys.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "总量必须等于原 qty"
+        );
 
         let qtys = split_qtys(0.05, 2, floor);
         assert_eq!(qtys.len(), 2);

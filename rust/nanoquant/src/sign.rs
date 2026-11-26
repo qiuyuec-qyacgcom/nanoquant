@@ -324,11 +324,16 @@ mod tests {
     fn order_type_market_keeps_market_and_limit_post_only_sends_gtx_price() {
         let market = order_params("BTCUSDT", "BUY", "long", "0.25", "nq-mkt", false, false);
         assert_eq!(
-            market.iter().find(|(k, _)| k == "type").map(|(_, v)| v.as_str()),
+            market
+                .iter()
+                .find(|(k, _)| k == "type")
+                .map(|(_, v)| v.as_str()),
             Some("MARKET"),
             "market 模式必须继续用市价单"
         );
-        assert!(!market.iter().any(|(k, _)| k == "timeInForce" || k == "price"));
+        assert!(!market
+            .iter()
+            .any(|(k, _)| k == "timeInForce" || k == "price"));
 
         let limit = order_params_typed(
             "BTCUSDT",

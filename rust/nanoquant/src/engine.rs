@@ -657,11 +657,7 @@ fn execution_view(segments: &Value) -> Value {
 async fn stats(State(db): State<Db>) -> Json<Value> {
     let mode = current_mode(&db);
     let segments = match crate::exec_client::global() {
-        Some(client) => client
-            .query_segments()
-            .await
-            .ok()
-            .unwrap_or(Value::Null),
+        Some(client) => client.query_segments().await.ok().unwrap_or(Value::Null),
         None => Value::Null,
     };
     let (rows, half_ai): (Vec<(String, f64, i64, String)>, Value) = {
@@ -768,11 +764,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
 
 async fn execution(State(_db): State<Db>) -> Json<Value> {
     let segments = match crate::exec_client::global() {
-        Some(client) => client
-            .query_segments()
-            .await
-            .ok()
-            .unwrap_or(Value::Null),
+        Some(client) => client.query_segments().await.ok().unwrap_or(Value::Null),
         None => Value::Null,
     };
     let total = &segments["total"];
@@ -1077,7 +1069,10 @@ fn evaluate_admission(db: &Db) -> Value {
         details.push(format!("已熔断: {}", &halted[..halted.len().min(60)]));
     }
     if let Some(until) = global_cooldown_until {
-        details.push(format!("全局冷却中，剩余 {}s", (until - crate::now()).max(0)));
+        details.push(format!(
+            "全局冷却中，剩余 {}s",
+            (until - crate::now()).max(0)
+        ));
     }
     steps.push(step(
         "engine",
@@ -1093,7 +1088,6 @@ fn evaluate_admission(db: &Db) -> Value {
         "调整时段/间隔",
     ));
     let params = crate::risk::SizeParams {
-
         margin_pct,
         min_notional_buffer: risk["min_notional_buffer"].as_f64().unwrap_or(1.05),
     };

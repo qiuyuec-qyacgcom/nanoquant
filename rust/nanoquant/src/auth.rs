@@ -200,7 +200,6 @@ const PASSWORD_GATE_ALLOWED: &[&str] = &["/api/v1/auth/me"];
 /// 全量请求生效，所以这里要显式放行：WS 自带首帧鉴权。
 const WS_PATHS: &[&str] = &["/api/v1/ws", "/api/v1/ws/klines"];
 
-
 #[derive(serde::Deserialize)]
 pub struct LoginIn {
     pub username: String,
@@ -364,7 +363,6 @@ pub async fn require_token(State(state): State<AuthState>, req: Request, next: N
         || PASSWORD_CHANGE_ALLOWED.contains(&path)
         || path.starts_with("/api/v1/public/")
         || matches!(path, "/api/v1/ws" | "/api/v1/ws/klines")
-
     {
         return next.run(req).await;
     }
@@ -395,7 +393,6 @@ pub async fn force_password_change(
         || PASSWORD_GATE_ALLOWED.contains(&path)
         || WS_PATHS.contains(&path)
         || path.starts_with("/api/v1/public/")
-
     {
         return next.run(req).await;
     }

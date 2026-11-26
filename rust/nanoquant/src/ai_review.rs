@@ -256,11 +256,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         },
     });
     crate::ai_analysis::gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
-    let messages = crate::ai_analysis::decision_messages_for_mode(
-        &context,
-        &cfg.personas,
-        cfg.veto_only,
-    );
+    let messages =
+        crate::ai_analysis::decision_messages_for_mode(&context, &cfg.personas, cfg.veto_only);
     let mut call = ChatCall::new(&messages, "engine_review");
     call.max_tokens = Some(16000);
     call.min_max_tokens = true;
@@ -301,10 +298,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
 }
 
 /// AI 未给有效期时回退 strategy.valid_bars，未配置则默认 6 根；越界夹到 1..=24。
-fn fill_default_valid_bars(
-    mut reviewed: ReviewDecision,
-    strategy_cfg: &Value,
-) -> ReviewDecision {
+fn fill_default_valid_bars(mut reviewed: ReviewDecision, strategy_cfg: &Value) -> ReviewDecision {
     if reviewed.valid_bars.is_none() {
         reviewed.valid_bars = strategy_cfg
             .get("valid_bars")
@@ -447,7 +441,7 @@ fn decision_to_review_mode(
                 invalidation_text,
                 risk_text,
                 scale: None,
-            })
+            });
         }
     };
     // 复核前置拒单：仅对开仓决策生效，hold/close 不因门槛被改写为 Reject。
@@ -515,7 +509,10 @@ fn decision_to_review_mode(
                 return Ok(reject_with("AI 与量化方向不一致", decision));
             }
             if !allow_ai_override {
-                return Ok(reject_with("AI 与量化方向不一致，且未允许 AI 覆盖", decision));
+                return Ok(reject_with(
+                    "AI 与量化方向不一致，且未允许 AI 覆盖",
+                    decision,
+                ));
             }
         }
     } else if require_agreement {
@@ -648,16 +645,8 @@ mod tests {
         let mut item = decision("hold", 0.9);
         item.invalidation = "   ".to_string();
         item.risk_flags = vec!["  ".to_string()];
-        let hold = decision_to_review(
-            &proposal("long"),
-            "any",
-            &item,
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
+        let hold =
+            decision_to_review(&proposal("long"), "any", &item, 0.45, true, false, 0.8).unwrap();
         assert_eq!(hold.action, ReviewAction::Hold);
         assert_eq!(hold.invalidation_text, None, "空白失效文本不应落库");
         assert_eq!(hold.risk_text, None, "空白风险文本不应落库");
@@ -665,16 +654,9 @@ mod tests {
         let mut rejected = decision("open_long", 0.2);
         rejected.invalidation = "\t ".to_string();
         rejected.risk_flags = vec![" ".to_string(), String::new()];
-        let rejected = decision_to_review(
-            &proposal("long"),
-            "any",
-            &rejected,
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
+        let rejected =
+            decision_to_review(&proposal("long"), "any", &rejected, 0.45, true, false, 0.8)
+                .unwrap();
         assert_eq!(rejected.action, ReviewAction::Reject);
         assert_eq!(
             rejected.invalidation_text, None,
@@ -685,16 +667,8 @@ mod tests {
         let mut mixed = decision("hold", 0.9);
         mixed.invalidation = " 跌破 EMA ".to_string();
         mixed.risk_flags = vec![" ".to_string(), " 上方套牢 ".to_string(), String::new()];
-        let mixed = decision_to_review(
-            &proposal("long"),
-            "any",
-            &mixed,
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
+        let mixed =
+            decision_to_review(&proposal("long"), "any", &mixed, 0.45, true, false, 0.8).unwrap();
         assert_eq!(
             mixed.invalidation_text.as_deref(),
             Some("跌破 EMA"),
@@ -741,17 +715,16 @@ mod tests {
 
     #[test]
     fn matching_ai_entry_is_approved() {
-        let result =
-            decision_to_review(
-                &proposal("long"),
-                "long",
-                &decision("open_long", 0.8),
-                0.45,
-                true,
-                false,
-                0.8,
-            )
-            .unwrap();
+        let result = decision_to_review(
+            &proposal("long"),
+            "long",
+            &decision("open_long", 0.8),
+            0.45,
+            true,
+            false,
+            0.8,
+        )
+        .unwrap();
         assert_eq!(result.action, ReviewAction::Agree);
     }
 
@@ -789,7 +762,8 @@ mod tests {
     fn low_data_quality_is_rejected() {
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.2);
-        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
         assert_eq!(
@@ -808,8 +782,8 @@ mod tests {
         // 数据质量门槛必须在校验 tighten 之前生效，否则低质量开仓会被当作可执行计划。
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.2);
-        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8)
-            .unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
     }
@@ -818,7 +792,8 @@ mod tests {
     fn low_rr_target_is_rejected() {
         let mut item = decision("open_long", 0.9);
         item.rr_target = Some(0.4);
-        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("盈亏比"));
         assert_eq!(
@@ -836,30 +811,16 @@ mod tests {
     fn thresholds_at_the_boundary_are_accepted() {
         let mut dq_equal = decision("open_long", 0.9);
         dq_equal.data_quality = Some(0.45);
-        let result = decision_to_review(
-            &proposal("long"),
-            "long",
-            &dq_equal,
-            0.45,
-            true,
-            true,
-            0.8,
-        )
-        .unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &dq_equal, 0.45, true, true, 0.8)
+                .unwrap();
         assert_eq!(result.action, ReviewAction::Agree, "dq 等于门槛应放行");
 
         let mut rr_equal = decision("open_long", 0.9);
         rr_equal.rr_target = Some(0.8);
-        let result = decision_to_review(
-            &proposal("long"),
-            "long",
-            &rr_equal,
-            0.45,
-            true,
-            true,
-            0.8,
-        )
-        .unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &rr_equal, 0.45, true, true, 0.8)
+                .unwrap();
         assert_eq!(result.action, ReviewAction::Agree, "rr 等于门槛应放行");
     }
 
@@ -882,16 +843,8 @@ mod tests {
     fn data_quality_slightly_below_threshold_is_rejected() {
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.449);
-        let result = decision_to_review(
-            &proposal("long"),
-            "long",
-            &item,
-            0.45,
-            true,
-            true,
-            0.8,
-        )
-        .unwrap();
+        let result =
+            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
     }
@@ -902,16 +855,9 @@ mod tests {
             let mut item = decision(action, 0.9);
             item.data_quality = Some(0.1);
             item.rr_target = Some(0.1);
-            let result = decision_to_review(
-                &proposal("long"),
-                "long",
-                &item,
-                0.45,
-                true,
-                true,
-                0.8,
-            )
-            .unwrap();
+            let result =
+                decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8)
+                    .unwrap();
             assert_eq!(
                 result.action,
                 ReviewAction::Hold,
@@ -1324,7 +1270,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             ..raised.clone()
         };
         let reviewed =
-            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false, 0.8).unwrap();
+            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false, 0.8)
+                .unwrap();
         assert_eq!(reviewed.leverage, Some(20.0), "超过上限压回上限");
 
         let too_low = ai_client::Decision {
@@ -1371,7 +1318,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             }
         }
         let clamped =
-            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true, false).unwrap();
+            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true, false)
+                .unwrap();
         assert_eq!(clamped.leverage, 2.0, "AI 未给杠杆时取全局下限");
         assert_eq!(clamped.stop_price, 90.0, "AI 给出的止损价直接生效");
     }
@@ -1388,7 +1336,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.8,
         )
         .unwrap();
-        assert_eq!(blocked.action, ReviewAction::Reject, "默认必须与量化方向一致");
+        assert_eq!(
+            blocked.action,
+            ReviewAction::Reject,
+            "默认必须与量化方向一致"
+        );
 
         let conflict = decision_to_review(
             &proposal("long"),
@@ -1496,7 +1448,11 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             0.8,
         )
         .unwrap();
-        assert_eq!(ai_first.action, ReviewAction::Agree, "无量化方向时 AI 仍是第一决策者");
+        assert_eq!(
+            ai_first.action,
+            ReviewAction::Agree,
+            "无量化方向时 AI 仍是第一决策者"
+        );
     }
 
     #[test]
@@ -1622,7 +1578,10 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inject_news_and_inject_mantras_gate_review_prompt() {
         let off = review_context_with(false, "off").await;
-        assert!(off.get("news").is_none(), "关闭时复核 prompt 不含 news: {off}");
+        assert!(
+            off.get("news").is_none(),
+            "关闭时复核 prompt 不含 news: {off}"
+        );
         assert!(
             off.get("mantras").is_none(),
             "关闭时复核 prompt 不含 mantras: {off}"
@@ -1642,7 +1601,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
 
     #[test]
     fn valid_bars_falls_back_to_strategy_config() {
-        let reviewed = fill_default_valid_bars(reviewed_with_new_fields(), &json!({"valid_bars": 10}));
+        let reviewed =
+            fill_default_valid_bars(reviewed_with_new_fields(), &json!({"valid_bars": 10}));
         assert_eq!(reviewed.valid_bars, Some(10));
     }
 

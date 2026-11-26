@@ -56,7 +56,11 @@ async fn protection_orders(
             // 否则保护单列表会出现 mark_price=0、距离=0。
             let missing: std::collections::BTreeSet<String> = rows
                 .iter()
-                .filter_map(|row| row.get("symbol").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|row| {
+                    row.get("symbol")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
                 .filter(|symbol| !marks.contains_key(symbol))
                 .collect();
             for symbol in missing {
@@ -233,7 +237,11 @@ fn local_marks(db: &crate::db::Db, mode: &str) -> std::collections::HashMap<Stri
 fn protection_item(row: Value, marks: &std::collections::HashMap<String, f64>) -> Option<Value> {
     let object = row.as_object()?;
     let symbol = object.get("symbol")?.as_str()?;
-    let trigger_price = number(object.get("triggerPrice").or_else(|| object.get("stopPrice")));
+    let trigger_price = number(
+        object
+            .get("triggerPrice")
+            .or_else(|| object.get("stopPrice")),
+    );
     let mark_price = marks.get(symbol).copied().unwrap_or(0.0);
     let distance_pct = if mark_price > 0.0 && trigger_price > 0.0 {
         ((trigger_price - mark_price) / mark_price * 10_000.0).round() / 100.0

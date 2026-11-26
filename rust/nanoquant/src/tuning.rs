@@ -10,9 +10,7 @@ use tokio::sync::watch;
 
 use crate::ai_client::{self, ChatCall};
 use crate::ai_providers::{provider_chain, AiState};
-use crate::ai_tuning::{
-    active_for_regime, insert_candidate, validate_candidate, AiTuningSet,
-};
+use crate::ai_tuning::{active_for_regime, insert_candidate, validate_candidate, AiTuningSet};
 
 const STARTUP_DELAY_SEC: u64 = 300;
 const DEFAULT_INTERVAL_SEC: i64 = 86_400;
@@ -730,7 +728,10 @@ mod tests {
         );
 
         assert_eq!(candidate_count(&db), 0, "关闭总开关不应生成候选");
-        assert!(event_payloads(&db).is_empty(), "关闭总开关不应写AI 调参事件");
+        assert!(
+            event_payloads(&db).is_empty(),
+            "关闭总开关不应写AI 调参事件"
+        );
     }
 
     #[tokio::test]
@@ -943,7 +944,6 @@ mod tests {
             "atr_pct_max",
             "volume_ratio_min",
             "entry_threshold",
-
         ] {
             assert!(fields.contains_key(key), "strategy.{key} 应出现在可调目录");
         }
@@ -973,7 +973,6 @@ mod tests {
         assert_eq!(fields["atr_pct_min"]["current"], 1.5);
         assert_eq!(fields["atr_pct_min"]["ai_bounds"], json!([0.0, 1.0]));
         assert!(fields["atr_pct_min"]["min"].is_number());
-
     }
 
     #[test]

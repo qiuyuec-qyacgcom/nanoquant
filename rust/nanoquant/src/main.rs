@@ -16,12 +16,14 @@
 
 mod ai;
 
+mod account_balance;
 mod ai_analysis;
 mod ai_client;
 mod ai_market;
 mod ai_providers;
 mod ai_review;
-mod account_balance;
+mod ai_tuning;
+mod ai_tuning_api;
 mod app_state;
 mod archive;
 mod auth;
@@ -58,17 +60,15 @@ mod news;
 mod oi_regime;
 mod ops_tools;
 mod param_registry;
-mod ai_tuning;
-mod ai_tuning_api;
 mod protection_api;
 mod providers;
 mod public;
 mod reasoning;
 mod reconcile;
 mod regime;
-mod rl_exec;
 mod review;
 mod risk;
+mod rl_exec;
 mod runtime;
 mod scan;
 mod schema;
@@ -76,7 +76,6 @@ mod secret;
 mod settings_api;
 mod sign;
 mod signal_audit;
-
 
 mod strategies;
 mod submit;
@@ -314,11 +313,17 @@ async fn main() {
     let (stop_tx, stop_rx) = runtime::stop_channel();
     // 自动换池独立任务：与交易引擎解耦，进程退出时随 stop_tx 一起收敛。
     if let Some(db) = database.clone() {
-        tokio::spawn(crate::symbol_scan::run_loop(db.clone(), stop_tx.subscribe()));
+        tokio::spawn(crate::symbol_scan::run_loop(
+            db.clone(),
+            stop_tx.subscribe(),
+        ));
         // 本地盘口：bookTicker 合并流只在开关打开且 live/demo 时启动；
         // 未启动或断线时 snapshot 会自动回退 REST。
         if crate::book_stream::startup_enabled(&db) {
-            tokio::spawn(crate::book_stream::run_task(db.clone(), stop_tx.subscribe()));
+            tokio::spawn(crate::book_stream::run_task(
+                db.clone(),
+                stop_tx.subscribe(),
+            ));
         }
         // 只要存在仓位，0.5 秒风控任务会直接检查止盈止损并平仓，不再等 480 秒周期。
         // 标记价/浮盈在同一循环里刷新，无需额外的 3 秒持仓标记任务。
@@ -384,10 +389,7 @@ async fn main() {
                             let _ = conn.execute(
                                 "INSERT INTO engine_events(ts, level, category, message, payload) \
                                  VALUES(?1, 'error', 'exec', ?2, '{}')",
-                                (
-                                    now(),
-                                    format!("执行内核握手失败，交易引擎未启动：{error}"),
-                                ),
+                                (now(), format!("执行内核握手失败，交易引擎未启动：{error}")),
                             );
                         }
                     }
@@ -403,7 +405,10 @@ async fn main() {
                     let _ = conn.execute(
                         "INSERT INTO engine_events(ts, level, category, message, payload) \
                          VALUES(?1, 'error', 'exec', ?2, '{}')",
-                        (now(), "未配置执行内核端点（EXEC_TCP/EXEC_SOCKET），交易引擎未启动"),
+                        (
+                            now(),
+                            "未配置执行内核端点（EXEC_TCP/EXEC_SOCKET），交易引擎未启动",
+                        ),
                     );
                 }
             }
@@ -515,7 +520,6 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         system::spawn_alert_task(system_state.clone());
         api = api.merge(system::routes().with_state(system_state));
         api = api.merge(settings_api::routes().with_state(database.clone()));
-
     }
 
     let mut app = Router::new()

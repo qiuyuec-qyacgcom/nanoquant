@@ -31,13 +31,12 @@ async fn refresh_account_balance(
     control: &EngineControl,
 ) -> Result<(), String> {
     let mode: String = {
-        let conn = db
-            .conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())?;
-        conn.query_row("SELECT value FROM engine_state WHERE key='mode'", [], |row| {
-            row.get(0)
-        })
+        let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
+        conn.query_row(
+            "SELECT value FROM engine_state WHERE key='mode'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or_else(|_| "demo".to_string())
     };
     if mode != "live" {
@@ -50,10 +49,7 @@ async fn refresh_account_balance(
         "wallet": account.wallet,
         "available": account.available_balance,
     });
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库锁不可用".to_string())?;
+    let conn = db.conn.lock().map_err(|_| "数据库锁不可用".to_string())?;
     conn.execute(
         "INSERT OR REPLACE INTO engine_state(key,value) VALUES('account.live',?1)",
         [payload.to_string()],

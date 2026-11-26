@@ -155,10 +155,7 @@ impl ExecClient {
     }
 
     fn current_conn(&self) -> Option<Arc<tokio::sync::Mutex<Connection>>> {
-        self.conn
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn clear_conn(&self) {
@@ -348,10 +345,7 @@ impl ExecClient {
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.last_error
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+        self.last_error.lock().ok().and_then(|slot| slot.clone())
     }
 
     pub fn dropped(&self) -> u64 {
@@ -400,7 +394,9 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(async move {
                     let (r, mut w) = tokio::io::split(stream);
                     let mut lines = BufReader::new(r).lines();
@@ -414,16 +410,22 @@ mod tests {
                                 "metrics_capacity": 2000}),
                             "health" => json!({"id": id, "ok": true, "algo": "hmac-sha256",
                                 "uptime_ms": 1, "sessions": 1}),
-                            "sign" => json!({"id": id, "ok": true, "signature": "x", "algo": "hmac-sha256",
-                                "query": req["query"]}),
-                            "metrics_ingest" => json!({"id": id, "ok": true, "accepted": req["samples"].as_array().map(|a| a.len()).unwrap_or(0), "dropped": 0}),
+                            "sign" => {
+                                json!({"id": id, "ok": true, "signature": "x", "algo": "hmac-sha256",
+                                "query": req["query"]})
+                            }
+                            "metrics_ingest" => {
+                                json!({"id": id, "ok": true, "accepted": req["samples"].as_array().map(|a| a.len()).unwrap_or(0), "dropped": 0})
+                            }
                             "metrics_query" => json!({"id": id, "ok": true, "segments": {}}),
                             "metrics_reset" => json!({"id": id, "ok": true}),
                             _ => json!({"id": id, "ok": false, "error": "unknown op"}),
                         };
                         let mut out = serde_json::to_string(&resp).unwrap();
                         out.push('\n');
-                        if w.write_all(out.as_bytes()).await.is_err() { break; }
+                        if w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
                         let _ = w.flush().await;
                     }
                 });

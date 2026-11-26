@@ -788,7 +788,10 @@ pub fn verify_exec_core(target: Option<&str>, secret: Option<&str>) -> Result<Va
         }
     };
     let mut checks = Vec::new();
-    let hello = exec_core_roundtrip(&target, &json!({"id": "1", "op": "hello", "version": "verify"}))?;
+    let hello = exec_core_roundtrip(
+        &target,
+        &json!({"id": "1", "op": "hello", "version": "verify"}),
+    )?;
     checks.push(json!({
         "name": "hello",
         "ok": hello["ok"] == true && !hello["kernel_version"].as_str().unwrap_or("").is_empty(),
@@ -1440,8 +1443,12 @@ mod tests {
             "存在白名单之外的未接线参数: {unreferenced:?}"
         );
         let allowlisted = report["allowlisted"].as_array().unwrap();
-        assert!(allowlisted.iter().any(|key| key == "api_rate_limit_per_min"));
-        assert!(allowlisted.iter().any(|key| key == "risk_disclaimer_accepted"));
+        assert!(allowlisted
+            .iter()
+            .any(|key| key == "api_rate_limit_per_min"));
+        assert!(allowlisted
+            .iter()
+            .any(|key| key == "risk_disclaimer_accepted"));
         assert!(allowlisted.iter().any(|key| key == "ai_summary"));
     }
 

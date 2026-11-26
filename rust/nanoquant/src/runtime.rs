@@ -189,9 +189,7 @@ struct EntryDraft {
 
 impl EntryDraft {
     fn signal_side(&self) -> Option<&str> {
-        self.quant_side
-            .as_deref()
-            .or(self.preview_side.as_deref())
+        self.quant_side.as_deref().or(self.preview_side.as_deref())
     }
 
     fn signal_score(&self) -> f64 {
@@ -1208,12 +1206,9 @@ impl EngineControl {
         mode: &str,
     ) -> Result<crate::providers::AccountSnapshot, String> {
         let creds = self.credentials_for_mode(mode)?;
-        let provider = crate::providers::BinanceProvider::for_account(
-            creds.base,
-            creds.api_key,
-            creds.secret,
-        )
-        .map_err(|error| format!("{error:?}"))?;
+        let provider =
+            crate::providers::BinanceProvider::for_account(creds.base, creds.api_key, creds.secret)
+                .map_err(|error| format!("{error:?}"))?;
         provider
             .account_snapshot()
             .await
@@ -1341,18 +1336,17 @@ impl EngineControl {
 
 /// 当前生效的 regime：优先用状态机确认后的 `regime.current`，
 /// 首轮尚未推进时回退到本轮投票写入的 `market_regime`。
-fn current_regime(
-    tx: &rusqlite::Transaction<'_>,
-    mode: &str,
-) -> Result<Option<String>, String> {
+fn current_regime(tx: &rusqlite::Transaction<'_>, mode: &str) -> Result<Option<String>, String> {
     for key in [
         format!("regime.current.{mode}"),
         format!("market_regime.{mode}"),
     ] {
         let value: Option<String> = tx
-            .query_row("SELECT value FROM engine_state WHERE key=?1", [&key], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT value FROM engine_state WHERE key=?1",
+                [&key],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|error| error.to_string())?;
         if let Some(value) = value.filter(|value| !value.is_empty()) {
@@ -1414,7 +1408,6 @@ impl EngineRuntime {
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
             atr_pct_min: num(strategy, "atr_pct_min", 0.05),
             atr_pct_max: num(strategy, "atr_pct_max", 4.0),
-
         }
     }
     fn engine_enabled(tx: &rusqlite::Transaction<'_>, config: &Value) -> Result<bool, String> {
@@ -1472,9 +1465,7 @@ impl EngineRuntime {
             reviewer,
             ai,
             reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            review_cache: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            review_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             exec_client: None,
         }
     }
@@ -1551,10 +1542,7 @@ impl EngineRuntime {
         self
     }
 
-    pub(crate) fn with_exec_client(
-        mut self,
-        client: Arc<crate::exec_client::ExecClient>,
-    ) -> Self {
+    pub(crate) fn with_exec_client(mut self, client: Arc<crate::exec_client::ExecClient>) -> Self {
         self.exec_client = Some(client);
         self
     }
@@ -1683,22 +1671,16 @@ impl EngineRuntime {
             .clamp(0, 1440)
             * 60;
         let _ = tx.execute("DELETE FROM cooldowns WHERE until_ts<=?1", [crate::now()]);
-        let (
-            mut preview_value,
-            report,
-            symbols,
-            positions,
-            rejected_rows,
-            risk_halt,
-        ) = Self::run_cycle_state(
-            &tx,
-            mode,
-            &strategy,
-            snapshot,
-            &metrics,
-            &order_differences,
-            engine_is_enabled,
-        )?;
+        let (mut preview_value, report, symbols, positions, rejected_rows, risk_halt) =
+            Self::run_cycle_state(
+                &tx,
+                mode,
+                &strategy,
+                snapshot,
+                &metrics,
+                &order_differences,
+                engine_is_enabled,
+            )?;
         // 行情闸门就把标的挡掉的，本轮已经有结论了，先落审计：
         // 「为什么没开仓」最常见的一种答案就是它。
         if !rejected_rows.is_empty() {
@@ -1797,12 +1779,8 @@ impl EngineRuntime {
             )?;
         }
         let ai_cfg = crate::ai_client::read_ai_config_conn(&tx);
-        let (
-            high_score_threshold,
-            low_score_threshold,
-            review_cache_ttl_sec,
-            review_concurrency,
-        ) = Self::ai_split_config(&tx);
+        let (high_score_threshold, low_score_threshold, review_cache_ttl_sec, review_concurrency) =
+            Self::ai_split_config(&tx);
         let drafts = if engine_is_enabled && !report.ai_symbols.is_empty() {
             Self::collect_entries(
                 &tx,
@@ -1990,114 +1968,111 @@ impl EngineRuntime {
         );
     }
 
-/// 有界并发映射，结果顺序与输入严格一致。
-///
-/// 只用本地线程池：扫描阶段已经拿到快照，指标计算是纯 CPU，
-/// 不能在这里额外打交易所接口。并发度上限 20，避免池子被扫描线程占满。
-fn map_bounded<T, R, F>(items: &[T], concurrency: usize, map: F) -> Vec<R>
-where
-    T: Sync,
-    R: Send,
-    F: Fn(&T) -> R + Sync,
-{
-    let workers = concurrency.clamp(1, 20).min(items.len());
-    if workers <= 1 {
-        return items.iter().map(&map).collect();
-    }
-    let chunk = items.len().div_ceil(workers);
-    let mut slots: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
-    std::thread::scope(|scope| {
-        for (chunk_items, chunk_slots) in items.chunks(chunk).zip(slots.chunks_mut(chunk)) {
-            let map = &map;
-            scope.spawn(move || {
-                for (item, slot) in chunk_items.iter().zip(chunk_slots.iter_mut()) {
-                    *slot = Some(map(item));
-                }
-            });
+    /// 有界并发映射，结果顺序与输入严格一致。
+    ///
+    /// 只用本地线程池：扫描阶段已经拿到快照，指标计算是纯 CPU，
+    /// 不能在这里额外打交易所接口。并发度上限 20，避免池子被扫描线程占满。
+    fn map_bounded<T, R, F>(items: &[T], concurrency: usize, map: F) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+        F: Fn(&T) -> R + Sync,
+    {
+        let workers = concurrency.clamp(1, 20).min(items.len());
+        if workers <= 1 {
+            return items.iter().map(&map).collect();
         }
-    });
-    slots.into_iter().flatten().collect()
-}
+        let chunk = items.len().div_ceil(workers);
+        let mut slots: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            for (chunk_items, chunk_slots) in items.chunks(chunk).zip(slots.chunks_mut(chunk)) {
+                let map = &map;
+                scope.spawn(move || {
+                    for (item, slot) in chunk_items.iter().zip(chunk_slots.iter_mut()) {
+                        *slot = Some(map(item));
+                    }
+                });
+            }
+        });
+        slots.into_iter().flatten().collect()
+    }
 
-/// 限价开仓优先挂对手盘最优价：买单挂买一，卖单挂卖一。
-/// 没有可信盘口（<=0 或非有限）时退回标记价，宁可挂不上也不追价。
-fn limit_entry_price(side: &str, bid: f64, ask: f64, mark: f64) -> f64 {
-    let book = if side == "BUY" { bid } else { ask };
-    if book.is_finite() && book > 0.0 {
-        book
-    } else {
-        mark
-    }
-}
-
-/// AI 建议限价只在「方向正确且贴近现价」时采用，否则回退宿主挂单价。
-/// 先按交易所 tick 归整：买单向下、卖单向上，归整后再复核一次，
-/// 避免归整把价格推出容差或推成反向。tick 不可信（<=0/非有限）时保留原值，
-/// 依赖下游 `SymbolFilter::format_price` 按小数位归整（后续项：归整下沉到下单出口）。
-fn preferred_limit_price(side: &str, mark: f64, ai_entry_price: f64, tick: f64) -> Option<f64> {
-    if !mark.is_finite() || mark <= 0.0 {
-        return None;
-    }
-    if !ai_entry_price.is_finite() || ai_entry_price <= 0.0 {
-        return None;
-    }
-    if side != "BUY" && side != "SELL" {
-        return None;
-    }
-    if (ai_entry_price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
-        return None;
-    }
-    if (side == "BUY" && ai_entry_price > mark) || (side == "SELL" && ai_entry_price < mark) {
-        return None;
-    }
-    let price = if tick.is_finite() && tick > 0.0 {
-        if side == "BUY" {
-            crate::live::floor_to_step(ai_entry_price, tick)
+    /// 限价开仓优先挂对手盘最优价：买单挂买一，卖单挂卖一。
+    /// 没有可信盘口（<=0 或非有限）时退回标记价，宁可挂不上也不追价。
+    fn limit_entry_price(side: &str, bid: f64, ask: f64, mark: f64) -> f64 {
+        let book = if side == "BUY" { bid } else { ask };
+        if book.is_finite() && book > 0.0 {
+            book
         } else {
-            crate::live::ceil_to_step(ai_entry_price, tick)
+            mark
         }
-    } else {
-        ai_entry_price
-    };
-    if !price.is_finite() || price <= 0.0 {
-        return None;
     }
-    if (price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
-        return None;
-    }
-    if (side == "BUY" && price > mark) || (side == "SELL" && price < mark) {
-        return None;
-    }
-    Some(price)
-}
 
-/// 开仓成交费率：只做 Maker 的限价开仓用 maker 费率，其余（市价开仓、
-/// 平仓、保护单）一律 taker，保证 positions/trades 的手续费口径一致。
-fn plan_fee_rate(plan: &LivePlan, taker_rate: f64, maker_rate: f64) -> f64 {
-    if plan.purpose == "entry" && plan.order_type.is_post_only() {
-        maker_rate
-    } else {
-        taker_rate
+    /// AI 建议限价只在「方向正确且贴近现价」时采用，否则回退宿主挂单价。
+    /// 先按交易所 tick 归整：买单向下、卖单向上，归整后再复核一次，
+    /// 避免归整把价格推出容差或推成反向。tick 不可信（<=0/非有限）时保留原值，
+    /// 依赖下游 `SymbolFilter::format_price` 按小数位归整（后续项：归整下沉到下单出口）。
+    fn preferred_limit_price(side: &str, mark: f64, ai_entry_price: f64, tick: f64) -> Option<f64> {
+        if !mark.is_finite() || mark <= 0.0 {
+            return None;
+        }
+        if !ai_entry_price.is_finite() || ai_entry_price <= 0.0 {
+            return None;
+        }
+        if side != "BUY" && side != "SELL" {
+            return None;
+        }
+        if (ai_entry_price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
+            return None;
+        }
+        if (side == "BUY" && ai_entry_price > mark) || (side == "SELL" && ai_entry_price < mark) {
+            return None;
+        }
+        let price = if tick.is_finite() && tick > 0.0 {
+            if side == "BUY" {
+                crate::live::floor_to_step(ai_entry_price, tick)
+            } else {
+                crate::live::ceil_to_step(ai_entry_price, tick)
+            }
+        } else {
+            ai_entry_price
+        };
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+        if (price - mark).abs() / mark > PREFERRED_ENTRY_TOLERANCE {
+            return None;
+        }
+        if (side == "BUY" && price > mark) || (side == "SELL" && price < mark) {
+            return None;
+        }
+        Some(price)
     }
-}
 
-/// 实盘开仓单是否还挂着。未成交的限价单不会写 positions，
-/// 只看仓位会重复挂单，所以必须回查订单表。
-fn live_entry_inflight(
-    tx: &rusqlite::Transaction<'_>,
-    symbol: &str,
-) -> Result<bool, String> {
-    tx.query_row(
+    /// 开仓成交费率：只做 Maker 的限价开仓用 maker 费率，其余（市价开仓、
+    /// 平仓、保护单）一律 taker，保证 positions/trades 的手续费口径一致。
+    fn plan_fee_rate(plan: &LivePlan, taker_rate: f64, maker_rate: f64) -> f64 {
+        if plan.purpose == "entry" && plan.order_type.is_post_only() {
+            maker_rate
+        } else {
+            taker_rate
+        }
+    }
+
+    /// 实盘开仓单是否还挂着。未成交的限价单不会写 positions，
+    /// 只看仓位会重复挂单，所以必须回查订单表。
+    fn live_entry_inflight(tx: &rusqlite::Transaction<'_>, symbol: &str) -> Result<bool, String> {
+        tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM orders WHERE mode='live' AND purpose='entry' AND symbol=?1 \
          AND status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED'))",
         [symbol],
         |row| row.get(0),
     )
     .map_err(|error| error.to_string())
-}
+    }
 
-/// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
-fn live_plans(
+    /// 实盘要发的订单：只把管仓动作翻译成反向 reduce-only 市价单。
+    fn live_plans(
         symbols: &[String],
         positions: &[crate::manage::ManagedPosition],
         report: &crate::cycle::CycleReport,
@@ -2140,7 +2115,7 @@ fn live_plans(
             .collect()
     }
 
-/// 扫描并发度：界面配置 1..20，0 或非法值回退 1。
+    /// 扫描并发度：界面配置 1..20，0 或非法值回退 1。
     /// 并发只作用于本地指标/候选计算，不放大交易所请求。
     fn scan_concurrency_of(engine: &Value) -> usize {
         let parsed = engine
@@ -2153,25 +2128,25 @@ fn live_plans(
 
     /// 扫描闸门配置。点差上限优先读界面字段 `max_spread_bps`，
     /// 兼容历史键 `spread_bps_max`，都为缺时按 8bp 兜底。
-fn scan_gates_of(strategy: &Value) -> crate::scan::ScanGates {
-    let spread_bps_max = strategy["max_spread_bps"]
-        .as_f64()
-        .or_else(|| strategy["spread_bps_max"].as_f64())
-        .unwrap_or(8.0);
-    crate::scan::ScanGates {
-        atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
-        atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
-        volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
-        min_24h_quote_volume: strategy["min_24h_quote_volume"]
+    fn scan_gates_of(strategy: &Value) -> crate::scan::ScanGates {
+        let spread_bps_max = strategy["max_spread_bps"]
             .as_f64()
-            .unwrap_or(3_000_000.0),
-        spread_bps_max,
-        funding_veto_bps: strategy["funding_veto_bps"].as_f64().unwrap_or(5.0),
-        entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
+            .or_else(|| strategy["spread_bps_max"].as_f64())
+            .unwrap_or(8.0);
+        crate::scan::ScanGates {
+            atr_pct_min: strategy["atr_pct_min"].as_f64().unwrap_or(0.05),
+            atr_pct_max: strategy["atr_pct_max"].as_f64().unwrap_or(4.0),
+            volume_ratio_min: strategy["volume_ratio_min"].as_f64().unwrap_or(0.8),
+            min_24h_quote_volume: strategy["min_24h_quote_volume"]
+                .as_f64()
+                .unwrap_or(3_000_000.0),
+            spread_bps_max,
+            funding_veto_bps: strategy["funding_veto_bps"].as_f64().unwrap_or(5.0),
+            entry_threshold: strategy["entry_threshold"].as_f64().unwrap_or(0.3),
+        }
     }
-}
 
-fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
+    fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         let minutes: i64 = match strategy["timeframe"].as_str().unwrap_or("4h") {
             "1m" => 1,
             "3m" => 3,
@@ -2311,7 +2286,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             .map_err(|error| error.to_string())?;
             // 信号反转要看当轮方向分：开仓时的分数不会随行情翻转。
             // 均值回归仓的评分无方向符号，且出场由独立阈值接管，这里给 0 避免误触发反转平仓。
-            let margin_stop_take = crate::mean_reversion::position_margin_limits(features.as_deref());
+            let margin_stop_take =
+                crate::mean_reversion::position_margin_limits(features.as_deref());
             let score = if margin_stop_take.is_some() {
                 0.0
             } else {
@@ -2719,9 +2695,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             });
             let gaps = recent
                 .windows(2)
-                .filter(|pair| {
-                    pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms
-                })
+                .filter(|pair| pair[1].close_time.saturating_sub(pair[0].close_time) != interval_ms)
                 .count();
             let preview = crate::trade_policy::preview(
                 &market.candles,
@@ -3050,12 +3024,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     Some(signal.reason),
                 )
             } else if mean_reversion_active {
-                let preview = crate::trade_policy::preview(
-                    &market.candles,
-                    price,
-                    metric.atr,
-                    features,
-                );
+                let preview =
+                    crate::trade_policy::preview(&market.candles, price, metric.atr, features);
                 let preview_side = preview
                     .filter(|item| item.side != "flat")
                     .map(|item| item.side.to_string());
@@ -3567,9 +3537,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             // AI 给了保证金比例就按 AI 值（已在复核层夹到中枢±5%）；
             // 没给时才回退到原有 ATR 缩放，避免双重放大。
             let margin_pct = reviewed.margin_pct.unwrap_or_else(|| {
-                (cfg["margin_pct"].as_f64().unwrap_or(50.0)
-                    * draft.scale.clamp(0.25, 2.0))
-                .clamp(0.0, 100.0)
+                (cfg["margin_pct"].as_f64().unwrap_or(50.0) * draft.scale.clamp(0.25, 2.0))
+                    .clamp(0.0, 100.0)
             });
             let (base_qty, _) = crate::risk::estimate_qty(
                 snapshot.account.equity,
@@ -3658,16 +3627,17 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     .unwrap_or((draft.mark_price, draft.mark_price));
                 let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
                 // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
-                let configured_limit = crate::fast_risk::gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
-                    .and_then(|ai_entry_price| {
-                        Self::preferred_limit_price(
-                            side,
-                            draft.mark_price,
-                            ai_entry_price,
-                            draft.filter.price_tick,
-                        )
-                    })
-                    .unwrap_or(fallback);
+                let configured_limit =
+                    crate::fast_risk::gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
+                        .and_then(|ai_entry_price| {
+                            Self::preferred_limit_price(
+                                side,
+                                draft.mark_price,
+                                ai_entry_price,
+                                draft.filter.price_tick,
+                            )
+                        })
+                        .unwrap_or(fallback);
                 // RL 只用盘口不平衡、价差、波动率与订单大小选执行动作。
                 let action = if rl_cfg.enabled {
                     let (bid_qty, ask_qty) = crate::book_stream::quote(&draft.symbol)
@@ -4034,7 +4004,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
     }
 
     /// close_on_halt 触发的 demo 全平：复用管仓平仓的成交结算路径，
-/// 只处理本地账本，不发网络请求。标记价缺失时用当前行情快照兜底。
+    /// 只处理本地账本，不发网络请求。标记价缺失时用当前行情快照兜底。
     fn flatten_demo_positions(
         tx: &rusqlite::Transaction<'_>,
         mode: &str,
@@ -4616,13 +4586,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
             ("marginType".to_string(), "ISOLATED".to_string()),
         ];
         let request = self
-            .build_live(
-                gate,
-                creds,
-                "POST",
-                "/fapi/v1/marginType",
-                &params,
-            )
+            .build_live(gate, creds, "POST", "/fapi/v1/marginType", &params)
             .await?;
         let reply = gateway.send(&request).await;
         if reply.transport_failed {
@@ -5014,10 +4978,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
     ) -> Result<(), String> {
         let params = vec![
             ("symbol".to_string(), symbol.to_string()),
-            (
-                "origClientOrderId".to_string(),
-                client_order_id.to_string(),
-            ),
+            ("origClientOrderId".to_string(), client_order_id.to_string()),
             ("recvWindow".to_string(), creds.recv_window_ms.to_string()),
         ];
         let request = self
@@ -5143,7 +5104,11 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     )?,
                     Some(failure) => {
                         // 明确拒绝也留痕，但不阻塞下一轮重试；结果未知的腿必须阻塞，避免重复挂单。
-                        let status = if outcome.unknown { "UNKNOWN" } else { "REJECTED" };
+                        let status = if outcome.unknown {
+                            "UNKNOWN"
+                        } else {
+                            "REJECTED"
+                        };
                         self.record_protection_order(symbol, purpose, &leg, status, "")?;
                         failures.push(format!("{symbol} 保护单 {failure}"));
                     }
@@ -5485,10 +5450,8 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         match self.take_halt_flatten_pending(&mode) {
                             Ok(true) => {
                                 // flatten 属于 EngineControl：复用撤单 + 市价平仓 + 本地结算的现有路径。
-                                let control = EngineControl::new(
-                                    self.db.clone(),
-                                    self.master_key.clone(),
-                                );
+                                let control =
+                                    EngineControl::new(self.db.clone(), self.master_key.clone());
                                 match control.flatten(false).await {
                                     Ok(value) => {
                                         self.events.record(
@@ -5569,7 +5532,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
     /// 心跳文件：守护脚本靠它判断「进程还在、引擎却不动了」。
     /// 引擎停用时后台同样在跑，所以这个文件只表示后台任务活着。
     /// 读取并清掉 close_on_halt 的实盘平仓标记。读取即删除，
-/// 即使平仓失败也不会在后续轮次重复全平（失败只告警，交给人工处理）。
+    /// 即使平仓失败也不会在后续轮次重复全平（失败只告警，交给人工处理）。
     fn take_halt_flatten_pending(&self, mode: &str) -> Result<bool, String> {
         let key = format!("close_on_halt.pending.{mode}");
         let conn = self
@@ -5868,12 +5831,9 @@ fn apply_regime_transition_at(
             // 激活成功即初始化守卫，计时从切换时刻开始。
             match crate::ai_tuning::active_set_for_regime(conn, regime.as_str()) {
                 Ok(Some(set)) => {
-                    if let Err(error) = crate::ai_tuning::set_guard(
-                        conn,
-                        regime.as_str(),
-                        set.id,
-                        now,
-                    ) {
+                    if let Err(error) =
+                        crate::ai_tuning::set_guard(conn, regime.as_str(), set.id, now)
+                    {
                         tracing::warn!(%error, regime = regime.as_str(), %mode, "AI 调参守卫初始化失败");
                     }
                 }
@@ -6005,9 +5965,6 @@ pub(crate) fn stop_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
 }
 
-
-
-
 /// 同向持仓的相关性判定：三大主流视为同一风险簇，
 /// 其余标的按去掉 USDT 后的基础资产归组。
 fn correlated_symbols(a: &str, b: &str) -> bool {
@@ -6026,7 +5983,6 @@ fn correlated_symbols(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
 
     #[test]
     fn local_leverage_rises_for_low_atr_high_score() {
@@ -6077,7 +6033,10 @@ mod tests {
     fn limit_entry_ignores_ai_price_when_switch_off() {
         // 限价委托在开关关闭时不采用 AI 入场价，直接回退买一/卖一。
         assert_eq!(crate::fast_risk::gate_ai_value(Some(101.0), false), None);
-        assert_eq!(crate::fast_risk::gate_ai_value(Some(101.0), true), Some(101.0));
+        assert_eq!(
+            crate::fast_risk::gate_ai_value(Some(101.0), true),
+            Some(101.0)
+        );
     }
 
     #[test]
@@ -6108,7 +6067,8 @@ mod tests {
             })
             .unwrap();
 
-        let changed = crate::fast_risk::apply_position_mark(&conn, id, 105.0, 100.0, 2.0, 1.0).unwrap();
+        let changed =
+            crate::fast_risk::apply_position_mark(&conn, id, 105.0, 100.0, 2.0, 1.0).unwrap();
         assert_eq!(changed, 1);
 
         let (mark, unrealized, ts, status): (f64, f64, i64, String) = conn
@@ -6248,8 +6208,10 @@ mod tests {
                 preview_side: None,
             })
             .collect();
-        let serial = EngineRuntime::map_bounded(&candidates, 1, |candidate| candidate.symbol.clone());
-        let parallel = EngineRuntime::map_bounded(&candidates, 4, |candidate| candidate.symbol.clone());
+        let serial =
+            EngineRuntime::map_bounded(&candidates, 1, |candidate| candidate.symbol.clone());
+        let parallel =
+            EngineRuntime::map_bounded(&candidates, 4, |candidate| candidate.symbol.clone());
         assert_eq!(parallel, serial, "并发结果必须与串行完全一致且顺序不变");
         assert_eq!(
             serial,
@@ -6259,11 +6221,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let unique: std::collections::BTreeSet<&String> = parallel.iter().collect();
-        assert_eq!(
-            unique.len(),
-            parallel.len(),
-            "并发扫描不能产生重复标的"
-        );
+        assert_eq!(unique.len(), parallel.len(), "并发扫描不能产生重复标的");
     }
 
     #[test]
@@ -6417,7 +6375,10 @@ mod tests {
     #[test]
     fn max_spread_bps_setting_rejects_a_wide_book() {
         let gates = EngineRuntime::scan_gates_of(&serde_json::json!({"max_spread_bps": 2.0}));
-        assert_eq!(gates.spread_bps_max, 2.0, "界面字段 max_spread_bps 必须生效");
+        assert_eq!(
+            gates.spread_bps_max, 2.0,
+            "界面字段 max_spread_bps 必须生效"
+        );
         let candidate = crate::scan::Candidate {
             symbol: "BTCUSDT".into(),
             data_ok: true,
@@ -6759,12 +6720,7 @@ mod tests {
             .snapshot()
             .await
             .unwrap();
-        upsert_state(
-            &db.lock(),
-            "symbol_regime.demo",
-            r#"{"BTCUSDT":"range"}"#,
-        )
-        .unwrap();
+        upsert_state(&db.lock(), "symbol_regime.demo", r#"{"BTCUSDT":"range"}"#).unwrap();
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         let value: String = db
             .lock()
@@ -6904,10 +6860,22 @@ mod tests {
         assert_eq!(value["preview_side"], "long");
         assert!(value["quant_side"].is_null());
         assert_eq!(value["quant_passed"], false);
-        assert!(value["atr_pct"].as_f64().is_some_and(|v| v > 0.0), "AI 复核行要带顶层 ATR");
-        assert!(value["vol_ratio"].as_f64().is_some(), "AI 复核行要带顶层量比");
-        assert!(value["quote_volume"].as_f64().is_some(), "AI 复核行要带顶层 24h 成交额");
-        assert!(value["spread_bps"].as_f64().is_some(), "AI 复核行要带顶层点差");
+        assert!(
+            value["atr_pct"].as_f64().is_some_and(|v| v > 0.0),
+            "AI 复核行要带顶层 ATR"
+        );
+        assert!(
+            value["vol_ratio"].as_f64().is_some(),
+            "AI 复核行要带顶层量比"
+        );
+        assert!(
+            value["quote_volume"].as_f64().is_some(),
+            "AI 复核行要带顶层 24h 成交额"
+        );
+        assert!(
+            value["spread_bps"].as_f64().is_some(),
+            "AI 复核行要带顶层点差"
+        );
         let preview_score = value["preview_score"].as_f64().unwrap();
         assert!((preview_score - score).abs() < 1e-9);
         assert_eq!(ai_action, "hold");
@@ -7026,7 +6994,11 @@ mod tests {
             features: None,
         };
         assert_eq!(
-            EngineRuntime::plan_fee_rate(&plan(LiveOrderType::LimitPostOnly, "entry"), 0.0005, 0.0002),
+            EngineRuntime::plan_fee_rate(
+                &plan(LiveOrderType::LimitPostOnly, "entry"),
+                0.0005,
+                0.0002
+            ),
             0.0002,
             "maker 开仓成交用 maker 费率"
         );
@@ -7036,7 +7008,11 @@ mod tests {
             "市价开仓仍用 taker 费率"
         );
         assert_eq!(
-            EngineRuntime::plan_fee_rate(&plan(LiveOrderType::LimitPostOnly, "stop_loss"), 0.0005, 0.0002),
+            EngineRuntime::plan_fee_rate(
+                &plan(LiveOrderType::LimitPostOnly, "stop_loss"),
+                0.0005,
+                0.0002
+            ),
             0.0005,
             "平仓始终是 taker，即使订单类型写着 LIMIT"
         );
@@ -7063,9 +7039,8 @@ mod tests {
         );
 
         let leverage = plan.entry.as_ref().unwrap().leverage.round() as i64;
-        let leverage_body = Box::leak(
-            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
-        );
+        let leverage_body =
+            Box::leak(format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str());
         let gateway = FakeLiveGateway::new(vec![
             (200, r#"{"dualSidePosition":false}"#),
             (200, leverage_body),
@@ -7177,9 +7152,8 @@ mod tests {
         let runtime = test_runtime(&db);
         let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
         let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
-        let leverage_body = Box::leak(
-            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
-        );
+        let leverage_body =
+            Box::leak(format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str());
         let gateway = FakeLiveGateway::new(vec![
             (200, r#"{"dualSidePosition":false}"#),
             (200, leverage_body),
@@ -7227,9 +7201,8 @@ mod tests {
         let runtime = test_runtime(&db);
         let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
         let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
-        let leverage_body = Box::leak(
-            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
-        );
+        let leverage_body =
+            Box::leak(format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str());
         let gateway = FakeLiveGateway::new(vec![
             (200, r#"{"dualSidePosition":false}"#),
             (200, leverage_body),
@@ -7254,11 +7227,9 @@ mod tests {
         {
             let conn = db.lock();
             let status: String = conn
-                .query_row(
-                    "SELECT status FROM orders WHERE mode='live'",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT status FROM orders WHERE mode='live'", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(status, "UNKNOWN");
             let positions: i64 = conn
@@ -7284,9 +7255,8 @@ mod tests {
         let runtime = test_runtime(&db);
         let plans = runtime.persist_snapshot("live", &snapshot).unwrap();
         let leverage = plans[0].entry.as_ref().unwrap().leverage.round() as i64;
-        let leverage_body = Box::leak(
-            format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str(),
-        );
+        let leverage_body =
+            Box::leak(format!(r#"{{"symbol":"BTCUSDT","leverage":{leverage}}}"#).into_boxed_str());
         let gateway = FakeLiveGateway::new(vec![
             (200, r#"{"dualSidePosition":false}"#),
             (200, leverage_body),
@@ -7678,7 +7648,10 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 VALUES('BTCUSDT','long',0.5,100,100,95,105,100,95,0,1,'open','demo');"#,
             )
             .unwrap();
-        let snapshot = DemoProvider::with_mark_price(mark).snapshot().await.unwrap();
+        let snapshot = DemoProvider::with_mark_price(mark)
+            .snapshot()
+            .await
+            .unwrap();
         (db, snapshot)
     }
 
@@ -7767,11 +7740,8 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         runtime.persist_snapshot("demo", &snapshot).unwrap();
         {
             let conn = db.lock();
-            conn.execute(
-                "UPDATE cooldowns SET until_ts=0 WHERE kind='global'",
-                [],
-            )
-            .unwrap();
+            conn.execute("UPDATE cooldowns SET until_ts=0 WHERE kind='global'", [])
+                .unwrap();
         }
         // 下一轮会清掉过期的全局冷却；symbol 冷却仍在有效期内，不能被一起删掉。
         runtime.persist_snapshot("demo", &snapshot).unwrap();
@@ -8254,7 +8224,11 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             Some(1.0)
         );
         assert_eq!(
-            reviewed[4].result.as_ref().expect_err("低分直接拒绝").action,
+            reviewed[4]
+                .result
+                .as_ref()
+                .expect_err("低分直接拒绝")
+                .action,
             "reject"
         );
     }

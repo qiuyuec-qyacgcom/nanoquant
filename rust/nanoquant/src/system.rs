@@ -1420,8 +1420,7 @@ async fn exec_self_test(State(state): State<SystemState>) -> Json<Value> {
             format!("执行内核已连接（algo={algo}）；签名逐字节比对用 ops verify-exec-core")
         }
         ExecCheck::Skipped => {
-            "执行内核已连接但当前交易环境没有配置交易所 Secret，只能探活、不能比对签名"
-                .to_string()
+            "执行内核已连接但当前交易环境没有配置交易所 Secret，只能探活、不能比对签名".to_string()
         }
         ExecCheck::Error => client
             .as_ref()
@@ -3104,7 +3103,10 @@ mod tests {
         assert!(body.get("order_ledger").is_some());
         assert_eq!(body["connected"], json!(false));
         assert_eq!(body["configured"], json!(false));
-        assert!(body["segments"].is_null(), "未连接时七段指标为 null: {body}");
+        assert!(
+            body["segments"].is_null(),
+            "未连接时七段指标为 null: {body}"
+        );
         let (_, tested) =
             request_json(app.clone(), "POST", "/api/v1/system/exec-core/self-test").await;
         assert!(
@@ -3112,11 +3114,7 @@ mod tests {
             "自检必须给出逐项结论: {tested}"
         );
         // 默认执行内核为必选组件：未连接就是故障，不能再算通过
-        assert_eq!(
-            tested["ok"],
-            json!(false),
-            "未连接时自检必须失败: {tested}"
-        );
+        assert_eq!(tested["ok"], json!(false), "未连接时自检必须失败: {tested}");
         assert_eq!(tested["outcome"], json!("error"));
         assert_eq!(tested["configured"], json!(false));
         let (_, after) = request_json(app.clone(), "GET", "/api/v1/system/exec-core").await;
@@ -3125,8 +3123,7 @@ mod tests {
             json!(1),
             "未连接的自检应计入失败: {after}"
         );
-        let (_, reset) =
-            request_json(app.clone(), "POST", "/api/v1/system/exec-core/reset").await;
+        let (_, reset) = request_json(app.clone(), "POST", "/api/v1/system/exec-core/reset").await;
         assert_eq!(reset["counts"]["checks"], 0);
         assert_eq!(reset["counts"]["errors"], 0);
         assert_eq!(reset["core_reset"], json!(false), "未连接时无内核可清零");
@@ -3322,10 +3319,7 @@ mod tests {
             .iter()
             .find(|check| check["name"] == "交易凭证")
             .unwrap_or_else(|| panic!("缺少交易凭证失败项: {failed:?}"));
-        assert!(credential["detail"]
-            .as_str()
-            .unwrap()
-            .contains("无法解密"));
+        assert!(credential["detail"].as_str().unwrap().contains("无法解密"));
         // 未连接执行内核是默认必选组件的故障，会同时让「交易通道」失败；
         // 除此之外不应有别的检查被凭证故障牵连。
         for check in &failed {

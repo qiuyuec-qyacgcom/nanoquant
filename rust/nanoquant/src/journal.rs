@@ -607,11 +607,7 @@ fn journal_min_record_confidence(conn: &Connection) -> f64 {
     )
     .ok()
     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    .and_then(|value| {
-        value
-            .get("min_record_confidence")
-            .and_then(Value::as_f64)
-    })
+    .and_then(|value| value.get("min_record_confidence").and_then(Value::as_f64))
     .filter(|value| value.is_finite())
     .unwrap_or(0.45)
     .clamp(0.0, 1.0)
@@ -1270,13 +1266,33 @@ mod tests {
             )
             .unwrap();
             assert!(
-                record_decision(&conn, "demo", "BTCUSDT", "long", 0.5, 100.0, 3.0, "", &json!({}))
-                    .is_none(),
+                record_decision(
+                    &conn,
+                    "demo",
+                    "BTCUSDT",
+                    "long",
+                    0.5,
+                    100.0,
+                    3.0,
+                    "",
+                    &json!({})
+                )
+                .is_none(),
                 "低于阈值的方向判断不应写入决策日志"
             );
             assert!(
-                record_decision(&conn, "demo", "BTCUSDT", "long", 0.7, 100.0, 3.0, "", &json!({}))
-                    .is_some(),
+                record_decision(
+                    &conn,
+                    "demo",
+                    "BTCUSDT",
+                    "long",
+                    0.7,
+                    100.0,
+                    3.0,
+                    "",
+                    &json!({})
+                )
+                .is_some(),
                 "达到阈值应正常写入"
             );
         }
