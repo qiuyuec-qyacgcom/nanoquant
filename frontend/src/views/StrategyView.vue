@@ -308,7 +308,7 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       hint: '当前唯一信号模型；按 regime 加权相对强弱、波动突破、资金费率与 OI/订单流',
     },
     valid_bars: { label: '信号有效期', unit: '根 K 线', min: 1, max: 24, step: 1, hint: 'AI 未给出有效期时使用；1 根 = 1 个当前 K 线周期，超过后该信号不再作为开仓依据（当前版本尚未生效，待后续任务启用）' },
-    min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', min: 0, max: 10, step: 0.1, hint: 'AI 预期盈亏比低于该值时不采纳（当前版本尚未生效，待后续任务启用）' },
+    min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', min: 0, max: 10, step: 0.1, hint: 'AI 预期盈亏比低于该值时不开仓' },
   },
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },

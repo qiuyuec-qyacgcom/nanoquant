@@ -31,12 +31,13 @@ impl AiReviewer for EngineAiReviewer {
 }
 
 async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewDecision, String> {
-    let strategy_cfg = state
-        .db
-        .setting("strategy")
-        .ok()
-        .flatten()
-        .unwrap_or(Value::Null);
+    let strategy_cfg = match state.db.setting("strategy") {
+        Ok(value) => value.unwrap_or(Value::Null),
+        Err(error) => {
+            tracing::debug!(error = ?error, "读取 strategy 配置失败，复核门槛回退默认值");
+            Value::Null
+        }
+    };
     let interval = strategy_cfg
         .get("timeframe")
         .and_then(Value::as_str)
@@ -209,11 +210,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .and_then(|filters| filters.get("side"))
         .and_then(Value::as_str)
         .unwrap_or("any");
-    // 开仓盈亏比门槛来自策略配置，未配置时回退默认值 0.8。
-    let min_rr = strategy_cfg
+    // 开仓盈亏比门槛来自策略配置，未配置时回退默认值。
+    let min_entry_rr = strategy_cfg
         .get("min_entry_rr")
         .and_then(Value::as_f64)
-        .unwrap_or(0.8);
+        .unwrap_or(DEFAULT_MIN_ENTRY_RR);
     decision_to_review(
         &proposal,
         side_lock,
@@ -221,9 +222,11 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         cfg.min_confidence,
         cfg.require_agreement,
         cfg.allow_ai_override,
-        min_rr,
+        min_entry_rr,
     )
 }
+
+const DEFAULT_MIN_ENTRY_RR: f64 = 0.8;
 
 fn reject(reason: impl Into<String>) -> ReviewDecision {
     ReviewDecision {
@@ -245,19 +248,8 @@ fn decision_to_review(
     min_confidence: f64,
     require_agreement: bool,
     allow_ai_override: bool,
-    min_rr_target: f64,
+    min_entry_rr: f64,
 ) -> Result<ReviewDecision, String> {
-    // 复核前置拒单：AI 自评的数据质量与预期盈亏比低于门槛时直接拒单。
-    if let Some(dq) = decision.data_quality {
-        if dq < min_confidence {
-            return Ok(reject(format!("AI 数据质量分 {dq:.2} 低于 {min_confidence:.2}")));
-        }
-    }
-    if let Some(rr) = decision.rr_target {
-        if rr < min_rr_target {
-            return Ok(reject(format!("AI 盈亏比 {rr:.2} 低于 {min_rr_target:.2}")));
-        }
-    }
     if decision.confidence < min_confidence {
         let mut rejected = reject(format!(
             "AI 置信度 {:.2} 低于 {:.2}",
@@ -287,6 +279,21 @@ fn decision_to_review(
             })
         }
     };
+    // 复核前置拒单：仅对开仓决策生效，hold/close 不因门槛被改写为 Reject。
+    if let Some(dq) = decision.data_quality {
+        if dq.is_finite() && dq < min_confidence {
+            let mut rejected = reject(format!("AI 数据质量分 {dq:.2} 低于 {min_confidence:.2}"));
+            rejected.confidence = decision.confidence;
+            return Ok(rejected);
+        }
+    }
+    if let Some(rr) = decision.rr_target {
+        if rr.is_finite() && rr < min_entry_rr {
+            let mut rejected = reject(format!("AI 盈亏比 {rr:.2} 低于 {min_entry_rr:.2}"));
+            rejected.confidence = decision.confidence;
+            return Ok(rejected);
+        }
+    }
     if side_lock == "long" && side == "short" {
         return Ok(reject("策略只允许做多，AI 方向相反"));
     }
@@ -498,20 +505,116 @@ mod tests {
 
     #[test]
     fn low_data_quality_is_rejected() {
-        let mut decision = decision("open_long", 0.9);
-        decision.data_quality = Some(0.2);
-        let result = decision_to_review(&proposal("long"), "long", &decision, 0.45, true, true, 0.8).unwrap();
+        let mut item = decision("open_long", 0.9);
+        item.data_quality = Some(0.2);
+        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("数据质量"));
+        assert!(
+            (result.confidence - 0.9).abs() < 1e-9,
+            "门槛拒单必须保留 AI 置信度"
+        );
+    }
+
+    #[test]
+    fn low_rr_target_is_rejected() {
+        let mut item = decision("open_long", 0.9);
+        item.rr_target = Some(0.4);
+        let result = decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+        assert_eq!(result.action, ReviewAction::Reject);
+        assert!(result.reason.contains("盈亏比"));
+        assert!(
+            (result.confidence - 0.9).abs() < 1e-9,
+            "门槛拒单必须保留 AI 置信度"
+        );
+    }
+
+    #[test]
+    fn thresholds_at_the_boundary_are_accepted() {
+        let mut dq_equal = decision("open_long", 0.9);
+        dq_equal.data_quality = Some(0.45);
+        let result = decision_to_review(
+            &proposal("long"),
+            "long",
+            &dq_equal,
+            0.45,
+            true,
+            true,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Agree, "dq 等于门槛应放行");
+
+        let mut rr_equal = decision("open_long", 0.9);
+        rr_equal.rr_target = Some(0.8);
+        let result = decision_to_review(
+            &proposal("long"),
+            "long",
+            &rr_equal,
+            0.45,
+            true,
+            true,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Agree, "rr 等于门槛应放行");
+    }
+
+    #[test]
+    fn missing_quality_and_rr_do_not_reject() {
+        let result = decision_to_review(
+            &proposal("long"),
+            "long",
+            &decision("open_long", 0.9),
+            0.45,
+            true,
+            true,
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(result.action, ReviewAction::Agree, "dq/rr 缺省时不做门槛");
+    }
+
+    #[test]
+    fn data_quality_slightly_below_threshold_is_rejected() {
+        let mut item = decision("open_long", 0.9);
+        item.data_quality = Some(0.449);
+        let result = decision_to_review(
+            &proposal("long"),
+            "long",
+            &item,
+            0.45,
+            true,
+            true,
+            0.8,
+        )
+        .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
     }
 
     #[test]
-    fn low_rr_target_is_rejected() {
-        let mut decision = decision("open_long", 0.9);
-        decision.rr_target = Some(0.4);
-        let result = decision_to_review(&proposal("long"), "long", &decision, 0.45, true, true, 0.8).unwrap();
-        assert_eq!(result.action, ReviewAction::Reject);
-        assert!(result.reason.contains("盈亏比"));
+    fn low_data_quality_does_not_turn_hold_or_close_into_reject() {
+        for action in ["hold", "close"] {
+            let mut item = decision(action, 0.9);
+            item.data_quality = Some(0.1);
+            item.rr_target = Some(0.1);
+            let result = decision_to_review(
+                &proposal("long"),
+                "long",
+                &item,
+                0.45,
+                true,
+                true,
+                0.8,
+            )
+            .unwrap();
+            assert_eq!(
+                result.action,
+                ReviewAction::Hold,
+                "{action} 不应因门槛被改为 Reject"
+            );
+        }
     }
 
     const MASTER_KEY: &str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
