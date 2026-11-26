@@ -390,11 +390,11 @@ onMounted(loadAll)
         </div>
 
         <div class="row row-wrap" style="gap: 18px">
-          <div class="row" style="gap: 6px">
+          <div v-if="!aiCfg.veto_only" class="row" style="gap: 6px">
             <div class="switch" :class="{ on: aiCfg.require_agreement }" @click="aiCfg.require_agreement = !aiCfg.require_agreement" />
             <span class="label">AI 必须与量化信号同向</span>
           </div>
-          <div class="row" style="gap: 6px">
+          <div v-if="!aiCfg.veto_only" class="row" style="gap: 6px">
             <div class="switch" :class="{ on: aiCfg.allow_ai_override }" @click="aiCfg.allow_ai_override = !aiCfg.allow_ai_override" />
             <span class="label">允许 AI 反向覆盖信号</span>
           </div>

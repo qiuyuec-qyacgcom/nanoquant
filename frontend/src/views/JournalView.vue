@@ -34,7 +34,7 @@ const loopHint = computed(() => {
   const enabled = expStats.value?.enabled ?? 0
   const topk = expStats.value?.retrieve_top_k ?? 5
   if (total === 0) {
-    return '闭环尚未启动：这里没有任何决策日志，说明还没有一次「AI 给出方向」的决策。' +
+    return '闭环尚未启动：这里没有任何决策日志，说明还没有一次「决策给出方向」的记录。' +
       '如果 AI 已开启却长期是 0，问题在决策链而不在这里 —— 去「信号审计」看 flat 行是否从未被 AI 复核。'
   }
   if (enabled === 0) {
@@ -148,7 +148,7 @@ onMounted(load)
         </div>
       </div>
       <div class="hint" style="padding: 8px 12px 0">
-        每次 AI 给出方向判断都会留一份快照；24h 后自动回访实际价格，把「预测方向 vs 实际」对齐成对/错。
+        每次决策给出方向判断都会留一份快照；24h 后自动回访实际价格，把「预测方向 vs 实际」对齐成对/错。
         hold（否决）只留痕不参与对赌，以免把「不追多」误判成可验证的方向预测。
       </div>
       <div class="panel-body flush table-scroll" style="max-height: 440px">

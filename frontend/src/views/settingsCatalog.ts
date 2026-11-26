@@ -115,7 +115,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
     {
       title: '仓位止盈止损',
-      hint: '你的心理预期（保证金收益率）：盈利/亏损达到该比例就强制平仓；与 AI 给出的价格先触发者生效，0=关闭',
+      hint: '你的心理预期（保证金收益率）：盈利/亏损达到该比例就强制平仓；与 AI 失效价先触发者生效，0=关闭',
       fields: ['global_stop_loss_pct', 'global_take_profit_pct'],
     },
     {
