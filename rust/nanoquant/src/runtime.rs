@@ -196,6 +196,7 @@ impl EntryDraft {
         ai_action: &str,
         ai_confidence: f64,
         ai_reason: &str,
+        ai_meta: Option<&crate::review::ReviewedEntry>,
     ) -> crate::signal_audit::AuditSignal {
         let mut features: Value =
             serde_json::from_str(&self.features_text).unwrap_or_else(|_| serde_json::json!({}));
@@ -213,13 +214,21 @@ impl EntryDraft {
             );
             object.insert("mark_price".to_string(), json!(self.mark_price));
         }
-        let row = crate::signal_audit::AuditSignal::new(&self.symbol)
+        let mut row = crate::signal_audit::AuditSignal::new(&self.symbol)
             .with_direction(direction)
             .with_score(self.signal_score())
             .with_features(features)
             .with_ai(ai_action, ai_confidence, ai_reason)
             .with_decision(decision)
             .with_reject_reason(reject_reason);
+        // 复核成功时把 AI 扩展字段一并落库；初筛或复核失败时保持为空。
+        if let Some(meta) = ai_meta {
+            row.data_quality = meta.data_quality;
+            row.rr_target = meta.rr_target;
+            row.valid_bars = meta.valid_bars;
+            row.invalidation_price = meta.invalidation_price;
+            row.entry_price = meta.entry_price;
+        }
         if !self.quant_passed
             && self.preview_side.as_deref() == Some(direction)
             && decision == "rejected"
@@ -2962,6 +2971,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         &error.action,
                         error.confidence,
                         &error.reason,
+                        None,
                     ));
                     continue;
                 }
@@ -3035,6 +3045,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     &reviewed.action,
                     reviewed.confidence,
                     &reviewed.reason,
+                    Some(&reviewed),
                 ));
                 continue;
             }
@@ -3057,6 +3068,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         &reviewed.action,
                         reviewed.confidence,
                         &reviewed.reason,
+                        Some(&reviewed),
                     ));
                     break;
                 }
@@ -3100,6 +3112,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                             &reviewed.action,
                             reviewed.confidence,
                             &reviewed.reason,
+                            Some(&reviewed),
                         )
                         .with_feature("client_order_id", serde_json::json!(&draft.client_id)),
                 );
@@ -3120,6 +3133,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     &reviewed.action,
                     reviewed.confidence,
                     &reviewed.reason,
+                    Some(&reviewed),
                 ));
                 continue;
             }
@@ -3168,6 +3182,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                 &reviewed.action,
                 reviewed.confidence,
                 &reviewed.reason,
+                Some(&reviewed),
             ));
         }
         // 审计写入失败不能拖垮下单：日志里留痕，下一轮继续。

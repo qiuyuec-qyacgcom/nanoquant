@@ -28,6 +28,16 @@ pub struct AuditSignal {
     pub reject_reason: String,
     /// gate：行情闸门初筛拒绝，未进入评分与 AI 复核；空串表示已进入后续阶段。
     pub stage: String,
+    /// AI 自评的数据质量分（dq）。
+    pub data_quality: Option<f64>,
+    /// AI 估计的盈亏比（rr）。
+    pub rr_target: Option<f64>,
+    /// AI 估计的有效 K 线根数（vb）。
+    pub valid_bars: Option<i64>,
+    /// AI 给出的失效价（ip）。
+    pub invalidation_price: Option<f64>,
+    /// AI 建议的入场价（ep）。
+    pub entry_price: Option<f64>,
 }
 
 impl AuditSignal {
@@ -43,6 +53,11 @@ impl AuditSignal {
             decision: "flat".to_string(),
             reject_reason: String::new(),
             stage: String::new(),
+            data_quality: None,
+            rr_target: None,
+            valid_bars: None,
+            invalidation_price: None,
+            entry_price: None,
         }
     }
 
@@ -90,6 +105,30 @@ impl AuditSignal {
         }
         self
     }
+
+    /// 在原有 features 基础上并入 AI 复核扩展字段，供审计与前端查询。
+    /// 未取到的字段不写入，避免用空值覆盖已有读数。
+    pub fn features_with_meta(&self) -> Value {
+        let mut features = self.features.clone();
+        if let Some(object) = features.as_object_mut() {
+            if let Some(v) = self.data_quality {
+                object.insert("ai_dq".into(), json!(v));
+            }
+            if let Some(v) = self.rr_target {
+                object.insert("ai_rr".into(), json!(v));
+            }
+            if let Some(v) = self.valid_bars {
+                object.insert("ai_vb".into(), json!(v));
+            }
+            if let Some(v) = self.invalidation_price {
+                object.insert("ai_ip".into(), json!(v));
+            }
+            if let Some(v) = self.entry_price {
+                object.insert("ai_ep".into(), json!(v));
+            }
+        }
+        features
+    }
 }
 
 /// 拒绝原因归一化：去掉数字与比较符号，只留「是哪一类原因」。
@@ -130,7 +169,7 @@ pub fn record(
             continue;
         }
         let key = reason_key(&row.reject_reason);
-        let mut features = row.features.clone();
+        let mut features = row.features_with_meta();
         if let Some(object) = features.as_object_mut() {
             object.insert("reason_key".to_string(), Value::from(key.clone()));
             if !row.stage.is_empty() {
@@ -346,6 +385,22 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_str(&features).unwrap();
         assert_eq!(value["stage"], "gate");
+    }
+
+    #[test]
+    fn audit_signal_persists_ai_meta_in_features() {
+        let mut row = AuditSignal::new("BTCUSDT").with_ai("open_long", 0.8, "趋势向上");
+        row.data_quality = Some(0.77);
+        row.rr_target = Some(1.6);
+        row.valid_bars = Some(6);
+        row.invalidation_price = Some(97.5);
+        row.entry_price = Some(99.8);
+        let features = row.features_with_meta();
+        assert_eq!(features["ai_dq"], 0.77);
+        assert_eq!(features["ai_rr"], 1.6);
+        assert_eq!(features["ai_vb"], 6);
+        assert_eq!(features["ai_ip"], 97.5);
+        assert_eq!(features["ai_ep"], 99.8);
     }
 
     #[test]
