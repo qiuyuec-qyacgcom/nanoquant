@@ -306,10 +306,14 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       options: [['fusion', 'NQ-Fusion（当前）']],
       hint: '当前唯一信号模型；按 regime 加权相对强弱、波动突破、资金费率与 OI/订单流',
     },
+    valid_bars: { label: '信号有效期', unit: '根 K 线', hint: 'AI 未给出有效期时使用；1 根 = 1 个当前 K 线周期，超过后该信号不再作为开仓依据' },
+    min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', hint: 'AI 预期盈亏比低于该值时不采纳' },
   },
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
+    use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓' },
+    use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 时忽略' },
     param_tuning_min_interval_sec: {
       label: '调参最小间隔', unit: '秒', min: 60, max: 604800,
       hint: '独立调参任务的最小间隔；0 已废弃，最低 60 秒，86400=每天一次',

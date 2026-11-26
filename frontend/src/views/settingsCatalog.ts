@@ -13,6 +13,7 @@ export interface SettingSection {
 export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
+  { id: 'ai', label: 'AI 复核', hint: 'AI 复核门槛与失效价/限价开关' },
   { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 每周期自动调整隐藏参数' },
   { id: 'symbol_scan', label: '自动换池', hint: '按配置的间隔与数量扫描 USDT 永续，自动替换不达标且无持仓的标的' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
@@ -30,11 +31,11 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '下单', fields: ['order_type', 'close_on_halt', 'recv_window_ms'] },
   ],
   strategy: [
-    { title: '基础', fields: ['timeframe', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
+    { title: '基础', fields: ['timeframe', 'valid_bars', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
     {
       title: '入场过滤',
       hint: '任一项不达标都不开仓',
-      fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume'],
+      fields: ['entry_threshold', 'exit_threshold', 'volume_ratio_min', 'atr_pct_min', 'atr_pct_max', 'min_24h_quote_volume', 'min_entry_rr'],
     },
     {
       title: '出场与保护',
@@ -57,6 +58,9 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
       hint: '当前唯一信号模型（fusion）。按趋势/震荡/高波动状态加权相对强弱、波动突破、资金费率与 OI/订单流；至少两个因子同向且置信度达标才开仓。',
       fields: [],
     },
+  ],
+  ai: [
+    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核', fields: ['use_invalidation_price', 'use_entry_price'] },
   ],
   ai_tuning: [
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },

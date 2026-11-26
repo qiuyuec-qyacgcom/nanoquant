@@ -11,6 +11,7 @@ describe('参数配置目录', () => {
     expect(groupIds).toEqual([
       'engine',
       'strategy',
+      'ai',
       'ai_tuning',
       'symbol_scan',
       'risk',
@@ -145,5 +146,21 @@ describe('参数配置目录', () => {
   it('目录正常时保留 section 之外的字段', () => {
     const keys = visibleSettingKeys('strategy', ['ema_fast', 'entry_threshold'], new Set(), false)
     expect(keys).toEqual(['ema_fast', 'entry_threshold'])
+  })
+
+  it('valid_bars 排在 K 线周期之后', () => {
+    const basic = SETTINGS_SECTIONS.strategy.find((s) => s.title === '基础')
+    expect(basic?.fields.slice(0, 2)).toEqual(['timeframe', 'valid_bars'])
+  })
+
+  it('min_entry_rr 出现在策略入场过滤', () => {
+    const filter = SETTINGS_SECTIONS.strategy.find((s) => s.title === '入场过滤')
+    expect(filter?.fields).toContain('min_entry_rr')
+  })
+
+  it('AI 复核分组包含两个开关', () => {
+    const keys = (SETTINGS_SECTIONS.ai || []).flatMap((s) => s.fields)
+    expect(keys).toContain('use_invalidation_price')
+    expect(keys).toContain('use_entry_price')
   })
 })
