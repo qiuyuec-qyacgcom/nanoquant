@@ -42,6 +42,8 @@ pub struct AuditSignal {
     pub invalidation_text: Option<String>,
     /// AI 给出的风险提示文本（risk）。
     pub risk_text: Option<String>,
+    /// AI 给出的下单数量缩放系数（0~1）。
+    pub scale: Option<f64>,
 }
 
 impl AuditSignal {
@@ -64,6 +66,7 @@ impl AuditSignal {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }
     }
 
@@ -143,9 +146,55 @@ impl AuditSignal {
             if let Some(v) = self.risk_text.as_ref() {
                 object.insert("ai_risk".into(), json!(v));
             }
+            if let Some(v) = self.scale {
+                object.insert("ai_scale".into(), json!(v));
+            }
+            // 统一决策追踪：一层一行就能看清走到哪、被谁拦、AI 想做什么。
+            let mut trace = json!({
+                "stage": self.stage,
+                "decision": self.decision,
+                "ai_action": self.ai_action,
+                "gate": classify_gate(&self.reject_reason, &self.stage),
+                "reject_reason": self.reject_reason,
+                "scale": self.scale,
+            });
+            if self.reject_reason.contains("ai_skip=high_score")
+                || self.ai_reason.contains("ai_skip=high_score")
+            {
+                if let Some(trace) = trace.as_object_mut() {
+                    trace.insert("skip".into(), json!(true));
+                }
+            }
+            object.insert("filter_trace".into(), trace);
         }
         features
     }
+}
+
+/// 把拒绝原因归到稳定的闸门类别；前缀匹配保证同一类原因不会因数字变化而漂移。
+fn classify_gate(reason: &str, _stage: &str) -> &'static str {
+    const PREFIXES: [(&str, &str); 11] = [
+        ("资金费率不利", "funding_veto"),
+        ("负面事件否决", "news_veto"),
+        ("同方向持仓已达上限", "direction_limit"),
+        ("高相关同方向持仓过多", "correlation_limit"),
+        ("评分低于 AI 分流下限", "score_split_low"),
+        ("AI 复核失败", "ai_fail_open"),
+        ("AI 数据质量分", "ai_dq"),
+        ("AI 盈亏比", "ai_rr"),
+        ("AI 置信度", "ai_confidence"),
+        ("方向不一致", "ai_direction"),
+        ("AI 方向", "ai_direction"),
+    ];
+    if reason.trim().is_empty() {
+        return "none";
+    }
+    for (prefix, gate) in PREFIXES {
+        if reason.starts_with(prefix) {
+            return gate;
+        }
+    }
+    "other"
 }
 
 /// 拒绝原因归一化：去掉数字与比较符号，只留「是哪一类原因」。
@@ -174,7 +223,7 @@ fn stored_key(features: &str) -> Option<String> {
 }
 
 /// 数值型 AI 自评字段：合并时新行缺失则沿用旧值，避免数据丢失。
-const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
+const AI_NUMERIC_META_KEYS: [&str; 6] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep", "ai_scale"];
 
 /// 文本型 AI 自评字段：以最新一轮为准，新行缺失时不得残留旧文本。
 const AI_TEXT_META_KEYS: [&str; 2] = ["ai_inv", "ai_risk"];
@@ -582,6 +631,132 @@ mod tests {
         assert!(
             value.get("ai_risk").is_none(),
             "新行没给风险文本时不得残留旧值: {value}"
+        );
+    }
+
+    #[test]
+    fn filter_trace_classifies_funding_veto() {
+        let row = AuditSignal::new("BTCUSDT")
+            .with_stage("gate")
+            .with_decision("rejected")
+            .with_reject_reason("资金费率不利 0.12%");
+        let features = row.features_with_meta();
+        assert_eq!(features["filter_trace"]["stage"], "gate");
+        assert_eq!(features["filter_trace"]["decision"], "rejected");
+        assert_eq!(features["filter_trace"]["gate"], "funding_veto");
+        assert_eq!(
+            features["filter_trace"]["reject_reason"],
+            "资金费率不利 0.12%"
+        );
+    }
+
+    #[test]
+    fn filter_trace_classifies_news_veto() {
+        let row = AuditSignal::new("BTCUSDT")
+            .with_stage("gate")
+            .with_decision("rejected")
+            .with_reject_reason("负面事件否决：交易所被调查");
+        let features = row.features_with_meta();
+        assert_eq!(features["filter_trace"]["gate"], "news_veto");
+    }
+
+    #[test]
+    fn filter_trace_classifies_score_split_low() {
+        let row = AuditSignal::new("BTCUSDT")
+            .with_decision("rejected")
+            .with_reject_reason("评分低于 AI 分流下限 0.200 < 0.450");
+        let features = row.features_with_meta();
+        assert_eq!(features["filter_trace"]["gate"], "score_split_low");
+    }
+
+    #[test]
+    fn filter_trace_classifies_ai_fail_open() {
+        let row = AuditSignal::new("BTCUSDT")
+            .with_decision("opened")
+            .with_reject_reason("AI 复核失败，按 fail-open 降仓: timeout");
+        let features = row.features_with_meta();
+        assert_eq!(features["filter_trace"]["gate"], "ai_fail_open");
+    }
+
+    #[test]
+    fn filter_trace_persists_scale() {
+        let mut row = AuditSignal::new("BTCUSDT").with_ai("open_long", 0.8, "趋势向上");
+        row.scale = Some(0.5);
+        let features = row.features_with_meta();
+        assert_eq!(features["ai_scale"], 0.5);
+        assert_eq!(features["filter_trace"]["scale"], 0.5);
+        assert_eq!(features["filter_trace"]["ai_action"], "open_long");
+    }
+
+    #[test]
+    fn filter_trace_marks_high_score_skip() {
+        let mut row = AuditSignal::new("BTCUSDT").with_ai("open_long", 0.0, "ai_skip=high_score");
+        row.scale = Some(1.0);
+        let features = row.features_with_meta();
+        assert_eq!(features["filter_trace"]["gate"], "none");
+        assert_eq!(features["filter_trace"]["skip"], true);
+        assert_eq!(features["filter_trace"]["ai_action"], "open_long");
+    }
+
+    #[test]
+    fn classify_gate_covers_stable_prefixes() {
+        assert_eq!(classify_gate("", "gate"), "none");
+        assert_eq!(classify_gate("资金费率不利 0.1%", ""), "funding_veto");
+        assert_eq!(classify_gate("负面事件否决：x", ""), "news_veto");
+        assert_eq!(classify_gate("同方向持仓已达上限 2", ""), "direction_limit");
+        assert_eq!(
+            classify_gate("高相关同方向持仓过多 3", ""),
+            "correlation_limit"
+        );
+        assert_eq!(
+            classify_gate("评分低于 AI 分流下限 0.2", ""),
+            "score_split_low"
+        );
+        assert_eq!(
+            classify_gate("AI 复核失败，按 fail-open 降仓: x", ""),
+            "ai_fail_open"
+        );
+        assert_eq!(classify_gate("AI 数据质量分 0.2 过低", ""), "ai_dq");
+        assert_eq!(classify_gate("AI 盈亏比 1.1 不足", ""), "ai_rr");
+        assert_eq!(classify_gate("AI 置信度 0.3 过低", ""), "ai_confidence");
+        assert_eq!(classify_gate("方向不一致", ""), "ai_direction");
+        assert_eq!(classify_gate("AI 方向为 short", ""), "ai_direction");
+        assert_eq!(classify_gate("量能不足", ""), "other");
+    }
+
+    #[test]
+    fn merged_signal_keeps_latest_filter_trace() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        record(
+            &tx,
+            "demo",
+            1000,
+            &[AuditSignal::new("BTCUSDT")
+                .with_stage("gate")
+                .with_decision("rejected")
+                .with_reject_reason("量能不足")],
+        )
+        .unwrap();
+        record(
+            &tx,
+            "demo",
+            1015,
+            &[AuditSignal::new("BTCUSDT")
+                .with_decision("rejected")
+                .with_reject_reason("量能不足")],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count(&conn), 1, "同类信号应合并成一行");
+        assert_eq!(repeats(&conn), 2);
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(
+            value["filter_trace"]["stage"], "",
+            "合并后 filter_trace 必须是最新一轮"
         );
     }
 

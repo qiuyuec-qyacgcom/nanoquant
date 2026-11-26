@@ -263,6 +263,7 @@ impl EntryDraft {
             row.entry_price = meta.entry_price;
             row.invalidation_text = meta.invalidation_text.clone();
             row.risk_text = meta.risk_text.clone();
+            row.scale = meta.scale;
         }
         if !self.quant_passed
             && self.preview_side.as_deref() == Some(direction)
@@ -3397,6 +3398,7 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                         entry_price: None,
                         invalidation_text: None,
                         risk_text: None,
+                        scale: None,
                     }),
                 });
             } else {

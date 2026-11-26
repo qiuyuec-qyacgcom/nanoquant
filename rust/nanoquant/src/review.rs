@@ -96,6 +96,8 @@ pub(crate) struct AiMeta {
     pub entry_price: Option<f64>,
     pub invalidation_text: Option<String>,
     pub risk_text: Option<String>,
+    /// 下单数量缩放系数（0~1）；None 表示不缩放。
+    pub scale: Option<f64>,
 }
 
 impl From<&ReviewedEntry> for AiMeta {
@@ -108,6 +110,7 @@ impl From<&ReviewedEntry> for AiMeta {
             entry_price: value.entry_price,
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
+            scale: value.scale,
         }
     }
 }
@@ -122,6 +125,7 @@ impl From<&ReviewDecision> for AiMeta {
             entry_price: value.entry_price,
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
+            scale: value.scale,
         }
     }
 }
@@ -136,6 +140,7 @@ impl From<&ReviewError> for AiMeta {
             entry_price: value.entry_price,
             invalidation_text: value.invalidation_text.clone(),
             risk_text: value.risk_text.clone(),
+            scale: value.scale,
         }
     }
 }
@@ -157,6 +162,8 @@ pub(crate) struct ReviewError {
     pub invalidation_text: Option<String>,
     /// AI 给出的风险提示文本（risk）。
     pub risk_text: Option<String>,
+    /// 下单数量缩放系数（0~1）；拒绝/观望时也留痕。
+    pub scale: Option<f64>,
 }
 
 impl ReviewError {
@@ -172,6 +179,7 @@ impl ReviewError {
             entry_price: None,
             invalidation_text: None,
             risk_text: None,
+            scale: None,
         }
     }
 
@@ -185,6 +193,10 @@ impl ReviewError {
         self.entry_price = meta.entry_price;
         self.invalidation_text = meta.invalidation_text;
         self.risk_text = meta.risk_text;
+        self.scale = decision
+            .scale
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value.clamp(0.0, 1.0));
         self
     }
 }
@@ -333,6 +345,7 @@ fn apply_decision(
                     entry_price: meta.entry_price,
                     invalidation_text: meta.invalidation_text,
                     risk_text: meta.risk_text,
+                    scale,
                 })
             }
             ReviewAction::Reject => {
@@ -351,6 +364,7 @@ fn apply_decision(
                     entry_price: meta.entry_price,
                     invalidation_text: meta.invalidation_text,
                     risk_text: meta.risk_text,
+                    scale,
                 })
             }
         }
@@ -425,6 +439,7 @@ fn apply_decision(
             entry_price: meta.entry_price,
             invalidation_text: meta.invalidation_text,
             risk_text: meta.risk_text,
+            scale,
         }),
         ReviewAction::Reject => Err(ReviewError {
             reason: if decision.reason.is_empty() {
@@ -441,6 +456,7 @@ fn apply_decision(
             entry_price: meta.entry_price,
             invalidation_text: meta.invalidation_text,
             risk_text: meta.risk_text,
+            scale,
         }),
         ReviewAction::Tighten => {
             let leverage = clamp_leverage(proposal, decision.leverage)
@@ -753,6 +769,16 @@ mod tests {
         assert_eq!(meta.invalidation_price, Some(97.5));
         assert_eq!(meta.valid_bars, Some(6));
         assert_eq!(meta.entry_price, Some(99.8));
+    }
+
+    #[test]
+    fn rejected_review_carries_ai_scale() {
+        let mut rejected = decision(ReviewAction::Reject);
+        rejected.scale = Some(1.5);
+        let error = apply_review(&proposal(), Some(&FakeReviewer(Ok(rejected))), true, false)
+            .expect_err("Reject 必须转成错误");
+        assert_eq!(error.scale, Some(1.0), "scale 必须夹到 0~1");
+        assert_eq!(AiMeta::from(&error).scale, Some(1.0));
     }
 
     #[test]
