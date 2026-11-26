@@ -520,7 +520,7 @@ fn decision_to_review_mode(
             entry_price: decision.entry_price,
             invalidation_text,
             risk_text,
-scale,
+            scale,
             latency: AiLatency::default(),
             prompt_profile: None,
         });
@@ -1644,8 +1644,16 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     async fn slim_profile_limits_klines_news_experiences() {
         let (reviewed, context) = review_with_profile(true, Some("slim"), "slim").await;
         assert_eq!(reviewed.prompt_profile.as_deref(), Some("slim"));
-        assert_eq!(context["klines"].as_array().unwrap().len(), 8, "瘦身 K 线 8 根");
-        assert_eq!(context["news"].as_array().unwrap().len(), 4, "瘦身资讯 4 条");
+        assert_eq!(
+            context["klines"].as_array().unwrap().len(),
+            8,
+            "瘦身 K 线 8 根"
+        );
+        assert_eq!(
+            context["news"].as_array().unwrap().len(),
+            4,
+            "瘦身资讯 4 条"
+        );
         assert_eq!(
             context["experiences"].as_array().unwrap().len(),
             3,
@@ -1658,8 +1666,16 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     async fn full_profile_keeps_default_context_sizes() {
         let (reviewed, context) = review_with_profile(true, Some("full"), "full").await;
         assert_eq!(reviewed.prompt_profile.as_deref(), Some("full"));
-        assert_eq!(context["klines"].as_array().unwrap().len(), 14, "完整 K 线 14 根");
-        assert_eq!(context["news"].as_array().unwrap().len(), 8, "完整资讯 8 条");
+        assert_eq!(
+            context["klines"].as_array().unwrap().len(),
+            14,
+            "完整 K 线 14 根"
+        );
+        assert_eq!(
+            context["news"].as_array().unwrap().len(),
+            8,
+            "完整资讯 8 条"
+        );
         assert_eq!(
             context["experiences"].as_array().unwrap().len(),
             4,

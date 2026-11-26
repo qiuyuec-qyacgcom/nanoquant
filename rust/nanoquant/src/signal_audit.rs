@@ -256,12 +256,12 @@ const AI_NUMERIC_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai
 /// ai_scale 只代表当前轮的下单缩放，跨轮沿用会与 filter_trace.scale 口径不一致；
 /// ai_latency 同理，跨轮沿用会让延迟样本被旧值污染。
 const AI_ROUND_META_KEYS: [&str; 5] = [
-        "ai_inv",
-        "ai_risk",
-        "ai_scale",
-        "ai_latency",
-        "ai_prompt_profile",
-    ];
+    "ai_inv",
+    "ai_risk",
+    "ai_scale",
+    "ai_latency",
+    "ai_prompt_profile",
+];
 
 /// 写入 signals.features 的 AI 自评字段键（数值 + 按轮次）。
 const AI_META_KEYS: [&str; AI_NUMERIC_META_KEYS.len() + AI_ROUND_META_KEYS.len()] = {
