@@ -110,6 +110,7 @@ impl AuditSignal {
     /// 未取到的字段不写入，避免用空值覆盖已有读数。
     pub fn features_with_meta(&self) -> Value {
         let mut features = self.features.clone();
+        // 仅对象形状的 features 会并入 AI 字段；非对象入参原样返回。
         if let Some(object) = features.as_object_mut() {
             if let Some(v) = self.data_quality {
                 object.insert("ai_dq".into(), json!(v));
@@ -156,6 +157,30 @@ fn stored_key(features: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 写入 signals.features 的 AI 自评字段键。
+const AI_META_KEYS: [&str; 5] = ["ai_dq", "ai_rr", "ai_vb", "ai_ip", "ai_ep"];
+
+/// 合并时把新行缺失的 AI 自评字段用旧值补齐，避免模型本轮没给就被清空。
+fn fill_missing_ai_meta(features: &mut Value, previous_text: &str) {
+    let previous: Value = match serde_json::from_str(previous_text) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let Some(previous_object) = previous.as_object() else {
+        return;
+    };
+    let Some(object) = features.as_object_mut() else {
+        return;
+    };
+    for key in AI_META_KEYS {
+        if !object.contains_key(key) {
+            if let Some(value) = previous_object.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
 /// 落库一批审计记录。返回受影响的行数（新增 + 合并）。
 pub fn record(
     tx: &Transaction<'_>,
@@ -169,15 +194,26 @@ pub fn record(
             continue;
         }
         let key = reason_key(&row.reject_reason);
+        let mergeable = find_mergeable(tx, mode, row, ts, &key)?;
         let mut features = row.features_with_meta();
+        // 合并时先用旧行的 AI 自评字段补齐新行缺失的键，再写入本轮的新值。
+        if let Some((_, previous_features)) = mergeable.as_ref() {
+            fill_missing_ai_meta(&mut features, previous_features);
+        }
         if let Some(object) = features.as_object_mut() {
             object.insert("reason_key".to_string(), Value::from(key.clone()));
             if !row.stage.is_empty() {
                 object.insert("stage".to_string(), Value::from(row.stage.clone()));
             }
         }
-        let features_text = serde_json::to_string(&features).unwrap_or_else(|_| "{}".to_string());
-        if let Some(id) = find_mergeable(tx, mode, row, ts, &key)? {
+        // 序列化失败时退回旧行文本，至少保住上一次的 features 与 reason_key。
+        let features_text = serde_json::to_string(&features).unwrap_or_else(|_| {
+            mergeable
+                .as_ref()
+                .map(|(_, previous)| previous.clone())
+                .unwrap_or_else(|| "{}".to_string())
+        });
+        if let Some((id, _)) = mergeable {
             tx.execute(
                 "UPDATE signals SET ts=?1, score=?2, features=?3, ai_confidence=?4, ai_reason=?5, \
                  repeats=repeats+1 WHERE id=?6",
@@ -224,7 +260,7 @@ fn find_mergeable(
     row: &AuditSignal,
     ts: i64,
     key: &str,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<(i64, String)>, String> {
     let mut stmt = tx
         .prepare(
             "SELECT id, features, reject_reason FROM signals WHERE mode=?1 AND symbol=?2 \
@@ -255,7 +291,7 @@ fn find_mergeable(
         let (id, features, reason) = candidate;
         let stored = stored_key(&features).unwrap_or_else(|| reason_key(&reason));
         if stored == key {
-            return Ok(Some(id));
+            return Ok(Some((id, features)));
         }
     }
     Ok(None)
@@ -401,6 +437,53 @@ mod tests {
         assert_eq!(features["ai_vb"], 6);
         assert_eq!(features["ai_ip"], 97.5);
         assert_eq!(features["ai_ep"], 99.8);
+    }
+
+    #[test]
+    fn record_persists_ai_meta_in_signals() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        let mut row = AuditSignal::new("ETHUSDT").with_ai("open_long", 0.8, "趋势向上");
+        row.data_quality = Some(0.77);
+        row.rr_target = Some(1.6);
+        row.valid_bars = Some(6);
+        row.invalidation_price = Some(97.5);
+        row.entry_price = Some(99.8);
+        record(&tx, "demo", 1000, &[row]).unwrap();
+        tx.commit().unwrap();
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["ai_dq"], 0.77);
+        assert_eq!(value["ai_rr"], 1.6);
+        assert_eq!(value["ai_vb"], 6);
+        assert_eq!(value["ai_ip"], 97.5);
+        assert_eq!(value["ai_ep"], 99.8);
+    }
+
+    #[test]
+    fn merged_signal_keeps_previous_ai_meta_when_new_row_missing() {
+        let mut conn = table();
+        let tx = conn.transaction().unwrap();
+        let mut first = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        first.data_quality = Some(0.8);
+        record(&tx, "demo", 1000, &[first]).unwrap();
+        // 第二轮模型没给 dq，合并后不能把旧值清空。
+        let second = AuditSignal::new("BTCUSDT")
+            .with_decision("flat")
+            .with_reject_reason("波动率过低");
+        record(&tx, "demo", 1015, &[second]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count(&conn), 1, "同类信号应合并成一行");
+        assert_eq!(repeats(&conn), 2, "合并要累加扫描次数");
+        let features: String = conn
+            .query_row("SELECT features FROM signals", [], |r| r.get(0))
+            .unwrap();
+        let value: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(value["ai_dq"], 0.8, "新行缺 ai_dq 时要沿用旧值");
     }
 
     #[test]

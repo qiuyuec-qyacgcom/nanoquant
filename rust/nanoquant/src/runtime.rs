@@ -188,6 +188,7 @@ impl EntryDraft {
 
     /// 拼一条信号审计记录。评分、方向、特征、AI 结论、拒绝原因一次带齐，
     /// 前端的「信号审计」页直接读这张表回答「为什么没开仓」。
+    /// `ai_meta` 为复核成功的结果，携带 AI 自评字段；初筛或复核失败传 `None`。
     fn audit_row(
         &self,
         decision: &str,
