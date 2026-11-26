@@ -110,6 +110,13 @@
     "min_oos_trades": 30,
     "auto_apply_timeframes": "1h"
   },
+  "rl_exec": {
+    "enabled": false,
+    "epsilon": 0.05,
+    "max_wait_ms": 3000,
+    "alpha": 0.1,
+    "gamma": 0.9
+  },
   "symbol_scan": {
     "enabled": true,
     "interval_hours": 3,

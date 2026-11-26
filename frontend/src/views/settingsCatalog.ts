@@ -15,6 +15,7 @@ export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
   { id: 'ai', label: 'AI 复核', hint: '失效价与限价开关（AI 复核行为的开关）' },
   { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 每周期自动调整隐藏参数' },
+  { id: 'rl_exec', label: 'RL 执行', hint: '只决定下单时机、限价偏移与拆单，不改方向/杠杆/止损止盈；默认关闭' },
   { id: 'symbol_scan', label: '自动换池', hint: '按配置的间隔与数量扫描 USDT 永续，自动替换不达标且无持仓的标的' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
   { id: 'data', label: '交易所', hint: '网络、代理与 API 凭证' },
@@ -73,6 +74,18 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
     { title: 'regime 与回滚', fields: ['regime_confirm_sec', 'regime_cooldown_sec', 'no_candidate_rollback_sec'] },
     { title: '证据门', fields: ['min_oos_trades'] },
+  ],
+  rl_exec: [
+    {
+      title: '开关与探索',
+      hint: '只影响下单方式（市价/限价/等待/拆单）；关闭时完全走原执行逻辑，Q 表不参与',
+      fields: ['enabled', 'epsilon'],
+    },
+    {
+      title: '等待与学习',
+      hint: '等待与拆单暂无执行器支持时自动退化为限价挂单/单笔；alpha/gamma 用于离线回放训练',
+      fields: ['max_wait_ms', 'alpha', 'gamma'],
+    },
   ],
   symbol_scan: [
     { title: '扫描', fields: ['enabled', 'interval_hours', 'market_limit'] },

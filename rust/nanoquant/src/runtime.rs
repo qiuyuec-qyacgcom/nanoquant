@@ -3497,6 +3497,13 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
         let cfg = Self::risk_settings(tx)?;
         let ai_cfg = crate::ai_client::read_ai_config_conn(tx);
         let entry_order_type = LiveOrderType::from_setting(engine["order_type"].as_str());
+        // RL 只决定怎么下单；关闭时不读 Q 表，完全走原逻辑。
+        let rl_cfg = crate::rl_exec::config_from_conn(tx);
+        let rl_table = if rl_cfg.enabled {
+            crate::rl_exec::load_q_table(tx)
+        } else {
+            crate::rl_exec::QTable::new()
+        };
         let mut plans = Vec::new();
         let mut available = snapshot.account.available_balance;
         let now = crate::now();
@@ -3640,31 +3647,74 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     ));
                     break;
                 }
-                let price = match entry_order_type {
-                    LiveOrderType::Market => None,
-                    LiveOrderType::LimitPostOnly => {
-                        let book = snapshot
-                            .markets
-                            .iter()
-                            .find(|market| market.symbol == draft.symbol);
-                        let (bid, ask) = book
-                            .map(|market| (market.bid, market.ask))
-                            .unwrap_or((draft.mark_price, draft.mark_price));
-                        let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
-                        // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
-                        let price = gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
-                            .and_then(|ai_entry_price| {
-                                Self::preferred_limit_price(
-                                    side,
-                                    draft.mark_price,
-                                    ai_entry_price,
-                                    draft.filter.price_tick,
-                                )
-                            })
-                            .unwrap_or(fallback);
-                        Some(price)
-                    }
+                let book = snapshot
+                    .markets
+                    .iter()
+                    .find(|market| market.symbol == draft.symbol);
+                let (bid, ask) = book
+                    .map(|market| (market.bid, market.ask))
+                    .unwrap_or((draft.mark_price, draft.mark_price));
+                let fallback = Self::limit_entry_price(side, bid, ask, draft.mark_price);
+                // AI 建议价按 tick 归整后仍满足方向与 0.5% 容差才采用，否则回退买一/卖一。
+                let configured_limit = gate_ai_value(reviewed.entry_price, ai_cfg.use_entry_price)
+                    .and_then(|ai_entry_price| {
+                        Self::preferred_limit_price(
+                            side,
+                            draft.mark_price,
+                            ai_entry_price,
+                            draft.filter.price_tick,
+                        )
+                    })
+                    .unwrap_or(fallback);
+                // RL 只用盘口不平衡、价差、波动率与订单大小选执行动作。
+                let action = if rl_cfg.enabled {
+                    let (bid_qty, ask_qty) = crate::book_stream::quote(&draft.symbol)
+                        .map(|book| (book.bid_qty, book.ask_qty))
+                        .unwrap_or((0.0, 0.0));
+                    let spread_bps = book.map(|market| market.spread_bps).unwrap_or(0.0);
+                    let atr_pct = features_value
+                        .get("atr_pct")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let state = crate::rl_exec::state_from_market(
+                        bid_qty,
+                        ask_qty,
+                        spread_bps,
+                        atr_pct,
+                        qty * draft.mark_price,
+                        snapshot.account.equity,
+                    );
+                    rl_table.decide(&state, rl_cfg.epsilon)
+                } else {
+                    crate::rl_exec::RlAction::Market
                 };
+                let resolved = crate::rl_exec::resolve_execution(
+                    rl_cfg.enabled,
+                    match entry_order_type {
+                        LiveOrderType::Market => crate::rl_exec::OrderKind::Market,
+                        LiveOrderType::LimitPostOnly => crate::rl_exec::OrderKind::Limit,
+                    },
+                    Some(configured_limit),
+                    action,
+                    side,
+                    rl_cfg.max_wait_ms,
+                );
+                let order_type = match resolved.kind {
+                    crate::rl_exec::OrderKind::Market => LiveOrderType::Market,
+                    crate::rl_exec::OrderKind::Limit => LiveOrderType::LimitPostOnly,
+                };
+                // RL 偏移价必须按交易所 tick 归整：买单向下、卖单向上，
+                // 与 AI 限价走同一条归整路径，避免 -4014 精度拒绝。
+                let price = resolved.price.map(|price| match resolved.kind {
+                    crate::rl_exec::OrderKind::Limit => {
+                        if side == "BUY" {
+                            crate::live::floor_to_step(price, draft.filter.price_tick)
+                        } else {
+                            crate::live::ceil_to_step(price, draft.filter.price_tick)
+                        }
+                    }
+                    crate::rl_exec::OrderKind::Market => price,
+                });
                 plans.push(LivePlan {
                     symbol: draft.symbol.clone(),
                     position_side: final_side.clone(),
@@ -3672,25 +3722,32 @@ fn timeframe_ms(strategy: &Value) -> Result<i64, String> {
                     qty,
                     purpose: "entry".into(),
                     mark_price: draft.mark_price,
-                    order_type: entry_order_type,
+                    order_type,
                     price,
                     entry: Some(entry),
                     features: Some(features_text.clone()),
                 });
                 // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
-                audit.push(
-                    draft
-                        .audit_row(
-                            "pending",
-                            draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
-                            "",
-                            &reviewed.action,
-                            reviewed.confidence,
-                            &reviewed.reason,
-                            Some(&crate::review::AiMeta::from(&reviewed)),
-                        )
-                        .with_feature("client_order_id", serde_json::json!(&draft.client_id)),
-                );
+                let mut row = draft
+                    .audit_row(
+                        "pending",
+                        draft.quant_side.as_deref().unwrap_or(final_side.as_str()),
+                        "",
+                        &reviewed.action,
+                        reviewed.confidence,
+                        &reviewed.reason,
+                        Some(&crate::review::AiMeta::from(&reviewed)),
+                    )
+                    .with_feature("client_order_id", serde_json::json!(&draft.client_id));
+                if rl_cfg.enabled {
+                    row = row
+                        .with_feature("rl_action", serde_json::json!(&resolved.action_key))
+                        .with_feature("rl_degraded", serde_json::json!(resolved.degraded));
+                    if let Some(note) = &resolved.note {
+                        row = row.with_feature("rl_note", serde_json::json!(note));
+                    }
+                }
+                audit.push(row);
                 break;
             }
             let exists: bool = tx

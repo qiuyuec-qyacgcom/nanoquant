@@ -13,6 +13,7 @@ describe('参数配置目录', () => {
       'strategy',
       'ai',
       'ai_tuning',
+      'rl_exec',
       'symbol_scan',
       'risk',
       'data',
@@ -47,6 +48,18 @@ describe('参数配置目录', () => {
     for (const key of removed) {
       expect(sectionKeys, key).not.toContain(key)
     }
+  })
+
+  it('RL 执行分组只暴露执行层参数', () => {
+    const sections = SETTINGS_SECTIONS.rl_exec
+    expect(sections, 'RL 执行参数必须可配置').toBeTruthy()
+    expect(sections.flatMap((section) => section.fields)).toEqual([
+      'enabled',
+      'epsilon',
+      'max_wait_ms',
+      'alpha',
+      'gamma',
+    ])
   })
 
   it('策略分组展示当前唯一信号模型', () => {

@@ -18,7 +18,7 @@ pub(crate) struct ParamMeta {
 pub(crate) const AI_FULL_WRITABLE_GROUPS: &[&str] = &["strategy"];
 
 /// 组级黑名单：即使整组对 AI 不可见也不得写入，避免新组默认变成可写。
-const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk", "symbol_scan"];
+const AI_BLOCKED_GROUPS: &[&str] = &["ai_tuning", "risk", "symbol_scan", "rl_exec"];
 
 /// 运行时开关：即使不可见也不交给 AI，避免它把自己关掉或切环境。
 /// v2 业务门槛同理：盈亏比门槛与信号有效期由人工配置，AI 不得自行放宽。
@@ -107,6 +107,11 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("ai_tuning", "regime_confirm_sec", 60.0, 86400.0, 60.0),
     ("ai_tuning", "regime_cooldown_sec", 0.0, 86400.0, 60.0),
     ("ai_tuning", "min_oos_trades", 1.0, 1000.0, 1.0),
+    // RL 执行层：只影响下单方式与限价偏移，默认关闭。
+    ("rl_exec", "epsilon", 0.0, 0.5, 0.01),
+    ("rl_exec", "max_wait_ms", 0.0, 10000.0, 500.0),
+    ("rl_exec", "alpha", 0.01, 1.0, 0.01),
+    ("rl_exec", "gamma", 0.5, 0.99, 0.01),
     ("symbol_scan", "interval_hours", 1.0, 24.0, 1.0),
     ("symbol_scan", "market_limit", 50.0, 500.0, 10.0),
     ("ai", "min_confidence", 0.0, 1.0, 0.01),
@@ -218,6 +223,10 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "min_oos_trades",
             "auto_apply_timeframes",
         ],
+    ),
+    (
+        "rl_exec",
+        &["enabled", "epsilon", "max_wait_ms", "alpha", "gamma"],
     ),
     (
         "symbol_scan",

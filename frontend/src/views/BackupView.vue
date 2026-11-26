@@ -24,6 +24,7 @@ const sizeText = computed(() => {
 const GROUP_LABELS: Record<string, string> = {
   engine: '引擎', risk: '风控', strategy: '策略', ai: 'AI', data: '数据源',
   news: '资讯', evolution: '自进化', backup: '备份', security: '安全', system: '系统',
+  rl_exec: 'RL 执行',
 }
 
 async function load() {

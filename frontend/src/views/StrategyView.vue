@@ -328,6 +328,11 @@ const BASE_META: Record<string, FieldMeta> = {
   show_engine_status: { label: '展示引擎状态', hint: '仅开关与模式，不含资金数据' },
   show_mantras: { label: '展示分析心法', hint: '脱敏展示：仅标题/分类/健康度' },
   show_performance: { label: '展示绩效指标', hint: '胜率/盈亏比等比例数据，不含金额' },
+
+  epsilon: { label: '探索率 ε', unit: '', min: 0, max: 0.5, step: 0.01, hint: 'epsilon-greedy 的探索概率；上限 0.5，默认 0.05' },
+  max_wait_ms: { label: '最长等待', unit: '毫秒', min: 0, max: 10000, step: 500, hint: '等待动作的上限；超过上限或执行器不支持时退化为限价挂单' },
+  alpha: { label: '学习率 α', min: 0.01, max: 1, step: 0.01, hint: '离线回放更新 Q 值的步长' },
+  gamma: { label: '折扣因子 γ', min: 0.5, max: 0.99, step: 0.01, hint: '未来奖励折扣；越接近 1 越看重后续滑点' },
 }
 
 // BASE_META 是按"字段名"索引的扁平表，但有些 key 在多个分组里语义不同。
@@ -387,6 +392,9 @@ const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     enabled: { label: '启用自动换池', widget: 'switch', hint: '开启后按间隔自动扫描并替换标的' },
     interval_hours: { label: '扫描间隔', unit: '小时', min: 1, max: 24, hint: '范围 1–24 小时' },
     market_limit: { label: '扫描数量', unit: '个', min: 50, max: 500, hint: '范围 50–500 个；按 24h 成交额取前 N 个 USDT 永续' },
+  },
+  rl_exec: {
+    enabled: { label: '启用 RL 执行', widget: 'switch', hint: '只决定下单方式与限价偏移；关闭时完全走原执行逻辑' },
   },
 }
 

@@ -37,6 +37,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "seed-symbols",
         "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
     ),
+    ("rl-replay", "回放历史 orders/trades 训练 RL 执行 Q 表"),
 
     ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
@@ -88,6 +89,9 @@ struct Options {
     port: Option<u16>,
     secret: Option<String>,
     baseline: Option<String>,
+    episodes: Option<u32>,
+    alpha: Option<f64>,
+    gamma: Option<f64>,
 }
 
 fn parse(argv: &[String], config: &Config) -> Options {
@@ -123,6 +127,9 @@ fn parse(argv: &[String], config: &Config) -> Options {
     let mut port = None;
     let mut secret = None;
     let mut baseline = None;
+    let mut episodes: Option<u32> = None;
+    let mut alpha: Option<f64> = None;
+    let mut gamma: Option<f64> = None;
     let mut exceptions = None;
     let mut archive_root = None;
     let mut max_depth = None;
@@ -269,6 +276,18 @@ fn parse(argv: &[String], config: &Config) -> Options {
                 index += 1;
                 baseline = argv.get(index).cloned();
             }
+            "--episodes" => {
+                index += 1;
+                episodes = argv.get(index).and_then(|value| value.parse().ok());
+            }
+            "--alpha" => {
+                index += 1;
+                alpha = argv.get(index).and_then(|value| value.parse().ok());
+            }
+            "--gamma" => {
+                index += 1;
+                gamma = argv.get(index).and_then(|value| value.parse().ok());
+            }
             other if other.starts_with("--") => {}
             other if command.is_empty() => command = other.to_string(),
             _ => {}
@@ -307,6 +326,9 @@ fn parse(argv: &[String], config: &Config) -> Options {
         port,
         secret,
         baseline,
+        episodes,
+        alpha,
+        gamma,
         exceptions,
         archive_root,
         max_depth,
@@ -359,6 +381,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "verify-exec-core" => verify_exec_core_command(&options),
         "show-exec-secret" => show_exec_secret(&options, config),
         "seed-symbols" => seed_symbols(&options),
+        "rl-replay" => rl_replay(&options),
 
         "contract-diff" => contract_diff_command(&options, config),
         "zero-python" => zero_python(&options, config),
@@ -551,6 +574,40 @@ fn seed_symbols(options: &Options) -> Result<(i32, Value), (i32, String)> {
 
 fn open_db(path: &str) -> Result<Db, (i32, String)> {
     Db::open(path).map_err(|error| (1, format!("无法打开数据库 {path}: {error}")))
+}
+
+/// 离线回放历史 orders/trades，训练 RL 执行 Q 表并落库。
+fn rl_replay(options: &Options) -> Result<(i32, Value), (i32, String)> {
+    let db = open_db(&options.db_path)?;
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| (1, "数据库连接锁被占用".to_string()))?;
+    let cfg = crate::rl_exec::config_from_conn(&conn);
+    let episodes = options.episodes.unwrap_or(0);
+    let alpha = options.alpha.unwrap_or(cfg.alpha);
+    let gamma = options.gamma.unwrap_or(cfg.gamma);
+    let stats = crate::rl_exec::run_replay(&conn, episodes, alpha, gamma)
+        .map_err(|error| (1, format!("RL 回放失败: {error}")))?;
+    Ok((
+        0,
+        json!({
+            "ok": true,
+            "samples": stats.samples,
+            "trained_pairs": stats.trained_pairs,
+            "baseline_slippage_bps": stats.baseline_slippage_bps,
+            "avg_slippage_bps": stats.avg_slippage_bps,
+            "improvement_pct": stats.improvement_pct,
+            "insufficient": stats.insufficient,
+            "detail": if stats.samples == 0 {
+                "orders/trades 样本为空，未生成 Q 表".to_string()
+            } else if stats.insufficient {
+                format!("仅 {} 条样本，改善结果仅供参考", stats.samples)
+            } else {
+                format!("已用 {} 条样本训练并写入 {}", stats.samples, crate::rl_exec::Q_TABLE_KEY)
+            },
+        }),
+    ))
 }
 
 fn preflight(options: &Options) -> Result<(i32, Value), (i32, String)> {
@@ -1786,7 +1843,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 20);
+        assert_eq!(text.len(), 21);
         for name in [
             "preflight",
             "reconcile",
@@ -1803,6 +1860,7 @@ mod tests {
             "verify-exec-core",
             "show-exec-secret",
             "seed-symbols",
+            "rl-replay",
             "mock-exec-core",
             "mock-exchange",
             "verify-partial-tp",
