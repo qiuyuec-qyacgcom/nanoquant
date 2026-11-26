@@ -3,8 +3,8 @@
 //! 哈希与令牌格式对齐 `backend/nanoquant/security.py`，现有 SQLite 库里的
 //! `pbkdf2_sha256$...` 密码无需迁移即可登录。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex};
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -94,6 +94,119 @@ impl LoginThrottle {
             stamps.retain(|t| now - *t < self.window_sec);
         }
     }
+}
+
+/// API 限流窗口长度（秒）：按分钟配额做 60s 滑动窗口。
+const API_RATE_WINDOW_SEC: i64 = 60;
+
+/// 全局 API 限流状态。放在静态里，中间件每次请求都复用同一份窗口。
+struct RateWindows {
+    windows: HashMap<String, VecDeque<i64>>,
+    last_sweep: i64,
+}
+
+static API_RATE_WINDOWS: LazyLock<Mutex<RateWindows>> = LazyLock::new(|| {
+    Mutex::new(RateWindows {
+        windows: HashMap::new(),
+        last_sweep: 0,
+    })
+});
+
+/// 读取 `system.api_rate_limit_per_min`；缺省或读取失败按 0（关闭）处理。
+fn api_rate_limit(db: &crate::db::Db) -> i64 {
+    let Ok(conn) = db.read() else {
+        return 0;
+    };
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key='system'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    .and_then(|value| {
+        value
+            .get("api_rate_limit_per_min")
+            .and_then(serde_json::Value::as_i64)
+    })
+    .unwrap_or(0)
+    .max(0)
+}
+
+/// 这个请求应该记到哪个桶：优先登录令牌，其次代理链来源 IP，最后本机。
+fn rate_key(headers: &axum::http::HeaderMap) -> String {
+    if let Some(auth) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        return format!("auth:{auth}");
+    }
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        return format!("ip:{ip}");
+    }
+    "local".to_string()
+}
+
+/// 滑动窗口放行判定：窗口内已达上限返回 false，否则记账并返回 true。
+fn rate_allow(key: &str, now: i64, limit: i64) -> bool {
+    if limit <= 0 {
+        return true;
+    }
+    let mut state = API_RATE_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 每分钟扫一次全局过期 key，避免大量一次性令牌把 map 撑大。
+    if now.saturating_sub(state.last_sweep) >= API_RATE_WINDOW_SEC {
+        state.windows.retain(|_, stamps| {
+            while stamps
+                .front()
+                .is_some_and(|ts| now.saturating_sub(*ts) >= API_RATE_WINDOW_SEC)
+            {
+                stamps.pop_front();
+            }
+            !stamps.is_empty()
+        });
+        state.last_sweep = now;
+    }
+    let stamps = state.windows.entry(key.to_string()).or_default();
+    while stamps
+        .front()
+        .is_some_and(|ts| now.saturating_sub(*ts) >= API_RATE_WINDOW_SEC)
+    {
+        stamps.pop_front();
+    }
+    if stamps.len() as i64 >= limit {
+        return false;
+    }
+    stamps.push_back(now);
+    true
+}
+
+/// API 限流中间件：健康检查与指标接口不计数，其余按桶配额放行。
+pub async fn rate_limit(State(db): State<crate::db::Db>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if matches!(
+        path,
+        "/health" | "/api/v1/health" | "/metrics" | "/api/v1/metrics"
+    ) {
+        return next.run(req).await;
+    }
+    let limit = api_rate_limit(&db);
+    if limit <= 0 {
+        return next.run(req).await;
+    }
+    let key = rate_key(req.headers());
+    if !rate_allow(&key, crate::now(), limit) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate_limited", "limit": limit})),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// 无状态会话令牌：`<base64url(json)>.<hmac-sha256 hex>`。
@@ -551,6 +664,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn rate_db(limit: i64) -> crate::db::Db {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings VALUES('system',?1,0)",
+            [serde_json::json!({"api_rate_limit_per_min": limit}).to_string()],
+        )
+        .unwrap();
+        crate::db::Db {
+            path: String::new(),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    fn rate_app(db: crate::db::Db) -> Router {
+        Router::new().nest(
+            "/api/v1",
+            Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/metrics", get(|| async { "ok" }))
+                .route("/ping", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(db, rate_limit)),
+        )
+    }
+
+    async fn rate_ping(app: &Router, auth: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ping")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn rate_limit_disabled_allows_all() {
+        let app = rate_app(rate_db(0));
+        for _ in 0..5 {
+            assert_eq!(
+                rate_ping(&app, "Bearer disabled").await,
+                StatusCode::OK,
+                "limit=0 时不应限流"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_after_limit() {
+        let app = rate_app(rate_db(2));
+        for _ in 0..2 {
+            assert_eq!(
+                rate_ping(&app, "Bearer limited").await,
+                StatusCode::OK,
+                "配额内应放行"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ping")
+                    .header("authorization", "Bearer limited")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "rate_limited");
+        assert_eq!(body["limit"], 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_uses_authorization_header() {
+        let app = rate_app(rate_db(1));
+        assert_eq!(
+            rate_ping(&app, "Bearer key-a").await,
+            StatusCode::OK,
+            "第一个令牌首次放行"
+        );
+        assert_eq!(
+            rate_ping(&app, "Bearer key-a").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "同一令牌超限"
+        );
+        assert_eq!(
+            rate_ping(&app, "Bearer key-b").await,
+            StatusCode::OK,
+            "不同令牌各自计数"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_ignores_health() {
+        let app = rate_app(rate_db(1));
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/health")
+                        .header("authorization", "Bearer health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "健康检查不进入限流");
+        }
     }
 
     fn password_db() -> crate::db::Db {

@@ -24,6 +24,8 @@ pub struct SystemState {
     archives_dir: std::path::PathBuf,
     /// 告警冷却记账表：同一类别在冷却窗口内只推一次。
     alert_last: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// 摘要模式缓冲：开启后 warn 级事件先攒着，到点合并成一条推送。
+    alert_digest: std::sync::Arc<std::sync::Mutex<Vec<AlertEvent>>>,
     exec: std::sync::Arc<std::sync::Mutex<ExecStats>>,
     exec_client: Option<std::sync::Arc<crate::exec_client::ExecClient>>,
 }
@@ -132,6 +134,7 @@ impl SystemState {
             alert_last: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            alert_digest: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             exec: std::sync::Arc::new(std::sync::Mutex::new(ExecStats::default())),
             exec_client: None,
         }
@@ -852,6 +855,10 @@ struct AlertCfg {
     cooldown_sec: i64,
     /// 静默时段，如 `23:00-07:00`，支持跨天；空串表示不静默。
     quiet_hours: String,
+    /// 摘要模式：warn 级告警不即时推，按间隔合并成一条。
+    digest_enabled: bool,
+    /// 摘要间隔（分钟），5–1440，缺省 60。
+    digest_minutes: i64,
 }
 
 impl AlertCfg {
@@ -914,6 +921,15 @@ fn alert_cfg(conn: &rusqlite::Connection) -> AlertCfg {
             .unwrap_or(120)
             .clamp(10, 3600),
         quiet_hours: text("alert_quiet_hours"),
+        digest_enabled: raw
+            .get("alert_digest_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        digest_minutes: raw
+            .get("alert_digest_minutes")
+            .and_then(Value::as_i64)
+            .unwrap_or(60)
+            .clamp(5, 1440),
     }
 }
 
@@ -1106,9 +1122,14 @@ fn in_quiet_hours(spec: &str, minutes_of_day: i64) -> bool {
 /// 自动告警的轮询间隔（秒）。
 const ALERT_POLL_SEC: u64 = 15;
 
+/// 摘要缓冲上限：告警风暴或推送持续失败时不无限增长，丢最旧的。
+const ALERT_DIGEST_BUFFER_MAX: usize = 200;
+
 /// 一条待推送的引擎事件。
+#[derive(Clone)]
 struct AlertEvent {
     id: i64,
+    ts: i64,
     level: String,
     category: String,
     message: String,
@@ -1137,6 +1158,9 @@ pub fn spawn_alert_task(state: SystemState) {
                     tracing::warn!(%error, category = %event.category, "自动告警推送失败");
                 }
             }
+            if let Err(error) = flush_digest(&state).await {
+                tracing::warn!(%error, "告警摘要推送失败");
+            }
         }
     });
 }
@@ -1156,7 +1180,7 @@ fn latest_event_id(state: &SystemState) -> i64 {
 fn new_events(state: &SystemState, cursor: i64) -> Vec<AlertEvent> {
     let conn = state.db.lock();
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, level, category, message FROM engine_events \
+        "SELECT id, ts, level, category, message FROM engine_events \
          WHERE id > ?1 ORDER BY id ASC LIMIT 200",
     ) else {
         return Vec::new();
@@ -1164,9 +1188,10 @@ fn new_events(state: &SystemState, cursor: i64) -> Vec<AlertEvent> {
     let rows = stmt.query_map([cursor], |row| {
         Ok(AlertEvent {
             id: row.get(0)?,
-            level: row.get(1)?,
-            category: row.get(2)?,
-            message: row.get(3)?,
+            ts: row.get(1)?,
+            level: row.get(2)?,
+            category: row.get(3)?,
+            message: row.get(4)?,
         })
     });
     match rows {
@@ -1189,6 +1214,15 @@ async fn dispatch_alert(state: &SystemState, event: &AlertEvent) -> Result<(), S
     }
     let urls = cfg.webhook_urls(&event.level);
     if urls.is_empty() && !cfg.telegram_enabled() {
+        return Ok(());
+    }
+    if cfg.digest_enabled && event.level == "warn" {
+        if let Ok(mut buffer) = state.alert_digest.lock() {
+            if buffer.len() >= ALERT_DIGEST_BUFFER_MAX {
+                buffer.remove(0);
+            }
+            buffer.push(event.clone());
+        }
         return Ok(());
     }
     if !cfg.quiet_hours.is_empty() {
@@ -1230,6 +1264,91 @@ async fn dispatch_alert(state: &SystemState, event: &AlertEvent) -> Result<(), S
             &event.level,
             &event.category,
             event.message.chars().take(500).collect::<String>(),
+            channels,
+            i64::from(ok),
+            error.chars().take(500).collect::<String>(),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 摘要是否到期：缓冲最早一条已经等待满 `minutes` 分钟。
+fn digest_due(oldest_ts: i64, now: i64, minutes: i64) -> bool {
+    minutes > 0 && now.saturating_sub(oldest_ts) >= minutes * 60
+}
+
+/// 摘要正文：标题写明合并了几条，后面逐条列出类别与消息。
+fn render_digest(events: &[AlertEvent]) -> String {
+    let mut text = format!("🟠 [NanoQuant] warn 摘要 {} 条", events.len());
+    for event in events {
+        text.push_str(&format!("\n- [{}] {}", event.category, event.message));
+    }
+    text
+}
+
+/// 到点把 warn 缓冲合并成一条推送。单次最多 20 条，剩余留到下一轮。
+async fn flush_digest(state: &SystemState) -> Result<(), String> {
+    let cfg = {
+        let conn = state.db.lock();
+        alert_cfg(&conn)
+    };
+    if !cfg.digest_enabled {
+        if let Ok(mut buffer) = state.alert_digest.lock() {
+            buffer.clear();
+        }
+        return Ok(());
+    }
+    if !cfg.quiet_hours.is_empty() {
+        let minutes_of_day = crate::now().rem_euclid(86_400) / 60;
+        if in_quiet_hours(&cfg.quiet_hours, minutes_of_day) {
+            return Ok(());
+        }
+    }
+    let now = crate::now();
+    let batch = {
+        let mut buffer = state
+            .alert_digest
+            .lock()
+            .map_err(|_| "告警摘要缓冲不可用".to_string())?;
+        let Some(oldest) = buffer.first() else {
+            return Ok(());
+        };
+        if !digest_due(oldest.ts, now, cfg.digest_minutes) {
+            return Ok(());
+        }
+        let take = buffer.len().min(20);
+        buffer.drain(0..take).collect::<Vec<_>>()
+    };
+    let urls = cfg.webhook_urls("warn");
+    if urls.is_empty() && !cfg.telegram_enabled() {
+        return Ok(());
+    }
+    let text = render_digest(&batch);
+    let results = send_alerts(&urls, &cfg, &text).await;
+    let ok = !results.is_empty() && results.iter().all(|item| item["ok"] == true);
+    let channels = results
+        .iter()
+        .filter_map(|item| item["channel"].as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = results
+        .iter()
+        .filter(|item| item["ok"] != true)
+        .filter_map(|item| item["error"].as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let conn = state
+        .db
+        .conn
+        .lock()
+        .map_err(|_| "数据库锁不可用".to_string())?;
+    conn.execute(
+        "INSERT INTO alert_logs(ts, level, category, message, channels, ok, error) \
+         VALUES(?1, 'warn', 'digest', ?2, ?3, ?4, ?5)",
+        (
+            now,
+            text.chars().take(500).collect::<String>(),
             channels,
             i64::from(ok),
             error.chars().take(500).collect::<String>(),
@@ -2947,6 +3066,7 @@ mod tests {
     fn alert_event() -> AlertEvent {
         AlertEvent {
             id: 1,
+            ts: crate::now(),
             level: "warn".to_string(),
             category: "risk".to_string(),
             message: "回撤超限".to_string(),
@@ -3025,6 +3145,178 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(logged, 0, "关闭时不写告警记录");
+    }
+
+    #[test]
+    fn digest_flushes_after_interval() {
+        assert!(!digest_due(1_000, 1_000 + 59 * 60, 60), "未满间隔不发");
+        assert!(digest_due(1_000, 1_000 + 60 * 60, 60), "满间隔该发");
+        assert!(!digest_due(1_000, 1_000 + 60 * 60, 0), "0 分钟视为未启用");
+    }
+
+    #[test]
+    fn digest_cfg_reads_minutes() {
+        let path = std::env::temp_dir().join("nq-digest-cfg.db");
+        let db = dead_fixture(&path);
+        {
+            let conn = db.lock();
+            let cfg = alert_cfg(&conn);
+            assert!(!cfg.digest_enabled, "摘要默认关闭");
+            assert_eq!(cfg.digest_minutes, 60, "摘要间隔缺省 60 分钟");
+        }
+        db.lock()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({"alert_digest_enabled": true, "alert_digest_minutes": 15}).to_string()],
+            )
+            .unwrap();
+        {
+            let conn = db.lock();
+            let cfg = alert_cfg(&conn);
+            assert!(cfg.digest_enabled);
+            assert_eq!(cfg.digest_minutes, 15);
+        }
+        db.lock()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({"alert_digest_minutes": 100_000}).to_string()],
+            )
+            .unwrap();
+        let clamped = {
+            let conn = db.lock();
+            alert_cfg(&conn).digest_minutes
+        };
+        assert_eq!(clamped, 1440, "超过上限应被夹到 1440");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn warn_is_buffered_when_digest_enabled() {
+        let (port, hits) = fake_webhook().await;
+        let path = std::env::temp_dir().join("nq-digest-buffer.db");
+        let db = dead_fixture(&path);
+        db.lock()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({
+                    "alert_enabled": true,
+                    "alert_webhook_url": format!("http://127.0.0.1:{port}/hook"),
+                    "alert_digest_enabled": true,
+                    "alert_digest_minutes": 5
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let state = SystemState::new(db.clone(), crate::now());
+        dispatch_alert(&state, &alert_event())
+            .await
+            .expect("缓冲不该报错");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "摘要模式下 warn 不应即时推送"
+        );
+        assert_eq!(
+            state.alert_digest.lock().unwrap().len(),
+            1,
+            "warn 应进入摘要缓冲"
+        );
+        let logged: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logged, 0, "缓冲阶段不写 alert_logs");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn error_is_sent_immediately_when_digest_enabled() {
+        let (port, hits) = fake_webhook().await;
+        let path = std::env::temp_dir().join("nq-digest-error.db");
+        let db = dead_fixture(&path);
+        db.lock()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({
+                    "alert_enabled": true,
+                    "alert_webhook_url": format!("http://127.0.0.1:{port}/hook"),
+                    "alert_digest_enabled": true,
+                    "alert_digest_minutes": 60
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let state = SystemState::new(db.clone(), crate::now());
+        let event = AlertEvent {
+            id: 2,
+            ts: crate::now(),
+            level: "error".to_string(),
+            category: "risk".to_string(),
+            message: "账户异常".to_string(),
+        };
+        dispatch_alert(&state, &event)
+            .await
+            .expect("error 应即时推送");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "摘要模式下 error 仍然即时推送"
+        );
+        assert!(state.alert_digest.lock().unwrap().is_empty());
+        let logged: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM alert_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(logged, 1, "即时推送应写 alert_logs");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn digest_flush_sends_and_logs() {
+        let (port, hits) = fake_webhook().await;
+        let path = std::env::temp_dir().join("nq-digest-flush.db");
+        let db = dead_fixture(&path);
+        db.lock()
+            .execute(
+                "INSERT OR REPLACE INTO app_settings VALUES('system',?1,0)",
+                [json!({
+                    "alert_enabled": true,
+                    "alert_webhook_url": format!("http://127.0.0.1:{port}/hook"),
+                    "alert_digest_enabled": true,
+                    "alert_digest_minutes": 5
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let state = SystemState::new(db.clone(), crate::now());
+        state.alert_digest.lock().unwrap().push(AlertEvent {
+            id: 9,
+            ts: crate::now() - 6 * 60,
+            level: "warn".to_string(),
+            category: "risk".to_string(),
+            message: "回撤超限".to_string(),
+        });
+        flush_digest(&state).await.expect("摘要应推送成功");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "到点应发出一次合并推送"
+        );
+        assert!(
+            state.alert_digest.lock().unwrap().is_empty(),
+            "推送后缓冲应清空"
+        );
+        let (category, message): (String, String) = db
+            .lock()
+            .query_row(
+                "SELECT category, message FROM alert_logs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(category, "digest");
+        assert!(message.contains("warn 摘要 1 条"), "摘要标题应含条数");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

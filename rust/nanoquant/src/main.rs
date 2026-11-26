@@ -520,6 +520,11 @@ fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         system::spawn_alert_task(system_state.clone());
         api = api.merge(system::routes().with_state(system_state));
         api = api.merge(settings_api::routes().with_state(database.clone()));
+        // 限流挂在 api 内层：外层 require_token 先跑，静态前端不经过这里。
+        api = api.layer(axum::middleware::from_fn_with_state(
+            database.clone(),
+            auth::rate_limit,
+        ));
     }
 
     let mut app = Router::new()
