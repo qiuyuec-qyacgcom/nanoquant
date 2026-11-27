@@ -20,7 +20,6 @@ pub(crate) fn ema_series(values: &[f64], period: usize) -> Option<Vec<f64>> {
     Some(out)
 }
 
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) struct Macd {
     pub dif: f64,
     pub dea: f64,
@@ -28,7 +27,6 @@ pub(crate) struct Macd {
 }
 
 /// MACD(12,26,9)。输入不足 `slow` 根时返回 None。
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) fn macd(values: &[f64], fast: usize, slow: usize, signal: usize) -> Option<Macd> {
     let fast_ema = ema_series(values, fast)?;
     let slow_ema = ema_series(values, slow)?;
@@ -47,7 +45,6 @@ pub(crate) fn macd(values: &[f64], fast: usize, slow: usize, signal: usize) -> O
     })
 }
 
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) struct Bollinger {
     pub middle: f64,
     pub upper: f64,
@@ -56,7 +53,6 @@ pub(crate) struct Bollinger {
     pub percent_b: f64,
 }
 
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) fn bollinger(values: &[f64], period: usize, k: f64) -> Option<Bollinger> {
     if period == 0 || values.len() < period {
         return None;
@@ -83,7 +79,6 @@ pub(crate) fn bollinger(values: &[f64], period: usize, k: f64) -> Option<Bolling
 }
 
 /// 成交量加权均价。
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) fn vwap(candles: &[CandleSnapshot]) -> Option<f64> {
     if candles.is_empty() {
         return None;
@@ -101,15 +96,15 @@ pub(crate) fn vwap(candles: &[CandleSnapshot]) -> Option<f64> {
     Some(pv / volume)
 }
 
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) struct AtrChannel {
+    /// 通道中轴使用的 ATR 原值，调用方按需取用。
+    #[allow(dead_code)]
     pub atr: f64,
     pub upper: f64,
     pub lower: f64,
 }
 
 /// 以最新收盘价为中轴的 ATR 通道。
-#[allow(dead_code)] // I2 特征快照接入
 pub(crate) fn atr_channel(
     candles: &[CandleSnapshot],
     atr_period: usize,

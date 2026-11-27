@@ -156,6 +156,10 @@ pub(crate) fn feature_snapshot(
     let candles = &market.candles;
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
     let metrics = candle_metrics(candles, atr_period);
+    let macd = crate::indicators::macd(&closes, 12, 26, 9);
+    let bands = crate::indicators::bollinger(&closes, 20, 2.0);
+    let vwap_value = crate::indicators::vwap(candles);
+    let channel = crate::indicators::atr_channel(candles, atr_period, 2.0);
     let last = closes.last().copied().unwrap_or(0.0);
     let bars_24h = (1440 / interval_minutes(interval)).max(1) as usize;
     let change_24h = if closes.len() > bars_24h {
@@ -180,6 +184,16 @@ pub(crate) fn feature_snapshot(
         "atr": metrics.map(|item| round4(item.atr)),
         "atr_pct": metrics.map(|item| item.atr_pct),
         "vol_ratio": metrics.map(|item| item.vol_ratio),
+        "macd_dif": macd.as_ref().map(|value| round4(value.dif)),
+        "macd_dea": macd.as_ref().map(|value| round4(value.dea)),
+        "macd_histogram": macd.as_ref().map(|value| round4(value.histogram)),
+        "bollinger_upper": bands.as_ref().map(|value| round4(value.upper)),
+        "bollinger_lower": bands.as_ref().map(|value| round4(value.lower)),
+        "bollinger_middle": bands.as_ref().map(|value| round4(value.middle)),
+        "bollinger_percent_b": bands.as_ref().map(|value| round4(value.percent_b)),
+        "vwap": vwap_value.map(round4),
+        "atr_channel_upper": channel.as_ref().map(|value| round4(value.upper)),
+        "atr_channel_lower": channel.as_ref().map(|value| round4(value.lower)),
         "ret_1": pct_change(&closes, 1).map(round4),
         "ret_5": pct_change(&closes, 5).map(round4),
         "ret_15": pct_change(&closes, 15).map(round4),
@@ -825,6 +839,56 @@ mod tests {
             feature(14, 14, 9, 30)["ema_slow"],
             "ema_slow 必须影响 ema_slow"
         );
+    }
+
+    #[test]
+    fn feature_snapshot_exposes_the_new_indicators() {
+        let closes: Vec<f64> = (0..60).map(|index| 100.0 + index as f64).collect();
+        let candles: Vec<CandleSnapshot> = closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| CandleSnapshot {
+                close_time: 1_700_000_000 + index as i64 * 900_000,
+                open: *close,
+                high: close + 1.0,
+                low: close - 1.0,
+                close: *close,
+                volume: 10.0,
+            })
+            .collect();
+        let market = MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            mark_price: *closes.last().unwrap(),
+            timestamp: 1_700_000_000,
+            quote_volume: 5_000_000.0,
+            funding_rate: 0.0001,
+            open_interest: 1000.0,
+            open_interest_change_pct: 1.5,
+            bid: 100.0,
+            ask: 100.01,
+            spread_bps: 1.0,
+            candles,
+        };
+        let features = feature_snapshot(
+            &market,
+            "15m",
+            14,
+            14,
+            crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+        );
+        for key in [
+            "macd_dif",
+            "macd_dea",
+            "macd_histogram",
+            "bollinger_upper",
+            "bollinger_lower",
+            "bollinger_percent_b",
+            "vwap",
+            "atr_channel_upper",
+            "atr_channel_lower",
+        ] {
+            assert!(features.get(key).is_some(), "特征缺少 {key}: {features}");
+        }
     }
 
     #[test]

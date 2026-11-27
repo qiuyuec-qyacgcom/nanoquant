@@ -54,6 +54,10 @@ struct Core {
     breakout: f64,
     carry: f64,
     flow: f64,
+    /// MACD 柱按 ATR 归一后的趋势因子，压到 [-1, 1]。
+    trend: f64,
+    /// 布林 %B 偏离中轨的价值因子，压到 [-1, 1]。
+    value: f64,
     score: f64,
     agreement: usize,
     coverage: f64,
@@ -165,18 +169,33 @@ fn core(
     } else {
         0.0
     };
-    let (w_rs, w_break, w_carry, w_flow) = match regime {
-        crate::regime::Regime::Trend => (0.30, 0.35, 0.10, 0.25),
-        crate::regime::Regime::Chaos => (0.20, 0.20, 0.25, 0.35),
-        _ => (0.15, 0.15, 0.35, 0.35),
+    // 趋势因子：MACD 柱 / ATR 归一，消除价格尺度影响。
+    let trend = match crate::indicators::macd(&closes, 12, 26, 9) {
+        Some(macd) if atr > 0.0 => (macd.histogram / atr).clamp(-1.0, 1.0),
+        _ => 0.0,
     };
-    let raw = w_rs * rs + w_break * breakout + w_carry * carry + w_flow * flow;
+    // 价值因子：布林 %B 偏离中轨 0.5 的幅度。
+    let value = match crate::indicators::bollinger(&closes, 20, 2.0) {
+        Some(bands) => ((bands.percent_b - 0.5) * 2.0).clamp(-1.0, 1.0),
+        None => 0.0,
+    };
+    let (w_rs, w_break, w_carry, w_flow, w_trend, w_value) = match regime {
+        crate::regime::Regime::Trend => (0.22, 0.24, 0.08, 0.18, 0.16, 0.12),
+        crate::regime::Regime::Chaos => (0.15, 0.15, 0.20, 0.28, 0.12, 0.10),
+        _ => (0.12, 0.12, 0.28, 0.28, 0.10, 0.10),
+    };
+    let raw = w_rs * rs
+        + w_break * breakout
+        + w_carry * carry
+        + w_flow * flow
+        + w_trend * trend
+        + w_value * value;
     let score = (raw * 1.2).tanh();
     if !score.is_finite() {
         return None;
     }
     let direction = score.signum();
-    let agreement = [rs, breakout, carry, flow]
+    let agreement = [rs, breakout, carry, flow, trend, value]
         .iter()
         .filter(|factor| factor.abs() > 0.15 && factor.signum() == direction)
         .count();
@@ -191,7 +210,7 @@ fn core(
         coverage += 0.075;
     }
     let coverage = coverage.min(1.0);
-    let confidence = (0.55 + 0.10 * agreement as f64) * coverage;
+    let confidence = ((0.55 + 0.10 * agreement as f64) * coverage).min(1.0);
     Some(Core {
         volume_ratio,
         atr_pct,
@@ -202,6 +221,8 @@ fn core(
         breakout,
         carry,
         flow,
+        trend,
+        value,
         score,
         agreement,
         coverage,
@@ -258,7 +279,7 @@ pub(crate) fn evaluate(
     if core.score.abs() < policy.base_threshold {
         return None;
     }
-    if core.agreement < 2 {
+    if core.agreement < 3 {
         return None;
     }
     if core.confidence < 0.55 {
@@ -268,7 +289,7 @@ pub(crate) fn evaluate(
         side: if core.score > 0.0 { "long" } else { "short" },
         score: core.score,
         reason: format!(
-            "fusion:score={:.4}:vol={:.2}:adx={:.1}:regime={},gap={:.4},rs={:.2},break={:.2},carry={:.2},flow={:.2},conf={:.2},coverage={:.2}",
+            "fusion:score={:.4}:vol={:.2}:adx={:.1}:regime={},gap={:.4},rs={:.2},break={:.2},carry={:.2},flow={:.2},trend={:.2},value={:.2},conf={:.2},coverage={:.2}",
             core.score,
             core.volume_ratio,
             core.adx,
@@ -278,6 +299,8 @@ pub(crate) fn evaluate(
             core.breakout,
             core.carry,
             core.flow,
+            core.trend,
+            core.value,
             core.confidence,
             core.coverage
         ),
@@ -419,7 +442,39 @@ mod tests {
     }
 
     #[test]
-    fn fusion_requires_at_least_two_agreeing_factors() {
+    fn fusion_uses_six_factors() {
+        // 6 个因子必须全部参与加权，且同向因子过半才算信号成立。
+        let values: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+        let data = candles(&values);
+        let mark = *values.last().unwrap();
+        let atr = mark * 0.01;
+        let signal = evaluate(
+            &data,
+            mark,
+            atr,
+            cfg(),
+            MarketFeatures {
+                funding_rate: 0.0,
+                open_interest_change_pct: 0.0,
+                relative_strength: 0.8,
+                relative_strength_available: true,
+            },
+        )
+        .expect("上涨趋势必须给出信号");
+        assert!(
+            signal.reason.contains("trend="),
+            "原因串必须暴露新因子: {}",
+            signal.reason
+        );
+        assert!(
+            signal.reason.contains("value="),
+            "原因串必须暴露新因子: {}",
+            signal.reason
+        );
+    }
+
+    #[test]
+    fn fusion_requires_majority_agreeing_factors() {
         let values = vec![100.0; 40];
         let signal = evaluate(
             &candles(&values),
@@ -440,13 +495,18 @@ mod tests {
             1.0,
             cfg(),
             MarketFeatures {
-                funding_rate: -0.001,
+                // RS / OI / 资金费三路数据全缺：覆盖率只剩基础 0.60，
+                // 即使趋势因子同向，置信度也必须不足。
+                funding_rate: f64::NAN,
                 open_interest_change_pct: f64::NAN,
                 relative_strength: 0.0,
                 relative_strength_available: false,
             },
         );
-        assert!(signal.is_none(), "缺失 RS 与 OI 时覆盖率不足应保持空仓");
+        assert!(
+            signal.is_none(),
+            "缺失 RS / OI / 资金费时覆盖率不足应保持空仓"
+        );
     }
 
     #[test]
