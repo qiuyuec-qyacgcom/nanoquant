@@ -59,6 +59,8 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("risk", "symbol_cooldown_minutes", 0.0, 1440.0, 1.0),
     ("risk", "min_notional_buffer", 1.0, 10.0, 0.01),
     ("risk", "atr_stop_mult", 1.0, 4.0, 0.1),
+    // 开仓止损距离下限：价格距离 = 该倍数 × ATR%，与杠杆无关。
+    ("risk", "stop_distance_atr_mult", 1.0, 4.0, 0.1),
     ("risk", "min_equity_usdt", 0.0, 100000.0, 0.1),
     ("risk", "fee_rate_taker", 0.0, 0.01, 0.0001),
     ("risk", "fee_rate_maker", 0.0, 0.01, 0.0001),
@@ -68,6 +70,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "ema_slow", 2.0, 400.0, 1.0),
     ("strategy", "rsi_period", 2.0, 100.0, 1.0),
     ("strategy", "atr_period", 2.0, 100.0, 1.0),
+    ("strategy", "adx_period", 2.0, 100.0, 1.0),
     ("strategy", "entry_threshold", 0.01, 1.0, 0.01),
     ("strategy", "exit_threshold", 0.0, 1.0, 0.01),
     ("strategy", "volume_ratio_min", 0.0, 10.0, 0.1),
@@ -263,6 +266,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "correlation_limit",
             "direction_exposure_limit_pct",
             "atr_stop_mult",
+            "stop_distance_atr_mult",
             "global_stop_loss_pct",
             "global_take_profit_pct",
             "daily_loss_limit_pct",
@@ -508,6 +512,43 @@ pub(crate) fn coerce(meta: &ParamMeta, value: &Value) -> Result<Value, String> {
     }
 }
 
+/// 读取 `strategy` 组里一个注册过的整数参数，并按注册范围校验。
+///
+/// 范围取自本表的注册值（`RANGES`），别处不再维护第二份边界。
+/// 返回 `None` 表示配置缺失、不是整数或越界，由调用方按各自语义处理。
+pub(crate) fn strategy_int(strategy: &Value, key: &str) -> Option<usize> {
+    let meta = find("strategy", key)?;
+    let min = meta.min?;
+    let max = meta.max?;
+    strategy
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+        .filter(|value| (min..=max).contains(value))
+        .map(|value| value as usize)
+}
+
+/// ADX 周期：缺省 14，必须落在注册表范围内，否则回退 14。
+pub(crate) fn adx_period(strategy: &Value) -> usize {
+    strategy_int(strategy, "adx_period").unwrap_or(14)
+}
+
+/// EMA 快慢周期：两个值都必须在注册范围内，且**快线必须短于慢线**。
+///
+/// 否则 `ema_gap_pct` 的符号会反转，信号方向被系统性带偏 —— 这类配置必须整体回退。
+/// 任一缺失、越界或非整数，或快线不短于慢线，一律回退缺省 (9, 21)。
+pub(crate) fn ema_periods(strategy: &Value) -> (usize, usize) {
+    const DEFAULT_FAST: usize = 9;
+    const DEFAULT_SLOW: usize = 21;
+    match (
+        strategy_int(strategy, "ema_fast"),
+        strategy_int(strategy, "ema_slow"),
+    ) {
+        (Some(fast), Some(slow)) if fast < slow => (fast, slow),
+        _ => (DEFAULT_FAST, DEFAULT_SLOW),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +568,59 @@ mod tests {
         );
         assert!(catalog["groups"].get("security").is_none());
         assert!(!serde_json::to_string(&catalog).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn adx_period_reads_config_and_falls_back_to_14() {
+        assert_eq!(adx_period(&json!({})), 14, "缺省是 14");
+        assert_eq!(adx_period(&json!({"adx_period": 7})), 7);
+        assert_eq!(
+            adx_period(&json!({"adx_period": 7.0})),
+            7,
+            "整数值的浮点写法也应接受"
+        );
+        assert_eq!(adx_period(&json!({"adx_period": 1})), 14, "越界回退");
+        assert_eq!(adx_period(&json!({"adx_period": 500})), 14, "越界回退");
+        assert_eq!(adx_period(&json!({"adx_period": 7.5})), 14, "非整数回退");
+    }
+
+    #[test]
+    fn ema_periods_read_config_and_reject_inverted_pairs() {
+        assert_eq!(ema_periods(&json!({})), (9, 21), "缺省是 9/21");
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 5, "ema_slow": 30})),
+            (5, 30)
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 5.0, "ema_slow": 30.0})),
+            (5, 30),
+            "整数值的浮点写法也应接受"
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 30, "ema_slow": 5})),
+            (9, 21),
+            "快线不短于慢线必须整体回退，否则 gap 符号会反转"
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 30, "ema_slow": 30})),
+            (9, 21),
+            "快慢相等也回退"
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 0, "ema_slow": 30})),
+            (9, 21),
+            "越界回退"
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 500, "ema_slow": 30})),
+            (9, 21),
+            "越界回退"
+        );
+        assert_eq!(
+            ema_periods(&json!({"ema_fast": 5.5, "ema_slow": 30})),
+            (9, 21),
+            "非整数回退"
+        );
     }
 
     #[test]

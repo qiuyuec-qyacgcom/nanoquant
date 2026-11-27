@@ -770,7 +770,7 @@ mod tests {
              CREATE TABLE trades(id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, qty REAL, entry_price REAL, \
              exit_price REAL, pnl REAL, opened_at INTEGER, closed_at INTEGER, hold_seconds INTEGER, \
              exit_reason TEXT, mode TEXT, features TEXT); \
-             UPDATE positions SET features='{\"injected_mantra_ids\":[1,2],\"injected_experience_ids\":[7]}' WHERE id=1;",
+             UPDATE positions SET features='{\"injected_mantra_ids\":[1,2],\"injected_experience_ids\":[7],\"ai_review\":{\"reviewed\":true,\"action\":\"open_long\",\"reason\":\"test\"}}' WHERE id=1;",
         )
         .unwrap();
         let fill = DemoFill {
@@ -807,6 +807,11 @@ mod tests {
             "决策时的注入 ID 必须随成交记录落库，复盘时才能回写命中率"
         );
         assert!(trade_features.contains("injected_experience_ids"));
+        assert!(
+            trade_features.contains("\"ai_review\"")
+                && trade_features.contains("\"reviewed\":true"),
+            "开仓 AI 复核结论必须随成交记录落库，复盘时才能追溯: {trade_features}"
+        );
     }
 
     #[test]

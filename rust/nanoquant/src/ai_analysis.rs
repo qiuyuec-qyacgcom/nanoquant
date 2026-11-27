@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use crate::ai_client::{self, AiPersona, ChatCall, ChatMessage};
 use crate::ai_providers::{provider_chain, AiState};
 use crate::providers::{candle_metrics, CandleSnapshot, MarketSnapshot};
+use crate::trade_policy::ema;
 
 pub fn routes() -> Router<AiState> {
     Router::new()
@@ -61,18 +62,6 @@ fn interval_minutes(interval: &str) -> i64 {
         "4h" => 240,
         _ => 15,
     }
-}
-
-fn ema(values: &[f64], period: usize) -> Option<f64> {
-    if period == 0 || values.len() < period {
-        return None;
-    }
-    let k = 2.0 / (period as f64 + 1.0);
-    let mut value = values[..period].iter().sum::<f64>() / period as f64;
-    for current in &values[period..] {
-        value = current * k + value * (1.0 - k);
-    }
-    Some(value)
 }
 
 fn rsi(values: &[f64], period: usize) -> Option<f64> {
@@ -133,6 +122,20 @@ fn interval_of(body_interval: &str) -> String {
     }
 }
 
+/// 从 strategy 配置读 EMA 快慢周期；与信号内核（trade_policy）共用同一份配置。
+pub(crate) fn ema_periods_of(strategy: &Value) -> crate::trade_policy::EmaPeriods {
+    let (fast, slow) = crate::param_registry::ema_periods(strategy);
+    crate::trade_policy::EmaPeriods { fast, slow }
+}
+
+/// 从 strategy 配置读 ATR 周期；缺省 14，配置存在但非法时同样回退 14。
+///
+/// 与实盘扫描、回测、证据门共用 `param_registry` 的注册范围，
+/// 避免各处各写一份边界导致 ATR 口径分叉。
+pub(crate) fn atr_period_of(strategy: &Value) -> usize {
+    crate::param_registry::strategy_int(strategy, "atr_period").unwrap_or(14)
+}
+
 /// 从 strategy 配置读 RSI 周期；缺省 14，非整数或越界时同样回退 14。
 pub(crate) fn rsi_period_of(strategy: &Value) -> usize {
     strategy
@@ -147,10 +150,12 @@ pub(crate) fn feature_snapshot(
     market: &MarketSnapshot,
     interval: &str,
     rsi_period: usize,
+    atr_period: usize,
+    ema_periods: crate::trade_policy::EmaPeriods,
 ) -> Value {
     let candles = &market.candles;
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
-    let metrics = candle_metrics(candles, 14);
+    let metrics = candle_metrics(candles, atr_period);
     let last = closes.last().copied().unwrap_or(0.0);
     let bars_24h = (1440 / interval_minutes(interval)).max(1) as usize;
     let change_24h = if closes.len() > bars_24h {
@@ -168,8 +173,8 @@ pub(crate) fn feature_snapshot(
     let mut features = json!({
         "bars": candles.len(),
         "close": round4(last),
-        "ema_fast": ema(&closes, 9).map(round4),
-        "ema_slow": ema(&closes, 21).map(round4),
+        "ema_fast": ema(&closes, ema_periods.fast).map(round4),
+        "ema_slow": ema(&closes, ema_periods.slow).map(round4),
         "rsi_period": rsi_period,
         "rsi": rsi(&closes, rsi_period).map(round4),
         "atr": metrics.map(|item| round4(item.atr)),
@@ -187,7 +192,10 @@ pub(crate) fn feature_snapshot(
         "quote_volume": market.quote_volume,
         "spread_bps": round4(market.spread_bps),
     });
-    if let (Some(fast), Some(slow)) = (ema(&closes, 9), ema(&closes, 21)) {
+    if let (Some(fast), Some(slow)) = (
+        ema(&closes, ema_periods.fast),
+        ema(&closes, ema_periods.slow),
+    ) {
         if slow > 0.0 {
             features["ema_gap_pct"] = json!(round4((fast - slow) / slow * 100.0));
         }
@@ -439,7 +447,13 @@ async fn analyze(
         return Err(bad_request("K 线数据不足, 无法分析"));
     }
     let strategy = strategy_config(&state);
-    let features = feature_snapshot(&market, &interval, rsi_period_of(&strategy));
+    let features = feature_snapshot(
+        &market,
+        &interval,
+        rsi_period_of(&strategy),
+        atr_period_of(&strategy),
+        ema_periods_of(&strategy),
+    );
     let snapshot_view = json!({
         "price": market.mark_price,
         "change_24h": features["change_24h"],
@@ -546,7 +560,13 @@ async fn decision_preview(
     if market.candles.len() < 30 {
         return Err(bad_request("K 线数据不足"));
     }
-    let features = feature_snapshot(&market, &interval, rsi_period_of(&strategy));
+    let features = feature_snapshot(
+        &market,
+        &interval,
+        rsi_period_of(&strategy),
+        atr_period_of(&strategy),
+        ema_periods_of(&strategy),
+    );
     let ema_gap = features["ema_gap_pct"].as_f64().unwrap_or(0.0);
     let fast = features["ema_fast"].as_f64().unwrap_or(0.0);
     let slow = features["ema_slow"].as_f64().unwrap_or(0.0);
@@ -719,6 +739,91 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn atr_period_setting_drives_the_feature_snapshot() {
+        assert_eq!(atr_period_of(&json!({})), 14, "缺省 ATR 周期是 14");
+        assert_eq!(atr_period_of(&json!({"atr_period": 7})), 7);
+        assert_eq!(
+            atr_period_of(&json!({"atr_period": 14.0})),
+            14,
+            "整数值的浮点写法也应接受"
+        );
+        assert_eq!(
+            atr_period_of(&json!({"atr_period": 0})),
+            14,
+            "非法周期回退 14"
+        );
+        assert_eq!(
+            atr_period_of(&json!({"atr_period": 999})),
+            14,
+            "越界回退 14"
+        );
+        assert_eq!(
+            atr_period_of(&json!({"atr_period": 14.5})),
+            14,
+            "非整数回退 14"
+        );
+    }
+
+    #[test]
+    fn ema_period_setting_drives_the_feature_snapshot() {
+        // EMA 周期必须真的进入特征计算：不同周期给出不同的 ema_fast 与 ema_gap_pct。
+        let closes: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+        let candles: Vec<CandleSnapshot> = closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| CandleSnapshot {
+                close_time: 1_700_000_000 + index as i64 * 60,
+                open: *close,
+                high: close + 0.5,
+                low: close - 0.5,
+                close: *close,
+                volume: 10.0,
+            })
+            .collect();
+        let market = MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            mark_price: *closes.last().unwrap(),
+            timestamp: 1_700_000_000,
+            quote_volume: 5_000_000.0,
+            funding_rate: 0.0001,
+            open_interest: 1000.0,
+            open_interest_change_pct: 1.5,
+            bid: 100.0,
+            ask: 100.01,
+            spread_bps: 1.0,
+            candles,
+        };
+        let default_ema = feature_snapshot(
+            &market,
+            "15m",
+            14,
+            14,
+            crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+        );
+        let short_ema = feature_snapshot(
+            &market,
+            "15m",
+            14,
+            14,
+            crate::trade_policy::EmaPeriods { fast: 5, slow: 11 },
+        );
+        assert_ne!(
+            default_ema["ema_fast"], short_ema["ema_fast"],
+            "EMA 周期必须真的影响特征：{default_ema} vs {short_ema}"
+        );
+        assert_ne!(
+            default_ema["ema_gap_pct"], short_ema["ema_gap_pct"],
+            "EMA 差必须跟着周期变化：{default_ema} vs {short_ema}"
+        );
+        // 两处 EMA 必须复用同一实现：特征快照就是信号内核口径。
+        assert_eq!(
+            default_ema["ema_fast"],
+            json!(ema(&closes, 9).map(round4)),
+            "AI 特征 EMA 必须与信号内核共用同一实现"
+        );
+    }
+
+    #[test]
     fn rsi_period_setting_drives_the_feature_snapshot() {
         assert_eq!(rsi_period_of(&json!({})), 14, "缺省 RSI 周期是 14");
         assert_eq!(rsi_period_of(&json!({"rsi_period": 7})), 7);
@@ -767,8 +872,8 @@ mod tests {
             spread_bps: 1.0,
             candles,
         };
-        let short = feature_snapshot(&market, "15m", 7);
-        let long = feature_snapshot(&market, "15m", 14);
+        let short = feature_snapshot(&market, "15m", 7, 14, ema_periods_of(&json!({})));
+        let long = feature_snapshot(&market, "15m", 14, 14, ema_periods_of(&json!({})));
         assert_eq!(short["rsi_period"], json!(7));
         assert_eq!(long["rsi_period"], json!(14));
         assert_ne!(

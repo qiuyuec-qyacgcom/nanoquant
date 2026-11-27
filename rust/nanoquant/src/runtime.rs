@@ -68,6 +68,17 @@ fn local_leverage(
         .round()
 }
 
+/// 决策日志的目标收益率：止盈价缺失时返回 0，
+/// 不能用 0 价硬算成 100% 污染日志与经验学习。
+fn journal_target_pct(entry_price: f64, take_profit: f64) -> f64 {
+    if entry_price > 0.0 && take_profit > 0.0 {
+        let pct = (take_profit - entry_price).abs() / entry_price * 100.0;
+        (pct * 10_000.0).round() / 10_000.0
+    } else {
+        0.0
+    }
+}
+
 /// 当前扫描周期（秒）。读不到配置就用最小值。
 pub(crate) fn cycle_interval_sec(conn: &rusqlite::Connection) -> u64 {
     conn.query_row(
@@ -1411,11 +1422,17 @@ impl EngineRuntime {
 
     pub(crate) fn trade_policy(strategy: &Value) -> crate::trade_policy::TradePolicy {
         let num = |value: &Value, key: &str, default: f64| value[key].as_f64().unwrap_or(default);
+        let (ema_fast, ema_slow) = crate::param_registry::ema_periods(strategy);
         crate::trade_policy::TradePolicy {
             base_threshold: num(strategy, "entry_threshold", 0.3),
             volume_ratio_min: num(strategy, "volume_ratio_min", 0.8),
             atr_pct_min: num(strategy, "atr_pct_min", 0.05),
             atr_pct_max: num(strategy, "atr_pct_max", 4.0),
+            ema: crate::trade_policy::EmaPeriods {
+                fast: ema_fast,
+                slow: ema_slow,
+            },
+            adx_period: crate::param_registry::adx_period(strategy),
         }
     }
     fn engine_enabled(tx: &rusqlite::Transaction<'_>, config: &Value) -> Result<bool, String> {
@@ -1620,11 +1637,9 @@ impl EngineRuntime {
             .unwrap_or(Value::Null);
         let atr_period = match strategy.get("atr_period") {
             None => 14,
-            Some(value) => value
-                .as_u64()
-                .filter(|period| (2..=100).contains(period))
-                .ok_or_else(|| "策略 ATR 周期必须是 2 到 100 的整数".to_string())?
-                as usize,
+            // ATR 周期与 AI 特征快照、回测、证据门共用同一个来源。
+            Some(_) => crate::param_registry::strategy_int(&strategy, "atr_period")
+                .ok_or_else(|| "策略 ATR 周期必须是 2 到 100 的整数".to_string())?,
         };
         let metrics: std::collections::BTreeMap<_, _> = snapshot
             .markets
@@ -1647,7 +1662,13 @@ impl EngineRuntime {
             &format!("candle_metrics.{mode}"),
             &serde_json::to_string(&metrics).map_err(|error| error.to_string())?,
         )?;
-        record_regimes(&tx, mode, &snapshot.markets, &metrics)?;
+        record_regimes(
+            &tx,
+            mode,
+            &snapshot.markets,
+            &metrics,
+            Self::trade_policy(&strategy),
+        )?;
         upsert_state(
             &tx,
             &format!("snapshot_ts.{mode}"),
@@ -2688,6 +2709,8 @@ impl EngineRuntime {
                 .collect()
         };
         let concurrency = Self::scan_concurrency_of(&engine);
+        // 预览评分必须与正式判定用同一份策略参数（含 EMA 周期），否则候选排序会与开仓口径不一致。
+        let policy = Self::trade_policy(strategy);
         // range 市若启用均值回归，候选排序与方向也要跟着 MR 信号走，
         // 否则趋势预览分低的正宗 MR 机会会在扫描阶段被 budget 截掉。
         let regime = current_regime(tx, mode)?;
@@ -2708,6 +2731,7 @@ impl EngineRuntime {
                 &market.candles,
                 market.mark_price,
                 metric.atr,
+                policy,
                 crate::trade_policy::MarketFeatures {
                     funding_rate: market.funding_rate,
                     open_interest_change_pct: market.open_interest_change_pct,
@@ -3031,8 +3055,13 @@ impl EngineRuntime {
                     Some(signal.reason),
                 )
             } else if mean_reversion_active {
-                let preview =
-                    crate::trade_policy::preview(&market.candles, price, metric.atr, features);
+                let preview = crate::trade_policy::preview(
+                    &market.candles,
+                    price,
+                    metric.atr,
+                    policy,
+                    features,
+                );
                 let preview_side = preview
                     .filter(|item| item.side != "flat")
                     .map(|item| item.side.to_string());
@@ -3066,6 +3095,7 @@ impl EngineRuntime {
                             &market.candles,
                             price,
                             metric.atr,
+                            policy,
                             features,
                         );
                         let preview_side = preview
@@ -3115,26 +3145,18 @@ impl EngineRuntime {
             );
             // 保证金以参数值为量化中枢，AI 不再调整该比例。
             let margin_base = cfg["margin_pct"].as_f64().unwrap_or(20.0);
-            // 仓位止盈止损率是用户的心理预期（保证金收益率）：
-            // 作为 AI 未给出止损/止盈价时的默认价，价格距离 = 保证金% ÷ 杠杆。
-            let direction = if side == "long" { 1.0 } else { -1.0 };
-            let global_stop = cfg["global_stop_loss_pct"].as_f64().unwrap_or(10.0);
-            let global_take_profit = cfg["global_take_profit_pct"].as_f64().unwrap_or(20.0);
+            // 仓位止盈止损率是运行时的账户风险预算（保证金收益率），
+            // 由 0.5 秒快平任务实时判定，不再在开仓时换算成价格距离。
+            // 趋势仓止损距离只由 ATR 决定，与杠杆解耦。
+            let atr_stop_mult = cfg["stop_distance_atr_mult"].as_f64().unwrap_or(1.3);
             // 均值回归仓使用独立的保证金止损止盈率，不继承趋势仓的全局阈值。
             let (stop_price, take_profit) = if mean_reversion {
                 crate::mean_reversion::mean_reversion_stops(&side, price, leverage, strategy)
             } else {
-                let stop_price = if global_stop > 0.0 {
-                    price * (1.0 - direction * global_stop / leverage / 100.0)
-                } else {
-                    0.0
-                };
-                let take_profit = if global_take_profit > 0.0 {
-                    price * (1.0 + direction * global_take_profit / leverage / 100.0)
-                } else {
-                    0.0
-                };
-                (stop_price, take_profit)
+                let stop_price =
+                    crate::risk::atr_stop_price(&side, price, metric.atr_pct, atr_stop_mult);
+                // 趋势仓止盈交给 ROI 阶梯与快平任务；开仓不预置固定止盈价。
+                (stop_price, 0.0)
             };
             let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
             let scale = if target > 0.0 && metric.atr_pct > 0.0 {
@@ -3538,6 +3560,9 @@ impl EngineRuntime {
                     "ai_review".to_string(),
                     serde_json::json!({
                         "reason": ai_reason,
+                        "reviewed": reviewed.reviewed,
+                        "action": reviewed.action,
+                        "confidence": reviewed.confidence,
                         "leverage": reviewed.leverage,
                         "margin_pct": margin_pct,
                         "stop_price": reviewed.stop_price,
@@ -3810,12 +3835,9 @@ impl EngineRuntime {
                 now,
                 Some(&features_text),
             )?;
-            let target_pct = if draft.mark_price > 0.0 {
-                let pct = (take_profit - draft.mark_price).abs() / draft.mark_price * 100.0;
-                (pct * 10_000.0).round() / 10_000.0
-            } else {
-                0.0
-            };
+            // 趋势仓没有预置止盈价时不能拿 0 价硬算，否则目标被记成 100%
+            // 污染决策日志与经验学习。
+            let target_pct = journal_target_pct(draft.mark_price, take_profit);
             crate::journal::record_decision(
                 tx,
                 mode,
@@ -4384,12 +4406,8 @@ impl EngineRuntime {
                     crate::now(),
                     features.as_deref(),
                 )?;
-                let target_pct = if *avg_price > 0.0 {
-                    let pct = (entry.take_profit - *avg_price).abs() / *avg_price * 100.0;
-                    (pct * 10_000.0).round() / 10_000.0
-                } else {
-                    0.0
-                };
+                // 趋势仓 take_profit=0 时不得把目标记成 100%。
+                let target_pct = journal_target_pct(*avg_price, entry.take_profit);
                 crate::journal::record_decision(
                     &tx,
                     "live",
@@ -5678,6 +5696,7 @@ fn record_regimes(
     mode: &str,
     markets: &[crate::providers::MarketSnapshot],
     metrics: &std::collections::BTreeMap<&str, crate::providers::CandleMetrics>,
+    policy: crate::trade_policy::TradePolicy,
 ) -> Result<(), String> {
     let mut regimes = Vec::new();
     let mut symbol_regimes = serde_json::Map::new();
@@ -5687,6 +5706,7 @@ fn record_regimes(
                 &market.candles,
                 market.mark_price,
                 metric.atr,
+                policy,
                 crate::trade_policy::MarketFeatures::default(),
             ) {
                 regimes.push(regime);
@@ -6033,6 +6053,17 @@ mod tests {
             10.0,
             "ATR 缺失时波动倍率回落到 1，按评分中性值给基准杠杆"
         );
+    }
+
+    #[test]
+    fn journal_target_pct_not_fake_when_take_profit_zero() {
+        assert_eq!(
+            journal_target_pct(100.0, 0.0),
+            0.0,
+            "take_profit=0 时不得把目标记成 100%"
+        );
+        assert_eq!(journal_target_pct(0.0, 110.0), 0.0);
+        assert!((journal_target_pct(100.0, 110.0) - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -6649,13 +6680,24 @@ mod tests {
             .map(|market| {
                 (
                     market.symbol.as_str(),
-                    crate::providers::candle_metrics(&market.candles, 14).unwrap(),
+                    crate::providers::candle_metrics(
+                        &market.candles,
+                        crate::ai_analysis::atr_period_of(&serde_json::json!({})),
+                    )
+                    .unwrap(),
                 )
             })
             .collect();
         let mut conn = db.lock();
         let tx = conn.transaction().unwrap();
-        record_regimes(&tx, "demo", &markets, &metrics).unwrap();
+        record_regimes(
+            &tx,
+            "demo",
+            &markets,
+            &metrics,
+            crate::runtime::EngineRuntime::trade_policy(&serde_json::json!({})),
+        )
+        .unwrap();
         let market_regime: String = tx
             .query_row(
                 "SELECT value FROM engine_state WHERE key = 'market_regime.demo'",
@@ -6897,7 +6939,8 @@ mod tests {
         assert_eq!(count, 1);
         assert!((qty - 50.0).abs() < 1e-9);
         assert_eq!(leverage, 5.0);
-        assert!(sl > 0.0 && sl < 100.0 && tp > 100.0);
+        assert!(sl > 0.0 && sl < 100.0);
+        assert_eq!(tp, 0.0, "趋势仓开仓不再预置止盈价");
         let orders: i64 = conn.query_row("SELECT COUNT(*) FROM orders WHERE purpose='entry' AND status='FILLED' AND reduce_only=0", [], |r| r.get(0)).unwrap();
         assert_eq!(orders, 1);
         let features: String = conn
@@ -6908,6 +6951,11 @@ mod tests {
             )
             .unwrap();
         let features: Value = serde_json::from_str(&features).unwrap();
+        assert_eq!(
+            features["ai_review"]["reviewed"], true,
+            "开仓 AI 复核结论必须可追溯: {features}"
+        );
+        assert_eq!(features["ai_review"]["action"], "open_long");
         assert!(
             !features["injected_mantra_ids"]
                 .as_array()
@@ -6922,17 +6970,52 @@ mod tests {
                 .contains(&serde_json::json!(1)),
             "同币种同向的赢家经验要注入: {features}"
         );
-        let (journal_status, journal_mode, journal_direction, journal_entry): (String, String, String, f64) = conn
+        let (journal_status, journal_mode, journal_direction, journal_entry, journal_target): (String, String, String, f64, f64) = conn
             .query_row(
-                "SELECT status, mode, direction, entry_price FROM decision_journal ORDER BY id DESC LIMIT 1",
+                "SELECT status, mode, direction, entry_price, target_pct FROM decision_journal ORDER BY id DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(journal_status, "pending", "开仓要留下待回访的决策快照");
         assert_eq!(journal_mode, "demo", "快照必须绑定开仓环境");
         assert_eq!(journal_direction, "long");
         assert_eq!(journal_entry, 100.0);
+        assert_eq!(journal_target, 0.0, "take_profit=0 时不得把目标记成 100%");
+    }
+
+    #[tokio::test]
+    async fn global_stop_not_used_at_entry() {
+        // 仓位止盈止损率是运行时 ROI 预算，不应影响开仓时的 ATR 止损价。
+        let (db_default, snapshot) = entry_fixture().await;
+        let (db_high_stop, _) = entry_fixture().await;
+        db_high_stop
+            .lock()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='risk'",
+                [r#"{"min_leverage":10,"max_leverage":20,"margin_pct":10,"rsi_long_max":100.1,"global_stop_loss_pct":50,"global_take_profit_pct":80}"#],
+            )
+            .unwrap();
+        for db in [&db_default, &db_high_stop] {
+            let runtime = test_runtime(db);
+            runtime.persist_snapshot("demo", &snapshot).unwrap();
+        }
+        let open_sl = |db: &Db| -> f64 {
+            db.lock()
+                .query_row(
+                    "SELECT COALESCE(MAX(sl_price),0) FROM positions WHERE mode='demo' AND status='open'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let default_sl = open_sl(&db_default);
+        let high_stop_sl = open_sl(&db_high_stop);
+        assert!(default_sl > 0.0, "默认配置应写入 ATR 止损价");
+        assert_eq!(
+            default_sl, high_stop_sl,
+            "改 risk.global_stop_loss_pct 不应改变开仓止损价"
+        );
     }
 
     #[tokio::test]
@@ -6957,7 +7040,6 @@ mod tests {
                 r#"{"orderId":42,"status":"FILLED","executedQty":"2","avgPrice":"100.1"}"#,
             ),
             (200, r#"{"algoId":12}"#),
-            (200, r#"{"algoId":13}"#),
         ]);
         let restarted = test_runtime(&db);
         let failures = restarted
@@ -6966,10 +7048,23 @@ mod tests {
             .unwrap();
         assert!(failures.is_empty(), "{failures:?}");
         let urls = gateway.sent_urls();
-        assert_eq!(urls.len(), 4);
+        assert_eq!(
+            urls.len(),
+            3,
+            "趋势仓 take_profit=0 只挂止损腿：dualSide + entry + STOP_MARKET"
+        );
         assert!(urls[0].contains("/fapi/v1/positionSide/dual"));
         assert!(urls[1].contains("origClientOrderId=nq-entry-test"));
         let conn = db.lock();
+        let (stop_legs, tp_legs): (i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(purpose='stop_loss'),0), COALESCE(SUM(purpose='take_profit'),0) \
+                 FROM orders WHERE mode='live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((stop_legs, tp_legs), (1, 0));
         let position: (String, f64, f64, f64) = conn
             .query_row(
                 "SELECT side,qty,entry_price,leverage FROM positions WHERE mode='live'",

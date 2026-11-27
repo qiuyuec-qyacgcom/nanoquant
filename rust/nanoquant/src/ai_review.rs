@@ -136,6 +136,8 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         market,
         &interval,
         crate::ai_analysis::rsi_period_of(&strategy_cfg),
+        crate::ai_analysis::atr_period_of(&strategy_cfg),
+        crate::ai_analysis::ema_periods_of(&strategy_cfg),
     );
     let risk = state
         .db

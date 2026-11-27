@@ -1,6 +1,7 @@
-//! 持仓管理。出场判定与 legacy 内核（已退役） `detect_exit` / `_manage_positions` 一致。
+//! 持仓管理。出场规则沿用 legacy 内核（已退役）的 `detect_exit` / `_manage_positions`。
 //!
-//! 判定顺序固定：部分止盈 → 硬止损 → 止盈 → 移动止损 → 信号反转 → 保本上移。
+//! 判定顺序固定：ATR 硬止损 → 全局 ROI 止盈止损 → 部分止盈 → 单仓止盈 → ROI 阶梯
+//! → 移动止损 → 信号反转 → 保本上移。
 //! 移动止损必须先浮盈到激活门槛才接管，否则开仓即追踪会把单子在硬止损之前
 //! 被噪声扫掉。部分止盈的 R 用**初始**止损计算，当前止损上移后会失真。
 
@@ -63,9 +64,9 @@ pub struct ManageConfig {
     pub exit_threshold: f64,
     /// 浮盈达到多少个 R 时把止损上移到保本，0 表示关闭。
     pub breakeven_at_r: f64,
-    /// 全局止损：保证金亏损达到该百分比就整仓平仓（价格距离 = 该值 ÷ 杠杆），0 表示关闭。
+    /// 全局止损：保证金亏损达到该百分比就整仓平仓（ROI 口径），0 表示关闭。
     pub global_stop_loss_pct: f64,
-    /// 全局止盈：保证金盈利达到该百分比就整仓平仓（价格距离 = 该值 ÷ 杠杆），0 表示关闭。
+    /// 全局止盈：保证金盈利达到该百分比就整仓平仓（ROI 口径），0 表示关闭。
     pub global_take_profit_pct: f64,
     pub qty_step: f64,
     pub min_qty: f64,
@@ -82,6 +83,12 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
     } else {
         0.0
     };
+    // ATR 保护价优先于 ROI 兜底：止损距离由波动决定，不能被保证金收益率抢先。
+    if pos.sl_price > 0.0 && hit(direction, pos.mark_price, pos.sl_price, true) {
+        return ManageAction::Close {
+            reason: "stop_loss".to_string(),
+        };
+    }
     // 全局止盈止损按保证金收益率判断：价格变动 × 杠杆。
     // 均值回归仓使用开仓时快照的独立阈值，不继承趋势仓的全局阈值。
     let (stop_loss_pct, take_profit_pct) = pos
@@ -109,11 +116,6 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
         }
     }
 
-    if pos.sl_price > 0.0 && hit(direction, pos.mark_price, pos.sl_price, true) {
-        return ManageAction::Close {
-            reason: "stop_loss".to_string(),
-        };
-    }
     if pos.tp_price > 0.0 && hit(direction, pos.mark_price, pos.tp_price, false) {
         return ManageAction::Close {
             reason: "take_profit".to_string(),
@@ -381,6 +383,25 @@ mod tests {
             ManageAction::PartialTakeProfit { qty } => assert!((qty - 0.5).abs() < 1e-9),
             other => panic!("expected partial tp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn atr_stop_precedes_roi_budget_in_manage() {
+        let mut pos = long_pos();
+        pos.sl_price = 95.0;
+        pos.initial_sl = 95.0;
+        pos.tp_price = 0.0;
+        // 价格 -6% × 10x = 保证金 -60%，同时跌破 ATR 保护价。
+        pos.mark_price = 94.0;
+        let mut config = cfg();
+        config.global_stop_loss_pct = 10.0;
+        assert_eq!(
+            manage(&pos, &config),
+            ManageAction::Close {
+                reason: "stop_loss".to_string()
+            },
+            "ATR 保护价必须先于 ROI 兜底，否则周期任务与快平任务口径不一致"
+        );
     }
 
     #[test]

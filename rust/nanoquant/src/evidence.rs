@@ -9,6 +9,8 @@ const MIN_BOOTSTRAP_P_POSITIVE: f64 = 0.90;
 const MAX_DRAWDOWN_PCT: f64 = 15.0;
 const MIN_RELATIVE_ADVANTAGE_PP: f64 = 0.10;
 const RELATIVE_ADVANTAGE_EPSILON: f64 = 1e-9;
+/// 止损距离至少 1 倍 ATR：低于该值说明止损落在噪音区，价格容易被扫。
+const MIN_STOP_ATR_RATIO: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EvidenceReport {
@@ -77,6 +79,12 @@ pub(crate) fn evaluate_gate(
         reasons.push(format!(
             "stressed_avg_negative: {}",
             metrics.stressed_avg_return_pct
+        ));
+    }
+    if metrics.avg_stop_atr_ratio > 0.0 && metrics.avg_stop_atr_ratio < MIN_STOP_ATR_RATIO {
+        reasons.push(format!(
+            "stop_atr_ratio_low: {} < {}",
+            metrics.avg_stop_atr_ratio, MIN_STOP_ATR_RATIO
         ));
     }
     if metrics.max_drawdown_pct > MAX_DRAWDOWN_PCT {
@@ -156,6 +164,8 @@ fn metrics_payload(metrics: &BasketMetrics) -> Value {
         "max_drawdown_pct": metrics.max_drawdown_pct,
         "bootstrap_ci_low": metrics.bootstrap_ci_low,
         "bootstrap_p_positive": metrics.bootstrap_p_positive,
+        "avg_stop_atr_ratio": metrics.avg_stop_atr_ratio,
+        "min_stop_atr_ratio": metrics.min_stop_atr_ratio,
     })
 }
 
@@ -183,6 +193,8 @@ mod tests {
             max_drawdown_pct: 15.0,
             bootstrap_ci_low: 0.01,
             bootstrap_p_positive: 0.90,
+            avg_stop_atr_ratio: 1.3,
+            min_stop_atr_ratio: 1.1,
             symbols_used: symbols(6),
             symbols_skipped: Vec::new(),
             target_regime: "range".to_string(),
@@ -201,6 +213,8 @@ mod tests {
             max_drawdown_pct: 10.0,
             bootstrap_ci_low: 0.02,
             bootstrap_p_positive: 0.91,
+            avg_stop_atr_ratio: 1.2,
+            min_stop_atr_ratio: 1.0,
             symbols_used: symbols(6),
             symbols_skipped: vec!["SKIPPEDUSDT".to_string()],
             target_regime: "range".to_string(),
@@ -264,6 +278,18 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("relative_advantage_low")));
+
+        let mut metrics = passing_metrics();
+        metrics.avg_stop_atr_ratio = 0.99;
+        let report = gate(&metrics, Some(0.2));
+        assert!(
+            !report.pass
+                && report
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("stop_atr_ratio_low")),
+            "止损距离低于 1×ATR 必须被证据门拒绝: {report:?}"
+        );
 
         let mut metrics = passing_metrics();
         metrics.symbols_used = symbols(5);

@@ -454,6 +454,10 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
         max_bars_hold: None,
         policy,
         manage,
+        stop_distance_atr_mult: prepared.risk["stop_distance_atr_mult"]
+            .as_f64()
+            .unwrap_or(1.3),
+        atr_period: crate::ai_analysis::atr_period_of(&prepared.strategy),
         mr: prepared.strategy.clone(),
     }
 }

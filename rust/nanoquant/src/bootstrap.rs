@@ -87,6 +87,14 @@ pub fn initialize(
         .map_err(|e| format!("补齐默认配置 {key} 失败: {e}"))?;
     }
 
+    // 启动时只告警不拒绝：存量库可能已有不兼容组合，直接失败会把引擎锁死；
+    // 保存路径会在 settings_api 里拒绝新增的非法组合。
+    let strategy = crate::settings_api::group_value_public(&conn, "strategy");
+    let data = crate::settings_api::group_value_public(&conn, "data");
+    if let Err(detail) = crate::settings_api::validate_indicator_windows(&strategy, &data) {
+        tracing::warn!(%detail, "指标周期与数据窗口不兼容，信号内核可能完全不出信号");
+    }
+
     // 必须在默认配置逐组写入之后：空库此时才有 strategy 行可供快照。
     crate::ai_tuning::seed_bootstrap(&conn)?;
 

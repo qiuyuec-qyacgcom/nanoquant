@@ -368,6 +368,7 @@ const INTEGER_STRATEGY_KEYS: &[&str] = &[
     "ema_slow",
     "rsi_period",
     "atr_period",
+    "adx_period",
     "max_data_gaps",
     "valid_bars",
 ];
@@ -975,6 +976,7 @@ mod tests {
         active["ema_slow"] = json!(21);
         active["rsi_period"] = json!(14);
         active["atr_period"] = json!(14);
+        active["adx_period"] = json!(14);
         active["max_data_gaps"] = json!(1);
         active["valid_bars"] = json!(6);
         let writable = writable_strategy_parameters(&active);
@@ -992,6 +994,7 @@ mod tests {
             "ema_slow",
             "rsi_period",
             "atr_period",
+            "adx_period",
             "max_data_gaps",
             "valid_bars",
         ] {

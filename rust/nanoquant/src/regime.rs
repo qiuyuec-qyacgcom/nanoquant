@@ -176,7 +176,11 @@ pub(crate) fn market_regime(regimes: &[Regime]) -> Option<Regime> {
 /// 逐根 bar 计算前缀的 regime；不足 30 根或指标不可用时为 None。
 ///
 /// A 期只读判定与记录，B 期回测复用。
-pub(crate) fn regime_series(candles: &[CandleSnapshot], atr_period: usize) -> Vec<Option<Regime>> {
+pub(crate) fn regime_series(
+    candles: &[CandleSnapshot],
+    atr_period: usize,
+    policy: crate::trade_policy::TradePolicy,
+) -> Vec<Option<Regime>> {
     (0..candles.len())
         .map(|index| {
             let end = index + 1;
@@ -191,6 +195,7 @@ pub(crate) fn regime_series(candles: &[CandleSnapshot], atr_period: usize) -> Ve
                 prefix,
                 mark,
                 metrics.atr,
+                policy,
                 crate::trade_policy::MarketFeatures::default(),
             )
         })
@@ -318,7 +323,18 @@ mod tests {
     #[test]
     fn regime_series_aligns_to_candles() {
         let candles = synthesized_candles(80);
-        let series = regime_series(&candles, 14);
+        let series = regime_series(
+            &candles,
+            14,
+            crate::trade_policy::TradePolicy {
+                base_threshold: 0.3,
+                volume_ratio_min: 0.8,
+                atr_pct_min: 0.05,
+                atr_pct_max: 4.0,
+                ema: crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+                adx_period: 14,
+            },
+        );
         assert_eq!(series.len(), candles.len());
         assert!(
             series[..MIN_BARS_FOR_REGIME - 1]

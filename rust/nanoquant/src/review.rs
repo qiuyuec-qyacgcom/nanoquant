@@ -76,6 +76,8 @@ pub(crate) struct ReviewedEntry {
     pub stop_price: f64,
     pub take_profit: f64,
     pub reason: String,
+    /// 本次开仓是否真的经过 AI 复核（fail-open 未复核时为 false）。
+    pub reviewed: bool,
     /// 归一化后的动作：open_long / open_short / hold。
     pub action: String,
     pub confidence: f64,
@@ -266,8 +268,8 @@ pub(crate) fn apply_review(
                 "none",
             ));
         }
-        if proposal.stop_price <= 0.0 || proposal.take_profit <= 0.0 {
-            return Err(ReviewError::new("缺少有效止损/止盈价，无法开仓", "reject"));
+        if proposal.stop_price <= 0.0 {
+            return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject"));
         }
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
@@ -276,6 +278,7 @@ pub(crate) fn apply_review(
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
+            reviewed: false,
             action: action_for(&proposal.side),
             confidence: 0.0,
             invalidation_price: None,
@@ -309,10 +312,8 @@ fn apply_decision(
         .scale
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| value.clamp(0.0, 1.0));
-    if proposal.stop_price <= 0.0 || proposal.take_profit <= 0.0 {
-        return Err(
-            ReviewError::new("缺少有效止损/止盈价，无法开仓", "reject").with_meta(&decision)
-        );
+    if proposal.stop_price <= 0.0 {
+        return Err(ReviewError::new("缺少有效止损价，无法开仓", "reject").with_meta(&decision));
     }
     match decision.action {
         ReviewAction::Agree => Ok(ReviewedEntry {
@@ -329,6 +330,7 @@ fn apply_decision(
             invalidation_text: decision.invalidation_text,
             risk_text: decision.risk_text,
             reason: decision.reason,
+            reviewed: true,
             action: action_for(&proposal.side),
             confidence,
             scale,
@@ -426,6 +428,7 @@ mod tests {
         let reviewed = apply_review(&proposal(), Some(&reviewer), true).unwrap();
         assert_eq!(reviewed.leverage, 10.0);
         assert_eq!(reviewed.stop_price, 95.0);
+        assert!(reviewed.reviewed, "真实复核结果必须标记 reviewed");
     }
 
     #[test]
@@ -514,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_stop_or_take_profit_is_rejected() {
+    fn missing_stop_is_rejected() {
         let mut bad = proposal();
         bad.stop_price = 0.0;
         let error = apply_review(
@@ -524,15 +527,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.action, "reject");
+    }
 
-        let mut bad = proposal();
-        bad.take_profit = 0.0;
-        assert!(apply_review(
-            &bad,
+    #[test]
+    fn trend_entry_allowed_without_take_profit() {
+        // 趋势仓止盈交给 ROI 阶梯与快平任务，开仓只要求有效止损价。
+        let mut no_tp = proposal();
+        no_tp.take_profit = 0.0;
+        let reviewed = apply_review(
+            &no_tp,
             Some(&FakeReviewer(Ok(decision(ReviewAction::Agree)))),
-            true
+            true,
         )
-        .is_err());
+        .expect("take_profit=0 的趋势仓必须允许开仓");
+        assert_eq!(reviewed.stop_price, 95.0);
+        assert_eq!(reviewed.take_profit, 0.0);
+    }
+
+    #[test]
+    fn fail_open_branch_allows_missing_take_profit() {
+        // AI 不可用时的 fail-open 分支同样只查止损价，
+        // 否则表现为「AI 一超时就不开仓」。
+        let mut no_tp = proposal();
+        no_tp.take_profit = 0.0;
+        let reviewed =
+            apply_review(&no_tp, None, false).expect("fail-open 分支不得因 take_profit=0 拒单");
+        assert_eq!(reviewed.take_profit, 0.0);
     }
 
     #[test]
@@ -542,6 +562,10 @@ mod tests {
         assert_eq!(unreviewed.leverage, 10.0);
         assert_eq!(unreviewed.stop_price, 95.0);
         assert_eq!(unreviewed.take_profit, 110.0);
+        assert!(
+            !unreviewed.reviewed,
+            "fail-open 未复核必须标记 reviewed=false"
+        );
     }
 
     #[test]

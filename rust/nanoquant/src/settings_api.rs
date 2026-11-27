@@ -241,6 +241,9 @@ async fn write_group(
     if let Err(detail) = validate(&group, &candidate) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
     }
+    if let Err(detail) = validate_cross_group(&conn, &group, &candidate) {
+        return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
+    }
     let payload = serde_json::to_string(&candidate).unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT INTO app_settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
@@ -295,6 +298,9 @@ async fn reset_group(
         }
     }
     if let Err(detail) = validate(&group, &candidate) {
+        return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
+    }
+    if let Err(detail) = validate_cross_group(&conn, &group, &candidate) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
     }
     let payload = serde_json::to_string(&candidate).unwrap_or_else(|_| "{}".to_string());
@@ -585,6 +591,52 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 跨组校验：指标周期不能超过引擎实际 K 线窗口，换池扫描的 K 线数必须大于 ATR 周期。
+///
+/// 这些组合不会让进程崩溃，但会让信号内核或换池扫描静默地完全不出结果，
+/// 必须挡在保存前，而不是在内核里悄悄收缩窗口改变策略数值。
+pub(crate) fn validate_indicator_windows(strategy: &Value, data: &Value) -> Result<(), String> {
+    let available = crate::providers::SNAPSHOT_KLINE_LIMIT.saturating_sub(1);
+    let (_, ema_slow) = crate::param_registry::ema_periods(strategy);
+    if ema_slow > available {
+        return Err(format!(
+            "ema_slow={ema_slow} 超过引擎可用 K 线窗口 {available}，信号内核会完全不出信号"
+        ));
+    }
+    let adx_period = crate::param_registry::adx_period(strategy);
+    if adx_period > available {
+        return Err(format!(
+            "adx_period={adx_period} 超过引擎可用 K 线窗口 {available}，信号内核会完全不出信号"
+        ));
+    }
+    let atr_period = crate::param_registry::strategy_int(strategy, "atr_period").unwrap_or(14);
+    let kline_limit = data["kline_limit"].as_f64().unwrap_or(200.0);
+    if !kline_limit.is_finite() || kline_limit < 20.0 {
+        return Err(format!(
+            "kline_limit={kline_limit} 低于换池扫描所需的最小 K 线数 20"
+        ));
+    }
+    let kline_limit = kline_limit as usize;
+    if kline_limit <= atr_period {
+        return Err(format!(
+            "kline_limit={kline_limit} 必须大于 atr_period={atr_period}，否则换池扫描拿不到 ATR，所有标的会被判为数据无效"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cross_group(
+    conn: &rusqlite::Connection,
+    group: &str,
+    candidate: &Value,
+) -> Result<(), String> {
+    match group {
+        "strategy" => validate_indicator_windows(candidate, &group_value(conn, "data")),
+        "data" => validate_indicator_windows(&group_value(conn, "strategy"), candidate),
+        _ => Ok(()),
+    }
 }
 
 /// AI 调参候选校验复用同一套配置规则，避免另维护一份边界。
@@ -1048,6 +1100,51 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["data"]["mode"], "demo", "旧库 paper 应迁移为 demo");
         assert_eq!(body["data"]["max_positions"], 2, "缺字段回退默认值");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn saving_ema_slow_beyond_the_snapshot_window_is_rejected() {
+        let path = std::env::temp_dir().join("nq-settings-ema-window.db");
+        let db = fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+        let (status, body) = put_settings(app, "strategy", r#"{"ema_slow":250}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("ema_slow"),
+            "{body}"
+        );
+        let stored: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "非法周期组合不得落库");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn scan_kline_limit_must_exceed_atr_period() {
+        let path = std::env::temp_dir().join("nq-settings-scan-window.db");
+        let db = fixture(&path);
+        let app = Router::new()
+            .nest("/api/v1", routes())
+            .with_state(db.clone());
+        let (status, body) = put_settings(app.clone(), "strategy", r#"{"atr_period":50}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = put_settings(app.clone(), "data", r#"{"kline_limit":20}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("kline_limit"),
+            "{body}"
+        );
+        let (status, body) = put_settings(app, "data", r#"{"kline_limit":100}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let _ = std::fs::remove_file(&path);
     }
 

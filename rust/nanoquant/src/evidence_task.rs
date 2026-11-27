@@ -322,6 +322,11 @@ pub(crate) fn build_config(
         max_bars_hold: None,
         policy,
         manage,
+        stop_distance_atr_mult: risk
+            .get("stop_distance_atr_mult")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.3),
+        atr_period: crate::ai_analysis::atr_period_of(params),
         mr: params.clone(),
     })
 }

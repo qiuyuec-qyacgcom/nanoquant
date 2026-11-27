@@ -120,6 +120,10 @@ impl Default for DemoProvider {
     }
 }
 
+/// 引擎行情快照请求的 K 线条数。盘中未收盘的最新一根会被剔除，
+/// 因此信号内核实际可用条数最多为 `SNAPSHOT_KLINE_LIMIT - 1`。
+pub(crate) const SNAPSHOT_KLINE_LIMIT: usize = 250;
+
 #[cfg(test)]
 impl SnapshotProvider for DemoProvider {
     fn snapshot(
@@ -134,7 +138,7 @@ impl SnapshotProvider for DemoProvider {
             let timestamp = crate::now();
             let interval_ms = 4 * 60 * 60 * 1_000;
             let last_close = timestamp * 1_000 / interval_ms * interval_ms - 1;
-            let candles = (0..250)
+            let candles = (0..SNAPSHOT_KLINE_LIMIT as i64)
                 .rev()
                 .map(|index| CandleSnapshot {
                     close_time: last_close - index * interval_ms,
@@ -759,7 +763,7 @@ impl SnapshotProvider for BinanceProvider {
                         &[
                             ("symbol".into(), symbol.clone()),
                             ("interval".into(), self.timeframe.clone()),
-                            ("limit".into(), "250".into()),
+                            ("limit".into(), SNAPSHOT_KLINE_LIMIT.to_string()),
                         ],
                         false,
                     )

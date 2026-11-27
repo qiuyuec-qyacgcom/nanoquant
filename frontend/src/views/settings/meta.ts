@@ -84,6 +84,11 @@ export const BASE_META: Record<string, FieldMeta> = {
     unit: '×',
     hint: '提示 AI：止损保证金比例 ≥ 该倍数 × ATR% × 杠杆；只做提示词引导，不强制校验',
   },
+  stop_distance_atr_mult: {
+    label: '开仓止损 ATR 倍数',
+    unit: '×',
+    hint: '开仓止损价格距离 = 该倍数 × ATR%，由引擎计算，与杠杆无关；1.3 表示至少 1.3 倍 ATR',
+  },
   min_leverage: {
     label: '杠杆下限', unit: 'x', min: 1,
     hint: '本地杠杆规则的下限：算出的杠杆低于该值会抬到此处',
@@ -130,8 +135,8 @@ export const BASE_META: Record<string, FieldMeta> = {
   },
   daily_loss_limit_pct: { label: '日内亏损上限', unit: '%', hint: '触发后当日停止开新仓' },
   max_drawdown_pct: { label: '最大回撤', unit: '%', hint: '基于权益峰值' },
-  global_stop_loss_pct: { label: '仓位止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
-  global_take_profit_pct: { label: '仓位止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓；价格距离 = 该值 ÷ 杠杆，0=关闭' },
+  global_stop_loss_pct: { label: '仓位止损率', unit: '%', hint: '保证金亏损达到该比例就整仓平仓，由 0.5 秒快平任务实时判定；与波动保护止损价先到者生效，0=关闭' },
+  global_take_profit_pct: { label: '仓位止盈率', unit: '%', hint: '保证金盈利达到该比例就整仓平仓，由 0.5 秒快平任务实时判定；趋势仓开仓不预置止盈价，0=关闭' },
   drawdown_peak_window_days: { label: '回撤峰值窗口', unit: '天', hint: '0=历史最高（永不遗忘）；>0 只看最近 N 天，小资金腰斩后不会永久卡死' },
   consecutive_loss_limit: { label: '连亏熔断', unit: '笔', hint: '连续亏损达到该笔数就暂停开新仓' },
   cooldown_minutes: { label: '熔断冷静期', unit: '分钟', hint: '熔断后暂停开新仓的分钟数' },

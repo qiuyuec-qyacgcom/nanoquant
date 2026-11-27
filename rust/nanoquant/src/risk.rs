@@ -203,6 +203,28 @@ pub fn estimate_qty(
     (qty, "ok".into())
 }
 
+/// 趋势仓的波动保护止损价：价格距离 = `stop_distance_atr_mult × ATR%`。
+///
+/// 该口径与杠杆无关，避免「止损距离 = 保证金% ÷ 杠杆」随杠杆收缩到噪音区。
+/// ATR% 或倍数非法时返回 0，让上游按「缺少有效止损价」拒单。
+pub(crate) fn atr_stop_price(side: &str, price: f64, atr_pct: f64, mult: f64) -> f64 {
+    if !price.is_finite()
+        || price <= 0.0
+        || !atr_pct.is_finite()
+        || atr_pct <= 0.0
+        || !mult.is_finite()
+        || mult <= 0.0
+    {
+        return 0.0;
+    }
+    let distance = mult * atr_pct / 100.0;
+    if distance >= 1.0 {
+        return 0.0;
+    }
+    let direction = if side == "long" { 1.0 } else { -1.0 };
+    price * (1.0 - direction * distance)
+}
+
 /// 交易时段。窗口形如 `09:00-12:00`，结束不大于开始视为跨日。空列表表示全天可交易。
 pub fn trading_window_open(windows: &[String], minutes_now: i64) -> bool {
     if windows.is_empty() {
@@ -351,6 +373,19 @@ mod tests {
         daily.equity = 940.0;
         let gate = global_gates(&daily);
         assert!(!gate.ok && gate.risk_halt, "日内亏损必须标记为风控熔断");
+    }
+
+    #[test]
+    fn atr_stop_distance_is_multiple_of_atr_without_leverage() {
+        // 3.55% ATR × 1.3 = 4.615% 价格距离，多头止损价 95.385、空头 104.615。
+        let long = atr_stop_price("long", 100.0, 3.55, 1.3);
+        let short = atr_stop_price("short", 100.0, 3.55, 1.3);
+        assert!((long - 95.385).abs() < 1e-9, "实际 {long}");
+        assert!((short - 104.615).abs() < 1e-9, "实际 {short}");
+        // 同样的 ATR 与倍数不因任何杠杆输入而改变。
+        assert_eq!(long, atr_stop_price("long", 100.0, 3.55, 1.3));
+        assert_eq!(atr_stop_price("long", 100.0, 0.0, 1.3), 0.0);
+        assert_eq!(atr_stop_price("long", 100.0, 3.55, 0.0), 0.0);
     }
 
     #[test]

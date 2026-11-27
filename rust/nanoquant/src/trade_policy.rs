@@ -1,9 +1,21 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// EMA 快慢周期：信号内核、regime 判定与 AI 特征快照共用同一份配置。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EmaPeriods {
+    pub fast: usize,
+    pub slow: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TradePolicy {
     pub base_threshold: f64,
     pub volume_ratio_min: f64,
     pub atr_pct_min: f64,
     pub atr_pct_max: f64,
+    pub ema: EmaPeriods,
+    /// ADX 计算周期，来自 strategy.adx_period。
+    pub adx_period: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -31,6 +43,10 @@ pub(crate) struct Preview {
 struct Core {
     volume_ratio: f64,
     atr_pct: f64,
+    /// ADX 值：regime 判定的趋势强度输入，周期随配置变化。
+    adx: f64,
+    /// EMA 快慢差（%）：regime 判定的趋势强度输入，随配置周期变化。
+    gap_pct: f64,
     regime: &'static str,
     rs: f64,
     breakout: f64,
@@ -42,13 +58,49 @@ struct Core {
     confidence: f64,
 }
 
+/// 信号内核需要的最小 K 线数：30 根基础窗口、ADX 需要 `period + 1` 个窗口、
+/// EMA 需要 `period` 根收盘价。任何一项不满足，`core` 都会整体返回 `None`，
+/// 这里把这条隐式耦合显式化，供校验与告警共用。
+fn required_candles(policy: &TradePolicy) -> usize {
+    30usize
+        .max(policy.adx_period.saturating_add(1))
+        .max(policy.ema.fast)
+        .max(policy.ema.slow)
+}
+
+/// 数据窗口不足是配置/行情问题，不是常规空信号；限流告警避免每轮刷屏。
+fn warn_insufficient_candles(available: usize, required: usize) {
+    static LAST_WARN_TS: AtomicI64 = AtomicI64::new(0);
+    let now = crate::now();
+    let last = LAST_WARN_TS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60 {
+        return;
+    }
+    if LAST_WARN_TS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        tracing::warn!(
+            available,
+            required,
+            "K 线不足以计算配置的指标周期，本轮不产生信号；请检查 ema_slow/adx_period 与行情数据窗口"
+        );
+    }
+}
+
 fn core(
     candles: &[crate::providers::CandleSnapshot],
     mark: f64,
     atr: f64,
+    policy: TradePolicy,
     features: MarketFeatures,
 ) -> Option<Core> {
-    if candles.len() < 30 || !mark.is_finite() || mark <= 0.0 || !atr.is_finite() || atr <= 0.0 {
+    let required = required_candles(&policy);
+    if candles.len() < required {
+        warn_insufficient_candles(candles.len(), required);
+        return None;
+    }
+    if !mark.is_finite() || mark <= 0.0 || !atr.is_finite() || atr <= 0.0 {
         return None;
     }
     let closes: Vec<f64> = candles.iter().map(|candle| candle.close).collect();
@@ -67,9 +119,9 @@ fn core(
         0.0
     };
     let atr_pct = atr / last * 100.0;
-    let adx_value = adx(candles, 14)?;
-    let fast = ema(&closes, 9)?;
-    let slow = ema(&closes, 21)?;
+    let adx_value = adx(candles, policy.adx_period)?;
+    let fast = ema(&closes, policy.ema.fast)?;
+    let slow = ema(&closes, policy.ema.slow)?;
     let gap_pct = (fast - slow) / slow * 100.0;
     let regime = crate::regime::classify(adx_value, gap_pct, atr_pct, volume_ratio);
     let prior = &candles[candles.len() - 21..candles.len() - 1];
@@ -141,6 +193,8 @@ fn core(
     Some(Core {
         volume_ratio,
         atr_pct,
+        adx: adx_value,
+        gap_pct,
         regime: regime.as_str(),
         rs,
         breakout,
@@ -157,18 +211,21 @@ pub(crate) fn regime_for(
     candles: &[crate::providers::CandleSnapshot],
     mark: f64,
     atr: f64,
+    policy: TradePolicy,
     features: MarketFeatures,
 ) -> Option<crate::regime::Regime> {
-    core(candles, mark, atr, features).and_then(|core| crate::regime::Regime::from_str(core.regime))
+    core(candles, mark, atr, policy, features)
+        .and_then(|core| crate::regime::Regime::from_str(core.regime))
 }
 
 pub(crate) fn preview(
     candles: &[crate::providers::CandleSnapshot],
     mark: f64,
     atr: f64,
+    policy: TradePolicy,
     features: MarketFeatures,
 ) -> Option<Preview> {
-    let core = core(candles, mark, atr, features)?;
+    let core = core(candles, mark, atr, policy, features)?;
     let side = if core.score > 0.0 {
         "long"
     } else if core.score < 0.0 {
@@ -189,7 +246,7 @@ pub(crate) fn evaluate(
     policy: TradePolicy,
     features: MarketFeatures,
 ) -> Option<TradeSignal> {
-    let core = core(candles, mark, atr, features)?;
+    let core = core(candles, mark, atr, policy, features)?;
     if core.volume_ratio < policy.volume_ratio_min {
         return None;
     }
@@ -209,10 +266,12 @@ pub(crate) fn evaluate(
         side: if core.score > 0.0 { "long" } else { "short" },
         score: core.score,
         reason: format!(
-            "fusion:score={:.4}:vol={:.2}:regime={},rs={:.2},break={:.2},carry={:.2},flow={:.2},conf={:.2},coverage={:.2}",
+            "fusion:score={:.4}:vol={:.2}:adx={:.1}:regime={},gap={:.4},rs={:.2},break={:.2},carry={:.2},flow={:.2},conf={:.2},coverage={:.2}",
             core.score,
             core.volume_ratio,
+            core.adx,
             core.regime,
+            core.gap_pct,
             core.rs,
             core.breakout,
             core.carry,
@@ -223,8 +282,10 @@ pub(crate) fn evaluate(
     })
 }
 
-fn ema(values: &[f64], period: usize) -> Option<f64> {
-    if values.len() < period {
+/// 全仓唯一 EMA 实现：以第一根收盘价播种，避免信号内核与 AI 特征快照
+/// 各用一套播种口径导致长周期下 EMA 差出现可见分叉。
+pub(crate) fn ema(values: &[f64], period: usize) -> Option<f64> {
+    if period == 0 || values.len() < period {
         return None;
     }
     let alpha = 2.0 / (period as f64 + 1.0);
@@ -273,6 +334,8 @@ mod tests {
             volume_ratio_min: 0.5,
             atr_pct_min: 0.05,
             atr_pct_max: 4.0,
+            ema: EmaPeriods { fast: 9, slow: 21 },
+            adx_period: 14,
         }
     }
 
@@ -414,7 +477,7 @@ mod tests {
             evaluate(&data, mark, 1.0, policy, MarketFeatures::default()).is_none(),
             "正式判定必须尊重量能门槛"
         );
-        let preview = preview(&data, mark, 1.0, MarketFeatures::default())
+        let preview = preview(&data, mark, 1.0, cfg(), MarketFeatures::default())
             .expect("量能不足时仍应给出预览评分");
         assert_eq!(preview.side, "long");
         assert!(preview.score > 0.0);
@@ -465,8 +528,134 @@ mod tests {
     }
 
     #[test]
+    fn ema_periods_drive_the_signal_kernel() {
+        // EMA 周期必须真的进入内核计算：不同周期给出不同的 EMA 差。
+        let values: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+        let data = candles(&values);
+        let mark = *values.last().unwrap();
+        let atr = mark * 0.01;
+        let gap = |fast: usize, slow: usize| {
+            core(
+                &data,
+                mark,
+                atr,
+                TradePolicy {
+                    ema: EmaPeriods { fast, slow },
+                    ..cfg()
+                },
+                MarketFeatures::default(),
+            )
+            .expect("K 线足够时应给出内核结果")
+            .gap_pct
+        };
+        let wide = gap(9, 21);
+        let narrow = gap(10, 11);
+        assert!(
+            (wide - narrow).abs() > 1e-9,
+            "EMA 周期必须真的影响内核的 gap（{wide} vs {narrow}）"
+        );
+    }
+
+    #[test]
+    fn adx_period_drives_the_signal_kernel() {
+        // 最近 6 根走平、此前单边上涨：短周期 ADX 被走平段稀释得更多，
+        // 长周期仍保留更多趋势段，两个周期必须给出不同的 ADX。
+        let mut values: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        values.extend(std::iter::repeat_n(139.0, 6));
+        let data = candles(&values);
+        let mark = *values.last().unwrap();
+        let atr = mark * 0.01;
+        let adx_for = |period: usize| {
+            core(
+                &data,
+                mark,
+                atr,
+                TradePolicy {
+                    adx_period: period,
+                    ..cfg()
+                },
+                MarketFeatures::default(),
+            )
+            .expect("K 线足够时应给出内核结果")
+            .adx
+        };
+        let short = adx_for(7);
+        let long = adx_for(14);
+        assert!(
+            (short - long).abs() > 1.0,
+            "ADX 周期必须真的进入内核计算（{short} vs {long}）"
+        );
+    }
+
+    #[test]
+    fn required_candles_cover_the_widest_indicator_window() {
+        assert_eq!(required_candles(&cfg()), 30, "默认 14/9/21 的基础窗口是 30");
+        assert_eq!(
+            required_candles(&TradePolicy {
+                adx_period: 40,
+                ..cfg()
+            }),
+            41,
+            "ADX 需要 period + 1 个窗口"
+        );
+        assert_eq!(
+            required_candles(&TradePolicy {
+                ema: EmaPeriods { fast: 9, slow: 60 },
+                ..cfg()
+            }),
+            60,
+            "EMA 慢线需要 period 根收盘价"
+        );
+    }
+
+    #[test]
+    fn core_returns_none_when_configured_period_exceeds_candles() {
+        let values: Vec<f64> = (0..40).map(|i| 100.0 + i as f64).collect();
+        let data = candles(&values);
+        let mark = *values.last().unwrap();
+        let atr = mark * 0.01;
+        assert!(
+            core(
+                &data,
+                mark,
+                atr,
+                TradePolicy {
+                    ema: EmaPeriods { fast: 9, slow: 50 },
+                    ..cfg()
+                },
+                MarketFeatures::default(),
+            )
+            .is_none(),
+            "ema_slow 超过可用 K 线时内核必须拒绝，且由告警暴露配置问题"
+        );
+        assert!(
+            core(
+                &data,
+                mark,
+                atr,
+                TradePolicy {
+                    adx_period: 40,
+                    ..cfg()
+                },
+                MarketFeatures::default(),
+            )
+            .is_none(),
+            "adx_period 用尽 K 线时内核必须拒绝"
+        );
+    }
+
+    #[test]
+    fn ema_uses_first_close_seed() {
+        // 全仓唯一 EMA 口径：第一根收盘价播种。alpha=0.5 时 100 → 101 → 102.5。
+        let values = [100.0, 102.0, 104.0];
+        assert!((ema(&values, 3).unwrap() - 102.5).abs() < 1e-9);
+        assert!(ema(&values, 0).is_none(), "0 周期必须拒绝");
+        assert!(ema(&values, 4).is_none(), "K 线不足必须拒绝");
+    }
+
+    #[test]
     fn preview_returns_none_without_enough_candles() {
         let data = candles(&(0..20).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
-        assert!(preview(&data, 120.0, 1.0, MarketFeatures::default()).is_none());
+        assert!(preview(&data, 120.0, 1.0, cfg(), MarketFeatures::default()).is_none());
     }
 }

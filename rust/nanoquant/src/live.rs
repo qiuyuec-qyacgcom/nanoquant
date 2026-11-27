@@ -1019,6 +1019,22 @@ mod tests {
     }
 
     #[test]
+    fn protection_legs_skip_zero_take_profit() {
+        // 趋势仓开仓不再预置止盈价：只挂止损腿，不能造出 0 价止盈单。
+        let legs = protection_legs(
+            "BTCUSDT",
+            "long",
+            49_000.0,
+            0.0,
+            &SymbolFilter::default(),
+            5_000,
+            1,
+        );
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].kind, "STOP_MARKET");
+    }
+
+    #[test]
     fn protection_legs_quote_the_close_side_and_skip_empty_prices() {
         let filter = SymbolFilter::default();
         let legs = protection_legs("BTCUSDT", "long", 49_000.0, 52_000.0, &filter, 5_000, 1);

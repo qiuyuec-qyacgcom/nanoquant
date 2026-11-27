@@ -309,6 +309,10 @@ fn activate_in_savepoint(
     }
     let after = crate::settings_api::normalized_group_value("strategy", &set.params);
     crate::settings_api::validate_group("strategy", &after)?;
+    crate::settings_api::validate_indicator_windows(
+        &after,
+        &crate::settings_api::group_value_public(conn, "data"),
+    )?;
 
     if set.status == "active" {
         if after == before {
@@ -680,6 +684,10 @@ fn rollback_in_savepoint(
     let before = crate::settings_api::group_value_public(conn, "strategy");
     let after = crate::settings_api::normalized_group_value("strategy", &previous.params);
     crate::settings_api::validate_group("strategy", &after)?;
+    crate::settings_api::validate_indicator_windows(
+        &after,
+        &crate::settings_api::group_value_public(conn, "data"),
+    )?;
 
     let now = crate::now();
     conn.execute(
@@ -1784,6 +1792,65 @@ mod tests {
         );
         let active = active_for_regime(&conn, "range").unwrap().unwrap();
         assert_eq!(active.id, range.id, "失败的激活不得改变 active");
+    }
+
+    #[test]
+    fn activate_rejects_indicator_window_beyond_snapshot() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range = active_for_regime(&conn, "range").unwrap().unwrap();
+        let mut params = range.params.clone();
+        params["ema_slow"] = json!(250);
+        let bad_id = insert_candidate(
+            &conn,
+            "range-bad-window",
+            "range",
+            "1h",
+            &params,
+            Some(range.id),
+        )
+        .unwrap();
+        mark_evidence(&conn, bad_id, true, &json!({"gate":{"pass":true}})).unwrap();
+        let before = strategy_value(&conn);
+
+        let error = activate(&conn, bad_id, "regime", "demo").unwrap_err();
+
+        assert!(error.contains("ema_slow"), "实际错误: {error}");
+        assert_eq!(
+            strategy_value(&conn),
+            before,
+            "非法指标窗口不得物化到 strategy"
+        );
+        assert_eq!(
+            load_set(&conn, bad_id).unwrap().status,
+            "approved",
+            "失败的激活不得改状态"
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_indicator_window_beyond_snapshot() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let current = active_for_regime(&conn, "range").unwrap().unwrap();
+        let mut params = current.params.clone();
+        params["ema_slow"] = json!(250);
+        let bad_id = insert_candidate(
+            &conn,
+            "range-bad-window-rollback",
+            "range",
+            "1h",
+            &params,
+            Some(current.id),
+        )
+        .unwrap();
+        let bad = load_set(&conn, bad_id).unwrap();
+        let before = strategy_value(&conn);
+
+        let error = rollback_in_savepoint(&conn, &current, &bad, "demo", "manual").unwrap_err();
+
+        assert!(error.contains("ema_slow"), "实际错误: {error}");
+        assert_eq!(strategy_value(&conn), before, "非法窗口不得回滚物化");
     }
 
     #[test]

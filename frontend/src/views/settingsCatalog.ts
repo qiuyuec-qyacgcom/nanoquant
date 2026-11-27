@@ -117,8 +117,8 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
     {
       title: '仓位止盈止损',
-      hint: '你的心理预期（保证金收益率）：盈利/亏损达到该比例就强制平仓；与 AI 失效价先触发者生效，0=关闭',
-      fields: ['global_stop_loss_pct', 'global_take_profit_pct'],
+      hint: '你的心理预期（保证金收益率）：盈利/亏损达到该比例就强制平仓，由 0.5 秒快平任务实时判定；止损价另由波动保护（stop_distance_atr_mult × ATR%）给出，两者先到者生效，0=关闭',
+      fields: ['global_stop_loss_pct', 'global_take_profit_pct', 'stop_distance_atr_mult'],
     },
     {
       title: '熔断与冷却',

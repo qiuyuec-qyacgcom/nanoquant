@@ -12,7 +12,7 @@ async function login(page: import('@playwright/test').Page) {
   await page.goto('/#/login')
   await page.locator('input[autocomplete="username"]').fill(USER)
   await page.locator('input[type="password"]').fill(PASS)
-  await page.getByRole('button', { name: '进入后台' }).click()
+  await page.getByRole('button', { name: /进入终端/ }).click()
   await expect(page).toHaveURL(/#\/admin\/dashboard/, { timeout: 15_000 })
 }
 

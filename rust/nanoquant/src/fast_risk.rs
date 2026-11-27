@@ -71,8 +71,8 @@ pub(crate) struct FastRiskInput<'a> {
     global_tp_pct: f64,
 }
 
-/// 快速风控裁决：先看全局止盈止损（保证金收益率），再看 AI 失效价，
-/// 最后看单仓止盈止损。返回 None 表示继续持仓。
+/// 快速风控裁决：AI 失效价 → ATR 保护价 → ROI 兜底 → 单仓止盈价。
+/// 返回 None 表示继续持仓。
 fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
     // 价格非法时直接放行，避免除零或 NaN 比较导致误平仓。
     if !input.entry.is_finite()
@@ -84,14 +84,8 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
     }
     // 非 "long" 一律按空单处理（沿用旧行为）。
     let direction = if input.side == "long" { 1.0 } else { -1.0 };
-    let margin_pct =
-        (input.mark - input.entry) * direction / input.entry * 100.0 * input.leverage.max(1.0);
-    if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
-        return Some("global_stop_loss");
-    }
-    if input.global_tp_pct > 0.0 && margin_pct >= input.global_tp_pct {
-        return Some("global_take_profit");
-    }
+
+    // ① AI 失效价：AI 的否决意见，保持最高优先级。
     if let Some(ip) = input
         .invalidation_price
         .filter(|v| *v > 0.0 && v.is_finite())
@@ -100,12 +94,26 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
             return Some("invalidation");
         }
     }
+
+    // ② ATR 保护价：开仓时按 ATR% 写入，不随杠杆收缩，必须先于 ROI 兜底。
     if input.sl > 0.0
         && ((direction > 0.0 && input.mark <= input.sl)
             || (direction < 0.0 && input.mark >= input.sl))
     {
         return Some("stop_loss");
     }
+
+    // ③ 仓位止盈止损率：ROI 口径的账户风险预算，整仓强制平仓。
+    let margin_pct =
+        (input.mark - input.entry) * direction / input.entry * 100.0 * input.leverage.max(1.0);
+    if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
+        return Some("global_stop_loss");
+    }
+    if input.global_tp_pct > 0.0 && margin_pct >= input.global_tp_pct {
+        return Some("global_take_profit");
+    }
+
+    // ④ 单仓止盈价：趋势仓开仓时为 0，仅均值回归仓仍有值。
     if input.tp > 0.0
         && ((direction > 0.0 && input.mark >= input.tp)
             || (direction < 0.0 && input.mark <= input.tp))
@@ -328,8 +336,9 @@ mod tests {
     }
 
     #[test]
-    fn global_stop_wins_over_invalidation() {
-        // 5 倍杠杆下 -10% 价格即 -50% 保证金，全局止损应先于失效价命中。
+    fn invalidation_has_highest_priority() {
+        // 失效价是 AI 的否决意见，优先级最高：
+        // 即便同时满足 ROI 兜底，也应返回 invalidation。
         assert_eq!(
             fast_risk_reason(&risk_input(
                 "long",
@@ -341,6 +350,29 @@ mod tests {
                 Some(95.0),
                 10.0,
                 0.0
+            )),
+            Some("invalidation")
+        );
+    }
+
+    #[test]
+    fn atr_stop_precedes_roi_budget() {
+        // sl=95、entry=100、lev=9：mark=94 同时跌破 ATR 保护价并越过 ROI 止损线，
+        // 必须先返回 stop_loss，否则 ATR 保护价永远轮不到触发。
+        assert_eq!(
+            fast_risk_reason(&risk_input(
+                "long", 100.0, 94.0, 95.0, 0.0, 9.0, None, 10.0, 0.0
+            )),
+            Some("stop_loss")
+        );
+    }
+
+    #[test]
+    fn roi_budget_still_triggers() {
+        // 无 ATR 保护价（sl=0）时，ROI 兜底仍按保证金收益率平仓。
+        assert_eq!(
+            fast_risk_reason(&risk_input(
+                "long", 100.0, 95.0, 0.0, 0.0, 2.0, None, 10.0, 0.0
             )),
             Some("global_stop_loss")
         );

@@ -350,7 +350,8 @@ fn load_config(db: &crate::db::Db) -> Result<Config, String> {
             .unwrap_or(3)
             .clamp(1, 20) as usize,
         kline_limit: data["kline_limit"].as_i64().unwrap_or(200).clamp(20, 500) as usize,
-        atr_period: strategy["atr_period"].as_i64().unwrap_or(14).max(1) as usize,
+        // ATR 周期与实盘扫描、特征快照、回测同源：范围取注册表，非法值回退 14。
+        atr_period: crate::ai_analysis::atr_period_of(&strategy),
         timeframe,
         gates,
         base_url: data[endpoint]

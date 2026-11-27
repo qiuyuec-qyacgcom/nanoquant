@@ -40,6 +40,10 @@ pub struct EngineConfig {
     pub max_bars_hold: Option<usize>,
     pub policy: TradePolicy,
     pub manage: ManageConfig,
+    /// 趋势仓波动保护止损：价格距离 = 该倍数 × ATR%，与杠杆无关。
+    pub stop_distance_atr_mult: f64,
+    /// ATR 周期：与实盘扫描、AI 特征快照同源，避免各算各的 ATR。
+    pub atr_period: usize,
     /// 策略参数快照：range 市均值回归的开关、阈值与独立止损止盈。
     /// 缺省 `Value::Null` 时均值回归关闭，保持既有回测语义。
     pub mr: Value,
@@ -60,6 +64,8 @@ pub struct BacktestTrade {
     pub score: f64,
     pub sl_pct: f64,
     pub tp_pct: f64,
+    /// 开仓时该标的的 ATR%，用于评估「止损距离 / ATR」是否落在噪音区。
+    pub atr_pct: f64,
     pub entry_fee: f64,
     pub funding: f64,
     pub partial_tp: bool,
@@ -96,6 +102,8 @@ struct OpenPosition {
     initial_qty: f64,
     sl_pct: f64,
     tp_pct: f64,
+    /// 开仓时该标的的 ATR%，落库到成交明细供证据门/GA 使用。
+    atr_pct: f64,
     stop_price: f64,
     tp_price: f64,
     initial_fee: f64,
@@ -203,6 +211,7 @@ impl<'a> Sim<'a> {
             score: position.score,
             sl_pct: position.sl_pct,
             tp_pct: position.tp_pct,
+            atr_pct: position.atr_pct,
             entry_fee: round(position.initial_fee, 6),
             funding: round(position.funding, 6),
             partial_tp: position.partial,
@@ -309,7 +318,21 @@ impl<'a> Sim<'a> {
                     continue;
                 }
 
-                // 全局止盈止损按保证金收益率，优先于 ATR 止损/止盈（与实盘 manage 同序）。
+                // 与实盘同序：ATR 保护价先于 ROI 兜底，
+                // 否则 ROI 线永远先于 ATR 线触发，波动保护等于没做。
+                if stop_price > 0.0
+                    && ((direction > 0.0 && bar.low <= stop_price)
+                        || (direction < 0.0 && bar.high >= stop_price))
+                {
+                    self.close_position(
+                        gap_fill(bar, stop_price, direction, true),
+                        index,
+                        "stop_loss",
+                    );
+                    continue;
+                }
+
+                // 全局止盈止损按保证金收益率，排在 ATR 保护价之后。
                 let bar_margin_pct = if entry > 0.0 {
                     (bar.close - entry) * direction / entry * 100.0 * self.config.leverage.max(1.0)
                 } else {
@@ -321,18 +344,6 @@ impl<'a> Sim<'a> {
                 }
                 if global_tp > 0.0 && bar_margin_pct >= global_tp {
                     self.close_position(bar.close, index, "global_take_profit");
-                    continue;
-                }
-
-                if stop_price > 0.0
-                    && ((direction > 0.0 && bar.low <= stop_price)
-                        || (direction < 0.0 && bar.high >= stop_price))
-                {
-                    self.close_position(
-                        gap_fill(bar, stop_price, direction, true),
-                        index,
-                        "stop_loss",
-                    );
                     continue;
                 }
 
@@ -418,7 +429,7 @@ impl<'a> Sim<'a> {
             }
             let slice_start = index.saturating_sub(180);
             let slice = &self.candles[slice_start..=index];
-            let Some(metrics) = candle_metrics(slice, 14) else {
+            let Some(metrics) = candle_metrics(slice, self.config.atr_period) else {
                 continue;
             };
             let closes: Vec<f64> = slice.iter().map(|candle| candle.close).collect();
@@ -442,7 +453,13 @@ impl<'a> Sim<'a> {
                 relative_strength_available: true,
             };
             // 与实盘同路由：range 且启用均值回归时，趋势信号不参与开仓。
-            let regime = trade_policy::regime_for(slice, bar.close, metrics.atr, features);
+            let regime = trade_policy::regime_for(
+                slice,
+                bar.close,
+                metrics.atr,
+                self.config.policy,
+                features,
+            );
             let mean_reversion = crate::mean_reversion::mean_reversion_active(
                 regime.map(|regime| regime.as_str()),
                 &self.config.mr,
@@ -475,12 +492,21 @@ impl<'a> Sim<'a> {
                     self.config.mr["mr_tp_pct"].as_f64().unwrap_or(30.0) / leverage,
                 )
             } else {
-                (
-                    self.config.manage.global_stop_loss_pct / leverage,
-                    self.config.manage.global_take_profit_pct / leverage,
+                // 趋势仓止损改由 ATR 决定，止盈交给 ROI 阶梯与快平任务。
+                (self.config.stop_distance_atr_mult * metrics.atr_pct, 0.0)
+            };
+            let stop_price = if mean_reversion {
+                entry * (1.0 - direction * sl_pct / 100.0)
+            } else {
+                crate::risk::atr_stop_price(
+                    side,
+                    entry,
+                    metrics.atr_pct,
+                    self.config.stop_distance_atr_mult,
                 )
             };
-            if sl_pct <= 0.0 || tp_pct <= 0.0 || entry <= 0.0 {
+            // 与实盘同闸门：没有有效止损价就不开仓，止盈可以为 0。
+            if sl_pct <= 0.0 || stop_price <= 0.0 || entry <= 0.0 {
                 continue;
             }
             // 仓位只由单仓保证金占比决定：名义额 = 权益 × margin_pct% × 杠杆。
@@ -491,6 +517,11 @@ impl<'a> Sim<'a> {
             }
             let entry_fee = entry * qty * self.fee_rate();
             self.fee_total += entry_fee;
+            let tp_price = if tp_pct > 0.0 {
+                entry * (1.0 + direction * tp_pct / 100.0)
+            } else {
+                0.0
+            };
             self.position = Some(OpenPosition {
                 side: side.to_string(),
                 entry_ts: next.open_time,
@@ -499,8 +530,9 @@ impl<'a> Sim<'a> {
                 initial_qty: qty,
                 sl_pct,
                 tp_pct,
-                stop_price: entry * (1.0 - direction * sl_pct / 100.0),
-                tp_price: entry * (1.0 + direction * tp_pct / 100.0),
+                atr_pct: metrics.atr_pct,
+                stop_price,
+                tp_price,
                 initial_fee: entry_fee,
                 realized: 0.0,
                 funding: 0.0,
@@ -1090,6 +1122,10 @@ pub struct BasketMetrics {
     pub max_drawdown_pct: f64,
     pub bootstrap_ci_low: f64,
     pub bootstrap_p_positive: f64,
+    /// OOS 成交的平均「止损距离 / ATR%」：<1 表示止损落在噪音区。
+    pub avg_stop_atr_ratio: f64,
+    /// OOS 成交里最窄的「止损距离 / ATR%」。
+    pub min_stop_atr_ratio: f64,
     pub symbols_used: Vec<String>,
     pub symbols_skipped: Vec<String>,
     pub target_regime: String,
@@ -1144,12 +1180,14 @@ fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnap
 fn build_market_regime_map(
     basket: &[(String, Vec<HistoryBar>)],
     frame_ms: i64,
+    atr_period: usize,
+    policy: crate::trade_policy::TradePolicy,
 ) -> BTreeMap<i64, crate::regime::Regime> {
     let per_symbol: Vec<BTreeMap<i64, crate::regime::Regime>> = basket
         .iter()
         .map(|(_, bars)| {
             let candles = candles_from_history(bars, frame_ms);
-            let series = crate::regime::regime_series(&candles, 14);
+            let series = crate::regime::regime_series(&candles, atr_period, policy);
             let mut map = BTreeMap::new();
             for (candle, regime) in candles.iter().zip(series) {
                 if let Some(regime) = regime {
@@ -1249,7 +1287,7 @@ pub fn run_walkforward_basket_fixed(
             base.interval_ms
         ));
     }
-    let regimes = build_market_regime_map(basket, frame_ms);
+    let regimes = build_market_regime_map(basket, frame_ms, base.atr_period, base.policy);
     let requested_folds = folds.clamp(MIN_FOLDS as i64, MAX_FOLDS as i64) as usize;
     let target = target_regime.as_str();
     let mut fold_results = Vec::new();
@@ -1258,6 +1296,7 @@ pub fn run_walkforward_basket_fixed(
     let mut is_fold_avgs = Vec::new();
     let mut seen_oos: BTreeSet<(String, i64)> = BTreeSet::new();
     let mut all_oos = Vec::new();
+    let mut all_stop_atr_ratios = Vec::new();
     let mut oos_ordered: Vec<(i64, f64)> = Vec::new();
     let mut used = Vec::new();
     let mut skipped = Vec::new();
@@ -1321,6 +1360,9 @@ pub fn run_walkforward_basket_fixed(
             {
                 if seen_oos.insert((symbol.clone(), trade.entry_ts)) {
                     all_oos.push(trade.pnl_pct);
+                    if trade.atr_pct > 0.0 && trade.sl_pct.is_finite() {
+                        all_stop_atr_ratios.push(trade.sl_pct / trade.atr_pct);
+                    }
                     oos_ordered.push((trade.exit_ts, trade.pnl_pct));
                 }
             }
@@ -1361,6 +1403,18 @@ pub fn run_walkforward_basket_fixed(
         max_drawdown_pct: round(compounded_max_drawdown(&oos_ordered), 4),
         bootstrap_ci_low: bootstrap["ci_low"].as_f64().unwrap_or_default(),
         bootstrap_p_positive: bootstrap["p_positive"].as_f64().unwrap_or_default(),
+        avg_stop_atr_ratio: round(average(&all_stop_atr_ratios), 4),
+        min_stop_atr_ratio: if all_stop_atr_ratios.is_empty() {
+            0.0
+        } else {
+            round(
+                all_stop_atr_ratios
+                    .iter()
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
+                4,
+            )
+        },
         symbols_used: used,
         symbols_skipped: skipped,
         target_regime: target.to_string(),
@@ -1439,6 +1493,8 @@ mod tests {
                 volume_ratio_min: 0.0,
                 atr_pct_min: 0.05,
                 atr_pct_max: 4.0,
+                ema: crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+                adx_period: 14,
             },
             manage: ManageConfig {
                 partial_tp_at_r: 1.0,
@@ -1454,8 +1510,28 @@ mod tests {
                 roi_min_r: 0.0,
                 roi_table: Vec::new(),
             },
+            stop_distance_atr_mult: 1.3,
+            atr_period: 14,
             mr: Value::Null,
         }
+    }
+
+    /// 振幅随 K 线位置周期变化的行情：ATR(7) 与 ATR(14) 的窗口平均必然不同，
+    /// 才能验证 ATR 周期参数真的接进了回测引擎（均匀趋势下两者恰好相等，测不出来）。
+    fn alternating_range_bars(count: usize) -> Vec<HistoryBar> {
+        (0..count)
+            .map(|index| {
+                let base = 100.0 + index as f64 * 0.5;
+                let range = 0.3 + 0.02 * (index as f64 % 25.0);
+                bar(
+                    index as i64 * 900_000,
+                    base,
+                    base + range,
+                    base - range * 0.5,
+                    base + range * 0.4,
+                )
+            })
+            .collect()
     }
 
     fn trending_bars(count: usize) -> Vec<HistoryBar> {
@@ -1500,6 +1576,119 @@ mod tests {
         assert!((fill_price(100.0, 10.0, -1.0, false) - 100.1).abs() < 1e-9);
     }
 
+    /// 重算开仓信号那一根 K 线的 ATR%，用于校验回测止损距离口径。
+    /// 周期取配置值，与回测引擎自身一致。
+    fn atr_pct_at_entry(bars: &[HistoryBar], entry_ts: i64, atr_period: usize) -> f64 {
+        let candles: Vec<CandleSnapshot> = bars
+            .iter()
+            .map(|bar| CandleSnapshot {
+                close_time: bar.close_time,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            })
+            .collect();
+        let entry_index = bars
+            .iter()
+            .position(|bar| bar.open_time == entry_ts)
+            .expect("成交时间必须能在 K 线里找到");
+        let signal_index = entry_index.saturating_sub(1);
+        let start = signal_index.saturating_sub(180);
+        candle_metrics(&candles[start..=signal_index], atr_period)
+            .expect("开仓前必须有足够 K 线算 ATR")
+            .atr_pct
+    }
+
+    #[test]
+    fn stop_distance_independent_of_leverage() {
+        let bars = trending_bars(400);
+        let mut low = config();
+        low.leverage = 5.0;
+        let mut high = config();
+        high.leverage = 9.0;
+
+        let first_sl = |cfg: &EngineConfig| -> f64 {
+            run(&bars, cfg)
+                .unwrap()
+                .trades
+                .first()
+                .expect("单边上涨行情应产生趋势仓")
+                .sl_pct
+        };
+        let low_sl = first_sl(&low);
+        let high_sl = first_sl(&high);
+        assert!(low_sl > 0.0 && high_sl > 0.0);
+        assert!(
+            (low_sl - high_sl).abs() < 1e-9,
+            "止损距离只由 ATR 决定，杠杆 5x 与 9x 必须相同（{low_sl} vs {high_sl}）"
+        );
+    }
+
+    #[test]
+    fn atr_period_drives_the_backtest_stop_and_matches_live() {
+        // ATR 周期必须真的生效：周期不同 → 止损距离不同。
+        // 若回测仍写死 14，本断言与下面的同口径断言会一起失败。
+        let bars = alternating_range_bars(400);
+        let mut cfg = config();
+        cfg.atr_period = 7;
+        let result = run(&bars, &cfg).unwrap();
+        let trade = result.trades.first().expect("单边上涨行情应产生趋势仓");
+
+        let mut wide = config();
+        wide.atr_period = 14;
+        let wide_result = run(&bars, &wide).unwrap();
+        let wide_trade = wide_result
+            .trades
+            .first()
+            .expect("单边上涨行情应产生趋势仓");
+        assert!(
+            (trade.sl_pct - wide_trade.sl_pct).abs() > 1e-9,
+            "ATR 周期必须真的影响止损距离（{:.6} vs {:.6}）",
+            trade.sl_pct,
+            wide_trade.sl_pct
+        );
+
+        // 回测止损距离必须等于实盘按同一周期算出的距离。
+        let atr_pct = atr_pct_at_entry(&bars, trade.entry_ts, cfg.atr_period);
+        let live_stop = crate::risk::atr_stop_price(
+            &trade.side,
+            trade.entry,
+            atr_pct,
+            cfg.stop_distance_atr_mult,
+        );
+        let live_distance = (trade.entry - live_stop).abs() / trade.entry * 100.0;
+        assert!(
+            (trade.sl_pct - live_distance).abs() < 1e-9,
+            "回测止损距离 {:.6}% 必须与实盘同周期 ATR 口径 {:.6}% 一致",
+            trade.sl_pct,
+            live_distance
+        );
+    }
+
+    #[test]
+    fn backtest_stop_matches_live_stop() {
+        let cfg = config();
+        let bars = trending_bars(400);
+        let result = run(&bars, &cfg).unwrap();
+        let trade = result.trades.first().expect("单边上涨行情应产生趋势仓");
+        let atr_pct = atr_pct_at_entry(&bars, trade.entry_ts, cfg.atr_period);
+        let live_stop = crate::risk::atr_stop_price(
+            &trade.side,
+            trade.entry,
+            atr_pct,
+            cfg.stop_distance_atr_mult,
+        );
+        let live_distance = (trade.entry - live_stop).abs() / trade.entry * 100.0;
+        assert!(
+            (trade.sl_pct - live_distance).abs() < 1e-9,
+            "回测止损距离 {:.6}% 必须与实盘 ATR 口径 {:.6}% 一致",
+            trade.sl_pct,
+            live_distance
+        );
+    }
+
     #[test]
     fn partial_take_profit_r_matches_the_live_manage_rule() {
         // 实盘 manage 在 mark=102、entry=100、initial_sl=98 时触发 1R 部分止盈。
@@ -1536,7 +1725,10 @@ mod tests {
 
     #[test]
     fn partial_take_profit_is_recorded_and_moves_stop_to_breakeven() {
-        let cfg = config();
+        let mut cfg = config();
+        // 趋势仓止盈改由 ROI 阶梯/快平任务接管；这里关闭全局止盈，
+        // 单独验证 R 阈值触发部分止盈的路径。
+        cfg.manage.global_take_profit_pct = 0.0;
         let result = run(&trending_bars(400), &cfg).unwrap();
         assert!(
             result.count("partial_tp_count") >= 1,
@@ -1769,9 +1961,9 @@ mod tests {
 
     fn tagged_regimes_cover_target(basket: &[(String, Vec<HistoryBar>)], target: &str) -> usize {
         let frame_ms = timeframe_ms("1h").unwrap();
-        let regimes = build_market_regime_map(basket, frame_ms);
-        assert!(!regimes.is_empty(), "市场 regime map 不应为空");
         let config = basket_config();
+        let regimes = build_market_regime_map(basket, frame_ms, config.atr_period, config.policy);
+        assert!(!regimes.is_empty(), "市场 regime map 不应为空");
         let mut tagged = 0;
         for (_, bars) in basket {
             let mut result = run(bars, &config).unwrap();
@@ -1811,6 +2003,11 @@ mod tests {
         assert!(metrics.folds >= 2);
         assert!(metrics.oos_trades > 0);
         assert!(metrics.max_drawdown_pct >= 0.0);
+        assert!(
+            metrics.avg_stop_atr_ratio > 0.0 && metrics.min_stop_atr_ratio > 0.0,
+            "OOS 成交必须带止损距离/ATR 维度"
+        );
+        assert!(metrics.avg_stop_atr_ratio >= metrics.min_stop_atr_ratio);
         assert!((0.0..=1.0).contains(&metrics.bootstrap_p_positive));
         assert!(
             tagged_regimes_cover_target(&basket, "range") > 0,
@@ -1838,7 +2035,9 @@ mod tests {
     fn basket_fixed_rejects_when_target_regime_has_no_oos_trades() {
         let basket = synthetic_basket(6, 700);
         let frame_ms = timeframe_ms("1h").unwrap();
-        let regimes = build_market_regime_map(&basket, frame_ms);
+        let regime_cfg = basket_config();
+        let regimes =
+            build_market_regime_map(&basket, frame_ms, regime_cfg.atr_period, regime_cfg.policy);
         assert!(!regimes.is_empty(), "chaos 用例仍应产生非空 regime map");
         assert!(
             regimes
@@ -1901,7 +2100,9 @@ mod tests {
             None,
             "5 票在固定 quorum=6 下不应给出 regime"
         );
-        let regimes = build_market_regime_map(&basket, frame_ms);
+        let regime_cfg = basket_config();
+        let regimes =
+            build_market_regime_map(&basket, frame_ms, regime_cfg.atr_period, regime_cfg.policy);
         assert!(
             regimes.contains_key(&last_ts),
             "某个标的最末桶缺 1 票时，动态 quorum 仍应给出 regime"
