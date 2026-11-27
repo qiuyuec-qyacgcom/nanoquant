@@ -344,8 +344,8 @@ mod tests {
     fn migrate_on_empty_database_creates_all_tables() {
         let conn = Connection::open_in_memory().unwrap();
         let report = migrate(&conn).unwrap();
-        assert_eq!(report.created_tables.len(), 22);
-        assert_eq!(table_count(&conn), 25);
+        assert_eq!(report.created_tables.len(), 23);
+        assert_eq!(table_count(&conn), 26);
     }
 
     #[test]
@@ -356,7 +356,7 @@ mod tests {
         assert!(second.created_tables.is_empty());
         assert!(second.added_columns.is_empty());
         assert!(second.added_indexes.is_empty());
-        assert_eq!(table_count(&conn), 25);
+        assert_eq!(table_count(&conn), 26);
     }
 
     #[test]

@@ -189,6 +189,7 @@
     "kline_limit": 200,
     "ticker_ttl_sec": 5,
     "kline_ttl_sec": 20,
+    "keep_days": 30,
     "request_timeout_sec": 12,
     "max_pool_size": 20,
     "book_ws_enabled": true,

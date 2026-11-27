@@ -1635,6 +1635,11 @@ impl EngineRuntime {
             .setting("strategy")
             .map_err(|error| error.to_string())?
             .unwrap_or(Value::Null);
+        // 行情留存用的周期与策略取数口径一致；缺失时按 15m 兜底。
+        let interval = strategy
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or("15m");
         let atr_period = match strategy.get("atr_period") {
             None => 14,
             // ATR 周期与 AI 特征快照、回测、证据门共用同一个来源。
@@ -1677,6 +1682,8 @@ impl EngineRuntime {
         if let Err(error) = Self::record_equity_point(&tx, mode, snapshot) {
             tracing::warn!(%error, "权益采样写入失败，不影响本轮周期");
         }
+        // 本轮已经拉到手的收盘 K 线顺手落库，供离线回放与复盘回看。
+        crate::market_store::upsert_candles(&tx, interval, &snapshot.markets)?;
         upsert_state(
             &tx,
             &format!("open_orders.{mode}"),
@@ -8561,6 +8568,18 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             candle.low = price - 0.05;
         }
         (db, snapshot)
+    }
+
+    #[tokio::test]
+    async fn persist_snapshot_writes_market_candles() {
+        let (db, snapshot) = entry_fixture().await;
+        let runtime = test_runtime(&db);
+        runtime.persist_snapshot("demo", &snapshot).unwrap();
+        let rows: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM market_candles", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows > 0, "快照里的 K 线必须落库");
     }
 
     #[tokio::test]

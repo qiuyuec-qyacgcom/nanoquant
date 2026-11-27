@@ -55,6 +55,7 @@ mod journal_api;
 mod kline_stream;
 mod live;
 mod manage;
+mod market_store;
 mod mean_reversion;
 mod news;
 mod oi_regime;
@@ -332,6 +333,8 @@ async fn main() {
             master_key.clone(),
             stop_tx.subscribe(),
         ));
+        // 行情留存清理：落库的 K 线按 data.keep_days 保留，超期自动删除。
+        crate::market_store::spawn_retention_task(db.clone(), stop_tx.subscribe());
         // 可用余额/钱包直接读交易所账户接口，同样不受策略周期限制。
         tokio::spawn(crate::account_balance::run_account_balance_task(
             db,

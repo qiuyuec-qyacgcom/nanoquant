@@ -362,6 +362,7 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   },
   data: {
     request_timeout_sec: { label: '行情请求超时', unit: '秒', hint: '只作用于交易所行情接口' },
+    keep_days: { label: '行情保留天数', unit: '天', hint: '落库的 K 线保留多久；超期自动清理，0=不清理' },
   },
   ai_tuning: {
     enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择与无候选回滚；候选始终需要人工激活' },

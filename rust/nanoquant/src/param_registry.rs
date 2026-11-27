@@ -136,6 +136,7 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("data", "kline_limit", 10.0, 1000.0, 10.0),
     ("data", "ticker_ttl_sec", 1.0, 3600.0, 1.0),
     ("data", "kline_ttl_sec", 1.0, 3600.0, 1.0),
+    ("data", "keep_days", 1.0, 3650.0, 1.0),
     ("data", "request_timeout_sec", 1.0, 300.0, 1.0),
     ("data", "max_pool_size", 1.0, 500.0, 1.0),
     ("data", "book_stale_ms", 500.0, 30000.0, 500.0),
@@ -292,6 +293,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "proxy",
             "book_ws_enabled",
             "book_stale_ms",
+            "keep_days",
         ],
     ),
     (

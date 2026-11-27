@@ -3217,6 +3217,103 @@
         }
       ],
       "foreign_keys": []
+    },
+    {
+      "name": "market_candles",
+      "sql": "CREATE TABLE market_candles (\n\tsymbol TEXT NOT NULL, \n\tinterval TEXT NOT NULL, \n\tclose_time INTEGER NOT NULL, \n\topen FLOAT NOT NULL, \n\thigh FLOAT NOT NULL, \n\tlow FLOAT NOT NULL, \n\tclose FLOAT NOT NULL, \n\tvolume FLOAT NOT NULL, \n\tPRIMARY KEY (symbol, interval, close_time)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "symbol",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "interval",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 2,
+          "name": "close_time",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 3,
+          "name": "open",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "high",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "low",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "close",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "volume",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_market_candles_symbol_interval",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "symbol"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "interval"
+            },
+            {
+              "seqno": 2,
+              "cid": 2,
+              "name": "close_time"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
     }
   ]
 }
