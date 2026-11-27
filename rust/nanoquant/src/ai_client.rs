@@ -889,6 +889,9 @@ pub struct AiConfig {
     pub scale_on_confidence: bool,
     /// AI 不可用/复核失败时的降仓系数。
     pub fail_open_scale: f64,
+    /// 一轮周期里 AI 复核的派发预算（秒）：耗尽后不再发起新请求，
+    /// 剩余候选直接降级为量化；在途请求仍受 `review_timeout_sec` 约束。
+    pub review_budget_sec: i64,
     /// 供应商排序模式："config" 按配置顺序，"fastest" 按最近 24h P95 延迟升序。
     pub provider_order_mode: String,
     /// 提示词上下文档位："full" 注入完整上下文，"slim" 精简 K 线/资讯/经验/心法。
@@ -921,6 +924,7 @@ impl Default for AiConfig {
 
             scale_on_confidence: true,
             fail_open_scale: 0.5,
+            review_budget_sec: 20,
             provider_order_mode: "fastest".to_string(),
             prompt_profile: "full".to_string(),
             circuit_breaker_failures: 3,
@@ -996,6 +1000,10 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
         if item.is_finite() {
             cfg.fail_open_scale = item.clamp(0.0, 1.0);
         }
+    }
+    if let Some(item) = value.get("review_budget_sec").and_then(Value::as_i64) {
+        // 预算下限 1 秒，避免 0 把当轮所有复核都跳过；上限沿用 review_timeout 的量级。
+        cfg.review_budget_sec = item.clamp(1, 120);
     }
     if let Some(item) = value.get("use_invalidation_price").and_then(Value::as_bool) {
         cfg.use_invalidation_price = item;

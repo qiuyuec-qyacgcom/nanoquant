@@ -202,6 +202,7 @@ describe('参数配置目录', () => {
       'low_score_threshold',
       'prompt_profile',
       'provider_order_mode',
+      'review_budget_sec',
       'review_cache_ttl_sec',
       'review_concurrency',
       'review_timeout_sec',

@@ -1872,6 +1872,8 @@ impl EngineRuntime {
         } else {
             None
         };
+        // 边界：止损、保护单与熔断平仓都已在复核之前完成，
+        // AI 只能影响「本轮新开仓」，新发起的复核还受 review_budget_sec 约束。
         let t_review = Instant::now();
         let reviewed = run_blocking_review(|| {
             Self::review_drafts(
@@ -1880,6 +1882,7 @@ impl EngineRuntime {
                 mode,
                 ai_required,
                 ai_cfg.fail_open_scale,
+                std::time::Duration::from_secs(ai_cfg.review_budget_sec.max(1) as u64),
                 high_score_threshold,
                 low_score_threshold,
                 Some(self.review_cache.as_ref()),
@@ -3293,6 +3296,7 @@ impl EngineRuntime {
         required: bool,
 
         fail_open_scale: f64,
+        budget: std::time::Duration,
         high_score_threshold: f64,
         low_score_threshold: f64,
         cache: Option<&std::sync::Mutex<std::collections::HashMap<String, ReviewCache>>>,
@@ -3300,6 +3304,19 @@ impl EngineRuntime {
         review_concurrency: usize,
         now: i64,
     ) -> Vec<ReviewedDraft> {
+        // AI 边界：复核只能占用周期的一段预算。预算耗尽后剩余候选直接降级，
+        // 不再排队等供应商，避免一个慢模型把整轮交易拖住。
+        let deadline = std::time::Instant::now() + budget;
+        let budget_expired = || required && std::time::Instant::now() >= deadline;
+        let degraded = |draft: &EntryDraft| {
+            crate::review::apply_review(&draft.proposal(), None, false).map(|mut entry| {
+                entry.reason = format!(
+                    "AI 复核失败，复核预算已用完；按 fail-open 降仓至 {fail_open_scale:.2}"
+                );
+                entry.scale = Some(fail_open_scale);
+                entry
+            })
+        };
         // 中间区统一出口：AI 明确拒绝/观望仍然否决，其它失败按 fail-open 降仓。
         let resolve = |draft: &EntryDraft, active: Option<&dyn crate::review::AiReviewer>| {
             let proposal = draft.proposal();
@@ -3393,6 +3410,10 @@ impl EngineRuntime {
                 if let Some(decision) = cached.as_ref().and_then(CachedReviewer::cached_decision) {
                     let result = resolve(&draft, Some(&CachedAnswerReviewer(&decision)));
                     results[idx] = Some(ReviewedDraft { draft, result });
+                } else if budget_expired() {
+                    // 预算已耗尽：缓存也来不及命中，直接按纯量化降级。
+                    let result = degraded(&draft);
+                    results[idx] = Some(ReviewedDraft { draft, result });
                 } else {
                     pending.push((idx, draft, cached));
                 }
@@ -3402,10 +3423,14 @@ impl EngineRuntime {
         let workers = review_concurrency.clamp(1, 16).min(pending.len());
         if reviewer.is_none() || workers <= 1 {
             for (idx, draft, cached) in pending {
-                let active = cached
-                    .as_ref()
-                    .map(|inner| inner as &dyn crate::review::AiReviewer);
-                let result = resolve(&draft, active.or(reviewer));
+                let result = if budget_expired() {
+                    degraded(&draft)
+                } else {
+                    let active = cached
+                        .as_ref()
+                        .map(|inner| inner as &dyn crate::review::AiReviewer);
+                    resolve(&draft, active.or(reviewer))
+                };
                 results[idx] = Some(ReviewedDraft { draft, result });
             }
         } else {
@@ -3413,6 +3438,8 @@ impl EngineRuntime {
             let pending = std::sync::Mutex::new(std::collections::VecDeque::from(pending));
             let collected = std::sync::Mutex::new(Vec::with_capacity(workers * 2));
             let resolve = &resolve;
+            let budget_expired = &budget_expired;
+            let degraded = &degraded;
             std::thread::scope(|scope| {
                 for _ in 0..workers {
                     let pending = &pending;
@@ -3422,10 +3449,16 @@ impl EngineRuntime {
                         let Some((idx, draft, cached)) = item else {
                             break;
                         };
-                        let active = cached
-                            .as_ref()
-                            .map(|inner| inner as &dyn crate::review::AiReviewer);
-                        let result = resolve(&draft, active.or(reviewer));
+                        // 每个工作线程在取单前重新核对预算：慢调用结束后
+                        // 队列里剩下的候选不再发起新的 AI 请求。
+                        let result = if budget_expired() {
+                            degraded(&draft)
+                        } else {
+                            let active = cached
+                                .as_ref()
+                                .map(|inner| inner as &dyn crate::review::AiReviewer);
+                            resolve(&draft, active.or(reviewer))
+                        };
                         if let Ok(mut items) = collected.lock() {
                             items.push((idx, ReviewedDraft { draft, result }));
                         }
@@ -8339,6 +8372,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             "demo",
             true,
             0.5,
+            std::time::Duration::from_secs(120),
             0.75,
             0.45,
             cache,
@@ -8529,6 +8563,39 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 .action,
             "reject"
         );
+    }
+
+    #[test]
+    fn review_budget_exhaustion_degrades_to_quant_without_ai_calls() {
+        let reviewer = CountingReviewer::default();
+        // 预算为 0：进入 review_drafts 时已耗尽，所有候选都不得再发起 AI 调用。
+        let reviewed = EngineRuntime::review_drafts(
+            Some(&reviewer),
+            vec![score_draft(0.6), score_draft(0.6)],
+            "demo",
+            true,
+            0.5,
+            std::time::Duration::ZERO,
+            0.75,
+            0.45,
+            None,
+            60,
+            2,
+            1_000,
+        );
+        assert_eq!(reviewer.calls(), 0, "预算耗尽后不得再调用 AI");
+        assert_eq!(reviewed.len(), 2);
+        for item in reviewed {
+            let entry = item.result.expect("预算耗尽必须 fail-open 而不是拒单");
+            assert_eq!(entry.scale, Some(0.5), "降级按 fail_open_scale 降仓");
+            assert!(
+                entry.reason.contains("复核预算已用完"),
+                "原因要能定位到预算而非模型: {}",
+                entry.reason
+            );
+            assert!(!entry.reviewed, "降级单不能标记为已复核");
+            assert_eq!(entry.side, "long", "方向仍由量化决定");
+        }
     }
 
     #[test]

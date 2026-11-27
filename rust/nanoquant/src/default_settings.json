@@ -140,6 +140,7 @@
     "review_cache_ttl_sec": 60,
     "review_concurrency": 8,
     "review_timeout_sec": 30,
+    "review_budget_sec": 20,
     "max_calls_per_hour": 30,
     "monthly_budget_usd": 3.0,
     "timeout_sec": 45,
