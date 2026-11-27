@@ -62,13 +62,12 @@ async fn evaluate_with_history(
 struct Prepared {
     candidate: AiTuningSet,
     baseline: Option<AiTuningSet>,
-    /// 当前生效的策略参数：有 active 基线用基线，否则用线上 strategy 组。
-    /// 过拟合体检检查的是「当前参数集本身是否有偏」，与候选无关。
-    active_params: Value,
     symbols: Vec<String>,
     risk: Value,
     live_timeframe: String,
     min_oos_trades: usize,
+    /// 同一 regime×timeframe 已尝试过的参数集数量：Deflated Sharpe 的试验次数。
+    trials: usize,
 }
 
 async fn run_gate(
@@ -114,30 +113,32 @@ async fn run_gate(
         &prepared.risk,
         &prepared.candidate.timeframe,
     )?;
-    // 体检用当前生效参数（active 基线或线上 strategy），跑在候选之前：
-    // 体检不过的候选即使证据门算了也进不了激活。
-    let health_config = build_config(
-        &prepared.active_params,
-        &prepared.risk,
-        &prepared.candidate.timeframe,
-    )?;
-    let (lookahead_suspicious, recursive_suspicious) = overfit_checks(&basket, &health_config);
+    // 体检必须针对候选参数本身：活动基线可能长期通过体检，却掩盖候选的过拟合风险。
+    let checks = overfit_checks(&basket, &candidate_config);
     let mut metrics = run_metrics(
         basket.clone(),
         candidate_config,
         regime,
         prepared.candidate.timeframe.clone(),
+        prepared.trials,
     )
     .await?;
-    metrics.lookahead_suspicious = lookahead_suspicious;
-    metrics.recursive_suspicious = recursive_suspicious;
+    metrics.lookahead_suspicious = checks.lookahead_suspicious;
+    metrics.lookahead_max_delta_pct = checks.lookahead_max_delta_pct;
+    metrics.recursive_suspicious = checks.recursive_suspicious;
     merge_skipped(&mut metrics, &data_skipped);
 
     let baseline = match &prepared.baseline {
         Some(set) => {
             let config = build_config(&set.params, &prepared.risk, &prepared.candidate.timeframe)?;
-            let mut baseline_metrics =
-                run_metrics(basket, config, regime, prepared.candidate.timeframe.clone()).await?;
+            let mut baseline_metrics = run_metrics(
+                basket,
+                config,
+                regime,
+                prepared.candidate.timeframe.clone(),
+                prepared.trials,
+            )
+            .await?;
             merge_skipped(&mut baseline_metrics, &data_skipped);
             Some(baseline_metrics)
         }
@@ -189,6 +190,15 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         .filter(|value| *value >= 1.0)
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MIN_OOS_TRADES as usize);
+    // 同一 regime×timeframe 的候选总数即多重试验次数：试得越多，DSR 门槛越高。
+    let trials = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_tuning_sets WHERE regime=?1 AND timeframe=?2",
+            (&candidate.regime, &candidate.timeframe),
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计调参试验次数失败: {error}"))?
+        .max(1) as usize;
 
     // 同 regime 的 active 作为基线；该 regime 没有 active 时回退 range-bootstrap。
     let mut baseline = ai_tuning::active_for_regime(&conn, &candidate.regime)?;
@@ -196,36 +206,43 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         baseline = ai_tuning::active_for_regime(&conn, "range")?;
     }
     let symbols = pool_symbols(&conn)?;
-    let active_params = baseline
-        .as_ref()
-        .map(|set| set.params.clone())
-        .unwrap_or_else(|| strategy.clone());
     Ok(Some(Prepared {
         candidate,
         baseline,
-        active_params,
         symbols,
         risk,
         live_timeframe,
         min_oos_trades,
+        trials,
     }))
 }
 
-/// 过拟合体检：对每个标的跑前视偏移与递归 warmup 检测，任一不过即标记。
-fn overfit_checks(basket: &[(String, Vec<HistoryBar>)], config: &EngineConfig) -> (bool, bool) {
-    let mut lookahead_suspicious = false;
+struct OverfitChecks {
+    lookahead_suspicious: bool,
+    /// 多档前视的最大 delta，百分比（12.5 表示 12.5%）。
+    lookahead_max_delta_pct: f64,
+    recursive_suspicious: bool,
+}
+
+/// 过拟合体检：对每个标的跑多档前视偏移（1/2/3 根）与递归 warmup 检测。
+fn overfit_checks(basket: &[(String, Vec<HistoryBar>)], config: &EngineConfig) -> OverfitChecks {
+    const LOOKAHEAD_SHIFTS: [usize; 3] = [1, 2, 3];
+    let mut lookahead_reports = Vec::new();
     let mut max_divergence = 0.0_f64;
     for (_, bars) in basket {
-        if let Ok(report) = backtest_engine::run_lookahead(bars, config, 1) {
-            if report.suspicious {
-                tracing::warn!(
-                    baseline = report.baseline_expectancy,
-                    shifted = report.shifted_expectancy,
-                    delta_pct = report.delta_pct,
-                    reason = %report.reason,
-                    "前视偏差体检可疑"
-                );
-                lookahead_suspicious = true;
+        for shift in LOOKAHEAD_SHIFTS {
+            if let Ok(report) = backtest_engine::run_lookahead(bars, config, shift) {
+                if report.suspicious {
+                    tracing::warn!(
+                        shift,
+                        baseline = report.baseline_expectancy,
+                        shifted = report.shifted_expectancy,
+                        delta_pct = report.delta_pct,
+                        reason = %report.reason,
+                        "前视偏差体检可疑"
+                    );
+                }
+                lookahead_reports.push(report);
             }
         }
         let candles = backtest_engine::candles_from_history(bars, config.interval_ms);
@@ -234,6 +251,8 @@ fn overfit_checks(basket: &[(String, Vec<HistoryBar>)], config: &EngineConfig) -
             max_divergence = divergence;
         }
     }
+    let (lookahead_suspicious, lookahead_max_delta) =
+        crate::overfit::summarize_lookahead(&lookahead_reports);
     let recursive = crate::overfit::evaluate_recursive_divergence(max_divergence);
     if recursive.suspicious {
         tracing::warn!(
@@ -242,7 +261,11 @@ fn overfit_checks(basket: &[(String, Vec<HistoryBar>)], config: &EngineConfig) -
             "递归指标稳定性体检可疑"
         );
     }
-    (lookahead_suspicious, recursive.suspicious)
+    OverfitChecks {
+        lookahead_suspicious,
+        lookahead_max_delta_pct: lookahead_max_delta * 100.0,
+        recursive_suspicious: recursive.suspicious,
+    }
 }
 
 pub(crate) fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
@@ -329,11 +352,12 @@ async fn run_metrics(
     config: EngineConfig,
     regime: Regime,
     timeframe: String,
+    trials: usize,
 ) -> Result<BasketMetrics, String> {
     tokio::task::spawn_blocking(move || {
         let cancel = AtomicBool::new(false);
         backtest_engine::run_walkforward_basket_fixed(
-            &basket, &config, FOLDS, TRAIN_BARS, regime, &timeframe, &cancel,
+            &basket, &config, FOLDS, TRAIN_BARS, regime, &timeframe, trials, &cancel,
         )
     })
     .await
@@ -997,6 +1021,37 @@ mod tests {
 
         assert_eq!(prepared.min_oos_trades, 30, "缺配置时默认 30 笔");
         assert_eq!(prepared.live_timeframe, "1h", "实盘周期照旧读取");
+    }
+
+    #[test]
+    fn candidate_health_config_follows_the_candidate_params() {
+        let (state, candidate_id) = setup("1h");
+
+        let prepared = prepare(&state, candidate_id).unwrap().unwrap();
+        let config = build_config(&prepared.candidate.params, &prepared.risk, "1h").unwrap();
+
+        assert_eq!(
+            config.policy.atr_pct_min, 0.7,
+            "过拟合体检必须跟随候选参数，而不是线上/活动基线"
+        );
+    }
+
+    #[test]
+    fn prepare_counts_trials_for_the_same_regime_and_timeframe() {
+        let (state, candidate_id) = setup("1h");
+
+        let prepared = prepare(&state, candidate_id).unwrap().unwrap();
+        let expected = {
+            let conn = state.db.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM ai_tuning_sets WHERE regime='range' AND timeframe='1h'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(prepared.trials, expected.max(1) as usize);
     }
 
     #[tokio::test]

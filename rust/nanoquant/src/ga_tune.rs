@@ -249,7 +249,7 @@ pub(crate) fn fitness(
     };
     let cancel = AtomicBool::new(false);
     match backtest_engine::run_walkforward_basket_fixed(
-        basket, &config, folds, train_bars, regime, timeframe, &cancel,
+        basket, &config, folds, train_bars, regime, timeframe, 1, &cancel,
     ) {
         Ok(metrics) => score_metrics(&metrics),
         Err(error) => {

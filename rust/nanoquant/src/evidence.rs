@@ -159,7 +159,11 @@ pub(crate) fn evidence_json(
             "pass": report.pass,
             "reasons": report.reasons,
             "lookahead_suspect": metrics.lookahead_suspicious,
+            "lookahead_max_delta_pct": metrics.lookahead_max_delta_pct,
             "recursive_suspect": metrics.recursive_suspicious,
+            "mc_prob_positive": metrics.mc_prob_positive,
+            "mc_max_drawdown_p95": metrics.mc_max_drawdown_p95,
+            "deflated_sharpe": metrics.deflated_sharpe,
         },
     })
 }
@@ -177,7 +181,11 @@ fn metrics_payload(metrics: &BasketMetrics) -> Value {
         "avg_stop_atr_ratio": metrics.avg_stop_atr_ratio,
         "min_stop_atr_ratio": metrics.min_stop_atr_ratio,
         "lookahead_suspicious": metrics.lookahead_suspicious,
+        "lookahead_max_delta_pct": metrics.lookahead_max_delta_pct,
         "recursive_suspicious": metrics.recursive_suspicious,
+        "mc_prob_positive": metrics.mc_prob_positive,
+        "mc_max_drawdown_p95": metrics.mc_max_drawdown_p95,
+        "deflated_sharpe": metrics.deflated_sharpe,
     })
 }
 
@@ -212,7 +220,11 @@ mod tests {
             target_regime: "range".to_string(),
             timeframe: "1h".to_string(),
             lookahead_suspicious: false,
+            lookahead_max_delta_pct: 0.0,
             recursive_suspicious: false,
+            mc_prob_positive: 0.95,
+            mc_max_drawdown_p95: 6.0,
+            deflated_sharpe: 0.97,
         }
     }
 
@@ -234,7 +246,11 @@ mod tests {
             target_regime: "range".to_string(),
             timeframe: "1h".to_string(),
             lookahead_suspicious: false,
+            lookahead_max_delta_pct: 0.0,
             recursive_suspicious: false,
+            mc_prob_positive: 0.93,
+            mc_max_drawdown_p95: 7.0,
+            deflated_sharpe: 0.9,
         }
     }
 
@@ -428,6 +444,11 @@ mod tests {
         assert_eq!(value["candidate"]["oos_trades"], 30);
         assert_eq!(value["candidate"]["positive_folds"], 4);
         assert_eq!(value["candidate"]["bootstrap_p_positive"], 0.9);
+        assert_eq!(value["candidate"]["mc_prob_positive"], 0.95);
+        assert_eq!(value["candidate"]["mc_max_drawdown_p95"], 6.0);
+        assert_eq!(value["candidate"]["deflated_sharpe"], 0.97);
+        assert_eq!(value["gate"]["deflated_sharpe"], 0.97);
+        assert_eq!(value["gate"]["lookahead_max_delta_pct"], 0.0);
         assert_eq!(value["baseline"]["oos_trades"], 24);
         assert_eq!(value["baseline"]["positive_folds"], 3);
         assert_eq!(value["baseline"]["oos_avg_return_pct"], 0.2);

@@ -1277,8 +1277,16 @@ pub struct BasketMetrics {
     pub timeframe: String,
     /// 前视偏差体检是否可疑：延后信号后表现反而更好。
     pub lookahead_suspicious: bool,
+    /// 多档前视检测的最大 delta%（证据任务回填）。
+    pub lookahead_max_delta_pct: f64,
     /// 递归指标稳定性体检是否可疑：不同 warmup 的 ATR% 不收敛。
     pub recursive_suspicious: bool,
+    /// Monte Carlo 贸易自助法：重采样后累计收益为正的概率。
+    pub mc_prob_positive: f64,
+    /// Monte Carlo 重采样序列的最大回撤 P95（百分比）。
+    pub mc_max_drawdown_p95: f64,
+    /// 按试验次数折减后的 Sharpe>0 概率（Deflated Sharpe Ratio）。
+    pub deflated_sharpe: f64,
 }
 
 fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
@@ -1424,6 +1432,8 @@ pub fn run_walkforward_basket_fixed(
     train_bars: i64,
     target_regime: crate::regime::Regime,
     timeframe: &str,
+    // 同一 regime×timeframe 已尝试过的参数集数量：Deflated Sharpe 的试验次数。
+    trials: usize,
     cancel: &AtomicBool,
 ) -> Result<BasketMetrics, String> {
     if basket.len() < 6 {
@@ -1549,6 +1559,9 @@ pub fn run_walkforward_basket_fixed(
     let is_avg = average(&is_fold_avgs);
     let positive_folds = fold_results.iter().filter(|value| **value > 0.0).count();
     let bootstrap = bootstrap_ci(&all_oos);
+    let (mc_prob_positive, mc_max_drawdown_p95) =
+        crate::overfit::monte_carlo_trade_bootstrap(&all_oos);
+    let deflated_sharpe = crate::overfit::deflated_sharpe(&all_oos, trials);
     Ok(BasketMetrics {
         folds: fold_results.len(),
         oos_trades: all_oos.len(),
@@ -1576,7 +1589,11 @@ pub fn run_walkforward_basket_fixed(
         target_regime: target.to_string(),
         timeframe: timeframe.to_string(),
         lookahead_suspicious: false,
+        lookahead_max_delta_pct: 0.0,
         recursive_suspicious: false,
+        mc_prob_positive,
+        mc_max_drawdown_p95,
+        deflated_sharpe,
     })
 }
 
@@ -2164,6 +2181,7 @@ mod tests {
             300,
             crate::regime::Regime::Range,
             "1h",
+            1,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -2195,6 +2213,7 @@ mod tests {
             300,
             crate::regime::Regime::Range,
             "1h",
+            1,
             &AtomicBool::new(false),
         )
         .unwrap_err();
@@ -2222,6 +2241,7 @@ mod tests {
             300,
             crate::regime::Regime::Chaos,
             "1h",
+            1,
             &AtomicBool::new(false),
         )
         .unwrap_err();
@@ -2242,6 +2262,7 @@ mod tests {
             150,
             crate::regime::Regime::Range,
             "1h",
+            1,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -2299,6 +2320,7 @@ mod tests {
             300,
             crate::regime::Regime::Range,
             "1h",
+            1,
             &AtomicBool::new(false),
         )
         .unwrap_err();
