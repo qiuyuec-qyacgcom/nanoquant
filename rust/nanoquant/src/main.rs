@@ -24,6 +24,7 @@ mod ai_providers;
 mod ai_review;
 mod ai_tuning;
 mod ai_tuning_api;
+mod ai_value;
 mod app_state;
 mod archive;
 mod auth;
@@ -1010,6 +1011,7 @@ mod tests {
             ("GET", "/api/v1/engine/signals"),
             ("GET", "/api/v1/engine/equity"),
             ("GET", "/api/v1/engine/stats"),
+            ("GET", "/api/v1/engine/ai-value"),
         ];
         for (method, path) in cases {
             let response = app

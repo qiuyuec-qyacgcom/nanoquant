@@ -16,6 +16,7 @@ pub fn routes() -> Router<Db> {
         .route("/engine/control", post(control))
         .route("/engine/status", get(status))
         .route("/engine/stats", get(stats))
+        .route("/engine/ai-value", get(ai_value))
         .route("/engine/positions", get(positions))
         .route("/engine/orders", get(orders))
         .route("/engine/trades", get(trades))
@@ -636,6 +637,15 @@ async fn reset_anchors(State(db): State<Db>) -> (StatusCode, Json<Value>) {
 
 async fn status(State(db): State<Db>) -> Json<Value> {
     Json(read_status(&db))
+}
+
+/// AI 增量价值：否决信号的反事实收益、置信度校准、成本/延迟对比。
+async fn ai_value(State(db): State<Db>) -> Json<Value> {
+    let mode = current_mode(&db);
+    let Ok(conn) = db.read() else {
+        return json!({"error": "数据库不可用"}).into();
+    };
+    Json(crate::ai_value::stats(&conn, &mode, crate::now(), 86_400))
 }
 
 fn round2(value: f64) -> f64 {
@@ -1853,6 +1863,43 @@ mod tests {
         assert!(body["positions"].is_array(), "{body}");
         assert!(body["stats"]["trades"].is_number(), "{body}");
         assert!(body["stats"]["win_rate"].is_number(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn ai_value_endpoint_returns_counterfactual_confidence_and_cost() {
+        let path = std::env::temp_dir().join("nq-ai-value.db");
+        let db = seed(&path);
+        db.lock()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS signals(ts INTEGER, symbol TEXT, direction TEXT, \
+                   score REAL, features TEXT, ai_action TEXT, ai_confidence REAL, ai_reason TEXT, \
+                   decision TEXT, reject_reason TEXT, mode TEXT, repeats INTEGER); \
+                 CREATE TABLE IF NOT EXISTS ai_call_logs(ts INTEGER, provider TEXT, model TEXT, \
+                   purpose TEXT, ok INTEGER, latency_ms INTEGER, prompt_tokens INTEGER, \
+                   completion_tokens INTEGER, cost_usd REAL, error TEXT, raw_text TEXT); \
+                 INSERT INTO signals(ts,symbol,direction,score,features,ai_action,ai_confidence, \
+                   ai_reason,decision,reject_reason,mode,repeats) \
+                 VALUES(1,'BTCUSDT','long',0.5,'{\"insight\":{\"vetoed_by\":\"ai_veto\"}}', \
+                   'hold',0.8,'','rejected','AI 置信度低','demo',1); \
+                 INSERT INTO trades(symbol,pnl,hold_seconds,exit_reason,mode,closed_at,ai_confidence,notional) \
+                 VALUES('BTCUSDT',-1,10,'sl','demo',2,0.8,100); \
+                 INSERT INTO ai_call_logs(ts,provider,model,purpose,ok,latency_ms,prompt_tokens, \
+                   completion_tokens,cost_usd,error,raw_text) \
+                 VALUES(1,'p','m','review',1,120,1,1,0.01,'','');",
+            )
+            .unwrap();
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let (status, body) = get(app, "/api/v1/engine/ai-value").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["mode"], "demo");
+        assert!(
+            body["counterfactual"]["vetoed_signals"].is_number(),
+            "{body}"
+        );
+        assert!(body["confidence"]["samples"].is_number(), "{body}");
+        assert_eq!(body["cost"]["scope"], "all_modes");
+        assert!(body["value"]["net_usd"].is_number(), "{body}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
