@@ -157,7 +157,7 @@ useSilentRefresh(load, 60000)
       以下源抓取失败:
       <b v-for="s in failedSources" :key="s.id" style="margin: 0 6px">{{ s.label }}</b>
       —— {{ failedSources[0].error }}
-      <a href="#/admin/strategy?group=data" style="margin-left: 6px">去配置全局代理</a>
+      <a href="#/admin/settings/params?group=data" style="margin-left: 6px">去配置全局代理</a>
       <span class="muted">（在「参数配置 → 交易所 → proxy」配置全局代理，资讯会复用）</span>
     </div>
 

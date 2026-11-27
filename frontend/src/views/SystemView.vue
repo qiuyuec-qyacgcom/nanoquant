@@ -178,7 +178,7 @@ useSilentRefresh(load, 15000)
         <span class="panel-title">执行内核（exec-core）</span>
         <div class="right">
           <span class="tag" :class="execTag.cls">{{ execTag.text }}</span>
-          <router-link to="/admin/strategy?group=system" class="btn btn-xs">配置</router-link>
+          <router-link to="/admin/settings/params?group=system" class="btn btn-xs">配置</router-link>
           <button class="btn btn-xs" :disabled="testing" @click="selfTestCore">
             {{ testing ? '自检中…' : '自检' }}
           </button>
@@ -292,7 +292,7 @@ useSilentRefresh(load, 15000)
         <span class="panel-title">最近告警</span>
         <div class="right">
           <span class="tag tag-dim">{{ alerts.length }}</span>
-          <router-link to="/admin/strategy?group=system" class="btn btn-xs">配置告警</router-link>
+          <router-link to="/admin/settings/params?group=system" class="btn btn-xs">配置告警</router-link>
         </div>
       </div>
       <div class="panel-body" style="padding: 0">

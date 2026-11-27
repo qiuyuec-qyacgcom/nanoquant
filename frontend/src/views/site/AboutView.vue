@@ -72,7 +72,7 @@ onMounted(async () => {
           公开页面仅展示聚合行情与脱敏信息，不展示账户余额、持仓、订单与密钥。完整功能请登录后台。
         </p>
         <div class="row" style="margin-top: 16px">
-          <router-link to="/admin/dashboard" class="btn btn-primary">进入后台</router-link>
+          <router-link to="/admin/overview/dashboard" class="btn btn-primary">进入后台</router-link>
           <router-link to="/insights" class="btn">浏览观点</router-link>
         </div>
       </div>

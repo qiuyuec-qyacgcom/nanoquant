@@ -57,7 +57,7 @@ onMounted(async () => {
         <span v-if="cfg" class="tag" :class="cfg.mode === 'live' ? 'tag-short' : 'tag-long'">
           {{ cfg.mode === 'live' ? 'LIVE 实盘' : 'DEMO 模拟盘' }}
         </span>
-        <router-link to="/admin/dashboard" class="btn btn-sm btn-primary">进入后台</router-link>
+        <router-link to="/admin/overview/dashboard" class="btn btn-sm btn-primary">进入后台</router-link>
       </div>
     </header>
 
@@ -74,7 +74,7 @@ onMounted(async () => {
             <div class="muted" style="font-size: 12px; line-height: 1.8">
               管理员已关闭公开前台，可前往后台继续使用完整功能。
             </div>
-            <router-link to="/admin/dashboard" class="btn btn-sm btn-primary" style="margin-top: 16px">进入后台</router-link>
+            <router-link to="/admin/overview/dashboard" class="btn btn-sm btn-primary" style="margin-top: 16px">进入后台</router-link>
           </div>
         </div>
 

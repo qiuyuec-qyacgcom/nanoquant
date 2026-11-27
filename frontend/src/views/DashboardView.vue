@@ -400,11 +400,11 @@ useSilentRefresh(refreshQuotes, 3000)
           </div>
           <div v-if="status?.trade_mode?.need_hedge" class="note warn" style="margin: 0">
             账户为单向持仓，系统按双向逐仓设计。
-            <router-link to="/admin/strategy?group=engine">前往参数配置一键开启双向持仓</router-link>
+            <router-link to="/admin/settings/params?group=engine">前往参数配置一键开启双向持仓</router-link>
           </div>
           <div v-else-if="status?.trade_mode?.need_isolated?.length" class="note warn" style="margin: 0">
             有 {{ status.trade_mode.need_isolated.length }} 个标的仍是全仓，建议在
-            <router-link to="/admin/strategy?group=engine">参数配置 → 交易模式</router-link> 切为逐仓。
+            <router-link to="/admin/settings/params?group=engine">参数配置 → 交易模式</router-link> 切为逐仓。
           </div>
           <div class="grid g3" style="gap: 10px">
 
@@ -425,11 +425,11 @@ useSilentRefresh(refreshQuotes, 3000)
       <div class="panel-hd">
         <span class="panel-title">超短线执行</span>
         <div class="right">
-          <router-link v-if="dlq.pending" to="/admin/dead-letters" class="tag tag-warn">
+          <router-link v-if="dlq.pending" to="/admin/settings/dead-letters" class="tag tag-warn">
             待补偿 {{ dlq.pending }}{{ dlq.stuck ? ` (滞留 ${dlq.stuck})` : '' }}
           </router-link>
           <span class="tag tag-dim">近 {{ scalp.count }} 笔</span>
-          <router-link to="/admin/strategy?group=strategy" class="btn btn-xs">调参</router-link>
+          <router-link to="/admin/settings/params?group=strategy" class="btn btn-xs">调参</router-link>
         </div>
       </div>
       <div class="panel-body stack" style="gap: 12px">

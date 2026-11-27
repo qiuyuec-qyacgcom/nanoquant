@@ -609,7 +609,7 @@ async function changePassword() {
     pwd.new_password = ''
     await app.loadSettings()
     app.notify('密码已更新', 'ok')
-    if (forced) router.push('/admin/dashboard')
+    if (forced) router.push('/admin/overview/dashboard')
   } catch (err: any) {
     app.notify(err.message, 'error')
   }
@@ -791,7 +791,7 @@ onUnmounted(() => {
             <div v-if="current === 'strategy'" class="note">
               这里是<b>机器真正执行的策略参数</b>：模式、周期、杠杆区间、准入闸门、止损止盈，改完直接影响下单。
               想改「AI 怎么分析」的文本指令，去
-              <router-link to="/admin/strategies">全局策略</router-link>。
+              <router-link to="/admin/research/strategies">全局策略</router-link>。
             </div>
 
             <!-- 风控: 日亏基准（充值/重置资金后必须对齐，否则会算出假 -99%） -->

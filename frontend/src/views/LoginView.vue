@@ -21,7 +21,7 @@ async function submit() {
   try {
     await auth.login(username.value.trim(), password.value)
     app.notify('登录成功', 'ok')
-    router.push((route.query.next as string) || '/admin/dashboard')
+    router.push((route.query.next as string) || '/admin/overview/dashboard')
   } catch (err: any) {
     error.value = err?.message || '登录失败'
   } finally {

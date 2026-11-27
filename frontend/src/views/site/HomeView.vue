@@ -63,7 +63,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           </p>
           <div class="row" style="gap: 8px; flex-wrap: wrap">
             <router-link to="/insights" class="btn btn-primary">观点与心法</router-link>
-            <router-link to="/admin/dashboard" class="btn">进入后台</router-link>
+            <router-link to="/admin/overview/dashboard" class="btn">进入后台</router-link>
           </div>
           <div class="landing-stats">
             <div class="landing-stat"><b>5m</b><span>主周期</span></div>

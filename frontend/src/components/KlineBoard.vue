@@ -417,7 +417,7 @@ onBeforeUnmount(() => {
           <span class="tag tag-dim">按添加顺序</span>
           <span class="tag tag-dim">WebSocket 推送</span>
         </div>
-        <router-link to="/admin/symbols" class="btn btn-sm btn-primary" style="margin-top: 16px">
+        <router-link to="/admin/trading/symbols" class="btn btn-sm btn-primary" style="margin-top: 16px">
           前往标的池添加
         </router-link>
       </div>

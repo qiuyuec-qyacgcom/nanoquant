@@ -8,46 +8,35 @@ import { fmt, timeStr } from '../utils/format'
 import { useSilentRefresh } from '../composables/silentRefresh'
 import CommandPalette from '../components/CommandPalette.vue'
 import type { CommandItem } from '../components/commandPalette'
+import { WORKSPACES, workspaceByPath, workspaceHome } from '../workspaces'
 
 const app = useAppStore()
 const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 
-const nav = [
-  { group: '概览', items: [
-    { path: '/admin/dashboard', label: '总览', ico: '◈' },
-    { path: '/admin/system', label: '系统诊断', ico: '⌁' },
-  ]},
-  { group: '交易', items: [
-    { path: '/admin/onboarding', label: '开仓检查', ico: '⇥' },
-    { path: '/admin/signals', label: '信号审计', ico: '▥' },
+// 侧边栏只保留工作区入口，页内导航交给 WorkspaceLayout 的页签。
+const nav = WORKSPACES
+const workspace = computed(() => workspaceByPath(route.path))
+const activeWorkspaceId = computed(() => workspace.value?.id)
+const workspaceLabel = computed(() => workspace.value?.label || '')
+// 页面标题也取自工作区配置，避免路由 meta 与导航清单各写一份。
+const pageLabel = computed(
+  () => workspace.value?.tabs.find((tab) => tab.path === route.path)?.label,
+)
 
-    { path: '/admin/strategies', label: '全局策略', ico: '⚑' },
-    { path: '/admin/symbols', label: '标的池', ico: '☰' },
-  ]},
-  { group: '研究', items: [
-    { path: '/admin/backtest', label: '回测', ico: '◇' },
-    { path: '/admin/news', label: '资讯情绪', ico: '✦' },
-    { path: '/admin/ai', label: 'AI 模型', ico: '◉' },
-    { path: '/admin/strategy', label: '参数配置', ico: '⚙' },
-    { path: '/admin/ai-tuning', label: 'AI 调参', ico: '▤' },
-  ]},
-  { group: '运维', items: [
-    { path: '/admin/backup', label: '备份还原', ico: '⛁' },
-    { path: '/admin/dead-letters', label: '落库补偿', ico: '⟳' },
-    { path: '/admin/evolution', label: '自进化心法', ico: '✧' },
-    { path: '/admin/journal', label: '决策经验', ico: '◈' },
-  ]},
-]
-
-const title = computed(() => (route.meta.title as string) || 'NanoQuant')
+const title = computed(() => pageLabel.value || 'NanoQuant')
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
 
-const commands: CommandItem[] = nav.flatMap((group) =>
-  group.items.map((item) => ({ label: item.label, path: item.path, ico: item.ico })),
+// 命令面板覆盖到每个页签，输入「工作区 / 页面」都能直达。
+const commands: CommandItem[] = WORKSPACES.flatMap((workspace) =>
+  workspace.tabs.map((tab) => ({
+    label: `${workspace.label} / ${tab.label}`,
+    path: tab.path,
+    ico: workspace.ico,
+  })),
 )
 const paletteOpen = ref(false)
 
@@ -166,19 +155,18 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <nav class="nav">
-        <template v-for="g in nav" :key="g.group">
-          <div class="nav-group">{{ g.group }}</div>
-          <router-link
-            v-for="item in g.items"
-            :key="item.path"
-            :to="item.path"
-            class="nav-item"
-            :class="{ active: route.path === item.path }"
-          >
-            <span class="ico">{{ item.ico }}</span>
-            <span>{{ item.label }}</span>
-          </router-link>
-        </template>
+        <div class="nav-group">工作区</div>
+        <router-link
+          v-for="workspace in nav"
+          :key="workspace.id"
+          :to="workspaceHome(workspace)"
+          class="nav-item"
+          :class="{ active: activeWorkspaceId === workspace.id }"
+          :title="workspace.hint"
+        >
+          <span class="ico">{{ workspace.ico }}</span>
+          <span>{{ workspace.label }}</span>
+        </router-link>
       </nav>
       <router-link to="/" class="nav-item" style="margin: 6px 10px 0">
         <span class="ico">⌂</span>
@@ -201,7 +189,7 @@ onBeforeUnmount(() => {
         <button class="nav-toggle" type="button" aria-label="打开菜单" @click="navOpen = true">☰</button>
         <div>
           <div class="page-title">{{ title }}</div>
-          <div class="page-sub">小资金 · 币安 U 本位永续 · 超短线</div>
+          <div class="page-sub">{{ workspaceLabel ? workspaceLabel + ' · ' : '' }}小资金 · 币安 U 本位永续 · 超短线</div>
         </div>
         <div class="topbar-right">
           <button class="command-trigger hide-sm" type="button" @click="openPalette">
@@ -226,7 +214,7 @@ onBeforeUnmount(() => {
       <main class="content">
         <div v-if="auth.mustChangePassword" class="note error" style="margin-bottom: 12px">
           当前仍是初始密码，后台除改密外的操作都已被拒绝。
-          <router-link to="/admin/strategy" style="text-decoration: underline">去「参数配置 → 安全」修改密码</router-link>
+          <router-link to="/admin/settings/params" style="text-decoration: underline">去「参数配置 → 安全」修改密码</router-link>
         </div>
         <div v-if="status?.last_error" class="note error" style="margin-bottom: 12px">
           引擎最近错误: {{ status.last_error }}

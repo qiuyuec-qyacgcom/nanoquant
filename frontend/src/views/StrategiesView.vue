@@ -188,8 +188,8 @@ onMounted(load)
       全局策略是 <b>AI 开仓分析指令</b>：引擎照常扫描全部标的，决策前按「优先级 + 适用范围」命中一条策略，把它的正文交给模型，由模型判断是否开仓、方向与节奏。
       一条都没启用、或标的不在适用范围时，AI 按通用铁律分析（默认行为）。<b>这里改不了杠杆、止损与仓位</b>——杠杆由本地风控规则按 ATR 与评分计算，AI 只能否决或降仓。
       开仓分析链路分工：<b>全局策略</b>管「模型怎么想」→
-      <router-link to="/admin/ai">AI 模型</router-link>管「用哪个模型、什么决策协议」→
-      <router-link to="/admin/strategy?group=strategy">参数配置 → 策略</router-link>管「机器实际执行的周期/杠杆/止损止盈」。
+      <router-link to="/admin/ai/models">AI 模型</router-link>管「用哪个模型、什么决策协议」→
+      <router-link to="/admin/settings/params?group=strategy">参数配置 → 策略</router-link>管「机器实际执行的周期/杠杆/止损止盈」。
     </div>
 
     <div class="panel">

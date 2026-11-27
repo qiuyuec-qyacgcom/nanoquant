@@ -77,7 +77,7 @@ export async function api<T = any>(path: string, init: RequestInit = {}, timeout
     // 后端拦下来说明仍是出厂密码：把标记记下来并把人送到改密页，
     // 否则用户只会看到一串莫名其妙的"请求失败"
     setMustChangePassword(true)
-    if (!location.hash.startsWith('#/admin/strategy')) location.hash = '#/admin/strategy'
+    if (!location.hash.startsWith('#/admin/settings/params')) location.hash = '#/admin/settings/params'
     throw new ApiError(403, detailOf(payload))
   }
   if (!res.ok) throw new ApiError(res.status, detailOf(payload))
