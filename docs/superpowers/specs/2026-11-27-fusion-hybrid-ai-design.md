@@ -55,11 +55,11 @@ L9 审计/复盘
 
 改动：
 
-- `ai_client.rs`：`Decision` 保留现有字段，但复核层只使用 `action`、`confidence`、`data_quality`、`rr_target`
-- `review.rs`：`ReviewDecision` 新增 `scale: Option<f64>`；`apply_review` 不再让 AI 覆盖 `leverage/stop_price/take_profit/side`
-- `ai_analysis.rs`：`ai.veto_only=true` 时 system prompt 只要求 `a/c/dq/rr/f`（可选 why/risk/inv），不再要求 `l/m/s/t`，减少输出 token；解析层继续兼容旧字段
+- `ai_client.rs`：`Decision` 只保留 `action`、`confidence`、`reason`、`risk_flags`、`invalidation` 与审计字段；`leverage/margin_pct/sl_pct/tp_pct` 已删除
+- `review.rs`：`ReviewDecision` 新增 `scale: Option<f64>`；`apply_review` 固定使用量化提案的方向/杠杆/保证金/止损/止盈
+- `ai_analysis.rs`：system prompt 固定只要求 `a/c/dq/rr/f`（可选 why/risk/inv），不再要求 `l/m/s/t`
 - `ai_review.rs`：`decision_to_review` 中：
-  - `ai.veto_only=true` 时忽略 AI 的 `leverage/margin_pct/sl_pct/tp_pct`
+  - AI 只能同意/否决/降仓，方向/杠杆/保证金/止损/止盈全部取量化提案
   - `scale = (0.5 + 0.5 * confidence).clamp(0.5, 1.0)`
   - `reject` 只由 `action=H/C`、方向冲突、`dq/rr` 门槛触发
 - `runtime.rs`：`estimate_qty` 得到 `qty` 后乘 `reviewed.scale.unwrap_or(1.0)`，再按最小名义额校正；AI 不可用时 `scale=0.5`。`scale` 不作用于 `margin_pct`，避免被 15–25% 下限抵消。
@@ -68,9 +68,10 @@ L9 审计/复盘
 
 | 参数 | 默认 | 范围 |
 |---|---:|---|
-| `ai.veto_only` | true | bool |
 | `ai.scale_on_confidence` | true | bool |
 | `ai.fail_open_scale` | 0.5 | 0.1–1.0 |
+
+AI 复核固定启用，仅受 `ai.enabled` 总开关控制；不再有 `require_agreement` / `veto_only` 独立开关。
 
 ### 4.2 本地杠杆规则
 
@@ -238,13 +239,13 @@ if correlated >= cfg["correlation_limit"].as_i64().unwrap_or(2) {
 - 只做离线 walk-forward
 - 适应度：期望值、最大回撤、换手
 - 结果走证据门（30 笔 OOS、bootstrap、压力测试）
-- `auto_apply=false`，人工确认
+- 自动启用已移除；候选只写入 `ai_tuning`，必须人工激活
 
 ## 6. 参数与默认值
 
 | 组 | 参数 | 默认 |
 |---|---|---:|
-| ai | veto_only | true |
+
 | ai | scale_on_confidence | true |
 | ai | fail_open_scale | 0.5 |
 | ai | high_score_threshold | 0.75 |
@@ -280,7 +281,7 @@ REST 兜底 ─────┘                                   ↓
 ## 8. 验收断言
 
 - AI 关闭或不可用时，量化信号按 `scale=0.5` 开仓，不再全部拒单
-- AI 返回的杠杆/止损/方向不生效（`veto_only=true`）
+- AI 不再输出杠杆/止损/方向字段；量化提案始终生效
 - 资金费率超过阈值时，同向信号被拒，反向不受影响
 - 负面新闻命中时，同向信号被拒，原因可查询
 - 盘口超过 `book_stale_ms` 时自动回退 REST

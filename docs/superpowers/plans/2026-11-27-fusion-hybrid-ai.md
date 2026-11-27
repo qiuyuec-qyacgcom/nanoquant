@@ -140,18 +140,18 @@
 
 1. `review.rs`：
    - `ReviewDecision`/`ReviewedEntry` 增加 `scale: Option<f64>`。
-   - `apply_review` 不再让 AI 覆盖 `leverage/stop_price/take_profit/side`；`veto_only=true` 时只采用 `action/confidence/scale`。
+   - `apply_review` 固定使用量化提案的方向/杠杆/保证金/止损/止盈；AI 只贡献 `action/confidence/scale`。
 2. `ai_review.rs`：
    - `decision_to_review` 增加 `scale = (0.5 + 0.5 * confidence).clamp(0.5, 1.0)`。
    - `fill_default_valid_bars` 保留。
    - 增加 `fill_scale`。
 3. `runtime.rs`：
-   - `review_drafts` 的 `required` 改为读取 `ai.enabled && ai.require_agreement`。
+   - `review_drafts` 的 `required` 改为读取 `ai.enabled`（AI 复核固定启用）。
    - `ai.enabled=false` 或复核失败时走 `apply_review(None, false)`，`scale=0.5`。
    - `estimate_qty` 得到 `qty` 后乘 `scale`，再按最小名义额校正。
 4. `ai_analysis.rs`：
-   - `veto_only=true` 时 prompt 只要求 `a/c/dq/rr/f`，不再要求 `l/m/s/t`。
-5. 参数：`ai.veto_only=true`、`ai.scale_on_confidence=true`、`ai.fail_open_scale=0.5`。
+   - prompt 固定只要求 `a/c/dq/rr/f`，不再要求 `l/m/s/t`。
+5. 参数：`ai.scale_on_confidence=true`、`ai.fail_open_scale=0.5`；AI 复核固定启用，无 `veto_only`/`require_agreement`。
 6. 测试：
    - AI 关闭时量化照常开仓、仓位 ×0.5
    - AI 的杠杆/止损/方向不生效
@@ -294,7 +294,7 @@
 2. 适应度：walk-forward 期望值 - 最大回撤惩罚 - 换手惩罚。
 3. 算子：锦标赛选择、单点交叉、高斯变异。
 4. 输出候选参数集，写入 `ai_tuning` 候选表，走证据门。
-5. `auto_apply=false`，人工确认。
+5. 自动启用已移除；候选只写入 `ai_tuning`，必须人工激活。
 6. 验收：样本外不劣于基线，参数不越界。
 7. commit `[D3] feat(tuning): 增加 GA 离线参数搜索`。
 
@@ -305,7 +305,7 @@
 **删除/删减：**
 
 - `review.rs` 中 AI 覆盖 `leverage/stop_price/take_profit/side` 的消费路径（A4 已改，清理残留分支）。
-- `ai_analysis.rs` 中 `veto_only` 下不再使用的 `l/m/s/t` 说明。
+- `ai_analysis.rs` 中已删除的 `l/m/s/t` 说明。
 - 前端 `AiView` 中已失效的「AI 决定杠杆」文案。
 - 未使用的 `ReviewDecision` 字段（若确认无消费）。
 - 冗余参数（AI 调参旧键、已舍去策略的键）。
