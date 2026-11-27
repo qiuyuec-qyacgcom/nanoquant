@@ -421,7 +421,7 @@ useSilentRefresh(() => load(true), 30000)
   padding: 10px;
   font-size: 10.5px;
   line-height: 1.5;
-  background: rgba(8, 14, 26, 0.6);
+  background: var(--surface-input);
   border-radius: 6px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -438,7 +438,7 @@ useSilentRefresh(() => load(true), 30000)
   gap: 10px;
   align-items: center;
   padding: 7px 0;
-  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+  border-top: 1px dashed var(--line);
 }
 .change-row:first-of-type {
   border-top: none;

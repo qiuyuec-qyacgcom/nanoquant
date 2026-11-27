@@ -374,7 +374,7 @@ useSilentRefresh(load, 15000)
               line-height: 1.5;
               white-space: pre-wrap;
               word-break: break-all;
-              background: rgba(8, 14, 26, 0.6);
+              background: var(--surface-input);
               border-radius: 6px;
               color: var(--muted);
             "

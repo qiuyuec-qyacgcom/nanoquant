@@ -58,7 +58,7 @@ defineProps<{
   gap: 10px;
   align-items: baseline;
   padding: 6px 0;
-  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+  border-top: 1px dashed var(--line);
   font-size: 11px;
 }
 .audit-row:first-of-type {

@@ -1,7 +1,7 @@
 /** 公开前台接口 (无需登录, 不做 401 跳转) */
 const BASE = '/api/v1/public'
 
-export async function pubGet<T = any>(path: string): Promise<T> {
+async function pubGet<T = any>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { headers: { Accept: 'application/json' } })
   const text = await res.text()
   let payload: any = null
@@ -81,17 +81,6 @@ export interface PublicOiSignal {
 export const publicOi = (symbol: string, interval = '15m') =>
   pubGet<PublicOiSignal>(`/oi?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`)
 
-/** 池内多标的 K 线 (空池返回 empty=true, 不会请求池外合约) */
-export const publicKlinesBatch = (interval = '1m', limit = 160) =>
-  pubGet<{
-    symbols: string[]
-    items: Record<string, import('../types/candle').Candle[]>
-    tickers: Record<string, { last: number; change_pct: number; high: number; low: number; quote_volume: number; ts: number }>
-    errors: Record<string, string>
-    interval: string
-    empty: boolean
-    updated_at: number
-  }>(`/klines/batch?interval=${encodeURIComponent(interval)}&limit=${limit}`)
 export const publicNews = (limit = 30, source = '') =>
   pubGet(`/news?limit=${limit}${source ? `&source=${encodeURIComponent(source)}` : ''}`)
 export const publicMantras = (limit = 8) => pubGet(`/mantras?limit=${limit}`)

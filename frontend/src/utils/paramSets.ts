@@ -13,7 +13,7 @@ export interface EvidenceLike {
   gate?: { pass?: boolean; reasons?: string[] }
 }
 
-export const REGIME_LABELS: Record<string, string> = {
+const REGIME_LABELS: Record<string, string> = {
   trend: '趋势',
   range: '震荡',
   chaos: '混乱',

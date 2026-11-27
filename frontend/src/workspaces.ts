@@ -6,7 +6,7 @@
  * 新增页面时先在这里登记 tab，再在 router 里挂对应组件。
  */
 
-export interface WorkspaceTab {
+interface WorkspaceTab {
   /** 完整路径，供页签、命令面板与深链直接跳转 */
   path: string
   /** 子路由名称，便于按 name 跳转与测试 */

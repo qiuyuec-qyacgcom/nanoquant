@@ -28,7 +28,7 @@ a {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1e2f4a;
+  background: var(--line-strong);
   border-radius: 8px;
 }
 ::-webkit-scrollbar-track {
@@ -133,7 +133,7 @@ a {
 
 .nav-group {
   font-size: 10px;
-  color: #4b5d7a;
+  color: var(--dim);
   letter-spacing: 1.4px;
   padding: 14px 10px 6px;
   text-transform: uppercase;
@@ -152,13 +152,13 @@ a {
   border: 1px solid transparent;
 }
 .nav-item:hover {
-  background: rgba(59, 130, 246, 0.08);
+  background: var(--panel-2);
   color: var(--text);
 }
 .nav-item.active {
-  background: linear-gradient(90deg, rgba(59, 130, 246, 0.18), rgba(34, 211, 238, 0.04));
-  border-color: rgba(59, 130, 246, 0.35);
-  color: #fff;
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--accent);
 }
 .nav-item .ico {
   width: 16px;
@@ -189,8 +189,8 @@ a {
   gap: 14px;
   padding: 0 20px;
   border-bottom: 1px solid var(--line-soft);
-  background: rgba(8, 14, 26, 0.85);
-  backdrop-filter: blur(10px);
+  background: rgba(10, 10, 11, 0.88);
+  backdrop-filter: blur(12px);
   position: sticky;
   top: 0;
   z-index: var(--z-nav);
@@ -224,7 +224,7 @@ a {
 
 /* ----------------------------------------------------------------- panels */
 .panel {
-  background: linear-gradient(180deg, rgba(16, 26, 44, 0.92), rgba(9, 15, 26, 0.92));
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
@@ -236,7 +236,7 @@ a {
   gap: 10px;
   padding: 11px 14px;
   border-bottom: 1px solid var(--line-soft);
-  background: rgba(20, 32, 52, 0.5);
+  background: var(--surface-head);
 }
 .panel-title {
   font-size: 12.5px;
@@ -272,7 +272,7 @@ a {
   gap: 12px;
 }
 .kpi {
-  background: linear-gradient(160deg, rgba(20, 33, 55, 0.9), rgba(10, 17, 30, 0.9));
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 13px 14px;
@@ -285,7 +285,7 @@ a {
   inset: 0 0 auto auto;
   width: 70px;
   height: 70px;
-  background: radial-gradient(circle at top right, rgba(59, 130, 246, 0.18), transparent 65%);
+  background: radial-gradient(circle at top right, rgba(46, 230, 166, 0.14), transparent 65%);
   pointer-events: none;
 }
 .kpi-label {
@@ -410,7 +410,7 @@ a {
   gap: 6px;
 }
 .btn:hover {
-  border-color: #2b4573;
+  border-color: var(--line-strong);
   background: var(--panel-3);
 }
 .btn:disabled {
@@ -482,8 +482,8 @@ textarea.input {
 }
 .input:focus,
 .select:focus {
-  border-color: #2f5fa8;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 textarea.input {
   resize: vertical;
@@ -500,7 +500,7 @@ textarea.input {
   width: 38px;
   height: 21px;
   border-radius: 999px;
-  background: #1b2a42;
+  background: var(--panel-3);
   border: 1px solid var(--line);
   position: relative;
   cursor: pointer;
@@ -515,13 +515,13 @@ textarea.input {
   width: 15px;
   height: 15px;
   border-radius: 50%;
-  background: #9fb0c9;
+  background: var(--muted);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
   transition: all 0.18s;
 }
 .switch.on {
-  background: rgba(18, 196, 139, 0.28);
-  border-color: rgba(18, 196, 139, 0.6);
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 .switch.on::after {
   left: 19px;
@@ -543,7 +543,7 @@ textarea.input {
   letter-spacing: 0.5px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
-  background: rgba(18, 29, 47, 0.6);
+  background: var(--surface-head);
   position: sticky;
   top: 0;
   z-index: 1;
@@ -556,7 +556,7 @@ textarea.input {
   white-space: nowrap;
 }
 .table tbody tr:hover td {
-  background: rgba(59, 130, 246, 0.05);
+  background: var(--line-soft);
 }
 .table-scroll {
   max-height: 520px;
@@ -586,7 +586,7 @@ textarea.input {
   border-color: rgba(240, 75, 90, 0.28);
 }
 .tag-dim {
-  background: rgba(120, 140, 170, 0.1);
+  background: var(--panel-2);
   color: var(--text-dim);
   border-color: var(--line);
 }
@@ -619,7 +619,7 @@ textarea.input {
   animation: pulse 2s infinite;
 }
 .dot.off {
-  background: #3a4a63;
+  background: var(--dim);
 }
 .dot.warn {
   background: var(--warn);
@@ -659,7 +659,7 @@ textarea.input {
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(3, 7, 14, 0.72);
+  background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(3px);
   display: grid;
   place-items: center;
@@ -704,9 +704,9 @@ textarea.input {
   right: 18px;
   z-index: 200;
   padding: 11px 16px;
-  border-radius: 9px;
-  background: #101d31;
-  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
   font-size: 12.5px;
   max-width: 420px;
   opacity: 0;
@@ -757,7 +757,7 @@ textarea.input {
 .bar-track {
   height: 6px;
   border-radius: 4px;
-  background: #142034;
+  background: var(--panel-3);
   overflow: hidden;
 }
 .bar-fill {
@@ -798,7 +798,7 @@ textarea.input {
 .event-cat {
   flex: 0 0 62px;
   font-size: 10px;
-  color: #6d86ad;
+  color: var(--dim);
   text-transform: uppercase;
 }
 .event-msg {
@@ -832,8 +832,8 @@ textarea.input {
   font-size: 11.5px;
   color: var(--text-dim);
   line-height: 1.7;
-  background: rgba(59, 130, 246, 0.06);
-  border: 1px solid rgba(59, 130, 246, 0.18);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
   border-left: 2px solid var(--accent);
   padding: 9px 12px;
   border-radius: 0 7px 7px 0;
@@ -892,7 +892,7 @@ textarea.input {
   color: var(--text-dim);
 }
 .btn-ghost:hover {
-  background: rgba(120, 150, 200, 0.1);
+  background: var(--panel-2);
   border-color: var(--line);
   color: var(--text);
 }
@@ -917,7 +917,7 @@ textarea.input {
 }
 .input:hover:not(:disabled),
 .select:hover:not(:disabled) {
-  border-color: #23395c;
+  border-color: var(--line-strong);
 }
 .input:focus-visible,
 .select:focus-visible,
@@ -1012,7 +1012,7 @@ textarea.input:focus-visible {
 }
 .modal-ft {
   padding: 11px 16px;
-  background: rgba(8, 14, 26, 0.45);
+  background: var(--panel-2);
 }
 @keyframes mask-in {
   from {
@@ -1038,7 +1038,7 @@ textarea.input:focus-visible {
   transition: border-color var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
 }
 .panel:hover {
-  border-color: #223554;
+  border-color: var(--line-strong);
 }
 .panel-flat {
   background: var(--panel-2);
@@ -1068,7 +1068,7 @@ textarea.input:focus-visible {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #2a4064;
+  background: var(--muted);
 }
 
 /* ------------------------------------------------- 后台移动端抽屉导航 */
@@ -1118,7 +1118,7 @@ textarea.input:focus-visible {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(2, 6, 12, 0.62);
+    background: rgba(0, 0, 0, 0.62);
     backdrop-filter: blur(2px);
     z-index: calc(var(--z-drawer) - 1);
     animation: mask-in var(--dur-2) var(--ease);

@@ -93,15 +93,15 @@ const usageOption = computed(() => {
   const rows = usage.value?.by_day || []
   return {
     grid: { left: 44, right: 16, top: 20, bottom: 26 },
-    tooltip: { trigger: 'axis', backgroundColor: '#0d1727', borderColor: '#1f3557', textStyle: { color: '#dbe6f5', fontSize: 11 } },
+    tooltip: { trigger: 'axis', backgroundColor: '#18181b', borderColor: 'rgba(255,255,255,0.12)', textStyle: { color: '#f4f4f5', fontSize: 11 } },
     xAxis: {
       type: 'category',
       data: rows.map((r: any) => r.date.slice(5)),
-      axisLine: { lineStyle: { color: '#1a2942' } },
-      axisLabel: { color: '#6b7c99', fontSize: 10 },
+      axisLine: { lineStyle: { color: 'rgba(255,255,255,0.10)' } },
+      axisLabel: { color: '#8a8a93', fontSize: 10 },
     },
     yAxis: [
-      { type: 'value', splitLine: { lineStyle: { color: 'rgba(26,41,66,0.5)' } }, axisLabel: { color: '#6b7c99', fontSize: 10 } },
+      { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } }, axisLabel: { color: '#8a8a93', fontSize: 10 } },
     ],
     series: [
       {
@@ -137,8 +137,6 @@ const modelFamily = computed(() => {
   if ((lib.non_reasoning_hints || []).some((h: string) => model.includes(h))) return null
   return (lib.families || []).find((f: any) => (f.hints || []).some((h: string) => model.includes(h))) || null
 })
-const extremeSupported = computed(() => !!modelFamily.value?.extreme)
-
 async function loadAll() {
   const [p, u, l, r] = await Promise.allSettled([
     http.get('/ai/providers'),

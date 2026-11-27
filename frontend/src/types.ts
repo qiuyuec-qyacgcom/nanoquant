@@ -1,4 +1,4 @@
-export interface Account {
+interface Account {
   wallet: number
   available: number
   unrealized: number
@@ -9,7 +9,7 @@ export interface Account {
   error?: string
 }
 
-export interface Position {
+interface Position {
   id: number
   symbol: string
   partial_tp?: boolean
@@ -96,20 +96,6 @@ export interface EngineStatus {
   }
 }
 
-export interface Ticker {
-  symbol: string
-  last: number
-  change_pct: number
-  high: number
-  low: number
-  quote_volume: number
-  bid: number
-  ask: number
-  spread_pct: number
-  ts: number
-  source: string
-}
-
 export interface NewsItem {
   id: number
   ts: number
@@ -187,20 +173,6 @@ export interface Trade {
   reviewed: boolean
   review_note: string
   mantra_ids: number[]
-}
-
-export interface Signal {
-  id: number
-  ts: number
-  symbol: string
-  direction: string
-  score: number
-  features: Record<string, any>
-  ai_action: string
-  ai_confidence: number
-  ai_reason: string
-  decision: string
-  reject_reason: string
 }
 
 export interface EventItem {

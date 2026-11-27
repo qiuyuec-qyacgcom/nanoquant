@@ -1,24 +1,28 @@
 /* 全局设计令牌 · H Modular Studio
  *
  * 后台、登录页与公开前台共用同一套黑色主题，不再提供浅色切换。
+ * 页面黑 / 卡片黑采用中性黑，取自 astraquant.top/trading 的配色层次。
  * 字体：Inter（Sans）+ JetBrains Mono（等宽），均为 GitHub 开源 OFL 字体，
  * 由 @fontsource 本地打包，不依赖外部 CDN。
  */
 
 :root {
   color-scheme: dark;
-  --bg: #0b0f14;
-  --bg-grid: rgba(255, 255, 255, 0.03);
-  --panel: #11161d;
-  --panel-2: #171f29;
-  --panel-3: #1d2733;
-  --line: rgba(255, 255, 255, 0.08);
-  --line-strong: rgba(255, 255, 255, 0.16);
-  --line-soft: rgba(255, 255, 255, 0.05);
-  --text: #e8edf4;
-  --text-dim: #c8d1dc;
-  --muted: #8b98a9;
-  --dim: #667085;
+  /* 中性黑：与 astraquant.top/trading 的页面黑 / 卡片黑保持一致 */
+  --bg: #0a0a0b;
+  --bg-grid: rgba(255, 255, 255, 0.02);
+  --panel: #111113;
+  --panel-2: #18181b;
+  --panel-3: #222226;
+  --surface-head: #0e0e11;
+  --surface-input: #0d0d10;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --line-soft: rgba(255, 255, 255, 0.04);
+  --text: #f4f4f5;
+  --text-dim: #d4d4d8;
+  --muted: #a1a1aa;
+  --dim: #8a8a93;
   --accent: #2ee6a6;
   --accent-2: #7cf0c4;
   --accent-soft: rgba(46, 230, 166, 0.12);

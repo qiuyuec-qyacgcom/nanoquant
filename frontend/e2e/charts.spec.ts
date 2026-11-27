@@ -13,8 +13,8 @@ async function login(page: import('@playwright/test').Page) {
   await page.goto('/#/login')
   await page.locator('input[autocomplete="username"]').fill(USER)
   await page.locator('input[type="password"]').fill(PASS)
-  await page.getByRole('button', { name: /进入终端/ }).click()
-  await expect(page).toHaveURL(/#\/admin\/dashboard/, { timeout: 15_000 })
+  await page.getByRole('button', { name: /进入工作台/ }).click()
+  await expect(page).toHaveURL(/#\/admin\/overview\/dashboard/, { timeout: 15_000 })
 }
 
 test('总览图表真的渲染出来了', async ({ page }) => {
@@ -26,11 +26,27 @@ test('总览图表真的渲染出来了', async ({ page }) => {
 
   await login(page)
 
-  const canvas = page.locator('canvas').first()
-  await expect(canvas).toBeVisible({ timeout: 15_000 })
-  const box = await canvas.boundingBox()
-  expect(box?.width ?? 0).toBeGreaterThan(100)
-  expect(box?.height ?? 0).toBeGreaterThan(60)
+  // 全新库里引擎可能还没采到权益点：有数据才断言 canvas，无数据断言空态，
+  // 两种情况下都要求没有 echarts 缺组件报错。
+  const points = await page.evaluate(async () => {
+    const token = localStorage.getItem('nq_token') || ''
+    const res = await fetch('/api/v1/engine/equity?hours=48', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) return 0
+    const body = await res.json()
+    return Array.isArray(body.items) ? body.items.length : 0
+  })
+
+  if (points > 1) {
+    const canvas = page.locator('canvas').first()
+    await expect(canvas).toBeVisible({ timeout: 15_000 })
+    const box = await canvas.boundingBox()
+    expect(box?.width ?? 0).toBeGreaterThan(100)
+    expect(box?.height ?? 0).toBeGreaterThan(60)
+  } else {
+    await expect(page.locator('body')).toContainText('权益采样将在引擎运行后每 60 秒记录一次')
+  }
 
   // echarts 缺注册时会打印 "Component series.line not exists" / "There is a chart instance..."
   const joined = errors.join('\n')

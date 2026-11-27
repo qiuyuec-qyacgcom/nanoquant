@@ -859,7 +859,7 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 4px;
   padding: 8px;
-  background: linear-gradient(180deg, rgba(16, 26, 44, 0.92), rgba(9, 15, 26, 0.92));
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   position: sticky;

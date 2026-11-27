@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { getToken, http } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { fmt, timeStr } from '../utils/format'
+import { timeStr } from '../utils/format'
 
 const app = useAppStore()
 const options = ref<any>(null)

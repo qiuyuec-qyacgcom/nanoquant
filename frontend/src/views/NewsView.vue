@@ -18,18 +18,6 @@ interface SourceStat {
   needs_proxy: boolean
 }
 
-interface DiagRow {
-  source: string
-  label: string
-  enabled: boolean
-  ok: boolean
-  count: number
-  latency_ms: number
-  error: string
-  url: string
-  hint: string
-}
-
 const app = useAppStore()
 const items = ref<NewsItem[]>([])
 const overview = ref<any>(null)

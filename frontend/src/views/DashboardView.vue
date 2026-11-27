@@ -245,10 +245,10 @@ function cssVar(name: string, fallback: string) {
 
 const equityOption = computed(() => {
   const points = equity.value
-  const panel = cssVar('--panel', '#11161d')
-  const line = cssVar('--line', 'rgba(255,255,255,.08)')
-  const muted = cssVar('--muted', '#8b98a9')
-  const text = cssVar('--text', '#e8edf4')
+  const panel = cssVar('--panel', '#111113')
+  const line = cssVar('--line', 'rgba(255,255,255,.10)')
+  const muted = cssVar('--muted', '#a1a1aa')
+  const text = cssVar('--text', '#f4f4f5')
   const accent = cssVar('--accent', '#2ee6a6')
   return {
     grid: { left: 54, right: 18, top: 22, bottom: 28 },
@@ -288,7 +288,7 @@ const equityOption = computed(() => {
 
 async function load() {
 
-  const [eq, tr, sg, us, ev, ex, pr, od, hs] = await Promise.allSettled([
+  const [eq, tr, sg, us, , ex, pr, od, hs] = await Promise.allSettled([
     http.get('/engine/equity?hours=48'),
     http.get('/engine/trades?limit=10'),
     http.get('/engine/signals?limit=12'),

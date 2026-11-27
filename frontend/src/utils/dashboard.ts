@@ -1,4 +1,4 @@
-export const ORDER_PURPOSE_LABELS: Record<string, string> = {
+const ORDER_PURPOSE_LABELS: Record<string, string> = {
   entry: '开仓',
   stop_loss: '止损',
   take_profit: '止盈',

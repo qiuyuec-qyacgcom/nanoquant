@@ -233,6 +233,7 @@ async function submit() {
 
 .login-secret { position: relative; }
 .login-secret .login-input { padding-right: 46px; }
+/* 颜色对齐参考站登录页的密码显隐按钮 */
 .login-eye {
   position: absolute;
   top: 50%;
@@ -242,12 +243,15 @@ async function submit() {
   place-items: center;
   width: 32px;
   height: 32px;
-  border-radius: var(--r-sm);
-  color: var(--muted);
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #8a8a93;
   cursor: pointer;
 }
 .login-eye svg { width: 16px; height: 16px; }
-.login-eye:hover { color: var(--text); background: var(--panel-3); }
+.login-eye:hover { color: #f4f4f5; background: rgba(255, 255, 255, 0.04); }
 .login-eye:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 .login-error {
@@ -260,6 +264,7 @@ async function submit() {
   font-size: 11px;
 }
 
+/* 登录按钮沿用项目原来的强调色 */
 .login-submit {
   display: flex;
   align-items: center;

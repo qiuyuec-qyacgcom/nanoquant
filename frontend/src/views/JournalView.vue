@@ -11,7 +11,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { pct, timeStr } from '../utils/format'
+import { timeStr } from '../utils/format'
 
 const app = useAppStore()
 const journal = ref<any[]>([])

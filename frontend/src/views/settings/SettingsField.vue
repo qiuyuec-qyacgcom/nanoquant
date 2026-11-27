@@ -234,7 +234,7 @@ const MONO_KEYS = new Set(['base_url', 'proxy', 'rsshub_base'])
   gap: 14px;
   align-items: center;
   padding: 9px 0;
-  border-top: 1px dashed rgba(26, 41, 66, 0.6);
+  border-top: 1px dashed var(--line);
 }
 
 /* 改过但还没保存的字段：左边一条黄线 + "已改"角标，滚动时也能一眼看到 */
@@ -295,7 +295,7 @@ const MONO_KEYS = new Set(['base_url', 'proxy', 'rsshub_base'])
   display: inline-flex;
   padding: 3px;
   gap: 3px;
-  background: #070d18;
+  background: var(--surface-input);
   border: 1px solid var(--line);
   border-radius: 8px;
   flex-wrap: wrap;
@@ -326,7 +326,7 @@ const MONO_KEYS = new Set(['base_url', 'proxy', 'rsshub_base'])
   gap: 6px;
   padding: 6px 8px;
   min-height: 38px;
-  background: #070d18;
+  background: var(--surface-input);
   border: 1px solid var(--line);
   border-radius: 7px;
 }

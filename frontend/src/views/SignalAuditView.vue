@@ -44,11 +44,6 @@ function decisionLabel(row: SignalRow): { text: string; cls: string } {
   return DECISION_LABELS[row.decision] || { text: row.decision, cls: 'tag-dim' }
 }
 
-function feat(row: SignalRow, key: string): string {
-  const v = row.features?.[key]
-  return v === undefined || v === null ? '--' : String(v)
-}
-
 function featureLine(row: SignalRow): string {
   const f = row.features || {}
   const rsi = f.rsi != null ? `RSI ${Number(f.rsi).toFixed(1)}` : ''
@@ -241,7 +236,7 @@ onMounted(load)
   gap: 2px;
   height: 48px;
   padding: 4px 2px;
-  background: rgba(8, 14, 26, 0.5);
+  background: var(--surface-input);
   border-radius: 6px;
 }
 .hour-col {

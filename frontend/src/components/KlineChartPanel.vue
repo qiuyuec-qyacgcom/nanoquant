@@ -36,14 +36,14 @@ function cssVar(name: string, fallback: string): string {
 
 /** 图表样式统一读取全局 CSS 变量。 */
 function chartStyles(): Record<string, any> {
-  const line = cssVar('--line', 'rgba(148,170,200,0.10)')
-  const lineStrong = cssVar('--line-strong', 'rgba(148,170,200,0.25)')
-  const text = cssVar('--text', '#dbe6f6')
-  const muted = cssVar('--muted', '#7c8ba1')
-  const panel = cssVar('--panel', '#0b1220')
-  const panel3 = cssVar('--panel-3', '#1f3557')
-  const up = cssVar('--up', '#12c48b')
-  const down = cssVar('--down', '#f04b5a')
+  const line = cssVar('--line', 'rgba(255,255,255,0.10)')
+  const lineStrong = cssVar('--line-strong', 'rgba(255,255,255,0.18)')
+  const text = cssVar('--text', '#f4f4f5')
+  const muted = cssVar('--muted', '#a1a1aa')
+  const panel = cssVar('--panel', '#111113')
+  const panel3 = cssVar('--panel-3', '#222226')
+  const up = cssVar('--up', '#2ee6a6')
+  const down = cssVar('--down', '#ff6b6b')
   return {
     grid: {
       horizontal: { color: line },

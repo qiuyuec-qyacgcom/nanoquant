@@ -4,7 +4,7 @@ import { http } from '../api/client'
 import Modal from '../components/Modal.vue'
 import { useAppStore } from '../stores/app'
 import type { Mantra, Trade } from '../types'
-import { CATEGORY_LABELS, EXIT_LABELS, pct, timeStr, usdt } from '../utils/format'
+import { CATEGORY_LABELS, EXIT_LABELS, timeStr, usdt } from '../utils/format'
 
 const app = useAppStore()
 const mantras = ref<Mantra[]>([])

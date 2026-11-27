@@ -194,13 +194,13 @@ const equityOption = computed(() => {
       data: curve.map((_, i) => i + 1),
       boundaryGap: false,
       axisLine: { lineStyle: { color: 'rgba(148,170,200,0.18)' } },
-      axisLabel: { color: '#64748b', fontSize: 10, interval: Math.max(0, Math.floor(curve.length / 8)) },
+      axisLabel: { color: '#8a8a93', fontSize: 10, interval: Math.max(0, Math.floor(curve.length / 8)) },
     },
     yAxis: {
       type: 'value',
       scale: true,
       splitLine: { lineStyle: { color: 'rgba(148,170,200,0.08)' } },
-      axisLabel: { color: '#64748b', fontSize: 10 },
+      axisLabel: { color: '#8a8a93', fontSize: 10 },
     },
     series: [
       {

@@ -41,7 +41,6 @@ const steps = computed<Step[]>(() => data.value?.steps || [])
 const blocking = computed(() => steps.value.filter((s) => !s.ok && s.level === 'fail'))
 const warnings = computed(() => steps.value.filter((s) => !s.ok && s.level === 'warn'))
 const symbols = computed<SymbolRow[]>(() => data.value?.symbols || [])
-const tradeable = computed(() => symbols.value.filter((s) => s.tradeable))
 
 const CHAIN = [
   { key: 'channel', label: '交易通道', desc: '凭证 + 接口' },
@@ -251,7 +250,7 @@ onMounted(load)
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: linear-gradient(180deg, rgba(20, 33, 55, 0.72), rgba(10, 17, 29, 0.88));
+  background: var(--panel-2);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -259,7 +258,7 @@ onMounted(load)
 }
 .flow-card:hover {
   transform: translateY(-2px);
-  border-color: #2a4877;
+  border-color: var(--line-strong);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
 }
 .flow-head {
@@ -276,8 +275,8 @@ onMounted(load)
   font-family: var(--mono);
   font-size: 10.5px;
   font-weight: 700;
-  background: #16233a;
-  color: #9fb6d6;
+  background: var(--panel-3);
+  color: var(--muted);
   border: 1px solid var(--line);
   flex: 0 0 19px;
 }
@@ -304,7 +303,7 @@ onMounted(load)
   content: '';
   width: 100%;
   height: 1px;
-  background: linear-gradient(90deg, var(--line), #2b4573);
+  background: linear-gradient(90deg, var(--line), var(--line-strong));
 }
 .flow-connector::after {
   content: '';
@@ -313,8 +312,8 @@ onMounted(load)
   top: 50%;
   width: 5px;
   height: 5px;
-  border-top: 1px solid #2b4573;
-  border-right: 1px solid #2b4573;
+  border-top: 1px solid var(--line-strong);
+  border-right: 1px solid var(--line-strong);
   transform: translateY(-50%) rotate(45deg);
 }
 
@@ -347,13 +346,13 @@ onMounted(load)
 }
 
 .flow-connector.ok::before {
-  background: linear-gradient(90deg, rgba(18, 196, 139, 0.5), #2b4573);
+  background: linear-gradient(90deg, rgba(18, 196, 139, 0.5), var(--line-strong));
 }
 .flow-connector.warn::before {
-  background: linear-gradient(90deg, rgba(240, 169, 42, 0.5), #2b4573);
+  background: linear-gradient(90deg, rgba(240, 169, 42, 0.5), var(--line-strong));
 }
 .flow-connector.fail::before {
-  background: linear-gradient(90deg, rgba(240, 75, 90, 0.5), #2b4573);
+  background: linear-gradient(90deg, rgba(240, 75, 90, 0.5), var(--line-strong));
 }
 
 .check-item {
@@ -412,7 +411,7 @@ onMounted(load)
   .flow-connector::before {
     width: 1px;
     height: 100%;
-    background: linear-gradient(180deg, var(--line), #2b4573);
+    background: linear-gradient(180deg, var(--line), var(--line-strong));
   }
   .flow-connector::after {
     right: auto;

@@ -21,7 +21,7 @@ export function setMustChangePassword(flag: boolean) {
   else localStorage.removeItem(MUST_CHANGE_KEY)
 }
 
-export class ApiError extends Error {
+class ApiError extends Error {
   status: number
   constructor(status: number, message: string) {
     super(message)
