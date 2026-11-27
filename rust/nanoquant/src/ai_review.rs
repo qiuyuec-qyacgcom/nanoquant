@@ -264,8 +264,7 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         },
     });
     crate::ai_analysis::gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
-    let messages =
-        crate::ai_analysis::decision_messages_for_mode(&context, &cfg.personas, cfg.veto_only);
+    let messages = crate::ai_analysis::decision_messages_for_mode(&context, &cfg.personas);
     let mut call = ChatCall::new(&messages, "engine_review");
     call.max_tokens = Some(16000);
     call.min_max_tokens = true;
@@ -293,15 +292,12 @@ async fn review_entry(state: AiState, proposal: EntryProposal) -> Result<ReviewD
         .unwrap_or(DEFAULT_MIN_ENTRY_RR);
     // AI 新协议字段照常落在审计里；`use_invalidation_price` / `use_entry_price`
     // 只在消费点（快速风控、限价开仓）决定是否采用，复核出口不得清空。
-    let mut reviewed = decision_to_review_mode(
+    let mut reviewed = decision_to_review(
         &proposal,
         side_lock,
         &decision,
         cfg.min_confidence,
-        cfg.require_agreement,
-        cfg.allow_ai_override,
         min_entry_rr,
-        cfg.veto_only,
         cfg.scale_on_confidence,
     )?;
     reviewed.latency = AiLatency {
@@ -330,11 +326,7 @@ const DEFAULT_MIN_ENTRY_RR: f64 = 0.8;
 fn reject(reason: impl Into<String>) -> ReviewDecision {
     ReviewDecision {
         action: ReviewAction::Reject,
-        side: None,
-        leverage: None,
-        margin_pct: None,
-        stop_price: None,
-        take_profit: None,
+
         reason: reason.into(),
         confidence: 0.0,
         invalidation_price: None,
@@ -381,39 +373,12 @@ fn reject_with(reason: impl Into<String>, decision: &ai_client::Decision) -> Rev
     }
 }
 
-/// 兼容旧调用：保留完整的 AI 覆盖语义（非否决、无置信度缩放）。
-#[cfg(test)]
 fn decision_to_review(
     proposal: &EntryProposal,
     side_lock: &str,
     decision: &ai_client::Decision,
     min_confidence: f64,
-    require_agreement: bool,
-    allow_ai_override: bool,
     min_entry_rr: f64,
-) -> Result<ReviewDecision, String> {
-    decision_to_review_mode(
-        proposal,
-        side_lock,
-        decision,
-        min_confidence,
-        require_agreement,
-        allow_ai_override,
-        min_entry_rr,
-        false,
-        false,
-    )
-}
-
-fn decision_to_review_mode(
-    proposal: &EntryProposal,
-    side_lock: &str,
-    decision: &ai_client::Decision,
-    min_confidence: f64,
-    require_agreement: bool,
-    allow_ai_override: bool,
-    min_entry_rr: f64,
-    veto_only: bool,
     scale_on_confidence: bool,
 ) -> Result<ReviewDecision, String> {
     if decision.confidence < min_confidence {
@@ -440,11 +405,7 @@ fn decision_to_review_mode(
             let (invalidation_text, risk_text) = text_fields(decision);
             return Ok(ReviewDecision {
                 action: ReviewAction::Hold,
-                side: None,
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: None,
+
                 reason: if decision.reason.is_empty() {
                     "AI 未批准开仓".to_string()
                 } else {
@@ -491,124 +452,18 @@ fn decision_to_review_mode(
     if side_lock == "short" && side == "long" {
         return Ok(reject_with("策略只允许做空，AI 方向相反", decision));
     }
-    // 否决模式：AI 只保留能否开仓与降仓，方向、杠杆、止损、止盈全部交回量化。
-    if veto_only {
-        if side != proposal.side {
-            return Ok(reject_with(
-                "AI 方向与量化相反，否决模式不覆盖方向",
-                decision,
-            ));
-        }
-        let (invalidation_text, risk_text) = text_fields(decision);
-        return Ok(ReviewDecision {
-            action: ReviewAction::Agree,
-            side: None,
-            leverage: None,
-            margin_pct: None,
-            stop_price: None,
-            take_profit: None,
-            reason: if decision.reason.is_empty() {
-                "AI 通过（否决模式）".to_string()
-            } else {
-                decision.reason.clone()
-            },
-            confidence: decision.confidence,
-            invalidation_price: decision.invalidation_price,
-            valid_bars: decision.valid_bars,
-            data_quality: decision.data_quality,
-            rr_target: decision.rr_target,
-            entry_price: decision.entry_price,
-            invalidation_text,
-            risk_text,
-            scale,
-            latency: AiLatency::default(),
-            prompt_profile: None,
-        });
+    // AI 固定为否决模式：只能同意、否决或降仓，方向必须与量化一致。
+    if side != proposal.side {
+        return Ok(reject_with("AI 方向与量化相反", decision));
     }
-    if let Some(quant_side) = proposal.quant_side.as_deref() {
-        if quant_side != side {
-            if require_agreement {
-                return Ok(reject_with("AI 与量化方向不一致", decision));
-            }
-            if !allow_ai_override {
-                return Ok(reject_with(
-                    "AI 与量化方向不一致，且未允许 AI 覆盖",
-                    decision,
-                ));
-            }
-        }
-    } else if require_agreement {
-        return Ok(reject_with("缺少量化方向，无法与量化方向一致", decision));
-    }
-    let mark = proposal.mark_price;
-    // 杠杆由 AI 在全局区间内决定：低于下限抬回下限，高于上限压回上限。
-    // 止损/止盈百分比按保证金收益率解释，换算价格距离前必须先确定最终杠杆。
-    let upper = proposal.max_leverage.max(proposal.leverage);
-    let leverage = (decision.leverage.is_finite() && decision.leverage > 0.0)
-        .then(|| decision.leverage.clamp(proposal.leverage, upper));
-    let effective_leverage = leverage.unwrap_or(proposal.leverage).max(1.0);
-    let stop_price = if decision.sl_pct > 0.0 {
-        let price_pct = decision.sl_pct / effective_leverage;
-        if side == "long" {
-            mark * (1.0 - price_pct / 100.0)
-        } else {
-            mark * (1.0 + price_pct / 100.0)
-        }
-    } else if side == proposal.side {
-        proposal.stop_price
-    } else {
-        let distance = (mark - proposal.stop_price).abs();
-        if side == "long" {
-            mark - distance
-        } else {
-            mark + distance
-        }
-    };
-    let take_profit = if decision.tp_pct > 0.0 {
-        let price_pct = decision.tp_pct / effective_leverage;
-        if side == "long" {
-            mark * (1.0 + price_pct / 100.0)
-        } else {
-            mark * (1.0 - price_pct / 100.0)
-        }
-    } else if side == proposal.side {
-        proposal.take_profit
-    } else {
-        let distance = (proposal.take_profit - mark).abs();
-        if side == "long" {
-            mark + distance
-        } else {
-            mark - distance
-        }
-    };
-    if !stop_price.is_finite()
-        || stop_price <= 0.0
-        || !take_profit.is_finite()
-        || take_profit <= 0.0
-    {
-        return Ok(reject_with("AI 返回的止损/止盈价无效", decision));
-    }
-    let leverage_changed =
-        leverage.is_some_and(|value| (value - proposal.leverage).abs() > f64::EPSILON);
-    let stop_tightened = match (side, side == proposal.side) {
-        ("long", true) => stop_price > proposal.stop_price,
-        ("short", true) => stop_price < proposal.stop_price,
-        _ => false,
-    };
-    let changed = side != proposal.side || leverage_changed || stop_tightened;
     let (invalidation_text, risk_text) = text_fields(decision);
     Ok(ReviewDecision {
-        action: if changed {
-            ReviewAction::Tighten
+        action: ReviewAction::Agree,
+        reason: if decision.reason.is_empty() {
+            "AI 同意".to_string()
         } else {
-            ReviewAction::Agree
+            decision.reason.clone()
         },
-        side: Some(side.to_string()),
-        leverage,
-        margin_pct: decision.margin_pct,
-        stop_price: Some(stop_price),
-        take_profit: Some(take_profit),
-        reason: decision.reason.clone(),
         confidence: decision.confidence,
         invalidation_price: decision.invalidation_price,
         valid_bars: decision.valid_bars,
@@ -634,10 +489,7 @@ mod tests {
             quant_side: Some(side.to_string()),
             quant_score: Some(0.8),
             leverage: 2.0,
-            max_leverage: 20.0,
             margin_pct: 20.0,
-            margin_min_pct: 15.0,
-            margin_max_pct: 25.0,
             stop_price: if side == "long" { 95.0 } else { 105.0 },
             take_profit: if side == "long" { 110.0 } else { 90.0 },
             mark_price: 100.0,
@@ -669,8 +521,7 @@ mod tests {
         let mut item = decision("hold", 0.9);
         item.invalidation = "   ".to_string();
         item.risk_flags = vec!["  ".to_string()];
-        let hold =
-            decision_to_review(&proposal("long"), "any", &item, 0.45, true, false, 0.8).unwrap();
+        let hold = decision_to_review(&proposal("long"), "any", &item, 0.45, 0.8, false).unwrap();
         assert_eq!(hold.action, ReviewAction::Hold);
         assert_eq!(hold.invalidation_text, None, "空白失效文本不应落库");
         assert_eq!(hold.risk_text, None, "空白风险文本不应落库");
@@ -679,8 +530,7 @@ mod tests {
         rejected.invalidation = "\t ".to_string();
         rejected.risk_flags = vec![" ".to_string(), String::new()];
         let rejected =
-            decision_to_review(&proposal("long"), "any", &rejected, 0.45, true, false, 0.8)
-                .unwrap();
+            decision_to_review(&proposal("long"), "any", &rejected, 0.45, 0.8, false).unwrap();
         assert_eq!(rejected.action, ReviewAction::Reject);
         assert_eq!(
             rejected.invalidation_text, None,
@@ -691,8 +541,7 @@ mod tests {
         let mut mixed = decision("hold", 0.9);
         mixed.invalidation = " 跌破 EMA ".to_string();
         mixed.risk_flags = vec![" ".to_string(), " 上方套牢 ".to_string(), String::new()];
-        let mixed =
-            decision_to_review(&proposal("long"), "any", &mixed, 0.45, true, false, 0.8).unwrap();
+        let mixed = decision_to_review(&proposal("long"), "any", &mixed, 0.45, 0.8, false).unwrap();
         assert_eq!(
             mixed.invalidation_text.as_deref(),
             Some("跌破 EMA"),
@@ -712,9 +561,8 @@ mod tests {
             "long",
             &decision("open_short", 0.8),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -728,9 +576,8 @@ mod tests {
             "short",
             &decision("open_long", 0.8),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
@@ -744,9 +591,8 @@ mod tests {
             "long",
             &decision("open_long", 0.8),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Agree);
@@ -759,9 +605,8 @@ mod tests {
             "any",
             &decision("open_long", 0.2),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(low.action, ReviewAction::Reject);
@@ -772,9 +617,8 @@ mod tests {
             "any",
             &decision("hold", 0.9),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(hold.action, ReviewAction::Hold);
@@ -787,7 +631,7 @@ mod tests {
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.2);
         let result =
-            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+            decision_to_review(&proposal("long"), "long", &item, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
         assert_eq!(
@@ -807,7 +651,7 @@ mod tests {
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.2);
         let result =
-            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+            decision_to_review(&proposal("long"), "long", &item, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
     }
@@ -817,7 +661,7 @@ mod tests {
         let mut item = decision("open_long", 0.9);
         item.rr_target = Some(0.4);
         let result =
-            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+            decision_to_review(&proposal("long"), "long", &item, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("盈亏比"));
         assert_eq!(
@@ -836,15 +680,13 @@ mod tests {
         let mut dq_equal = decision("open_long", 0.9);
         dq_equal.data_quality = Some(0.45);
         let result =
-            decision_to_review(&proposal("long"), "long", &dq_equal, 0.45, true, true, 0.8)
-                .unwrap();
+            decision_to_review(&proposal("long"), "long", &dq_equal, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Agree, "dq 等于门槛应放行");
 
         let mut rr_equal = decision("open_long", 0.9);
         rr_equal.rr_target = Some(0.8);
         let result =
-            decision_to_review(&proposal("long"), "long", &rr_equal, 0.45, true, true, 0.8)
-                .unwrap();
+            decision_to_review(&proposal("long"), "long", &rr_equal, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Agree, "rr 等于门槛应放行");
     }
 
@@ -855,9 +697,8 @@ mod tests {
             "long",
             &decision("open_long", 0.9),
             0.45,
-            true,
-            true,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Agree, "dq/rr 缺省时不做门槛");
@@ -868,7 +709,7 @@ mod tests {
         let mut item = decision("open_long", 0.9);
         item.data_quality = Some(0.449);
         let result =
-            decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8).unwrap();
+            decision_to_review(&proposal("long"), "long", &item, 0.45, 0.8, false).unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
         assert!(result.reason.contains("数据质量"));
     }
@@ -880,8 +721,7 @@ mod tests {
             item.data_quality = Some(0.1);
             item.rr_target = Some(0.1);
             let result =
-                decision_to_review(&proposal("long"), "long", &item, 0.45, true, true, 0.8)
-                    .unwrap();
+                decision_to_review(&proposal("long"), "long", &item, 0.45, 0.8, false).unwrap();
             assert_eq!(
                 result.action,
                 ReviewAction::Hold,
@@ -1223,291 +1063,63 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     #[test]
-    fn ai_tightening_keeps_side_semantics_for_long_and_short() {
-        let long = ai_client::Decision {
-            action: "open_long".to_string(),
-            confidence: 0.9,
-            leverage: 4.0,
-            margin_pct: None,
-            sl_pct: 8.0,
-            tp_pct: 0.0,
-            reason: "tighten".to_string(),
-            risk_flags: Vec::new(),
-            invalidation: String::new(),
-            params: Vec::new(),
-            invalidation_price: None,
-            valid_bars: None,
-            data_quality: None,
-            rr_target: None,
-            entry_price: None,
-        };
-        let reviewed =
-            decision_to_review(&proposal("long"), "any", &long, 0.45, true, false, 0.8).unwrap();
-        assert_eq!(reviewed.action, ReviewAction::Tighten);
-        assert_eq!(reviewed.leverage, Some(4.0));
-        let long_stop = reviewed.stop_price.expect("多单应收紧止损");
-        assert!(
-            (long_stop - 98.0).abs() < 1e-9,
-            "多单止损必须上移到 98，实际 {long_stop}"
-        );
-        assert!(long_stop > 95.0, "收紧后的多单止损不能低于原止损");
-
-        let short = ai_client::Decision {
-            action: "open_short".to_string(),
-            confidence: 0.9,
-            leverage: 3.0,
-            margin_pct: None,
-            sl_pct: 6.0,
-            tp_pct: 0.0,
-            reason: "tighten".to_string(),
-            risk_flags: Vec::new(),
-            invalidation: String::new(),
-            params: Vec::new(),
-            invalidation_price: None,
-            valid_bars: None,
-            data_quality: None,
-            rr_target: None,
-            entry_price: None,
-        };
-        let reviewed =
-            decision_to_review(&proposal("short"), "any", &short, 0.45, true, false, 0.8).unwrap();
-        assert_eq!(reviewed.leverage, Some(3.0));
-        let short_stop = reviewed.stop_price.expect("空单应收紧止损");
-        assert!(
-            (short_stop - 102.0).abs() < 1e-9,
-            "空单止损必须下移到 102，实际 {short_stop}"
-        );
-        assert!(short_stop < 105.0, "收紧后的空单止损不能高于原止损");
-    }
-
-    #[test]
-    fn ai_leverage_is_clamped_to_the_global_bounds() {
-        let raised = ai_client::Decision {
-            action: "open_long".to_string(),
-            confidence: 0.9,
-            leverage: 12.0,
-            margin_pct: None,
-            sl_pct: 0.0,
-            tp_pct: 0.0,
-            reason: "波动收敛，区间内加杠杆".to_string(),
-            risk_flags: Vec::new(),
-            invalidation: String::new(),
-            params: Vec::new(),
-            invalidation_price: None,
-            valid_bars: None,
-            data_quality: None,
-            rr_target: None,
-            entry_price: None,
-        };
-        let reviewed =
-            decision_to_review(&proposal("long"), "any", &raised, 0.45, true, false, 0.8).unwrap();
-        assert_eq!(reviewed.leverage, Some(12.0), "区间内允许上调杠杆");
-
-        let too_high = ai_client::Decision {
-            leverage: 80.0,
-            ..raised.clone()
-        };
-        let reviewed =
-            decision_to_review(&proposal("long"), "any", &too_high, 0.45, true, false, 0.8)
-                .unwrap();
-        assert_eq!(reviewed.leverage, Some(20.0), "超过上限压回上限");
-
-        let too_low = ai_client::Decision {
-            leverage: 1.0,
-            ..raised
-        };
-        let reviewed =
-            decision_to_review(&proposal("long"), "any", &too_low, 0.45, true, false, 0.8).unwrap();
-        assert_eq!(reviewed.leverage, Some(2.0), "低于下限抬回下限");
-    }
-
-    #[test]
-    fn ai_stop_is_used_for_an_agree_decision() {
-        let wider = ai_client::Decision {
-            action: "open_long".to_string(),
-            confidence: 0.9,
-            leverage: 0.0,
-            margin_pct: None,
-            sl_pct: 20.0,
-            tp_pct: 0.0,
-            reason: "wider".to_string(),
-            risk_flags: Vec::new(),
-            invalidation: String::new(),
-            params: Vec::new(),
-            invalidation_price: None,
-            valid_bars: None,
-            data_quality: None,
-            rr_target: None,
-            entry_price: None,
-        };
-        let reviewed =
-            decision_to_review(&proposal("long"), "any", &wider, 0.45, true, false, 0.8).unwrap();
+    fn ai_cannot_change_side_leverage_margin_stop_or_take_profit() {
+        let mut ai = decision("open_long", 0.9);
+        ai.leverage = 80.0;
+        ai.margin_pct = Some(90.0);
+        ai.sl_pct = 20.0;
+        ai.tp_pct = 50.0;
+        let reviewed = decision_to_review(&proposal("long"), "any", &ai, 0.45, 0.8, false).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
-        assert_eq!(reviewed.leverage, None);
-        assert_eq!(reviewed.stop_price, Some(90.0));
+        assert_eq!(reviewed.confidence, 0.9);
 
-        struct Fixed(crate::review::ReviewDecision);
+        struct Fixed(ReviewDecision);
         impl crate::review::AiReviewer for Fixed {
             fn review(
                 &self,
                 _proposal: &crate::review::EntryProposal,
-            ) -> Result<crate::review::ReviewDecision, String> {
+            ) -> Result<ReviewDecision, String> {
                 Ok(self.0.clone())
             }
         }
-        let clamped =
-            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true, false)
-                .unwrap();
-        assert_eq!(clamped.leverage, 2.0, "AI 未给杠杆时取全局下限");
-        assert_eq!(clamped.stop_price, 90.0, "AI 给出的止损价直接生效");
+        let applied =
+            crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
+        assert_eq!(applied.side, "long", "AI 不得改变方向");
+        assert_eq!(applied.leverage, 2.0, "AI 杠杆不得生效");
+        assert_eq!(applied.margin_pct, Some(20.0), "AI 保证金不得生效");
+        assert_eq!(applied.stop_price, 95.0, "AI 止损不得生效");
+        assert_eq!(applied.take_profit, 110.0, "AI 止盈不得生效");
     }
 
     #[test]
-    fn ai_side_can_override_the_quant_signal() {
-        let blocked = decision_to_review(
-            &proposal("long"),
-            "any",
-            &decision("open_short", 0.9),
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(
-            blocked.action,
-            ReviewAction::Reject,
-            "默认必须与量化方向一致"
-        );
-
-        let conflict = decision_to_review(
-            &proposal("long"),
-            "any",
-            &decision("open_short", 0.9),
-            0.45,
-            false,
-            true,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(conflict.action, ReviewAction::Tighten);
-        assert_eq!(conflict.side.as_deref(), Some("short"));
-    }
-
-    fn proposal_without_quant(side: &str) -> EntryProposal {
-        let mut item = proposal(side);
-        item.quant_side = None;
-        item.quant_score = None;
-        item
-    }
-
-    #[test]
-    fn require_agreement_blocks_ai_against_quant_side() {
+    fn ai_opposite_direction_is_rejected_regardless_of_confidence() {
         let result = decision_to_review(
             &proposal("long"),
             "any",
             &decision("open_short", 0.9),
             0.45,
-            true,
-            true,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(result.action, ReviewAction::Reject);
-        assert!(result.reason.contains("AI 与量化方向不一致"));
-
-        let agree = decision_to_review(
-            &proposal("long"),
-            "any",
-            &decision("open_long", 0.9),
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(agree.action, ReviewAction::Agree);
+        assert!(result.reason.contains("AI 方向与量化相反"));
     }
 
     #[test]
-    fn allow_ai_override_false_blocks_ai_against_quant_side() {
-        let result = decision_to_review(
-            &proposal("long"),
-            "any",
-            &decision("open_short", 0.9),
-            0.45,
-            false,
-            false,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(result.action, ReviewAction::Reject);
-        assert!(result.reason.contains("未允许 AI 覆盖"));
-    }
-
-    #[test]
-    fn allow_ai_override_true_permits_a_side_flip() {
-        let result = decision_to_review(
-            &proposal("short"),
-            "any",
-            &decision("open_long", 0.9),
-            0.45,
-            false,
-            true,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(result.action, ReviewAction::Tighten);
-        assert_eq!(result.side.as_deref(), Some("long"));
-    }
-
-    #[test]
-    fn require_agreement_without_quant_side_rejects_preview_entry() {
-        let result = decision_to_review(
-            &proposal_without_quant("long"),
-            "any",
-            &decision("open_long", 0.9),
-            0.45,
-            true,
-            false,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(result.action, ReviewAction::Reject);
-        assert!(result.reason.contains("缺少量化方向"));
-
-        let ai_first = decision_to_review(
-            &proposal_without_quant("long"),
-            "any",
-            &decision("open_long", 0.9),
-            0.45,
-            false,
-            false,
-            0.8,
-        )
-        .unwrap();
-        assert_eq!(
-            ai_first.action,
-            ReviewAction::Agree,
-            "无量化方向时 AI 仍是第一决策者"
-        );
-    }
-
-    #[test]
-    fn hold_is_held_regardless_of_agreement_flags() {
-        for (require_agreement, allow_ai_override) in [(true, false), (false, true)] {
+    fn hold_and_close_are_held_without_entry_fields() {
+        for action in ["hold", "close"] {
             let result = decision_to_review(
                 &proposal("long"),
                 "any",
-                &decision("hold", 0.9),
+                &decision(action, 0.9),
                 0.45,
-                require_agreement,
-                allow_ai_override,
                 0.8,
+                false,
             )
             .unwrap();
-            assert_eq!(result.action, ReviewAction::Hold);
-            assert_eq!(result.side, None);
+            assert_eq!(result.action, ReviewAction::Hold, "{action} 必须转为观望");
+            assert_eq!(result.scale, None);
         }
     }
 
@@ -1518,9 +1130,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             "any",
             &decision("open_long", 0.45),
             0.45,
-            true,
-            false,
             0.8,
+            false,
         )
         .unwrap();
         assert_eq!(

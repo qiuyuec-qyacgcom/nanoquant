@@ -67,7 +67,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   ],
   ai: [
     { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核；复核超时独立于模型请求超时', fields: ['use_invalidation_price', 'use_entry_price', 'review_timeout_sec'] },
-    { title: '否决与降仓', hint: 'AI 只决定能否开仓与降仓，不改写方向、杠杆、止损止盈', fields: ['veto_only', 'scale_on_confidence', 'fail_open_scale'] },
+    { title: '否决与降仓', hint: 'AI 只能同意/否决/降仓，不改写方向、杠杆、保证金、止损止盈', fields: ['scale_on_confidence', 'fail_open_scale'] },
     { title: '评分分流与缓存', hint: '高分直接放行、低分直接拒绝，仅中间区调用 AI；中间区结论按标的+方向+评分桶缓存；中间区复核按并发上限并行执行', fields: ['high_score_threshold', 'low_score_threshold', 'review_cache_ttl_sec', 'review_concurrency'] },
     { title: '供应商编排与熔断', hint: '按最近 24h P95 延迟升序选择供应商；连续失败达到阈值后短路一段时间，避免反复打 503/超时', fields: ['provider_order_mode', 'circuit_breaker_failures', 'circuit_breaker_sec'] },
     { title: '提示词档位', hint: '完整=14 根 K 线/8 条资讯/全部经验与心法；瘦身=8 根/4 条/3 条，仅压缩注入上下文，不改 prompt 文本与输出上限', fields: ['prompt_profile'] },

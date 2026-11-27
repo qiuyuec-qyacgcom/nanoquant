@@ -468,7 +468,7 @@ mod tests {
         let ai = stored_group(&conn, "ai");
         assert_eq!(ai["enabled"], false, "已有值不得被默认值覆盖");
         assert_eq!(ai["min_confidence"], serde_json::json!(0.6));
-        assert_eq!(ai["veto_only"], true, "旧库必须补上 veto_only");
+
         assert_eq!(
             ai["scale_on_confidence"], true,
             "旧库必须补上 scale_on_confidence"
@@ -479,8 +479,8 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_does_not_override_existing_veto_only() {
-        let dir = workspace("keep-veto-only");
+    fn bootstrap_does_not_override_existing_scale_switch() {
+        let dir = workspace("keep-scale-switch");
         let db = dir.join("nanoquant.db");
         let key = dir.join(".master_key");
         initialize(&db, &key, Some("test-password")).unwrap();
@@ -488,7 +488,7 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='ai'",
-                params![r#"{"enabled":true,"veto_only":false}"#],
+                params![r#"{"enabled":true,"scale_on_confidence":false}"#],
             )
             .unwrap();
         }
@@ -496,8 +496,11 @@ mod tests {
         initialize(&db, &key, Some("test-password")).unwrap();
         let conn = Connection::open(&db).unwrap();
         let ai = stored_group(&conn, "ai");
-        assert_eq!(ai["veto_only"], false, "用户显式关闭时不得被默认值改回");
-        assert_eq!(ai["scale_on_confidence"], true, "其余缺失键仍要补齐");
+        assert_eq!(
+            ai["scale_on_confidence"], false,
+            "用户显式关闭时不得被默认值改回"
+        );
+        assert_eq!(ai["fail_open_scale"], serde_json::json!(0.5));
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

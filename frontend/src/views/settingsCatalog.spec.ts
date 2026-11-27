@@ -212,7 +212,7 @@ describe('参数配置目录', () => {
       'scale_on_confidence',
       'use_entry_price',
       'use_invalidation_price',
-      'veto_only',
+
     ])
   })
 })

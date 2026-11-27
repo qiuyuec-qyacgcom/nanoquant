@@ -168,12 +168,8 @@ struct EntryDraft {
     quant_passed: bool,
     /// 本地规则按 ATR 与评分算出的杠杆，仍受全局上下限约束。
     leverage: f64,
-    /// 全局杠杆上限，已并入交易所与单标的限制。
-    max_leverage: f64,
-    /// AI 的保证金比例参考中枢，以及允许的 ±5% 区间。
+    /// 量化保证金比例中枢。
     margin_pct: f64,
-    margin_min_pct: f64,
-    margin_max_pct: f64,
     stop_price: f64,
     take_profit: f64,
     /// 该草稿来自 range 市的均值回归信号；止损止盈走独立阈值。
@@ -205,10 +201,7 @@ impl EntryDraft {
             quant_side: self.quant_side.clone(),
             quant_score: self.quant_score,
             leverage: self.leverage,
-            max_leverage: self.max_leverage,
             margin_pct: self.margin_pct,
-            margin_min_pct: self.margin_min_pct,
-            margin_max_pct: self.margin_max_pct,
             stop_price: self.stop_price,
             take_profit: self.take_profit,
             mark_price: self.mark_price,
@@ -1843,7 +1836,6 @@ impl EngineRuntime {
             drafts,
             mode,
             ai_required,
-            ai_cfg.veto_only,
             ai_cfg.fail_open_scale,
             high_score_threshold,
             low_score_threshold,
@@ -3122,10 +3114,8 @@ impl EngineRuntime {
                 lower as f64,
                 upper as f64,
             );
-            // 保证金以参数值为中枢，AI 可按波动率上下调整 5 个百分点。
+            // 保证金以参数值为量化中枢，AI 不再调整该比例。
             let margin_base = cfg["margin_pct"].as_f64().unwrap_or(20.0);
-            let margin_min = (margin_base - 5.0).max(0.0);
-            let margin_max = (margin_base + 5.0).min(100.0);
             // 仓位止盈止损率是用户的心理预期（保证金收益率）：
             // 作为 AI 未给出止损/止盈价时的默认价，价格距离 = 保证金% ÷ 杠杆。
             let direction = if side == "long" { 1.0 } else { -1.0 };
@@ -3195,10 +3185,7 @@ impl EngineRuntime {
                 preview_score,
                 quant_passed,
                 leverage,
-                max_leverage: upper as f64,
                 margin_pct: margin_base,
-                margin_min_pct: margin_min,
-                margin_max_pct: margin_max,
                 stop_price,
                 take_profit,
                 mean_reversion,
@@ -3315,7 +3302,7 @@ impl EngineRuntime {
         drafts: Vec<EntryDraft>,
         mode: &str,
         required: bool,
-        veto_only: bool,
+
         fail_open_scale: f64,
         high_score_threshold: f64,
         low_score_threshold: f64,
@@ -3328,26 +3315,25 @@ impl EngineRuntime {
         let resolve = |draft: &EntryDraft, active: Option<&dyn crate::review::AiReviewer>| {
             let proposal = draft.proposal();
             let started = std::time::Instant::now();
-            let mut result =
-                match crate::review::apply_review(&proposal, active, required, veto_only) {
-                    Ok(mut entry) => {
-                        if !required {
-                            entry.scale = Some(fail_open_scale);
-                        }
-                        Ok(entry)
+            let mut result = match crate::review::apply_review(&proposal, active, required) {
+                Ok(mut entry) => {
+                    if !required {
+                        entry.scale = Some(fail_open_scale);
                     }
-                    Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
-                    Err(error) => crate::review::apply_review(&proposal, None, false, false).map(
-                        |mut entry| {
-                            entry.reason = format!(
-                                "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
-                                error.reason
-                            );
-                            entry.scale = Some(fail_open_scale);
-                            entry
-                        },
-                    ),
-                };
+                    Ok(entry)
+                }
+                Err(error) if matches!(error.action.as_str(), "reject" | "hold") => Err(error),
+                Err(error) => {
+                    crate::review::apply_review(&proposal, None, false).map(|mut entry| {
+                        entry.reason = format!(
+                            "{}；AI 复核不可用，按 fail-open 降仓至 {fail_open_scale:.2}",
+                            error.reason
+                        );
+                        entry.scale = Some(fail_open_scale);
+                        entry
+                    })
+                }
+            };
             // 总耗时覆盖排队、供应商调用与解析；provider/parse 由复核层带出。
             let wall_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
             match &mut result {
@@ -3366,7 +3352,7 @@ impl EngineRuntime {
             if split_enabled && score >= high_score_threshold {
                 // 高分直接放行，按满仓处理，不花 AI 调用。
                 let proposal = draft.proposal();
-                let result = crate::review::apply_review(&proposal, None, false, veto_only).map(
+                let result = crate::review::apply_review(&proposal, None, false).map(
                     |mut entry| {
                         entry.scale = Some(1.0);
                         entry.reason = format!(
@@ -6456,14 +6442,10 @@ mod tests {
             &self,
             proposal: &crate::review::EntryProposal,
         ) -> Result<crate::review::ReviewDecision, String> {
-            let Some(side) = proposal.quant_side.clone() else {
+            let Some(_side) = proposal.quant_side.clone() else {
                 return Ok(crate::review::ReviewDecision {
                     action: crate::review::ReviewAction::Reject,
-                    side: None,
-                    leverage: None,
-                    margin_pct: None,
-                    stop_price: None,
-                    take_profit: None,
+
                     reason: "flat 候选不自动开仓".to_string(),
                     confidence: 0.0,
                     invalidation_price: None,
@@ -6480,11 +6462,7 @@ mod tests {
             };
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Agree,
-                side: Some(side),
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: Some(proposal.take_profit),
+
                 reason: "test approve".to_string(),
                 confidence: 0.0,
                 invalidation_price: None,
@@ -6837,11 +6815,7 @@ mod tests {
         ) -> Result<crate::review::ReviewDecision, String> {
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Hold,
-                side: None,
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: None,
+
                 reason: "测试观望".to_string(),
                 confidence: 0.62,
                 invalidation_price: None,
@@ -7545,11 +7519,7 @@ mod tests {
         ) -> Result<crate::review::ReviewDecision, String> {
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Reject,
-                side: None,
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: None,
+
                 reason: "test reject".to_string(),
                 confidence: 0.0,
                 invalidation_price: Some(97.5),
@@ -8054,16 +8024,12 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     impl crate::review::AiReviewer for CountingReviewer {
         fn review(
             &self,
-            proposal: &crate::review::EntryProposal,
+            _proposal: &crate::review::EntryProposal,
         ) -> Result<crate::review::ReviewDecision, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Agree,
-                side: Some(proposal.side.clone()),
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: Some(proposal.take_profit),
+
                 reason: "counted approve".to_string(),
                 confidence: 0.8,
                 invalidation_price: None,
@@ -8090,10 +8056,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             preview_score: Some(score),
             quant_passed: true,
             leverage: 10.0,
-            max_leverage: 20.0,
             margin_pct: 10.0,
-            margin_min_pct: 5.0,
-            margin_max_pct: 15.0,
             stop_price: 95.0,
             take_profit: 110.0,
             mean_reversion: false,
@@ -8127,7 +8090,6 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             Some(reviewer),
             drafts,
             "demo",
-            true,
             true,
             0.5,
             0.75,
@@ -8187,11 +8149,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             std::thread::sleep(delay);
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Agree,
-                side: Some(proposal.side.clone()),
-                leverage: None,
-                margin_pct: None,
-                stop_price: None,
-                take_profit: Some(proposal.take_profit),
+
                 reason: "slow approve".to_string(),
                 confidence: 0.8,
                 invalidation_price: None,
@@ -8362,22 +8320,17 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     struct ScaleReviewer {
-        margin_pct: Option<f64>,
         scale: Option<f64>,
     }
 
     impl crate::review::AiReviewer for ScaleReviewer {
         fn review(
             &self,
-            proposal: &crate::review::EntryProposal,
+            _proposal: &crate::review::EntryProposal,
         ) -> Result<crate::review::ReviewDecision, String> {
             Ok(crate::review::ReviewDecision {
                 action: crate::review::ReviewAction::Agree,
-                side: Some(proposal.side.clone()),
-                leverage: None,
-                margin_pct: self.margin_pct,
-                stop_price: None,
-                take_profit: Some(proposal.take_profit),
+
                 reason: "scale test".to_string(),
                 confidence: 0.8,
                 invalidation_price: None,
@@ -8394,21 +8347,18 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
     }
 
-    async fn entry_with_scale(margin_pct: f64, scale: f64) -> (Db, f64, Value) {
+    async fn entry_with_scale(scale: f64) -> (Db, f64, Value) {
         let (db, snapshot) = entry_fixture().await;
         db.lock()
             .execute(
                 "INSERT INTO app_settings(key,value,updated_at) \
-                 VALUES('ai','{\"enabled\":true,\"veto_only\":false,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
+                 VALUES('ai','{\"enabled\":true,\"scale_on_confidence\":false,\"fail_open_scale\":0.5}',0) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [],
             )
             .unwrap();
         test_runtime(&db)
-            .with_reviewer(Arc::new(ScaleReviewer {
-                margin_pct: Some(margin_pct),
-                scale: Some(scale),
-            }))
+            .with_reviewer(Arc::new(ScaleReviewer { scale: Some(scale) }))
             .persist_snapshot("demo", &snapshot)
             .unwrap();
         let qty = entry_qty(&db);
@@ -8426,8 +8376,8 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
 
     #[tokio::test]
     async fn scale_only_affects_qty_not_margin_pct() {
-        let (_full_db, full_qty, full_features) = entry_with_scale(12.0, 1.0).await;
-        let (_half_db, half_qty, half_features) = entry_with_scale(12.0, 0.5).await;
+        let (_full_db, full_qty, full_features) = entry_with_scale(1.0).await;
+        let (_half_db, half_qty, half_features) = entry_with_scale(0.5).await;
         assert!(full_qty > 0.0 && half_qty > 0.0);
         assert!(
             (half_qty - full_qty * 0.5).abs() < 1e-9,
@@ -8435,11 +8385,12 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         );
         assert_eq!(
             full_features["ai_review"]["margin_pct"],
-            serde_json::json!(12.0)
+            serde_json::json!(10.0),
+            "保证金必须来自量化参数，AI 不得改写"
         );
         assert_eq!(
             half_features["ai_review"]["margin_pct"],
-            serde_json::json!(12.0),
+            serde_json::json!(10.0),
             "scale 不得作用于 margin_pct"
         );
         assert_eq!(half_features["ai_review"]["scale"], serde_json::json!(0.5));

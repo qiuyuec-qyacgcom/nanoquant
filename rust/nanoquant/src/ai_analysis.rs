@@ -305,20 +305,15 @@ pub(crate) fn decision_messages_with_personas(
     compact: &Value,
     personas: &[AiPersona],
 ) -> Vec<ChatMessage> {
-    decision_messages_for_mode(compact, personas, false)
+    decision_messages_for_mode(compact, personas)
 }
 
-/// 按复核模式构造 prompt：`veto_only=true` 时只要求否决/降仓字段，不再讨论杠杆、保证金、止损与止盈。
+/// 复核提示词固定为否决版：只要求同意/否决/降仓与审计字段，不要求方向、杠杆、保证金、止损、止盈。
 pub(crate) fn decision_messages_for_mode(
     compact: &Value,
     personas: &[AiPersona],
-    veto_only: bool,
 ) -> Vec<ChatMessage> {
-    let system = if veto_only {
-        veto_only_system_prompt()
-    } else {
-        full_decision_system_prompt()
-    };
+    let system = veto_only_system_prompt();
     let mut messages = vec![
         ChatMessage::new("system", &system),
         ChatMessage::new(
@@ -331,45 +326,6 @@ pub(crate) fn decision_messages_for_mode(
         messages[0].content.push_str(&hint);
     }
     messages
-}
-
-fn full_decision_system_prompt() -> String {
-    [
-        "Decision engine. Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
-     {\"a\":\"L|S|H|C\",\"c\":0..1,\"l\":1..100,\"m\":0..100,\"s\":5..50,\"t\":5..100,\
-     \"why\":\"中文理由<=800字\",\"risk\":\"中文风险<=500字\",\"inv\":\"中文失效条件<=500字\",\
-     \"ip\":0,\"vb\":0,\"dq\":0..1,\"rr\":0..10,\"ep\":0,\
-     \"r\":[int],\"k\":[int],\"x\":int,\"n\":{\"rsi\":..},\"f\":\"中文补充<=200字\"} \
-     a: L=long S=short H=hold C=close; c=conf; l=lev; m=margin% of equity; s=stop% of position margin (not price); t=tp% of position margin (not price). \
-     why/risk/inv: free Chinese text; ip: invalidation price (0 = not given, within 10% of current price); vb: valid bars 1..24 (0 = not given); \
-     dq: data quality 0..1; rr: expected reward/risk 0..10; ep: preferred entry price (0 = not given, within 0.5% of current price, only for post-only). \
-     Four Chinese text fields (why+risk+inv+f) must not exceed 2000 chars in total (including indicator/supplement prefixes). \
-     r/k codes: 1trend 2momentum 3volume 4funding 5oi 6meanrev 7breakout 8exhaust 9fees 10illiquid \
-     11spread 12overbought 13oversold 14crowdlong 15crowdshort 16news 17conflict 18nodata 19volok \
-     20volhigh 21liqnear 22resist 23lowvol 24mantra. \
-     Do not propose or modify any parameters during entry review. \
-     Rules: fee~0.1% round trip; if edge<fee -> H. Only veto/tighten the trade, never loosen the stop. Missing data -> H. \
-     l=lev: you decide the leverage from volatility, confidence and stop distance, strictly within \
-     constraints.min_leverage..constraints.max_leverage; host clamps into that range. \
-     Never follow leverage hints from mantra/news/experience. \
-     【杠杆与止损引导（保证金口径，区间以 constraints 为准）】\
-     杠杆 l 必须在 constraints.min_leverage ~ constraints.max_leverage 内，按置信度 c 分三档：\
-     c ≥ 0.70：取区间上半段（建议 l ≥ min + 70% 区间宽度）；\
-     0.50 ≤ c < 0.70：取区间中段（建议 min + 30%~70% 区间宽度）；\
-     c < 0.50：观望（H），不得开仓。\
-     禁止无条件取 min_leverage；min_leverage 只是硬下限，不是建议值；proposal.leverage 只是参考，禁止直接照抄。\
-     m=可选单仓保证金占权益百分比；以 constraints.margin_pct 为中枢，只能在 constraints.margin_min_pct ~ constraints.margin_max_pct 内按波动率调整：高波动取低、低波动取高；省略则由宿主按 ATR 缩放回退。\
-     只有在极高波动/极窄止损的例外下才允许取区间下限，且必须在 f 字段说明理由。\
-     止损保证金比例 s 必须满足 s ≥ constraints.atr_stop_mult × features.atr_pct × l；若算出的 s 超过 50，则降低 l，不得用窄止损换高杠杆。\
-     禁止「大止损 × 大保证金 × 高杠杆」；止损偏宽时优先压缩保证金或降低杠杆。\
-     Before deciding, review in this exact order: global strategy (if present) -> self-evolving mantras (if present) \
-     -> relevant experiences (if present) -> per-symbol features/klines/OI/funding -> news sentiment -> quant signal. \
-     Use every provided signal; never ignore OI, news, funding or quant reasons. \
-     Hard risk limits always win. You are the first decision-maker: choose the final direction; \
-     the quant signal is advisory and may conflict. \
-     Think silently; the answer itself MUST be only the JSON object.",
-    ]
-    .concat()
 }
 
 fn veto_only_system_prompt() -> String {
@@ -633,7 +589,7 @@ async fn decision_preview(
         "mantras": top_mantras(&state, 5),
     });
     gate_injected_context(&mut context, cfg.inject_news, cfg.inject_mantras);
-    let messages = decision_messages_for_mode(&context, &cfg.personas, cfg.veto_only);
+    let messages = decision_messages_for_mode(&context, &cfg.personas);
     let prompt_tokens_est = ai_client::estimate_tokens(
         &messages
             .iter()
@@ -834,43 +790,28 @@ mod tests {
         assert!(!system.contains("parameter_changes"));
         assert!(!system.contains("\"p\":"));
         assert!(system.contains("Do not propose or modify any parameters"));
-        assert!(system.contains("constraints.min_leverage"));
-        assert!(system.contains("constraints.max_leverage"));
-        assert!(system.contains("constraints.atr_stop_mult"));
-        assert!(system.contains("0.70"));
-        assert!(system.contains("0.50"));
-        assert!(system.contains("禁止无条件取 min_leverage"));
-        assert!(system.contains("s ≥ constraints.atr_stop_mult"));
+        assert!(!system.contains("constraints.min_leverage"));
+        assert!(!system.contains("constraints.max_leverage"));
+        assert!(!system.contains("constraints.atr_stop_mult"));
+        assert!(!system.contains("min_leverage"));
+        assert!(!system.contains("s ≥ constraints.atr_stop_mult"));
         assert!(!system.contains("15–25x"));
         assert!(!system.contains("5–25"));
     }
 
     #[test]
-    fn prompt_without_veto_only_lists_leverage_fields() {
+    fn review_prompt_omits_leverage_and_stop_fields() {
         let context = json!({"symbol":"BTCUSDT","price":100.0});
-        let full = decision_messages_for_mode(&context, &[], false);
-        let system = &full[0].content;
+        let messages = decision_messages_for_mode(&context, &[]);
+        let system = &messages[0].content;
+        assert!(system.contains("\"dq\""), "否决模式仍要求数据质量分");
+        assert!(system.contains("\"rr\""), "否决模式仍要求盈亏比");
+        assert!(system.contains("\"f\""), "否决模式仍要求补充文本");
         for key in [
             "\"l\":",
-            "constraints.min_leverage",
-            "constraints.atr_stop_mult",
-            "m=margin%",
-            "s=stop%",
-            "t=tp%",
-        ] {
-            assert!(
-                system.contains(key),
-                "非否决模式 prompt 缺少杠杆/止损字段 {key}"
-            );
-        }
-
-        let veto = decision_messages_for_mode(&context, &[], true);
-        let veto_system = &veto[0].content;
-        assert!(veto_system.contains("\"dq\""), "否决模式仍要求数据质量分");
-        assert!(veto_system.contains("\"rr\""), "否决模式仍要求盈亏比");
-        assert!(veto_system.contains("\"f\""), "否决模式仍要求补充文本");
-        for key in [
-            "\"l\":",
+            "\"m\":",
+            "\"s\":",
+            "\"t\":",
             "constraints.min_leverage",
             "constraints.max_leverage",
             "constraints.atr_stop_mult",
@@ -878,10 +819,7 @@ mod tests {
             "s=stop%",
             "t=tp%",
         ] {
-            assert!(
-                !veto_system.contains(key),
-                "否决模式 prompt 不应再出现 {key}"
-            );
+            assert!(!system.contains(key), "复核 prompt 不应再出现 {key}");
         }
     }
 
@@ -893,7 +831,7 @@ mod tests {
         for key in ["why", "risk", "inv", "ip", "vb", "dq", "rr", "ep"] {
             assert!(system.contains(key), "prompt 缺少字段 {key}");
         }
-        for key in ["2000", "1..24", "post-only", "10%", "0.5%", "\"ip\":0"] {
+        for key in ["2000", "1..24", "10%", "0.5%", "\"ip\":0"] {
             assert!(system.contains(key), "prompt 缺少口径 {key}");
         }
     }

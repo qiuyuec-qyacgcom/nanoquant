@@ -832,10 +832,8 @@ pub struct AiConfig {
     pub decision_schema_version: i64,
     pub inject_news: bool,
     pub inject_mantras: bool,
+    /// 是否启用 AI 复核；false 时纯量化，不调用 AI。
     pub require_agreement: bool,
-    pub allow_ai_override: bool,
-    /// 否决模式：AI 只决定能否开仓与降仓，不改写方向、杠杆、止损、止盈。
-    pub veto_only: bool,
     /// 是否按 AI 置信度缩放仓位（0.5 + 0.5 * c）。
     pub scale_on_confidence: bool,
     /// AI 不可用/复核失败时的降仓系数。
@@ -870,8 +868,7 @@ impl Default for AiConfig {
             inject_news: true,
             inject_mantras: true,
             require_agreement: true,
-            allow_ai_override: false,
-            veto_only: true,
+
             scale_on_confidence: true,
             fail_open_scale: 0.5,
             provider_order_mode: "fastest".to_string(),
@@ -944,12 +941,7 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     if let Some(item) = value.get("require_agreement").and_then(Value::as_bool) {
         cfg.require_agreement = item;
     }
-    if let Some(item) = value.get("allow_ai_override").and_then(Value::as_bool) {
-        cfg.allow_ai_override = item;
-    }
-    if let Some(item) = value.get("veto_only").and_then(Value::as_bool) {
-        cfg.veto_only = item;
-    }
+
     if let Some(item) = value.get("scale_on_confidence").and_then(Value::as_bool) {
         cfg.scale_on_confidence = item;
     }
@@ -1760,9 +1752,9 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn ai_config_default_enables_veto_only() {
+    fn ai_config_default_scales_on_confidence() {
         let cfg = AiConfig::default();
-        assert!(cfg.veto_only, "默认必须启用否决模式");
+        assert!(cfg.require_agreement, "默认启用 AI 复核");
         assert!(cfg.scale_on_confidence, "默认必须按置信度降仓");
         assert_eq!(cfg.fail_open_scale, 0.5);
     }

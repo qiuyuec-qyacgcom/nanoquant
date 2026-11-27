@@ -239,7 +239,6 @@ const VISIBLE: &[(&str, &[&str])] = &[
         &[
             "use_invalidation_price",
             "use_entry_price",
-            "veto_only",
             "scale_on_confidence",
             "fail_open_scale",
             "high_score_threshold",
