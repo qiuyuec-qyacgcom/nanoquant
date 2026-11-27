@@ -571,9 +571,13 @@ pub(crate) fn demo_fill_for_manage(
         return None;
     }
     let (qty, purpose, reason) = match action {
-        ManageAction::PartialTakeProfit { qty } => {
-            (*qty, "partial-tp", "partial_take_profit".to_string())
-        }
+        ManageAction::PartialTakeProfit { qty } => (
+            *qty,
+            "partial-tp",
+            crate::exit_reason::ExitReason::PartialTakeProfit
+                .as_str()
+                .to_string(),
+        ),
         ManageAction::Close { reason } => (position_qty, "close", reason.clone()),
         ManageAction::Hold | ManageAction::MoveToBreakeven { .. } => return None,
     };

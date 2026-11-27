@@ -18,7 +18,6 @@ pub enum ExitReason {
     Timeout,
     RiskHalt,
     /// 部分止盈不是整仓退出，但审计需要同一套取值。
-    #[allow(dead_code)]
     PartialTakeProfit,
     /// 人工平仓由外部调用方触发，保留枚举值供解析。
     #[allow(dead_code)]
@@ -123,20 +122,47 @@ mod tests {
         )
     }
 
+    /// 会落库到 `trades.exit_reason` / `orders.purpose` 的生产模块。
+    const EXIT_REASON_SOURCES: &[(&str, &str)] = &[
+        ("manage.rs", include_str!("manage.rs")),
+        ("execution.rs", include_str!("execution.rs")),
+        ("runtime.rs", include_str!("runtime.rs")),
+        ("live.rs", include_str!("live.rs")),
+        ("cycle.rs", include_str!("cycle.rs")),
+        ("fast_risk.rs", include_str!("fast_risk.rs")),
+        ("backtest_engine.rs", include_str!("backtest_engine.rs")),
+    ];
+
+    /// `purpose` 位置允许的非退出原因订单用途。
+    const NON_EXIT_PURPOSES: &[&str] = &["entry", "close", "partial-tp", "protection"];
+
     #[test]
-    fn no_unknown_reason_literal_is_left_in_the_source() {
-        let source = include_str!("manage.rs");
-        for line in source.lines() {
-            let Some(start) = line.find("reason: \"") else {
-                continue;
-            };
-            let rest = &line[start + 9..];
-            let Some(end) = rest.find('"') else { continue };
-            let value = &rest[..end];
-            assert!(
-                ExitReason::from_str(value).is_some(),
-                "manage.rs 出现了枚举外的退出原因 {value}"
-            );
+    fn no_unknown_reason_literal_is_left_in_the_production_path() {
+        // 只扫生产代码：测试里用字面量断言是允许的。
+        // 覆盖范围从 manage.rs 扩到所有会写退出原因/平仓用途的模块，
+        // 防止 `let purpose = "take_profit"` 这类裸字面量绕过枚举。
+        for (name, source) in EXIT_REASON_SOURCES {
+            let production = source
+                .find("\nmod tests {")
+                .map_or(*source, |index| &source[..index]);
+            for (index, line) in production.lines().enumerate() {
+                let line_no = index + 1;
+                for needle in ["reason: \"", "purpose: \""] {
+                    let Some(start) = line.find(needle) else {
+                        continue;
+                    };
+                    let rest = &line[start + needle.len()..];
+                    let Some(end) = rest.find('"') else { continue };
+                    let value = &rest[..end];
+                    if needle.starts_with("purpose") && NON_EXIT_PURPOSES.contains(&value) {
+                        continue;
+                    }
+                    assert!(
+                        ExitReason::from_str(value).is_some(),
+                        "{name}:{line_no} 出现了枚举外的退出原因 {value}"
+                    );
+                }
+            }
         }
     }
 }

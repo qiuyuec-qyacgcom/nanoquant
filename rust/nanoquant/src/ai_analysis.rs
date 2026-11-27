@@ -777,10 +777,50 @@ mod tests {
         );
     }
 
+    /// 整数策略参数 → 特征快照里可直接观测的键。
+    const INTEGER_FEATURE_PROBES: &[(&str, &str)] = &[
+        ("rsi_period", "rsi"),
+        ("atr_period", "atr"),
+        ("ema_fast", "ema_fast"),
+        ("ema_slow", "ema_slow"),
+    ];
+
+    /// 不在特征快照里体现的整数策略参数 → 已有的生效证据位置。
+    const INTEGER_EXTERNAL_EVIDENCE: &[(&str, &str)] = &[
+        (
+            "adx_period",
+            "trade_policy::tests::adx_period_drives_the_signal_kernel",
+        ),
+        ("max_data_gaps", "runtime 数据缺口闸门"),
+        ("mr_rsi_high", "mean_reversion::tests 均值回归阈值"),
+        ("mr_rsi_low", "mean_reversion::tests 均值回归阈值"),
+        ("mr_sl_pct", "mean_reversion::tests 止损百分比"),
+        ("mr_tp_pct", "mean_reversion::tests 止盈百分比"),
+    ];
+
     #[test]
-    fn every_integer_semantics_strategy_param_changes_the_features() {
-        // strategy 组里所有「整数语义」的周期参数，改值必须改变特征输出。
+    fn every_integer_semantics_strategy_param_is_classified_and_effective() {
+        // 清单从注册表推导，而不是手写：新增整数策略参数必须给出特征证据、
+        // 外部模块证据，或在 param_registry::SOFT_PARAMS 登记为软参数。
         // 这条断言锁死「注册了却不被计算」的装饰参数不会再出现。
+        let registered: Vec<&str> = crate::param_registry::integer_strategy_params().collect();
+        assert!(!registered.is_empty(), "注册表必须包含整数策略参数");
+        let unclassified: Vec<&str> = registered
+            .iter()
+            .copied()
+            .filter(|key| {
+                !crate::param_registry::is_soft("strategy", key)
+                    && !INTEGER_FEATURE_PROBES.iter().any(|(param, _)| param == key)
+                    && !INTEGER_EXTERNAL_EVIDENCE
+                        .iter()
+                        .any(|(param, _)| param == key)
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "整数策略参数缺少生效证据，请补特征探针/外部证据或登记 SOFT_PARAMS: {unclassified:?}"
+        );
+
         let closes: Vec<f64> = (0..80)
             .map(|i| 100.0 + (i as f64 * 1.7).sin() * 3.0)
             .collect();
@@ -809,36 +849,39 @@ mod tests {
             spread_bps: 1.0,
             candles,
         };
-        let feature = |rsi: usize, atr: usize, fast: usize, slow: usize| {
+        let base_strategy = json!({
+            "rsi_period": 14,
+            "atr_period": 14,
+            "ema_fast": 9,
+            "ema_slow": 21,
+        });
+        let feature = |strategy: &Value| {
             feature_snapshot(
                 &market,
                 "15m",
-                rsi,
-                atr,
-                crate::trade_policy::EmaPeriods { fast, slow },
+                rsi_period_of(strategy),
+                atr_period_of(strategy),
+                ema_periods_of(strategy),
             )
         };
-        let base = feature(14, 14, 9, 21);
-        assert_ne!(
-            base["rsi"],
-            feature(7, 14, 9, 21)["rsi"],
-            "rsi_period 必须影响 rsi"
-        );
-        assert_ne!(
-            base["atr"],
-            feature(14, 7, 9, 21)["atr"],
-            "atr_period 必须影响 atr"
-        );
-        assert_ne!(
-            base["ema_fast"],
-            feature(14, 14, 5, 21)["ema_fast"],
-            "ema_fast 必须影响 ema_fast"
-        );
-        assert_ne!(
-            base["ema_slow"],
-            feature(14, 14, 9, 30)["ema_slow"],
-            "ema_slow 必须影响 ema_slow"
-        );
+        let base = feature(&base_strategy);
+        for (param, feature_key) in INTEGER_FEATURE_PROBES {
+            let meta = crate::param_registry::find("strategy", param)
+                .unwrap_or_else(|| panic!("{param} 必须注册"));
+            let current = base_strategy[param].as_f64().expect("基准值必须是数字");
+            let candidate = (current / 2.0).floor().max(meta.min.unwrap());
+            assert!(
+                candidate != current && candidate <= meta.max.unwrap(),
+                "{param} 的对照值必须在注册范围内且不同于基准值"
+            );
+            let mut strategy = base_strategy.clone();
+            strategy[*param] = json!(candidate);
+            assert_ne!(
+                base[*feature_key],
+                feature(&strategy)[*feature_key],
+                "{param}={candidate} 必须影响特征 {feature_key}"
+            );
+        }
     }
 
     #[test]

@@ -2115,9 +2115,12 @@ impl EngineRuntime {
             .filter_map(|((symbol, position), action)| {
                 let (qty, purpose) = match action {
                     crate::manage::ManageAction::Close { reason } => (position.qty, reason.clone()),
-                    crate::manage::ManageAction::PartialTakeProfit { qty } => {
-                        (*qty, "partial_take_profit".to_string())
-                    }
+                    crate::manage::ManageAction::PartialTakeProfit { qty } => (
+                        *qty,
+                        crate::exit_reason::ExitReason::PartialTakeProfit
+                            .as_str()
+                            .to_string(),
+                    ),
                     crate::manage::ManageAction::Hold
                     | crate::manage::ManageAction::MoveToBreakeven { .. } => return None,
                 };
@@ -5183,9 +5186,9 @@ impl EngineRuntime {
             );
             for leg in legs {
                 let purpose = if leg.kind == "STOP_MARKET" {
-                    "stop_loss"
+                    crate::exit_reason::ExitReason::StopLoss.as_str()
                 } else {
-                    "take_profit"
+                    crate::exit_reason::ExitReason::TakeProfit.as_str()
                 };
                 let outcome = crate::live::place_protection_leg(
                     &mut gate,

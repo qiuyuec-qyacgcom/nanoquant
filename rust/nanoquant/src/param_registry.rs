@@ -33,6 +33,27 @@ const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("strategy", "mr_enabled"),
 ];
 
+/// 软参数：只有配置默认值/审计展示语义，不参与特征或信号计算。
+///
+/// 注册表里的整数策略参数都必须在「生效证据」里出现；软参数在此显式登记豁免，
+/// 避免「注册了却不被计算」的装饰参数被静默放过。
+pub(crate) const SOFT_PARAMS: &[(&str, &str)] = &[("strategy", "valid_bars")];
+
+pub(crate) fn is_soft(group: &str, key: &str) -> bool {
+    SOFT_PARAMS.contains(&(group, key))
+}
+
+/// 注册表里所有整数语义的策略参数（步长 1）。
+///
+/// 「注册即生效」回归测试据此推导清单：新增整数参数必须补生效证据或登记为软参数。
+#[cfg(test)]
+pub(crate) fn integer_strategy_params() -> impl Iterator<Item = &'static str> {
+    RANGES
+        .iter()
+        .filter(|(group, _, _, _, step)| *group == "strategy" && *step == 1.0)
+        .map(|(_, key, ..)| *key)
+}
+
 pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("engine", "cycle_interval_sec", 15.0, 3600.0, 1.0),
     ("engine", "max_positions", 1.0, 50.0, 1.0),
@@ -450,6 +471,7 @@ pub(crate) fn catalog() -> Value {
                     "step": step,
                     "visible": visible,
                     "ai_writable": ai_writable,
+                    "soft": is_soft(group, key),
                 }),
             );
         }
@@ -569,6 +591,33 @@ mod tests {
         );
         assert!(catalog["groups"].get("security").is_none());
         assert!(!serde_json::to_string(&catalog).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn soft_params_are_registered_and_marked_in_the_catalog() {
+        for (group, key) in SOFT_PARAMS {
+            assert!(find(group, key).is_some(), "{group}.{key} 必须注册");
+        }
+        assert!(is_soft("strategy", "valid_bars"));
+        assert!(!is_soft("strategy", "atr_period"));
+        assert_eq!(
+            catalog()["groups"]["strategy"]["meta"]["valid_bars"]["soft"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn integer_strategy_params_cover_every_step_one_entry() {
+        let listed: Vec<&str> = integer_strategy_params().collect();
+        for key in [
+            "rsi_period",
+            "atr_period",
+            "ema_fast",
+            "ema_slow",
+            "valid_bars",
+        ] {
+            assert!(listed.contains(&key), "整数参数清单缺少 {key}: {listed:?}");
+        }
     }
 
     #[test]
