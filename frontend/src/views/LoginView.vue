@@ -15,6 +15,14 @@ const username = ref('admin')
 const password = ref('')
 const loading = ref(false)
 const error = ref('')
+const showPassword = ref(false)
+
+const flow = [
+  { k: '01', title: '信号', desc: '量化评分' },
+  { k: '02', title: '风控', desc: '硬闸门' },
+  { k: '03', title: 'AI 复核', desc: '同意 / 否决' },
+  { k: '04', title: '执行', desc: '下单与保护' },
+]
 
 async function submit() {
   if (loading.value) return
@@ -33,411 +41,430 @@ async function submit() {
 </script>
 
 <template>
-  <div class="login-page">
-    <button class="login-theme btn btn-sm btn-ghost" type="button" @click="toggleTheme">
-      {{ theme === 'dark' ? '浅色' : '深色' }}
-    </button>
-    <section class="login-visual">
-      <div class="login-brand">
-        <div class="brand-mark">N</div>
+  <div class="gate">
+    <header class="gate-head">
+      <div class="gate-brand">
+        <span class="gate-mark">N</span>
         <div>
-          <div class="login-brand-name">NanoQuant</div>
-          <div class="login-brand-sub">systematic micro capital</div>
+          <b>NanoQuant</b>
+          <small>MODULAR STUDIO</small>
         </div>
       </div>
+      <button class="btn btn-sm btn-ghost" type="button" @click="toggleTheme">
+        {{ theme === 'dark' ? '浅色' : '深色' }}
+      </button>
+    </header>
 
-      <div class="login-quote">
-        <div class="eyebrow">PRIVATE TERMINAL / 2026</div>
-        <h1>先活下来，<br />再谈<em>收益</em>。</h1>
-        <p>策略只提出候选，风控决定是否允许下单。每一次进出、每一次参数变更，都写入同一本审计账本。</p>
-      </div>
+    <main class="gate-main">
+      <section class="gate-copy">
+        <span class="eyebrow">PRIVATE WORKSPACE / 2026</span>
+        <h1>把每一次决策<br />放在<em>同一张桌面</em>上。</h1>
+        <p class="gate-lead">
+          信号、风控、AI 复核与执行共用一套数据与审计链路。
+          每一笔开仓、每一次拒绝、每一个参数变更，都能回到同一处查证。
+        </p>
 
-      <div class="login-stats">
-        <div><b>5–30m</b><span>主执行周期</span></div>
-        <div><b>0600</b><span>UDS / 执行侧车</span></div>
-      </div>
-    </section>
+        <div class="bento">
+          <article class="bcard wide">
+            <div class="bcard-head">
+              <span>执行链路</span>
+              <span class="tag tag-dim">实时</span>
+            </div>
+            <div class="flow">
+              <div v-for="step in flow" :key="step.k" class="flow-step">
+                <b>{{ step.k }}</b>
+                <span>{{ step.title }}</span>
+                <small>{{ step.desc }}</small>
+              </div>
+            </div>
+          </article>
 
-    <section class="login-panel">
-      <div class="login-form">
-        <div class="eyebrow">SECURE ACCESS</div>
-        <h2>登录交易终端</h2>
-        <p class="login-lead">仅限授权操作员。所有操作会记录到审计日志。</p>
-
-        <form @submit.prevent="submit">
-          <label class="login-label" for="login-user">账号</label>
-          <input id="login-user" v-model="username" class="login-input mono" autocomplete="username" />
-
-          <label class="login-label" for="login-password">密码</label>
-          <input
-            id="login-password"
-            v-model="password"
-            type="password"
-            class="login-input mono"
-            autocomplete="current-password"
-            placeholder="首次登录密码见启动日志"
-          />
-
-          <div v-if="error" class="login-error">{{ error }}</div>
-          <button class="login-submit" type="submit" :disabled="loading">
-            {{ loading ? '验证中…' : '进入终端' }} <span>→</span>
-          </button>
-        </form>
-
-        <div class="login-hint">
-          首次登录或重置后，系统会要求修改默认密码。不要在公共网络保存凭证。
+          <article class="bcard">
+            <span class="bcard-k">环境</span>
+            <b class="bcard-v">DEMO</b>
+            <span class="bcard-s">模拟盘 · 币安测试网</span>
+          </article>
+          <article class="bcard">
+            <span class="bcard-k">审计</span>
+            <b class="bcard-v">全链路</b>
+            <span class="bcard-s">决策 ID · 可追溯</span>
+          </article>
+          <article class="bcard">
+            <span class="bcard-k">访问</span>
+            <b class="bcard-v">会话令牌</b>
+            <span class="bcard-s">失败锁定 · 审计</span>
+          </article>
+          <article class="bcard">
+            <span class="bcard-k">AI 复核</span>
+            <b class="bcard-v">预算内</b>
+            <span class="bcard-s">超时自动降级</span>
+          </article>
         </div>
-        <div class="login-security"><i></i> TLS · 会话令牌 · 登录失败锁定</div>
-        <div class="login-links">
-          <router-link to="/">← 返回公开站点</router-link>
-          <span>v1.1.0</span>
+      </section>
+
+      <section class="gate-auth">
+        <div class="auth-card">
+          <div class="auth-head">
+            <span class="auth-mark">N</span>
+            <div>
+              <h2>登录工作台</h2>
+              <p>仅限授权操作员</p>
+            </div>
+          </div>
+
+          <form @submit.prevent="submit">
+            <label class="auth-label" for="login-user">账号</label>
+            <input
+              id="login-user"
+              v-model="username"
+              class="auth-input mono"
+              autocomplete="username"
+              spellcheck="false"
+            />
+
+            <label class="auth-label" for="login-password">密码</label>
+            <div class="auth-secret">
+              <input
+                id="login-password"
+                v-model="password"
+                :type="showPassword ? 'text' : 'password'"
+                class="auth-input mono"
+                autocomplete="current-password"
+                placeholder="首次登录密码见启动日志"
+              />
+              <button class="auth-eye" type="button" @click="showPassword = !showPassword">
+                {{ showPassword ? '隐藏' : '显示' }}
+              </button>
+            </div>
+
+            <div v-if="error" class="auth-error">{{ error }}</div>
+
+            <button class="auth-submit" type="submit" :disabled="loading">
+              {{ loading ? '验证中…' : '进入工作台' }}
+              <span aria-hidden="true">→</span>
+            </button>
+          </form>
+
+          <div class="auth-meta">
+            <span>首次登录需修改密码</span>
+            <span>v1.1.0</span>
+          </div>
+          <router-link to="/" class="auth-back">← 返回公开站点</router-link>
         </div>
-      </div>
-    </section>
+        <p class="auth-foot">TLS · 会话令牌 · 登录失败锁定 · 全部操作写入审计日志</p>
+      </section>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.login-page {
+.gate {
   position: relative;
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
-  display: grid;
-  grid-template-columns: 57% 43%;
-  background: var(--bg);
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 32px 28px;
   color: var(--text);
   overflow: hidden;
 }
 
-.login-theme {
-  position: absolute;
-  top: 18px;
-  right: 20px;
-  z-index: 5;
-}
-
-.login-visual {
-  position: relative;
-  padding: 46px 54px;
-  background:
-    radial-gradient(circle at 78% 20%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 32%),
-    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 35%),
-    var(--bg);
-  overflow: hidden;
-}
-
-.login-visual::before {
+.gate::before {
   content: '';
   position: absolute;
-  inset: 0;
-  background-image: linear-gradient(color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px);
-  background-size: 48px 48px;
-}
-
-.login-visual::after {
-  content: '';
-  position: absolute;
-  right: -260px;
-  bottom: -280px;
+  inset: -240px 40% auto -240px;
   width: 620px;
   height: 620px;
-  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
   border-radius: 50%;
-  box-shadow: 0 0 0 70px color-mix(in srgb, var(--accent) 3%, transparent),
-    0 0 0 140px color-mix(in srgb, var(--accent) 2%, transparent);
+  background: radial-gradient(circle, color-mix(in srgb, var(--accent) 10%, transparent), transparent 68%);
+  pointer-events: none;
 }
 
-.login-brand,
-.login-quote,
-.login-stats {
+.gate-head {
   position: relative;
   z-index: 1;
-}
-
-.login-brand {
   display: flex;
   align-items: center;
-  gap: 11px;
+  justify-content: space-between;
+  gap: 16px;
 }
 
-.login-brand .brand-mark {
+.gate-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.gate-mark,
+.auth-mark {
+  display: grid;
+  place-items: center;
   width: 30px;
   height: 30px;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--mono);
   font-size: 14px;
-}
-
-.login-brand-name {
-  font-family: var(--sans);
-  font-size: 18px;
   font-weight: 600;
 }
-
-.login-brand-sub {
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  margin-top: 2px;
-}
-
-.login-quote {
-  margin-top: 150px;
-  max-width: 560px;
-}
-
-.login-quote .eyebrow {
-  color: var(--accent);
-  font-size: 10px;
-  letter-spacing: 0.18em;
-}
-
-.login-quote h1 {
-  margin: 17px 0 0;
-  font-family: var(--sans);
-  font-size: 52px;
-  line-height: 1.04;
-  font-weight: 600;
-  letter-spacing: -0.055em;
-}
-
-.login-quote h1 em {
-  color: var(--accent);
-  font-style: normal;
-}
-
-.login-quote p {
-  max-width: 460px;
-  margin: 19px 0 0;
-  color: var(--muted);
-  font-size: 11.5px;
-  line-height: 1.9;
-}
-
-.login-stats {
-  position: absolute;
-  left: 54px;
-  right: 54px;
-  bottom: 46px;
-  display: flex;
-  border-top: 1px solid var(--line);
-}
-
-.login-stats > div {
-  flex: 1;
-  padding: 14px 0 0 18px;
-  border-left: 1px solid var(--line);
-}
-
-.login-stats > div:first-child {
-  border-left: 0;
-  padding-left: 0;
-}
-
-.login-stats b {
+.gate-brand b {
   display: block;
-  font-family: var(--mono);
-  font-size: 17px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.login-stats span {
-  display: block;
-  margin-top: 5px;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.login-panel {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 80px;
-  background: var(--panel);
-  color: var(--text);
-}
-
-.login-panel::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: linear-gradient(180deg, transparent, var(--accent), transparent);
-  opacity: 0.55;
-}
-
-.login-form {
-  width: 100%;
-  max-width: 370px;
-  margin-top: -30px;
-}
-
-.login-form .eyebrow {
-  color: var(--accent);
-  font-size: 10px;
-  letter-spacing: 0.18em;
-}
-
-.login-form h2 {
-  margin: 13px 0 0;
-  font-family: var(--sans);
-  font-size: 34px;
+  font-size: 15px;
   font-weight: 600;
-  letter-spacing: -0.045em;
+  letter-spacing: -0.01em;
 }
-
-.login-lead {
+.gate-brand small {
+  display: block;
   color: var(--muted);
-  font-size: 11px;
-  margin: 8px 0 0;
-}
-
-.login-form form {
-  display: grid;
-  gap: 6px;
-  margin-top: 30px;
-}
-
-.login-label {
-  color: var(--text-dim);
   font-family: var(--mono);
   font-size: 9px;
-  letter-spacing: 0.05em;
-  margin-top: 8px;
-  text-transform: uppercase;
+  letter-spacing: 0.16em;
 }
 
-.login-input {
-  width: 100%;
-  height: 42px;
-  padding: 0 13px;
+.gate-main {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
+  align-items: center;
+  gap: 48px;
+  padding: 40px 0 24px;
+}
+
+.gate-copy { min-width: 0; }
+.eyebrow {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+}
+.gate-copy h1 {
+  margin: 14px 0 0;
+  font-size: clamp(30px, 3.4vw, 44px);
+  line-height: 1.16;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+}
+.gate-copy h1 em {
+  font-style: normal;
+  color: var(--accent);
+}
+.gate-lead {
+  max-width: 52ch;
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.bento {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 26px;
+}
+.bcard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 14px 16px;
+  background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 2px;
-  background: var(--panel-2);
-  color: var(--text);
+  border-radius: var(--r-lg);
+}
+.bcard.wide { grid-column: span 2; }
+.bcard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.bcard-k {
+  color: var(--muted);
   font-size: 11px;
+}
+.bcard-v {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.bcard-s {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.flow-step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+.flow-step:first-child { border-left: 0; padding-left: 0; }
+.flow-step b {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+}
+.flow-step span { font-size: 12px; font-weight: 500; }
+.flow-step small { color: var(--muted); font-size: 10px; }
+
+.gate-auth { min-width: 0; }
+
+.auth-card {
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow-2);
+}
+.auth-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.auth-head h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.auth-head p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.auth-label {
+  display: block;
+  margin: 14px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.auth-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 12px;
   outline: none;
 }
-
-.login-input:focus {
+.auth-input::placeholder { color: var(--dim); }
+.auth-input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: var(--focus-ring);
 }
 
-.login-error {
-  margin-top: 10px;
-  padding: 8px 10px;
+.auth-secret { position: relative; }
+.auth-secret .auth-input { padding-right: 58px; }
+.auth-eye {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.auth-eye:hover { color: var(--text); background: var(--panel-3); }
+
+.auth-error {
+  margin-top: 12px;
+  padding: 9px 11px;
   border: 1px solid var(--down);
+  border-radius: var(--r-sm);
   background: var(--down-soft);
   color: var(--down);
   font-size: 11px;
 }
 
-.login-submit {
-  width: 100%;
-  height: 43px;
-  margin-top: 10px;
-  border: 0;
-  border-radius: 2px;
-  background: var(--accent);
-  color: var(--on-accent);
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.login-submit span {
-  color: var(--on-accent);
-  margin-left: 8px;
-}
-
-.login-submit:disabled {
-  opacity: 0.6;
-}
-
-.login-hint {
-  color: var(--muted);
-  font-size: 9px;
-  line-height: 1.7;
-  margin-top: 14px;
-}
-
-.login-security {
+.auth-submit {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 22px;
+  justify-content: space-between;
+  width: 100%;
+  height: 42px;
+  margin-top: 18px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+  font-weight: 600;
+  transition: filter var(--dur-1) var(--ease);
+}
+.auth-submit:hover:not(:disabled) { filter: brightness(1.05); }
+.auth-submit:disabled { opacity: 0.6; cursor: wait; }
+.auth-submit span { font-family: var(--mono); }
+
+.auth-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.04em;
+  font-size: 10px;
 }
-
-.login-security i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--up);
-  box-shadow: 0 0 8px var(--up);
-}
-
-.login-links {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 42px;
+.auth-back {
+  display: inline-block;
+  margin-top: 14px;
   color: var(--muted);
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.05em;
+  font-size: 11px;
+}
+.auth-back:hover { color: var(--text); }
+.auth-foot {
+  margin: 12px 0 0;
+  color: var(--dim);
+  font-size: 10px;
+  text-align: center;
 }
 
-.login-links a {
-  color: var(--accent-2);
-}
-
-@media (max-width: 900px) {
-  .login-page {
+@media (max-width: 980px) {
+  .gate-main {
     grid-template-columns: 1fr;
-    min-height: 100vh;
+    gap: 28px;
+    padding-top: 24px;
   }
+  .gate-auth { order: -1; }
+  .gate-copy h1 { font-size: 30px; }
+}
 
-  .login-visual {
-    min-height: 260px;
-    padding: 24px 24px 20px;
-  }
+@media (max-width: 620px) {
+  .gate { padding: 16px; }
+  .gate-main { padding-top: 18px; }
+  .gate-copy h1 { font-size: 26px; }
+  .bento { grid-template-columns: 1fr; }
+  .bcard.wide { grid-column: auto; }
+  .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .flow-step:nth-child(3) { border-left: 0; padding-left: 0; }
+  .auth-card { padding: 20px; }
+  .gate-lead { font-size: 12px; }
+}
 
-  .login-quote {
-    margin-top: 34px;
-  }
-
-  .login-quote h1 {
-    font-size: 36px;
-  }
-
-  .login-quote p {
-    font-size: 10px;
-  }
-
-  .login-stats {
-    display: none;
-  }
-
-  .login-panel {
-    padding: 34px 24px 44px;
-  }
-
-  .login-form {
-    margin-top: 0;
-  }
+@media (prefers-reduced-motion: reduce) {
+  .auth-submit { transition: none; }
 }
 </style>
