@@ -1086,7 +1086,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
             crate::review::apply_review(&proposal("long"), Some(&Fixed(reviewed)), true).unwrap();
         assert_eq!(applied.side, "long", "AI 不得改变方向");
         assert_eq!(applied.leverage, 2.0, "AI 杠杆不得生效");
-        assert_eq!(applied.margin_pct, Some(20.0), "AI 保证金不得生效");
+
         assert_eq!(applied.stop_price, 95.0, "AI 止损不得生效");
         assert_eq!(applied.take_profit, 110.0, "AI 止盈不得生效");
     }

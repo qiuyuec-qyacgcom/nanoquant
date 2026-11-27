@@ -3517,24 +3517,6 @@ impl EngineRuntime {
                     continue;
                 }
             };
-            let mut features_value: Value = serde_json::from_str(&draft.features_text)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let ai_reason = reviewed.reason.clone();
-            if let Some(object) = features_value.as_object_mut() {
-                object.insert(
-                    "ai_review".to_string(),
-                    serde_json::json!({
-                        "reason": ai_reason,
-                        "leverage": reviewed.leverage,
-                        "margin_pct": reviewed.margin_pct,
-                        "stop_price": reviewed.stop_price,
-                        "scale": reviewed.scale,
-                    }),
-                );
-            }
-            let features_text = serde_json::to_string(&features_value)
-                .unwrap_or_else(|_| draft.features_text.clone());
-            draft.features_text = features_text.clone();
             let final_side = if reviewed.side.is_empty() {
                 draft.side.clone()
             } else {
@@ -3547,12 +3529,26 @@ impl EngineRuntime {
             };
             let leverage = reviewed.leverage;
             let stop_price = reviewed.stop_price;
-            // AI 给了保证金比例就按 AI 值（已在复核层夹到中枢±5%）；
-            // 没给时才回退到原有 ATR 缩放，避免双重放大。
-            let margin_pct = reviewed.margin_pct.unwrap_or_else(|| {
-                (cfg["margin_pct"].as_f64().unwrap_or(50.0) * draft.scale.clamp(0.25, 2.0))
-                    .clamp(0.0, 100.0)
-            });
+            // 保证金 = 量化中枢 × ATR 波动缩放；AI 的 scale 只作用于下单数量。
+            let margin_pct = (draft.margin_pct * draft.scale.clamp(0.25, 2.0)).clamp(0.0, 100.0);
+            let mut features_value: Value = serde_json::from_str(&draft.features_text)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let ai_reason = reviewed.reason.clone();
+            if let Some(object) = features_value.as_object_mut() {
+                object.insert(
+                    "ai_review".to_string(),
+                    serde_json::json!({
+                        "reason": ai_reason,
+                        "leverage": reviewed.leverage,
+                        "margin_pct": margin_pct,
+                        "stop_price": reviewed.stop_price,
+                        "scale": reviewed.scale,
+                    }),
+                );
+            }
+            let features_text = serde_json::to_string(&features_value)
+                .unwrap_or_else(|_| draft.features_text.clone());
+            draft.features_text = features_text.clone();
             let (base_qty, _) = crate::risk::estimate_qty(
                 snapshot.account.equity,
                 draft.mark_price,
@@ -8347,7 +8343,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
     }
 
-    async fn entry_with_scale(scale: f64) -> (Db, f64, Value) {
+    async fn entry_with_scales(ai_scale: f64, vol_target_atr_pct: f64) -> (Db, f64, Value) {
         let (db, snapshot) = entry_fixture().await;
         db.lock()
             .execute(
@@ -8357,8 +8353,18 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 [],
             )
             .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE app_settings SET value=?1 WHERE key='risk'",
+                [format!(
+                    r#"{{"min_leverage":10,"max_leverage":20,"margin_pct":10,"rsi_long_max":100.1,"vol_target_atr_pct":{vol_target_atr_pct}}}"#
+                )],
+            )
+            .unwrap();
         test_runtime(&db)
-            .with_reviewer(Arc::new(ScaleReviewer { scale: Some(scale) }))
+            .with_reviewer(Arc::new(ScaleReviewer {
+                scale: Some(ai_scale),
+            }))
             .persist_snapshot("demo", &snapshot)
             .unwrap();
         let qty = entry_qty(&db);
@@ -8375,23 +8381,43 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[tokio::test]
-    async fn scale_only_affects_qty_not_margin_pct() {
-        let (_full_db, full_qty, full_features) = entry_with_scale(1.0).await;
-        let (_half_db, half_qty, half_features) = entry_with_scale(0.5).await;
+    async fn quant_scale_affects_margin() {
+        let (_base_db, base_qty, base_features) = entry_with_scales(1.0, 0.0).await;
+        let (_boost_db, boost_qty, boost_features) = entry_with_scales(1.0, 1e9).await;
+        assert_eq!(
+            base_features["ai_review"]["margin_pct"],
+            serde_json::json!(10.0),
+            "draft.scale=1 时保证金等于量化中枢"
+        );
+        assert_eq!(
+            boost_features["ai_review"]["margin_pct"],
+            serde_json::json!(20.0),
+            "ATR 波动缩放必须放大保证金"
+        );
+        assert!(
+            boost_qty > base_qty,
+            "量化波动缩放应提高下单数量: base={base_qty}, boost={boost_qty}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_scale_only_affects_qty_not_margin_pct() {
+        let (_full_db, full_qty, full_features) = entry_with_scales(1.0, 0.0).await;
+        let (_half_db, half_qty, half_features) = entry_with_scales(0.5, 0.0).await;
         assert!(full_qty > 0.0 && half_qty > 0.0);
         assert!(
             (half_qty - full_qty * 0.5).abs() < 1e-9,
-            "scale 必须只缩放下单数量: full={full_qty}, half={half_qty}"
+            "AI scale 必须只缩放下单数量: full={full_qty}, half={half_qty}"
         );
         assert_eq!(
             full_features["ai_review"]["margin_pct"],
             serde_json::json!(10.0),
-            "保证金必须来自量化参数，AI 不得改写"
+            "保证金来自量化中枢 × ATR 缩放"
         );
         assert_eq!(
             half_features["ai_review"]["margin_pct"],
             serde_json::json!(10.0),
-            "scale 不得作用于 margin_pct"
+            "AI scale 不得作用于 margin_pct"
         );
         assert_eq!(half_features["ai_review"]["scale"], serde_json::json!(0.5));
     }

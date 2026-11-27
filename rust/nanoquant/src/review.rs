@@ -72,8 +72,7 @@ pub(crate) struct EntryProposal {
 pub(crate) struct ReviewedEntry {
     pub side: String,
     pub leverage: f64,
-    /// 量化保证金比例；AI 不可改写。
-    pub margin_pct: Option<f64>,
+
     pub stop_price: f64,
     pub take_profit: f64,
     pub reason: String,
@@ -273,7 +272,7 @@ pub(crate) fn apply_review(
         return Ok(ReviewedEntry {
             side: proposal.side.clone(),
             leverage: proposal.leverage,
-            margin_pct: Some(proposal.margin_pct),
+
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             reason: "AI 复核未启用".to_string(),
@@ -319,7 +318,7 @@ fn apply_decision(
         ReviewAction::Agree => Ok(ReviewedEntry {
             side: proposal.side.clone(),
             leverage: proposal.leverage,
-            margin_pct: Some(proposal.margin_pct),
+
             stop_price: proposal.stop_price,
             take_profit: proposal.take_profit,
             invalidation_price: decision.invalidation_price,
@@ -438,7 +437,7 @@ mod tests {
         let reviewed = apply_review(&proposal(), Some(&FakeReviewer(Ok(approved))), true).unwrap();
         assert_eq!(reviewed.side, "long");
         assert_eq!(reviewed.leverage, 10.0);
-        assert_eq!(reviewed.margin_pct, Some(20.0));
+
         assert_eq!(reviewed.stop_price, 95.0);
         assert_eq!(reviewed.take_profit, 110.0);
         assert_eq!(
@@ -461,7 +460,7 @@ mod tests {
         .unwrap();
         assert_eq!(reviewed.side, "long", "AI 不得改变方向");
         assert_eq!(reviewed.leverage, 10.0, "AI 不得改变杠杆");
-        assert_eq!(reviewed.margin_pct, Some(20.0), "AI 不得改变保证金");
+
         assert_eq!(reviewed.stop_price, 95.0, "AI 不得改变止损");
         assert_eq!(reviewed.take_profit, 110.0, "AI 不得改变止盈");
         assert_eq!(reviewed.scale, None, "AI 未给 scale 时不缩放");
@@ -537,10 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn unreviewed_entry_keeps_quant_margin() {
+    fn unreviewed_entry_keeps_quant_plan() {
         let unreviewed = apply_review(&proposal(), None, false).unwrap();
-        assert_eq!(unreviewed.margin_pct, Some(20.0), "保证金来自量化中枢");
+        assert_eq!(unreviewed.side, "long");
         assert_eq!(unreviewed.leverage, 10.0);
+        assert_eq!(unreviewed.stop_price, 95.0);
+        assert_eq!(unreviewed.take_profit, 110.0);
     }
 
     #[test]
