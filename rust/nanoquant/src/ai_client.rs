@@ -1159,14 +1159,12 @@ fn normalize_free_text(text: &str) -> String {
     trim_display(&replaced).to_string()
 }
 
+/// AI 决策只表达动作、置信度与审计字段；仓位结构（杠杆/保证金/止损/止盈）
+/// 一律由量化引擎决定，模型输出中的对应字段会被忽略。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Decision {
     pub action: String,
     pub confidence: f64,
-    pub leverage: f64,
-    pub margin_pct: Option<f64>,
-    pub sl_pct: f64,
-    pub tp_pct: f64,
     pub reason: String,
     pub risk_flags: Vec<String>,
     pub invalidation: String,
@@ -1197,13 +1195,7 @@ impl Decision {
             _ => "hold".to_string(),
         };
         self.confidence = self.confidence.clamp(0.0, 1.0);
-        self.leverage = self.leverage.clamp(0.0, 125.0);
-        self.margin_pct = self
-            .margin_pct
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .map(|value| value.clamp(0.0, 100.0));
-        self.sl_pct = self.sl_pct.clamp(0.0, 50.0);
-        self.tp_pct = self.tp_pct.clamp(0.0, 100.0);
+
         self.reason = self.reason.chars().take(TEXT_BUDGET).collect();
         self.risk_flags.truncate(6);
         self.invalidation = self.invalidation.chars().take(INV_MAX).collect();
@@ -1292,14 +1284,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let margin_pct = localized
-        .get("margin_pct")
-        .and_then(|value| {
-            value
-                .as_f64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
-        })
-        .filter(|value| value.is_finite() && *value > 0.0);
+
     let mark = ctx
         .and_then(|c| c.get("price"))
         .and_then(Value::as_f64)
@@ -1318,10 +1303,7 @@ pub fn parse_decision(text: &str, ctx: Option<&Value>) -> Result<Decision, Strin
     Ok(Decision {
         action: text_of("action"),
         confidence: float("confidence"),
-        leverage: float("leverage"),
-        margin_pct,
-        sl_pct: float("sl_pct"),
-        tp_pct: float("tp_pct"),
+
         reason: text_of("reason"),
         risk_flags: flags,
         invalidation: text_of("invalidation"),
@@ -1452,10 +1434,7 @@ pub fn localize(data: &Map<String, Value>, ctx: Option<&Value>) -> Map<String, V
     let mut out = Map::new();
     out.insert("action".to_string(), json!(action));
     out.insert("confidence".to_string(), json!(number("c")));
-    out.insert("leverage".to_string(), json!(number("l")));
-    out.insert("margin_pct".to_string(), json!(number("m")));
-    out.insert("sl_pct".to_string(), json!(number("s")));
-    out.insert("tp_pct".to_string(), json!(number("t")));
+
     out.insert(
         "reason".to_string(),
         json!(reason.chars().take(TEXT_BUDGET).collect::<String>()),
@@ -1882,17 +1861,16 @@ mod tests {
 
     #[test]
     fn parses_v1_and_v2_decisions_into_chinese_fields() {
-        let v1 = r#"{"action":"LONG","confidence":1.4,"leverage":-3,"sl_pct":2,"tp_pct":5,"reason":"突破","risk_flags":["a"]}"#;
+        let v1 = r#"{"action":"LONG","confidence":1.4,"reason":"突破","risk_flags":["a"]}"#;
         let decision = parse_decision(v1, None).unwrap();
         assert_eq!(decision.action, "open_long");
         assert_eq!(decision.confidence, 1.0);
-        assert_eq!(decision.leverage, 0.0);
 
-        let v2 = r#"{"a":"S","c":0.72,"l":12,"s":1.5,"t":3,"r":[1,9],"k":[16],"x":2,"n":{"rsi":71.25},"f":"fade rally"}"#;
+        let v2 =
+            r#"{"a":"S","c":0.72,"r":[1,9],"k":[16],"x":2,"n":{"rsi":71.25},"f":"fade rally"}"#;
         let decision = parse_decision(v2, None).unwrap();
         assert_eq!(decision.action, "open_short");
         assert_eq!(decision.confidence, 0.72);
-        assert_eq!(decision.leverage, 12.0);
         assert!(decision.reason.contains("趋势结构与信号方向一致"));
         assert!(decision.reason.contains("预期波动不足以覆盖双边手续费"));
         assert!(decision.reason.contains("RSI 71.25"));
@@ -1902,15 +1880,27 @@ mod tests {
     }
 
     #[test]
-    fn sl_pct_is_clamped_to_the_50_margin_ceiling() {
-        let text = r#"{"a":"S","c":0.7,"l":10,"s":150,"t":50,"r":[1],"k":[1],"x":1,"f":"x"}"#;
-        let decision = parse_decision(text, None).unwrap();
-        assert_eq!(decision.sl_pct, 50.0);
+    fn legacy_ai_leverage_and_stop_fields_are_ignored() {
+        let ctx = json!({"price": 100.0});
+        let v2 = r#"{"a":"S","c":0.72,"l":12,"m":20,"s":1.5,"t":3,"r":[1],"k":[9],"x":2}"#;
+        let decision = parse_decision(v2, Some(&ctx)).unwrap();
+        assert_eq!(
+            decision.action, "open_short",
+            "遗留仓位字段不应影响动作解析"
+        );
+        assert_eq!(decision.confidence, 0.72);
+        assert!(!decision.reason.is_empty(), "理由仍应正常生成");
+
+        let v1 = r#"{"action":"long","confidence":0.6,"leverage":12,"margin_pct":20,"sl_pct":1.5,"tp_pct":3,"reason":"突破"}"#;
+        let decision = parse_decision(v1, Some(&ctx)).unwrap();
+        assert_eq!(decision.action, "open_long");
+        assert_eq!(decision.confidence, 0.6);
+        assert_eq!(decision.reason, "突破");
     }
 
     #[test]
     fn decision_parses_v2_param_updates() {
-        let text = r#"{"a":"L","c":0.7,"l":3,"s":1,"t":2,"r":[1],"k":[1],"x":1,"p":[{"g":"strategy","k":"entry_threshold","v":0.35,"w":"放量"}]}"#;
+        let text = r#"{"a":"L","c":0.7,"r":[1],"k":[1],"x":1,"p":[{"g":"strategy","k":"entry_threshold","v":0.35,"w":"放量"}]}"#;
         let decision = parse_decision(text, None).unwrap();
         assert_eq!(decision.params.len(), 1);
         assert_eq!(decision.params[0].group, "strategy");

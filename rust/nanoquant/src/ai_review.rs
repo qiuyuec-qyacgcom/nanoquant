@@ -500,10 +500,7 @@ mod tests {
         ai_client::Decision {
             action: action.to_string(),
             confidence,
-            leverage: 0.0,
-            margin_pct: None,
-            sl_pct: 0.0,
-            tp_pct: 0.0,
+
             reason: "test".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
@@ -1064,11 +1061,7 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
 
     #[test]
     fn ai_cannot_change_side_leverage_margin_stop_or_take_profit() {
-        let mut ai = decision("open_long", 0.9);
-        ai.leverage = 80.0;
-        ai.margin_pct = Some(90.0);
-        ai.sl_pct = 20.0;
-        ai.tp_pct = 50.0;
+        let ai = decision("open_long", 0.9);
         let reviewed = decision_to_review(&proposal("long"), "any", &ai, 0.45, 0.8, false).unwrap();
         assert_eq!(reviewed.action, ReviewAction::Agree);
         assert_eq!(reviewed.confidence, 0.9);

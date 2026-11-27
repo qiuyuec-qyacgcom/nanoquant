@@ -313,7 +313,7 @@ pub(crate) fn decision_messages_for_mode(
     compact: &Value,
     personas: &[AiPersona],
 ) -> Vec<ChatMessage> {
-    let system = veto_only_system_prompt();
+    let system = decision_system_prompt();
     let mut messages = vec![
         ChatMessage::new("system", &system),
         ChatMessage::new(
@@ -328,7 +328,7 @@ pub(crate) fn decision_messages_for_mode(
     messages
 }
 
-fn veto_only_system_prompt() -> String {
+fn decision_system_prompt() -> String {
     [
         "Decision engine (veto mode). Output ONLY one JSON object, no prose/markdown/thinking in the answer. \
      {\"a\":\"L|S|H|C\",\"c\":0..1,\"dq\":0..1,\"rr\":0..10,\"f\":\"中文补充<=200字\",\
@@ -649,9 +649,7 @@ async fn decision_preview(
         "ok": true,
         "action": decision.action,
         "confidence": decision.confidence,
-        "leverage": decision.leverage,
-        "sl_pct": decision.sl_pct,
-        "tp_pct": decision.tp_pct,
+
         "reason": decision.reason,
         "risk_flags": decision.risk_flags,
         "invalidation": decision.invalidation,
@@ -693,9 +691,7 @@ fn fail_closed(
         "ok": false,
         "action": hold.action,
         "confidence": hold.confidence,
-        "leverage": hold.leverage,
-        "sl_pct": hold.sl_pct,
-        "tp_pct": hold.tp_pct,
+
         "reason": hold.reason,
         "risk_flags": hold.risk_flags,
         "invalidation": hold.invalidation,
@@ -797,6 +793,20 @@ mod tests {
         assert!(!system.contains("s ≥ constraints.atr_stop_mult"));
         assert!(!system.contains("15–25x"));
         assert!(!system.contains("5–25"));
+    }
+
+    #[test]
+    fn decision_prompt_excludes_position_fields() {
+        let messages = decision_messages_for_mode(&json!({"symbol":"BTCUSDT","price":100.0}), &[]);
+        let system = &messages[0].content;
+        for key in ["\"l\":", "\"m\":", "\"s\":", "\"t\":"] {
+            assert!(
+                !system.contains(key),
+                "决策 prompt 不应要求仓位字段输出: {key}"
+            );
+        }
+        assert!(system.contains("\"a\""), "动作仍是必需字段");
+        assert!(system.contains("\"c\""), "置信度仍是必需字段");
     }
 
     #[test]
@@ -1162,6 +1172,9 @@ CREATE TABLE mantras(id INTEGER PRIMARY KEY, title TEXT, rule TEXT, tags TEXT, c
         assert_eq!(body["ok"], true, "{}", body);
         assert_eq!(body["action"], "open_short");
         assert_eq!(body["schema_version"], 2);
+        assert!(body.get("leverage").is_none(), "预览输出不得再含杠杆");
+        assert!(body.get("sl_pct").is_none(), "预览输出不得再含止损");
+        assert!(body.get("tp_pct").is_none(), "预览输出不得再含止盈");
         assert!(body["reason"].as_str().unwrap().contains("趋势结构"));
         assert_eq!(body["votes"][0]["persona"], "single");
         assert!(
