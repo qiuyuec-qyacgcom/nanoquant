@@ -564,13 +564,14 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
     let Some(object) = value.as_object() else {
         return Ok(());
     };
-    // 高周期过滤：只接受 history 支持的周期名，避免运行时静默失效。
+    // 高周期过滤：空字符串表示关闭（默认）；其余只接受 history 支持的周期名，
+    // 避免运行时静默失效。
     if group == "strategy" {
         if let Some(candidate) = object.get("higher_timeframe") {
             let Some(text) = candidate.as_str() else {
                 return Err("higher_timeframe: 必须是周期字符串".to_string());
             };
-            if crate::history::interval_ms(text).is_none() {
+            if !text.trim().is_empty() && crate::history::interval_ms(text).is_none() {
                 return Err(format!("higher_timeframe: 不支持的周期 {text}"));
             }
         }
@@ -851,6 +852,10 @@ mod tests {
         assert!(validate("strategy", &value).is_err(), "非字符串必须拒绝");
         value["higher_timeframe"] = json!("4h");
         assert!(validate("strategy", &value).is_ok());
+        value["higher_timeframe"] = json!("");
+        assert!(validate("strategy", &value).is_ok(), "空字符串表示关闭");
+        value["higher_timeframe"] = json!("  ");
+        assert!(validate("strategy", &value).is_ok(), "空白同样视为关闭");
     }
 
     #[test]

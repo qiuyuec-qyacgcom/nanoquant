@@ -182,10 +182,10 @@ describe('参数配置目录', () => {
     expect(keys).toEqual(['ema_fast', 'entry_threshold'])
   })
 
-  it('valid_bars 紧跟 K 线周期', () => {
+  it('valid_bars 紧跟 K 线周期与高周期过滤', () => {
     const basic = SETTINGS_SECTIONS.strategy.find((s) => s.title === '基础')
     const fields = basic?.fields || []
-    expect(fields.indexOf('valid_bars')).toBe(fields.indexOf('timeframe') + 1)
+    expect(fields.slice(0, 3)).toEqual(['timeframe', 'higher_timeframe', 'valid_bars'])
   })
 
   it('min_entry_rr 出现在策略入场过滤', () => {

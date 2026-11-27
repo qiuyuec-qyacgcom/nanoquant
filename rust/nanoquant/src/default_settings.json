@@ -46,7 +46,7 @@
   "strategy": {
     "mode": "fusion",
     "timeframe": "4h",
-    "higher_timeframe": "4h",
+    "higher_timeframe": "",
     "valid_bars": 6,
 
     "ema_fast": 9,

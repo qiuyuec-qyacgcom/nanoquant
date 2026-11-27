@@ -233,6 +233,55 @@ pub(crate) fn higher_timeframe_regime(
     )
 }
 
+/// 高周期过滤结果。
+///
+/// `Off`：未启用（空字符串或与本周期相同）；`Ready`：已判定；
+/// `InsufficientData`：已配置但聚合后 K 线不足或周期不可用，调用方必须显式展示后放行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HtfGate {
+    Off,
+    Ready(Regime),
+    InsufficientData,
+}
+
+impl HtfGate {
+    pub(crate) fn regime(self) -> Option<Regime> {
+        match self {
+            HtfGate::Ready(regime) => Some(regime),
+            HtfGate::Off | HtfGate::InsufficientData => None,
+        }
+    }
+
+    /// 审计/特征里的稳定状态串。
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            HtfGate::Off => "off",
+            HtfGate::Ready(_) => "ok",
+            HtfGate::InsufficientData => "insufficient_htf_data",
+        }
+    }
+}
+
+/// 高周期过滤入口：把「未启用 / 已判定 / 行情不足」三态显式区分开。
+///
+/// 行情不足时仍返回可放行结果，但状态必须是 `InsufficientData`，
+/// 由调用方写进特征并告警，避免静默 fail-open。
+pub(crate) fn higher_timeframe_gate(
+    candles: &[CandleSnapshot],
+    higher: &str,
+    base: &str,
+    atr_period: usize,
+    policy: crate::trade_policy::TradePolicy,
+) -> HtfGate {
+    if higher.trim().is_empty() || higher == base {
+        return HtfGate::Off;
+    }
+    match higher_timeframe_regime(candles, higher, base, atr_period, policy) {
+        Some(regime) => HtfGate::Ready(regime),
+        None => HtfGate::InsufficientData,
+    }
+}
+
 /// 按 close_time 所在的高周期桶聚合 K 线；输入需按时间升序。
 fn aggregate_candles(candles: &[CandleSnapshot], bucket_ms: i64) -> Vec<CandleSnapshot> {
     let mut out: Vec<CandleSnapshot> = Vec::new();
@@ -440,6 +489,46 @@ mod tests {
             higher_timeframe_regime(&candles[..60], "4h", "1h", 14, policy).is_none(),
             "聚合后不足 30 根必须放行"
         );
+    }
+
+    #[test]
+    fn higher_timeframe_gate_distinguishes_off_ready_and_insufficient_data() {
+        let candles = synthesized_candles(240);
+        let policy = crate::trade_policy::TradePolicy {
+            base_threshold: 0.3,
+            volume_ratio_min: 0.8,
+            atr_pct_min: 0.05,
+            atr_pct_max: 4.0,
+            ema: crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+            adx_period: 14,
+        };
+        assert_eq!(
+            higher_timeframe_gate(&candles, "", "1h", 14, policy),
+            HtfGate::Off,
+            "空字符串表示关闭"
+        );
+        assert_eq!(
+            higher_timeframe_gate(&candles, "1h", "1h", 14, policy),
+            HtfGate::Off,
+            "与本周期相同等于关闭"
+        );
+        assert_eq!(
+            higher_timeframe_gate(&candles, "4h", "1h", 14, policy),
+            HtfGate::Ready(Regime::Trend)
+        );
+        assert_eq!(
+            higher_timeframe_gate(&candles[..60], "4h", "1h", 14, policy),
+            HtfGate::InsufficientData,
+            "聚合后不足 30 根必须显式标记，而不是静默放行"
+        );
+        assert_eq!(
+            higher_timeframe_gate(&candles, "7m", "1h", 14, policy),
+            HtfGate::InsufficientData,
+            "非法周期同样不可判定"
+        );
+        assert_eq!(HtfGate::Off.status(), "off");
+        assert_eq!(HtfGate::Ready(Regime::Trend).status(), "ok");
+        assert_eq!(HtfGate::InsufficientData.status(), "insufficient_htf_data");
     }
 
     #[test]

@@ -3028,6 +3028,7 @@ impl EngineRuntime {
             .collect();
 
         let mut drafts = Vec::new();
+        let mut warned_htf = false;
         for symbol in scanned {
             let Some(filter) = filters.get(symbol) else {
                 continue;
@@ -3052,17 +3053,26 @@ impl EngineRuntime {
                 continue;
             };
             let price = market.mark_price;
-            let higher_regime = if !mean_reversion_active && higher_timeframe != base_timeframe {
-                crate::regime::higher_timeframe_regime(
+            let htf_gate = if mean_reversion_active {
+                crate::regime::HtfGate::Off
+            } else {
+                crate::regime::higher_timeframe_gate(
                     &market.candles,
                     higher_timeframe,
                     base_timeframe,
                     atr_period,
                     policy,
                 )
-            } else {
-                None
             };
+            let higher_regime = htf_gate.regime();
+            if htf_gate == crate::regime::HtfGate::InsufficientData && !warned_htf {
+                warned_htf = true;
+                tracing::warn!(
+                    %higher_timeframe,
+                    %base_timeframe,
+                    "高周期过滤已启用但行情不足，本轮按 insufficient_htf_data 放行"
+                );
+            }
             if !mean_reversion_active {
                 if let Some(higher) = higher_regime {
                     if !crate::trade_policy::higher_timeframe_allows_trend(higher) {
@@ -3077,6 +3087,7 @@ impl EngineRuntime {
                             .with_features(serde_json::json!({
                                 "higher_timeframe": higher_timeframe,
                                 "higher_regime": higher.as_str(),
+                                "htf_status": htf_gate.status(),
                             }))
                             .with_decision("rejected")
                             .with_reject_reason(&reason);
@@ -3265,6 +3276,7 @@ impl EngineRuntime {
                 "mean_reversion": mean_reversion,
                 "higher_timeframe": higher_timeframe,
                 "higher_regime": higher_regime.map(|regime| regime.as_str()),
+                "htf_status": htf_gate.status(),
                 "mr_sl_pct": if mean_reversion { strategy["mr_sl_pct"].as_f64().unwrap_or(20.0) } else { 0.0 },
                 "mr_tp_pct": if mean_reversion { strategy["mr_tp_pct"].as_f64().unwrap_or(30.0) } else { 0.0 },
                 "signal_reason": signal_reason,
