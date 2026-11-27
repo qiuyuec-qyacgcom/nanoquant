@@ -115,10 +115,10 @@ pub(crate) fn load_funding_points(
         .collect()
 }
 
-/// 写入一轮快照里的 K 线。同一根 K 线重复写入是幂等的（覆盖写）。
+/// 写入一轮快照里的新 K 线，返回新增行数。
 ///
-/// `conn` 可以是裸连接（每条语句各自提交），也可以是 `&Transaction` 的解引用
-/// （此时写入并入外层事务）。
+/// 只插入 close_time 大于该标的已存最大值的 bar：盘中每轮重写 250 根历史
+/// 会把写事务和 WAL 提交拖长，是 `persist` 尾延迟的主要来源。
 pub(crate) fn upsert_candles(
     conn: &Connection,
     interval: &str,
@@ -126,6 +126,12 @@ pub(crate) fn upsert_candles(
 ) -> Result<usize, String> {
     // 幂等 DDL：测试夹具与迁移前的老库都不必额外改表结构。
     ensure_table(conn)?;
+    let mut last_stmt = conn
+        .prepare(
+            "SELECT COALESCE(MAX(close_time), 0) FROM market_candles \
+             WHERE symbol=?1 AND interval=?2",
+        )
+        .map_err(|e| format!("准备读取行情水位失败: {e}"))?;
     let mut stmt = conn
         .prepare(
             "INSERT INTO market_candles(symbol, interval, close_time, open, high, low, close, volume) \
@@ -137,7 +143,14 @@ pub(crate) fn upsert_candles(
         .map_err(|e| format!("准备写入行情失败: {e}"))?;
     let mut written = 0usize;
     for market in markets {
-        for candle in &market.candles {
+        let last_close: i64 = last_stmt
+            .query_row(params![market.symbol, interval], |row| row.get(0))
+            .map_err(|e| format!("读取 {} 行情水位失败: {e}", market.symbol))?;
+        for candle in market
+            .candles
+            .iter()
+            .filter(|candle| candle.close_time > last_close)
+        {
             stmt.execute(params![
                 market.symbol,
                 interval,
@@ -314,6 +327,28 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "同一根 K 线重复写入必须幂等");
         assert_eq!(close, 100.0);
+    }
+
+    #[test]
+    fn upsert_candles_skips_bars_already_on_disk() {
+        let conn = conn();
+        let first = market("BTCUSDT", vec![candle(1_000, 100.0)]);
+        assert_eq!(
+            upsert_candles(&conn, "15m", std::slice::from_ref(&first)).unwrap(),
+            1
+        );
+        assert_eq!(
+            upsert_candles(&conn, "15m", std::slice::from_ref(&first)).unwrap(),
+            0,
+            "已存在的 bar 不应每轮重写"
+        );
+
+        let newer = market("BTCUSDT", vec![candle(2_000, 101.0), candle(3_000, 102.0)]);
+        assert_eq!(
+            upsert_candles(&conn, "15m", &[newer]).unwrap(),
+            2,
+            "只写入新增的收盘 bar"
+        );
     }
 
     #[test]
