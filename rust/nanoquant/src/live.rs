@@ -545,16 +545,15 @@ impl LegOutcome {
     }
 }
 
-/// 挂一条保护腿。`failure` 为空表示挂上了。
-pub(crate) async fn place_protection_leg(
+/// 准备一条保护腿的请求（签名等本地工作），网络发送由调用方调度。
+pub(crate) async fn prepare_protection_leg(
     gate: &mut BanGate,
-    gateway: &dyn Gateway,
     base: &str,
     api_key: &str,
     secret: &str,
     leg: &ProtectionLeg,
-) -> LegOutcome {
-    let request = match prepare(
+) -> Result<PreparedRequest, String> {
+    prepare(
         gate,
         base,
         "POST",
@@ -564,11 +563,19 @@ pub(crate) async fn place_protection_leg(
         secret,
     )
     .await
-    {
-        Ok(request) => request,
-        Err(error) => return LegOutcome::failed(format!("{}: {error}", leg.kind)),
-    };
-    let raw = gateway.send(&request).await;
+    .map_err(|error| format!("{}: {error}", leg.kind))
+}
+
+/// 处理保护腿的交易所回包；必要时回落旧版条件单。
+pub(crate) async fn finish_protection_leg(
+    gate: &mut BanGate,
+    gateway: &dyn Gateway,
+    base: &str,
+    api_key: &str,
+    secret: &str,
+    leg: &ProtectionLeg,
+    raw: GatewayReply,
+) -> LegOutcome {
     if raw.transport_failed {
         return LegOutcome::unknown(format!("{}: 结果未知，已阻止重发", leg.kind));
     }
@@ -617,6 +624,23 @@ pub(crate) async fn place_protection_leg(
         Reply::Unknown => LegOutcome::unknown(format!("{}: 结果未知，已阻止重发", leg.kind)),
         Reply::NotFound => LegOutcome::unknown(format!("{}: 交易所查不到该保护单", leg.kind)),
     }
+}
+
+/// 挂一条保护腿。`failure` 为空表示挂上了。
+pub(crate) async fn place_protection_leg(
+    gate: &mut BanGate,
+    gateway: &dyn Gateway,
+    base: &str,
+    api_key: &str,
+    secret: &str,
+    leg: &ProtectionLeg,
+) -> LegOutcome {
+    let request = match prepare_protection_leg(gate, base, api_key, secret, leg).await {
+        Ok(request) => request,
+        Err(error) => return LegOutcome::failed(error),
+    };
+    let raw = gateway.send(&request).await;
+    finish_protection_leg(gate, gateway, base, api_key, secret, leg, raw).await
 }
 
 async fn prepare(

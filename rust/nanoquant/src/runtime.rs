@@ -1386,6 +1386,10 @@ fn current_regime(tx: &rusqlite::Transaction<'_>, mode: &str) -> Result<Option<S
 /// 逐仓/杠杆确认结果缓存时长：交易所侧这些状态很少变化，10 分钟内不重复确认。
 const VENUE_SETUP_CACHE_SEC: i64 = 600;
 
+/// 未知单重查退避（毫秒）：交易所落账通常在数百毫秒内完成，
+/// 短退避能把 `wait` 段最坏等待从 3.6 秒压到约 1 秒。
+const RESOLVE_BACKOFF_MS: [u64; 3] = [150, 300, 600];
+
 impl EngineRuntime {
     pub(crate) fn manage_config(strategy: &Value, risk: &Value) -> crate::manage::ManageConfig {
         crate::manage::ManageConfig {
@@ -4690,8 +4694,8 @@ impl EngineRuntime {
             let reply = crate::live::submit(gateway, &request).await;
             match reply {
                 crate::live::Reply::NotFound if attempt < 3 => {
-                    // 交易所接受后落账有延迟，立刻重查必然落空。
-                    sleep(Duration::from_millis(1_200)).await;
+                    // 交易所接受后落账有延迟；短退避重查，避免把单笔延迟拖到秒级。
+                    sleep(Duration::from_millis(RESOLVE_BACKOFF_MS[attempt as usize])).await;
                 }
                 other => return other,
             }
@@ -5307,6 +5311,13 @@ impl EngineRuntime {
         };
         let mut gate = self.ban_gate();
         let mut failures = Vec::new();
+        // 先把所有腿的请求准备好（签名是本地工作），再按并发度统一发送。
+        let mut pending: Vec<(
+            String,
+            &'static str,
+            crate::live::ProtectionLeg,
+            crate::submit::PreparedRequest,
+        )> = Vec::new();
         for (index, (symbol, side, sl, tp)) in targets.iter().enumerate() {
             let filter = filters.get(symbol).copied().unwrap_or_default();
             let legs = crate::live::protection_legs_mode(
@@ -5325,38 +5336,81 @@ impl EngineRuntime {
                 } else {
                     crate::exit_reason::ExitReason::TakeProfit.as_str()
                 };
-                let outcome = crate::live::place_protection_leg(
+                match crate::live::prepare_protection_leg(
                     &mut gate,
-                    gateway,
                     &creds.base,
                     &creds.api_key,
                     &creds.secret,
                     &leg,
                 )
-                .await;
-                match outcome.failure {
-                    None => self.record_protection_order(
-                        symbol,
-                        purpose,
-                        &leg,
-                        "ACCEPTED",
-                        &outcome.exchange_order_id,
-                    )?,
-                    Some(failure) => {
-                        // 明确拒绝也留痕，但不阻塞下一轮重试；结果未知的腿必须阻塞，避免重复挂单。
-                        let status = if outcome.unknown {
-                            "UNKNOWN"
-                        } else {
-                            "REJECTED"
-                        };
-                        self.record_protection_order(symbol, purpose, &leg, status, "")?;
-                        failures.push(format!("{symbol} 保护单 {failure}"));
-                    }
+                .await
+                {
+                    Ok(request) => pending.push((symbol.clone(), purpose, leg, request)),
+                    Err(error) => failures.push(format!("{symbol} 保护单 {error}")),
                 }
+            }
+        }
+        if !pending.is_empty() {
+            // 单仓两腿保持顺序（便于排障）；多仓时分批并发，尾部不再按腿数线性增长。
+            let concurrency = if pending.len() <= 2 { 1 } else { 4 };
+            let mut sent: Vec<(usize, crate::live::GatewayReply)> =
+                Vec::with_capacity(pending.len());
+            for chunk in pending.chunks(concurrency) {
+                let base = sent.len();
+                let mut batch = Vec::with_capacity(chunk.len());
+                for (offset, item) in chunk.iter().enumerate() {
+                    let idx = base + offset;
+                    batch.push(async move { (idx, gateway.send(&item.3).await) });
+                }
+                sent.extend(futures_util::future::join_all(batch).await);
+            }
+            for (idx, raw) in sent {
+                let (symbol, purpose, leg, _) = &pending[idx];
+                let outcome = crate::live::finish_protection_leg(
+                    &mut gate,
+                    gateway,
+                    &creds.base,
+                    &creds.api_key,
+                    &creds.secret,
+                    leg,
+                    raw,
+                )
+                .await;
+                self.handle_protection_outcome(symbol, purpose, leg, outcome, &mut failures)?;
             }
         }
         self.save_ban_gate(&gate);
         Ok(failures)
+    }
+
+    fn handle_protection_outcome(
+        &self,
+        symbol: &str,
+        purpose: &str,
+        leg: &crate::live::ProtectionLeg,
+        outcome: crate::live::LegOutcome,
+        failures: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match outcome.failure {
+            None => self.record_protection_order(
+                symbol,
+                purpose,
+                leg,
+                "ACCEPTED",
+                &outcome.exchange_order_id,
+            )?,
+            Some(failure) => {
+                // 明确拒绝也留痕，但不阻塞下一轮重试；结果未知的腿必须阻塞，避免重复挂单。
+                let status = if outcome.unknown {
+                    "UNKNOWN"
+                } else {
+                    "REJECTED"
+                };
+                self.record_protection_order(symbol, purpose, leg, status, "")?;
+                failures.push(format!("{symbol} 保护单 {failure}"));
+            }
+        }
+        Ok(())
     }
 
     fn record_protection_order(
@@ -8863,6 +8917,15 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[test]
+    fn unknown_order_backoff_is_short_and_increasing() {
+        assert_eq!(RESOLVE_BACKOFF_MS, [150, 300, 600]);
+        assert!(
+            RESOLVE_BACKOFF_MS.iter().sum::<u64>() <= 1_050,
+            "最坏等待必须远小于旧的 1.2s × 3"
+        );
+    }
+
+    #[test]
     fn flush_cycle_phases_writes_a_ring_sample_and_clears_buffers() {
         let db = test_db();
         let runtime = test_runtime(&db);
@@ -9380,6 +9443,55 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             })
             .unwrap();
         assert_eq!(order_status, "REJECTED");
+    }
+
+    #[tokio::test]
+    async fn protection_for_multiple_positions_is_sent_in_parallel_and_all_recorded() {
+        let db = test_db();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE app_settings SET value=?1 WHERE key='engine'",
+                [r#"{"enabled":true,"mode":"live"}"#],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('BTCUSDT','long',0.5,51000,50500,49000,60000,51000,49000,0.0,1,'open','live'); \
+                 INSERT INTO positions(symbol,side,qty,entry_price,mark_price,sl_price,tp_price,\
+                 peak_price,initial_sl_price,signal_score,opened_at,status,mode) \
+                 VALUES('ETHUSDT','long',1.0,3000,2950,2800,3500,3000,2800,0.0,1,'open','live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'BTCUSDT','BUY','MARKET',0.5,51000,'FILLED','entry','nq-btc','',0,'live'); \
+                 INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode) \
+                 VALUES(1,'ETHUSDT','BUY','MARKET',1.0,3000,'FILLED','entry','nq-eth','',0,'live');",
+            )
+            .unwrap();
+        }
+        let runtime = test_runtime(&db);
+        let gateway = FakeLiveGateway::new(vec![
+            (200, r#"{"dualSidePosition":false}"#),
+            (200, r#"{"orderId":201,"status":"NEW"}"#),
+            (200, r#"{"orderId":202,"status":"NEW"}"#),
+            (200, r#"{"orderId":203,"status":"NEW"}"#),
+            (200, r#"{"orderId":204,"status":"NEW"}"#),
+        ]);
+        let failures = runtime
+            .run_live_with(&live_creds(), &gateway, Vec::new())
+            .await
+            .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let conn = db.lock();
+        let (stop, take): (i64, i64) = conn
+            .query_row(
+                "SELECT SUM(purpose='stop_loss'), SUM(purpose='take_profit') \
+                 FROM orders WHERE mode='live' AND status='ACCEPTED'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((stop, take), (2, 2), "两仓四条保护腿都要留痕");
     }
 
     #[tokio::test]
