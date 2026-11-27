@@ -30,6 +30,7 @@ mod auth;
 mod backtest;
 mod backtest_engine;
 mod backup;
+mod behavior;
 mod book_stream;
 mod bootstrap;
 mod cli;
