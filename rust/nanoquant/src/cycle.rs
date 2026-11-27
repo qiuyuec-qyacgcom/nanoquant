@@ -245,7 +245,9 @@ mod tests {
         assert_eq!(
             report.manage,
             vec![ManageAction::Close {
-                reason: "stop_loss".to_string()
+                reason: crate::exit_reason::ExitReason::StopLoss
+                    .as_str()
+                    .to_string()
             }],
             "熔断也不能把该止损的仓留在场内"
         );

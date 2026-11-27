@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::time::Duration;
 
+use crate::exit_reason::ExitReason;
 use crate::runtime::EngineControl;
 
 /// 把最新标记价和浮盈写回持仓。快速风控每 0.5 秒调用一次，
@@ -73,7 +74,7 @@ pub(crate) struct FastRiskInput<'a> {
 
 /// 快速风控裁决：AI 失效价 → ATR 保护价 → ROI 兜底 → 单仓止盈价。
 /// 返回 None 表示继续持仓。
-fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
+fn fast_risk_reason(input: &FastRiskInput) -> Option<ExitReason> {
     // 价格非法时直接放行，避免除零或 NaN 比较导致误平仓。
     if !input.entry.is_finite()
         || input.entry <= 0.0
@@ -91,7 +92,7 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
         .filter(|v| *v > 0.0 && v.is_finite())
     {
         if (direction > 0.0 && input.mark <= ip) || (direction < 0.0 && input.mark >= ip) {
-            return Some("invalidation");
+            return Some(ExitReason::Invalidation);
         }
     }
 
@@ -100,17 +101,17 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
         && ((direction > 0.0 && input.mark <= input.sl)
             || (direction < 0.0 && input.mark >= input.sl))
     {
-        return Some("stop_loss");
+        return Some(ExitReason::StopLoss);
     }
 
     // ③ 仓位止盈止损率：ROI 口径的账户风险预算，整仓强制平仓。
     let margin_pct =
         (input.mark - input.entry) * direction / input.entry * 100.0 * input.leverage.max(1.0);
     if input.global_stop_pct > 0.0 && margin_pct <= -input.global_stop_pct {
-        return Some("global_stop_loss");
+        return Some(ExitReason::GlobalStopLoss);
     }
     if input.global_tp_pct > 0.0 && margin_pct >= input.global_tp_pct {
-        return Some("global_take_profit");
+        return Some(ExitReason::GlobalTakeProfit);
     }
 
     // ④ 单仓止盈价：趋势仓开仓时为 0，仅均值回归仓仍有值。
@@ -118,7 +119,7 @@ fn fast_risk_reason(input: &FastRiskInput) -> Option<&'static str> {
         && ((direction > 0.0 && input.mark >= input.tp)
             || (direction < 0.0 && input.mark <= input.tp))
     {
-        return Some("take_profit");
+        return Some(ExitReason::TakeProfit);
     }
     None
 }
@@ -214,8 +215,8 @@ async fn fast_risk_cycle(
             continue;
         };
         closing.insert(id);
-        if let Err(error) = control.close_position(id, reason).await {
-            tracing::debug!(error = ?error, symbol = %symbol, reason, "快速风控平仓失败");
+        if let Err(error) = control.close_position(id, reason.as_str()).await {
+            tracing::debug!(error = ?error, symbol = %symbol, reason = reason.as_str(), "快速风控平仓失败");
         }
         closing.remove(&id);
     }
@@ -269,7 +270,7 @@ mod tests {
                 30.0,
                 15.0
             )),
-            Some("invalidation")
+            Some(ExitReason::Invalidation)
         );
         assert_eq!(
             fast_risk_reason(&risk_input(
@@ -283,7 +284,7 @@ mod tests {
                 30.0,
                 15.0
             )),
-            Some("invalidation")
+            Some(ExitReason::Invalidation)
         );
         assert_eq!(
             fast_risk_reason(&risk_input(
@@ -331,7 +332,7 @@ mod tests {
                 30.0,
                 15.0,
             )),
-            Some("invalidation")
+            Some(ExitReason::Invalidation)
         );
     }
 
@@ -351,7 +352,7 @@ mod tests {
                 10.0,
                 0.0
             )),
-            Some("invalidation")
+            Some(ExitReason::Invalidation)
         );
     }
 
@@ -363,7 +364,7 @@ mod tests {
             fast_risk_reason(&risk_input(
                 "long", 100.0, 94.0, 95.0, 0.0, 9.0, None, 10.0, 0.0
             )),
-            Some("stop_loss")
+            Some(ExitReason::StopLoss)
         );
     }
 
@@ -374,7 +375,7 @@ mod tests {
             fast_risk_reason(&risk_input(
                 "long", 100.0, 95.0, 0.0, 0.0, 2.0, None, 10.0, 0.0
             )),
-            Some("global_stop_loss")
+            Some(ExitReason::GlobalStopLoss)
         );
     }
 

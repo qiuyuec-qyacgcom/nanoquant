@@ -5,6 +5,8 @@
 //! 移动止损必须先浮盈到激活门槛才接管，否则开仓即追踪会把单子在硬止损之前
 //! 被噪声扫掉。部分止盈的 R 用**初始**止损计算，当前止损上移后会失真。
 
+use crate::exit_reason::ExitReason;
+
 /// 管仓动作。
 #[derive(Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -86,7 +88,7 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
     // ATR 保护价优先于 ROI 兜底：止损距离由波动决定，不能被保证金收益率抢先。
     if pos.sl_price > 0.0 && hit(direction, pos.mark_price, pos.sl_price, true) {
         return ManageAction::Close {
-            reason: "stop_loss".to_string(),
+            reason: ExitReason::StopLoss.as_str().to_string(),
         };
     }
     // 全局止盈止损按保证金收益率判断：价格变动 × 杠杆。
@@ -97,12 +99,12 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
     let margin_pct = price_pct * pos.leverage.max(1.0);
     if stop_loss_pct > 0.0 && margin_pct <= -stop_loss_pct {
         return ManageAction::Close {
-            reason: "global_stop_loss".to_string(),
+            reason: ExitReason::GlobalStopLoss.as_str().to_string(),
         };
     }
     if take_profit_pct > 0.0 && margin_pct >= take_profit_pct {
         return ManageAction::Close {
-            reason: "global_take_profit".to_string(),
+            reason: ExitReason::GlobalTakeProfit.as_str().to_string(),
         };
     }
 
@@ -118,7 +120,7 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
 
     if pos.tp_price > 0.0 && hit(direction, pos.mark_price, pos.tp_price, false) {
         return ManageAction::Close {
-            reason: "take_profit".to_string(),
+            reason: ExitReason::TakeProfit.as_str().to_string(),
         };
     }
 
@@ -130,7 +132,7 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
                 >= cfg.roi_min_r;
         if r_ok && roi_pct >= target {
             return ManageAction::Close {
-                reason: "roi_target".to_string(),
+                reason: ExitReason::RoiTarget.as_str().to_string(),
             };
         }
     }
@@ -152,7 +154,7 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
             };
             if pulled_back {
                 return ManageAction::Close {
-                    reason: "trailing_stop".to_string(),
+                    reason: ExitReason::TrailingStop.as_str().to_string(),
                 };
             }
         }
@@ -160,12 +162,12 @@ pub fn manage(pos: &ManagedPosition, cfg: &ManageConfig) -> ManageAction {
 
     if direction > 0.0 && pos.score <= -cfg.exit_threshold {
         return ManageAction::Close {
-            reason: "signal_flip".to_string(),
+            reason: ExitReason::SignalFlip.as_str().to_string(),
         };
     }
     if direction < 0.0 && pos.score >= cfg.exit_threshold {
         return ManageAction::Close {
-            reason: "signal_flip".to_string(),
+            reason: ExitReason::SignalFlip.as_str().to_string(),
         };
     }
 
@@ -299,7 +301,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "trailing_stop".to_string()
+                reason: ExitReason::TrailingStop.as_str().to_string()
             }
         );
     }
@@ -353,7 +355,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &cfg()),
             ManageAction::Close {
-                reason: "stop_loss".to_string()
+                reason: ExitReason::StopLoss.as_str().to_string()
             }
         );
     }
@@ -365,7 +367,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &cfg()),
             ManageAction::Close {
-                reason: "signal_flip".to_string()
+                reason: ExitReason::SignalFlip.as_str().to_string()
             }
         );
 
@@ -398,7 +400,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "stop_loss".to_string()
+                reason: ExitReason::StopLoss.as_str().to_string()
             },
             "ATR 保护价必须先于 ROI 兜底，否则周期任务与快平任务口径不一致"
         );
@@ -415,7 +417,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "global_stop_loss".to_string()
+                reason: ExitReason::GlobalStopLoss.as_str().to_string()
             }
         );
     }
@@ -444,7 +446,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "global_stop_loss".to_string()
+                reason: ExitReason::GlobalStopLoss.as_str().to_string()
             }
         );
         // 保证金 +25%：全局 20% 会提前止盈，独立 30% 应继续持有。
@@ -454,7 +456,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "global_take_profit".to_string()
+                reason: ExitReason::GlobalTakeProfit.as_str().to_string()
             }
         );
     }
@@ -471,7 +473,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "global_take_profit".to_string()
+                reason: ExitReason::GlobalTakeProfit.as_str().to_string()
             }
         );
     }
@@ -486,7 +488,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "global_take_profit".to_string()
+                reason: ExitReason::GlobalTakeProfit.as_str().to_string()
             },
             "全局止盈先于持仓自身的止盈价"
         );
@@ -517,7 +519,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "roi_target".to_string()
+                reason: ExitReason::RoiTarget.as_str().to_string()
             }
         );
     }
@@ -553,7 +555,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "roi_target".to_string()
+                reason: ExitReason::RoiTarget.as_str().to_string()
             },
             "r >= roi_min_r 后按 roi_table 继续执行"
         );
@@ -572,7 +574,7 @@ mod tests {
         assert_eq!(
             manage(&pos, &config),
             ManageAction::Close {
-                reason: "roi_target".to_string()
+                reason: ExitReason::RoiTarget.as_str().to_string()
             },
             "roi_min_r <= 0 视为关闭门槛"
         );

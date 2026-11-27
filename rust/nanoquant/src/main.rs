@@ -47,6 +47,7 @@ mod evolution_review;
 mod exchange_time;
 mod exec_client;
 mod execution;
+mod exit_reason;
 mod fast_risk;
 mod ga_tune;
 mod history;

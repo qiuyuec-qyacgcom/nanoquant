@@ -4135,7 +4135,9 @@ impl EngineRuntime {
                     .unwrap_or(0.0)
             };
             let action = crate::manage::ManageAction::Close {
-                reason: "halt_flatten".to_string(),
+                reason: crate::exit_reason::ExitReason::RiskHalt
+                    .as_str()
+                    .to_string(),
             };
             let Some(fill) = crate::execution::demo_fill_for_manage(
                 &cycle_id, &symbol, &side, qty, mark, &action,

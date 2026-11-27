@@ -323,7 +323,7 @@ impl<'a> Sim<'a> {
                     self.close_position(
                         gap_fill(bar, liq_price, direction, true),
                         index,
-                        "liquidation",
+                        crate::exit_reason::ExitReason::Liquidation.as_str(),
                     );
                     self.liquidations += 1;
                     continue;
@@ -338,7 +338,7 @@ impl<'a> Sim<'a> {
                     self.close_position(
                         gap_fill(bar, stop_price, direction, true),
                         index,
-                        "stop_loss",
+                        crate::exit_reason::ExitReason::StopLoss.as_str(),
                     );
                     continue;
                 }
@@ -350,11 +350,19 @@ impl<'a> Sim<'a> {
                     0.0
                 };
                 if global_stop > 0.0 && bar_margin_pct <= -global_stop {
-                    self.close_position(bar.close, index, "global_stop_loss");
+                    self.close_position(
+                        bar.close,
+                        index,
+                        crate::exit_reason::ExitReason::GlobalStopLoss.as_str(),
+                    );
                     continue;
                 }
                 if global_tp > 0.0 && bar_margin_pct >= global_tp {
-                    self.close_position(bar.close, index, "global_take_profit");
+                    self.close_position(
+                        bar.close,
+                        index,
+                        crate::exit_reason::ExitReason::GlobalTakeProfit.as_str(),
+                    );
                     continue;
                 }
 
@@ -365,7 +373,7 @@ impl<'a> Sim<'a> {
                     self.close_position(
                         gap_fill(bar, tp_price, direction, false),
                         index,
-                        "take_profit",
+                        crate::exit_reason::ExitReason::TakeProfit.as_str(),
                     );
                     continue;
                 }
@@ -406,7 +414,11 @@ impl<'a> Sim<'a> {
                         bar.close >= new_peak * (1.0 + pullback)
                     };
                     if armed && pulled_back {
-                        self.close_position(bar.close, index, "trailing_stop");
+                        self.close_position(
+                            bar.close,
+                            index,
+                            crate::exit_reason::ExitReason::TrailingStop.as_str(),
+                        );
                         continue;
                     }
                 }
@@ -423,13 +435,21 @@ impl<'a> Sim<'a> {
                     // ROI 阶梯按保证金收益率，与实盘 manage 同口径。
                     let margin_pct = profit_pct * self.config.leverage.max(1.0);
                     if target > 0.0 && margin_pct >= target {
-                        self.close_position(bar.close, index, "roi");
+                        self.close_position(
+                            bar.close,
+                            index,
+                            crate::exit_reason::ExitReason::RoiTarget.as_str(),
+                        );
                         continue;
                     }
                 }
 
                 if hold_limit > 0 && held_bars >= hold_limit {
-                    self.close_position(bar.close, index, "timeout");
+                    self.close_position(
+                        bar.close,
+                        index,
+                        crate::exit_reason::ExitReason::Timeout.as_str(),
+                    );
                     continue;
                 }
                 continue;
@@ -569,7 +589,11 @@ impl<'a> Sim<'a> {
         if self.position.is_some() {
             let last = self.bars.len() - 1;
             let close = self.bars[last].close;
-            self.close_position(close, last, "timeout");
+            self.close_position(
+                close,
+                last,
+                crate::exit_reason::ExitReason::Timeout.as_str(),
+            );
         }
 
         self.summary(bar_minutes, leverage, mmr)
