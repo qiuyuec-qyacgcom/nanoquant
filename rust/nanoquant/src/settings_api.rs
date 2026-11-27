@@ -495,6 +495,15 @@ fn drop_removed_keys(group: &str, value: &mut Value) {
     if group == "ai" {
         if let Some(object) = value.as_object_mut() {
             object.remove("require_agreement");
+            object.remove("veto_only");
+            object.remove("allow_ai_override");
+        }
+    }
+    if group == "ai_tuning" {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("auto_apply");
+            object.remove("auto_apply_timeframes");
+            object.remove("max_auto_apply_per_24h");
         }
     }
 }

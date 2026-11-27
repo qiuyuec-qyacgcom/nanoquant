@@ -27,6 +27,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "config-audit",
         "配置消费审计：列出未被 Rust 源码引用的默认配置叶子键 [--fail]",
     ),
+    (
+        "config-cleanup",
+        "清理旧 AI 配置键、auto_apply_since 与历史 auto_apply 激活记录（默认执行；--dry-run 预览；--keep-history 保留记录）",
+    ),
     ("final-verdict", "策略判定"),
     ("bench-exec", "执行侧压测"),
     ("p99-bench", "签名 p99 基准"),
@@ -65,6 +69,8 @@ struct Options {
     vacuum: bool,
     force: bool,
     fail: bool,
+    dry_run: bool,
+    keep_history: bool,
     self_test: bool,
     keep: bool,
     plain: bool,
@@ -115,6 +121,8 @@ fn parse(argv: &[String], config: &Config) -> Options {
     let mut vacuum = false;
     let mut force = false;
     let mut fail = false;
+    let mut dry_run = false;
+    let mut keep_history = false;
     let mut self_test = false;
     let mut keep = false;
     let mut plain = false;
@@ -176,6 +184,8 @@ fn parse(argv: &[String], config: &Config) -> Options {
             "--vacuum" => vacuum = true,
             "--force" => force = true,
             "--fail" => fail = true,
+            "--dry-run" => dry_run = true,
+            "--keep-history" => keep_history = true,
             "--self-test" => self_test = true,
             "--keep" => keep = true,
             "--plain" => plain = true,
@@ -337,6 +347,8 @@ fn parse(argv: &[String], config: &Config) -> Options {
         vacuum,
         force,
         fail,
+        dry_run,
+        keep_history,
         self_test,
         keep,
         plain,
@@ -407,6 +419,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "reset-password" => reset_password(&options),
         "cleanup-history" => cleanup_history(&options),
         "config-audit" => config_audit_command(&options),
+        "config-cleanup" => config_cleanup_command(&options),
         "archive-replay" => archive_replay(&options),
         "backup-create" => backup_create(&options),
         "backup-drill" => backup_drill(&options),
@@ -1102,6 +1115,13 @@ fn config_audit_command(options: &Options) -> Result<(i32, Value), (i32, String)
         0
     };
     Ok((code, report))
+}
+
+fn config_cleanup_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
+    let db = open_db(&options.db_path)?;
+    let report = crate::ops_tools::cleanup_legacy_ai(&db, options.dry_run, options.keep_history)
+        .map_err(|error| (1, error))?;
+    Ok((0, report))
 }
 
 fn cleanup_history(options: &Options) -> Result<(i32, Value), (i32, String)> {
@@ -2159,7 +2179,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 23);
+        assert_eq!(text.len(), 24);
         for name in [
             "preflight",
             "reconcile",
@@ -2169,6 +2189,7 @@ mod tests {
             "archive-replay",
             "cleanup-history",
             "config-audit",
+            "config-cleanup",
             "final-verdict",
             "bench-exec",
             "p99-bench",

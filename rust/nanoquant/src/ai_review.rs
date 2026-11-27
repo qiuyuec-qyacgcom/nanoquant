@@ -504,7 +504,7 @@ mod tests {
             reason: "test".to_string(),
             risk_flags: Vec::new(),
             invalidation: String::new(),
-            params: Vec::new(),
+
             invalidation_price: None,
             valid_bars: None,
             data_quality: None,
@@ -950,8 +950,8 @@ CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, mod
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_entry_ignores_ai_param_updates() {
-        let path = std::env::temp_dir().join("nq-ai-reviewer-ignores-params.db");
+    async fn review_entry_ignores_ai_param_suggestions() {
+        let path = std::env::temp_dir().join("nq-ai-reviewer-ignores-param-suggestions.db");
         let db = fixture(&path);
         {
             let conn = db.lock();

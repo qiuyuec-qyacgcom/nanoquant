@@ -1345,6 +1345,127 @@ pub fn config_audit(source_dir: &Path, allowlist: &[&str]) -> Result<Value, Stri
     }))
 }
 
+// ---------------------------------------------------------------- config-cleanup
+
+const LEGACY_AI_KEYS: [&str; 3] = ["require_agreement", "veto_only", "allow_ai_override"];
+const LEGACY_AI_TUNING_KEYS: [&str; 3] = [
+    "auto_apply",
+    "auto_apply_timeframes",
+    "max_auto_apply_per_24h",
+];
+const LEGACY_AUTO_APPLY_SINCE: &str = "ai_tuning.auto_apply_since";
+
+/// 一次性清理旧 AI 配置键、`auto_apply_since` 与历史 `auto_apply` 激活记录。
+/// `dry_run=true` 只统计不写库；`keep_history=true` 保留激活记录。
+pub fn cleanup_legacy_ai(
+    db: &crate::db::Db,
+    dry_run: bool,
+    keep_history: bool,
+) -> Result<Value, String> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| "数据库连接锁不可用".to_string())?;
+    let now = crate::now();
+    let groups = [
+        ("ai", &LEGACY_AI_KEYS[..]),
+        ("ai_tuning", &LEGACY_AI_TUNING_KEYS[..]),
+    ];
+    let mut removed_ai = 0i64;
+    let mut removed_ai_tuning = 0i64;
+    for (group, keys) in groups {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [group],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(raw) = raw else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        let mut removed = 0i64;
+        for key in keys {
+            if object.remove(*key).is_some() {
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            continue;
+        }
+        if group == "ai" {
+            removed_ai += removed;
+        } else {
+            removed_ai_tuning += removed;
+        }
+        if !dry_run {
+            let payload = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+            conn.execute(
+                "UPDATE app_settings SET value = ?1, updated_at = ?2 WHERE key = ?3",
+                (payload, now, group),
+            )
+            .map_err(|error| format!("写回 {group} 配置失败: {error}"))?;
+        }
+    }
+
+    let removed_engine_state: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM engine_state WHERE key = ?1",
+            [LEGACY_AUTO_APPLY_SINCE],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if removed_engine_state > 0 && !dry_run {
+        conn.execute(
+            "DELETE FROM engine_state WHERE key = ?1",
+            [LEGACY_AUTO_APPLY_SINCE],
+        )
+        .map_err(|error| format!("删除 {LEGACY_AUTO_APPLY_SINCE} 失败: {error}"))?;
+    }
+
+    let has_activations: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ai_tuning_activations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    let purged_activations = if !keep_history && has_activations {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ai_tuning_activations WHERE trigger = 'auto_apply'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if count > 0 && !dry_run {
+            conn.execute(
+                "DELETE FROM ai_tuning_activations WHERE trigger = 'auto_apply'",
+                [],
+            )
+            .map_err(|error| format!("删除历史 auto_apply 激活记录失败: {error}"))?;
+        }
+        count
+    } else {
+        0
+    };
+
+    Ok(json!({
+        "ok": true,
+        "dry_run": dry_run,
+        "removed": {"ai": removed_ai, "ai_tuning": removed_ai_tuning},
+        "removed_engine_state": removed_engine_state,
+        "purged_activations": purged_activations,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,5 +1582,134 @@ mod tests {
             report["message"],
             format!("源码不可用: {}", missing.display())
         );
+    }
+
+    fn cleanup_fixture(tag: &str) -> (std::path::PathBuf, crate::db::Db) {
+        let path =
+            std::env::temp_dir().join(format!("nq-config-cleanup-{}-{tag}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+             CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+             CREATE TABLE ai_tuning_activations(id INTEGER PRIMARY KEY, set_id INTEGER NOT NULL,
+                 regime TEXT NOT NULL, previous_set_id INTEGER, ts INTEGER NOT NULL, trigger TEXT NOT NULL);
+             INSERT INTO app_settings VALUES('ai','{\"enabled\":true,\"require_agreement\":true,\"veto_only\":true,\"allow_ai_override\":true}',0);
+             INSERT INTO app_settings VALUES('ai_tuning','{\"enabled\":true,\"auto_apply\":true,\"auto_apply_timeframes\":\"1h\",\"max_auto_apply_per_24h\":3}',0);
+             INSERT INTO engine_state VALUES('ai_tuning.auto_apply_since','1',0);
+             INSERT INTO ai_tuning_activations(set_id,regime,previous_set_id,ts,trigger) VALUES(1,'range',NULL,1,'auto_apply');
+             INSERT INTO ai_tuning_activations(set_id,regime,previous_set_id,ts,trigger) VALUES(2,'range',1,2,'manual');",
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::db::Db::open(path.to_str().unwrap()).unwrap();
+        (path, db)
+    }
+
+    fn stored_group(db: &crate::db::Db, group: &str) -> Value {
+        let raw: String = db
+            .lock()
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn config_cleanup_removes_legacy_keys_and_history() {
+        let (path, db) = cleanup_fixture("full");
+        let report = cleanup_legacy_ai(&db, false, false).unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["dry_run"], false);
+        assert_eq!(report["removed"]["ai"], 3);
+        assert_eq!(report["removed"]["ai_tuning"], 3);
+        assert_eq!(report["removed_engine_state"], 1);
+        assert_eq!(report["purged_activations"], 1);
+
+        let ai = stored_group(&db, "ai");
+        assert_eq!(ai["enabled"], true);
+        for key in LEGACY_AI_KEYS {
+            assert!(ai.get(key).is_none(), "ai.{key} 应被删除: {ai}");
+        }
+        let ai_tuning = stored_group(&db, "ai_tuning");
+        assert_eq!(ai_tuning["enabled"], true);
+        for key in LEGACY_AI_TUNING_KEYS {
+            assert!(
+                ai_tuning.get(key).is_none(),
+                "ai_tuning.{key} 应被删除: {ai_tuning}"
+            );
+        }
+        let conn = db.lock();
+        let since: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_state WHERE key = 'ai_tuning.auto_apply_since'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(since, 0);
+        let triggers: Vec<String> = conn
+            .prepare("SELECT trigger FROM ai_tuning_activations ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(triggers, vec!["manual"], "只保留非 auto_apply 记录");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_cleanup_dry_run_does_not_modify() {
+        let (path, db) = cleanup_fixture("dry");
+        let report = cleanup_legacy_ai(&db, true, false).unwrap();
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["removed"]["ai"], 3);
+        assert_eq!(report["removed"]["ai_tuning"], 3);
+        assert_eq!(report["removed_engine_state"], 1);
+        assert_eq!(report["purged_activations"], 1);
+
+        assert_eq!(stored_group(&db, "ai")["veto_only"], true);
+        assert_eq!(stored_group(&db, "ai_tuning")["auto_apply"], true);
+        let conn = db.lock();
+        let since: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM engine_state WHERE key = 'ai_tuning.auto_apply_since'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(since, 1, "dry-run 不得删除 auto_apply_since");
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 2, "dry-run 不得删除激活记录");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_cleanup_keep_history_preserves_activations() {
+        let (path, db) = cleanup_fixture("keep");
+        let report = cleanup_legacy_ai(&db, false, true).unwrap();
+        assert_eq!(report["purged_activations"], 0);
+        assert_eq!(report["removed"]["ai"], 3);
+        let conn = db.lock();
+        let activations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 2, "keep-history 必须保留全部激活记录");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 }

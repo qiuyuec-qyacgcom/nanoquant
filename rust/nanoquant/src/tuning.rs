@@ -117,7 +117,7 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
     if !outcome.ok {
         return Err(format!("AI 调参调用失败: {}", outcome.error));
     }
-    let decision = ai_client::parse_decision(&outcome.text, None)
+    let updates = parse_param_updates(&outcome.text)
         .map_err(|error| format!("AI 调参输出无法解析: {error}"))?;
 
     let conn = state
@@ -127,13 +127,10 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
         .map_err(|_| "数据库连接锁不可用".to_string())?;
     let now = crate::now();
     // 校验是纯函数，先做：失败时不会开启事务，也不会留下半条记录。
-    let next = if decision.params.is_empty() {
+    let next = if updates.is_empty() {
         None
     } else {
-        Some(validate_candidate(
-            &prepared.active.params,
-            &decision.params,
-        )?)
+        Some(validate_candidate(&prepared.active.params, &updates)?)
     };
     // 候选、调参时间戳与事件必须同进同退：事件失败时整轮回滚，下一轮还能重试。
     let tx = conn
@@ -183,6 +180,52 @@ pub(crate) async fn run_once(state: &AiState) -> Result<Option<i64>, String> {
     tx.commit()
         .map_err(|error| format!("提交调参事务失败: {error}"))?;
     Ok(None)
+}
+
+/// 调参任务专用解析：只读取模型输出里的 `p`/`params` 参数建议。
+/// 决策协议（`Decision`）不再承载参数建议，解析下沉到调参任务自身。
+fn parse_param_updates(text: &str) -> Result<Vec<ai_client::ParamUpdate>, String> {
+    let data = ai_client::extract_json(text)?;
+    let items = data
+        .get("params")
+        .or_else(|| data.get("p"))
+        .and_then(Value::as_array);
+    let mut updates = Vec::new();
+    for item in items.into_iter().flatten() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let group = object
+            .get("group")
+            .or_else(|| object.get("g"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let key = object
+            .get("key")
+            .or_else(|| object.get("k"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let Some(value) = object.get("value").or_else(|| object.get("v")).cloned() else {
+            continue;
+        };
+        if group.is_empty() || key.is_empty() {
+            continue;
+        }
+        let reason = object
+            .get("reason")
+            .or_else(|| object.get("w"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        updates.push(ai_client::ParamUpdate {
+            group: group.to_string(),
+            key: key.to_string(),
+            value,
+            reason: reason.chars().take(200).collect(),
+        });
+    }
+    Ok(updates)
 }
 
 struct Prepared {
