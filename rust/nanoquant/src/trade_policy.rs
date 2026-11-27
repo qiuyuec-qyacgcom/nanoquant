@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use crate::indicators::adx;
+
 /// EMA 快慢周期：信号内核、regime 判定与 AI 特征快照共用同一份配置。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct EmaPeriods {
@@ -292,21 +294,6 @@ pub(crate) fn ema(values: &[f64], period: usize) -> Option<f64> {
     Some(values.iter().skip(1).fold(values[0], |current, value| {
         alpha * value + (1.0 - alpha) * current
     }))
-}
-
-fn adx(candles: &[crate::providers::CandleSnapshot], period: usize) -> Option<f64> {
-    if candles.len() <= period {
-        return None;
-    }
-    let mut dx = Vec::new();
-    for pair in candles.windows(2).rev().take(period) {
-        let up = pair[1].high - pair[0].high;
-        let down = pair[0].low - pair[1].low;
-        let plus = if up > down && up > 0.0 { up } else { 0.0 };
-        let minus = if down > up && down > 0.0 { down } else { 0.0 };
-        dx.push((plus - minus).abs() / (plus + minus).max(1e-12) * 100.0);
-    }
-    (!dx.is_empty()).then(|| dx.iter().sum::<f64>() / dx.len() as f64)
 }
 
 #[cfg(test)]
