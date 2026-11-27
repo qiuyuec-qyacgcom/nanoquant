@@ -3,7 +3,6 @@
 //! 默认实现与改造前的写死逻辑**逐行等价** —— 任何数值差异都视为回归。
 
 /// 撮合模型：决定成交价与成交比例。
-#[allow(dead_code)] // K2 回测引擎接入
 pub trait FillModel: Send + Sync {
     /// 滑点 + 半价差（bps）：由撮合模型自己持有成本假设。
     fn slip_bps(&self) -> f64 {
@@ -18,14 +17,12 @@ pub trait FillModel: Send + Sync {
 }
 
 /// 费用模型。
-#[allow(dead_code)] // K2 回测引擎接入
 pub trait FeeModel: Send + Sync {
     fn taker_rate(&self) -> f64;
     fn maker_rate(&self) -> f64;
 }
 
 /// 保证金模型。
-#[allow(dead_code)] // K2 回测引擎接入
 pub trait MarginModel: Send + Sync {
     fn maintenance_margin_rate(&self) -> f64;
     /// 强平价；返回 None 表示不判定强平。
@@ -33,7 +30,6 @@ pub trait MarginModel: Send + Sync {
 }
 
 /// 延迟模型：以 K 线根数为单位。
-#[allow(dead_code)] // K2 回测引擎接入
 pub trait LatencyModel: Send + Sync {
     fn bars(&self) -> usize {
         0
@@ -41,7 +37,6 @@ pub trait LatencyModel: Send + Sync {
 }
 
 /// 默认撮合：滑点 + 半价差，方向符号与改造前一致。
-#[allow(dead_code)] // K2 回测引擎接入
 pub struct DefaultFill {
     pub slippage_bps: f64,
     pub spread_bps: f64,
@@ -64,7 +59,6 @@ impl FillModel for DefaultFill {
 }
 
 /// 默认费用：只区分 taker。
-#[allow(dead_code)] // K2 回测引擎接入
 pub struct DefaultFee {
     pub taker_bps: f64,
 }
@@ -80,7 +74,6 @@ impl FeeModel for DefaultFee {
 }
 
 /// 默认保证金：维持保证金率固定，强平价沿用改造前的算法。
-#[allow(dead_code)] // K2 回测引擎接入
 pub struct DefaultMargin {
     pub maintenance_margin_rate: f64,
 }
@@ -96,7 +89,6 @@ impl MarginModel for DefaultMargin {
 }
 
 /// 无延迟。
-#[allow(dead_code)] // K2 回测引擎接入
 pub struct NoLatency;
 
 impl LatencyModel for NoLatency {}

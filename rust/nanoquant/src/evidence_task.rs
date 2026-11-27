@@ -356,9 +356,17 @@ pub(crate) fn build_config(
     let manage = EngineRuntime::manage_config(params, risk);
     Ok(EngineConfig {
         interval_ms,
-        fee_bps: taker * 10_000.0,
-        slippage_bps: 2.0,
-        spread_bps: 0.0,
+        fill: std::sync::Arc::new(crate::behavior::DefaultFill {
+            slippage_bps: 2.0,
+            spread_bps: 0.0,
+        }),
+        fee: std::sync::Arc::new(crate::behavior::DefaultFee {
+            taker_bps: taker * 10_000.0,
+        }),
+        margin: std::sync::Arc::new(crate::behavior::DefaultMargin {
+            maintenance_margin_rate: 0.005,
+        }),
+        latency: std::sync::Arc::new(crate::behavior::NoLatency),
         funding_bps_8h: 1.0,
         initial_equity: 100.0,
 
@@ -370,7 +378,6 @@ pub(crate) fn build_config(
             .get("min_leverage")
             .and_then(Value::as_f64)
             .unwrap_or(1.0),
-        maintenance_margin_rate: 0.005,
         max_bars_hold: None,
         policy,
         manage,
@@ -787,20 +794,19 @@ mod tests {
 
         assert_eq!(config.interval_ms, 3_600_000);
         assert!(
-            (config.fee_bps - 5.0).abs() < 1e-9,
-            "费率必须按 risk 折算 bps"
+            (config.fee.taker_rate() - 0.0005).abs() < 1e-9,
+            "费率必须按 risk 折算"
         );
         assert_eq!(config.policy.atr_pct_min, 1.5);
         assert_eq!(config.policy.atr_pct_max, 8.0);
         assert_eq!(config.policy.volume_ratio_min, 1.1);
-        assert_eq!(config.slippage_bps, 2.0);
-        assert_eq!(config.spread_bps, 0.0);
+        assert!((config.fill.slip_bps() - 2.0).abs() < 1e-9);
         assert_eq!(config.funding_bps_8h, 1.0);
         assert_eq!(config.initial_equity, 100.0);
 
         assert_eq!(config.margin_pct, 50.0);
         assert_eq!(config.leverage, 1.0);
-        assert_eq!(config.maintenance_margin_rate, 0.005);
+        assert_eq!(config.margin.maintenance_margin_rate(), 0.005);
         assert!(config.max_bars_hold.is_none());
         assert!(
             build_config(&params, &risk, "3d").is_err(),

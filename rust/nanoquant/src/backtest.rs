@@ -481,16 +481,23 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
     let taker = prepared.risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
     EngineConfig {
         interval_ms: history::interval_ms(&input.interval).unwrap_or(900_000),
-        fee_bps: fee_bps(input.fee_bps, taker),
-        slippage_bps: input.slippage_bps,
-        spread_bps: input.spread_bps,
+        fill: std::sync::Arc::new(crate::behavior::DefaultFill {
+            slippage_bps: input.slippage_bps,
+            spread_bps: input.spread_bps,
+        }),
+        fee: std::sync::Arc::new(crate::behavior::DefaultFee {
+            taker_bps: fee_bps(input.fee_bps, taker),
+        }),
+        margin: std::sync::Arc::new(crate::behavior::DefaultMargin {
+            maintenance_margin_rate: 0.005,
+        }),
+        latency: std::sync::Arc::new(crate::behavior::NoLatency),
         funding_bps_8h: input.funding_bps_8h,
         initial_equity: input.initial_equity,
 
         margin_pct: prepared.risk["margin_pct"].as_f64().unwrap_or(50.0),
         // 回测没有 AI 决策，杠杆取全局下限：与实盘「AI 未给杠杆时的回退值」一致
         leverage: prepared.risk["min_leverage"].as_f64().unwrap_or(1.0),
-        maintenance_margin_rate: 0.005,
         max_bars_hold: None,
         policy,
         manage,

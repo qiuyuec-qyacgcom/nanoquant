@@ -25,18 +25,22 @@ pub const MIN_GRID_TRADES: usize = 8;
 pub const MAX_FOLDS: usize = 6;
 pub const MIN_FOLDS: usize = 2;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     pub interval_ms: i64,
-    pub fee_bps: f64,
-    pub slippage_bps: f64,
-    pub spread_bps: f64,
+    /// 撮合成本假设：滑点与半价差。
+    pub fill: std::sync::Arc<dyn crate::behavior::FillModel>,
+    /// 手续费模型。
+    pub fee: std::sync::Arc<dyn crate::behavior::FeeModel>,
+    /// 保证金与强平模型。
+    pub margin: std::sync::Arc<dyn crate::behavior::MarginModel>,
+    /// 延迟模型（当前默认 0 根）。
+    pub latency: std::sync::Arc<dyn crate::behavior::LatencyModel>,
     pub funding_bps_8h: f64,
     pub initial_equity: f64,
 
     pub margin_pct: f64,
     pub leverage: f64,
-    pub maintenance_margin_rate: f64,
     pub max_bars_hold: Option<usize>,
     pub policy: TradePolicy,
     pub manage: ManageConfig,
@@ -170,11 +174,17 @@ impl<'a> Sim<'a> {
     }
 
     fn slip_bps(&self) -> f64 {
-        self.config.slippage_bps + self.config.spread_bps / 2.0
+        self.config.fill.slip_bps()
+    }
+
+    fn fill_price(&self, price: f64, direction: f64, opening: bool) -> f64 {
+        self.config
+            .fill
+            .fill_price(price, self.slip_bps(), direction, opening)
     }
 
     fn fee_rate(&self) -> f64 {
-        self.config.fee_bps / 10_000.0
+        self.config.fee.taker_rate()
     }
 
     fn book(&mut self, amount: f64) {
@@ -191,7 +201,7 @@ impl<'a> Sim<'a> {
             return;
         };
         let direction = direction_of(&position.side);
-        let exit_fill = fill_price(price, self.slip_bps(), direction, false);
+        let exit_fill = self.fill_price(price, direction, false);
         let gross = (exit_fill - position.entry) * position.qty * direction;
         let exit_fee = exit_fill * position.qty * self.fee_rate();
         let entry_share =
@@ -223,7 +233,6 @@ impl<'a> Sim<'a> {
     }
 
     fn take_partial(&mut self, price: f64) {
-        let slip = self.slip_bps();
         let fee_rate = self.fee_rate();
         let ratio = self.config.manage.partial_tp_ratio;
         let Some(position) = self.position.as_ref() else {
@@ -237,7 +246,7 @@ impl<'a> Sim<'a> {
         let entry = position.entry;
         let initial_fee = position.initial_fee;
         let initial_qty = position.initial_qty.max(f64::EPSILON);
-        let fill = fill_price(price, slip, direction, false);
+        let fill = self.fill_price(price, direction, false);
         let gross = (fill - entry) * leg_qty * direction;
         let leg_fee = fill * leg_qty * fee_rate;
         let entry_share = initial_fee * (leg_qty / initial_qty);
@@ -262,7 +271,7 @@ impl<'a> Sim<'a> {
         let ratio = self.config.manage.partial_tp_ratio;
         let funding_rate = self.config.funding_bps_8h / 10_000.0;
         let leverage = self.config.leverage.max(1.0);
-        let mmr = self.config.maintenance_margin_rate.max(0.0);
+        let mmr = self.config.margin.maintenance_margin_rate().max(0.0);
         let hold_limit = self.config.max_bars_hold.unwrap_or(0);
 
         for index in WARMUP..self.bars.len() - 1 {
@@ -493,7 +502,7 @@ impl<'a> Sim<'a> {
             };
             let direction = direction_of(side);
             let next = self.bars[index + 1];
-            let entry = fill_price(next.open, self.slip_bps(), direction, true);
+            let entry = self.fill_price(next.open, direction, true);
             let (sl_pct, tp_pct) = if mean_reversion {
                 (
                     self.config.mr["mr_sl_pct"].as_f64().unwrap_or(20.0) / leverage,
@@ -519,7 +528,7 @@ impl<'a> Sim<'a> {
             }
             // 仓位只由单仓保证金占比决定：名义额 = 权益 × margin_pct% × 杠杆。
             let max_notional = self.equity * (self.config.margin_pct / 100.0) * leverage;
-            let qty = max_notional / entry;
+            let qty = max_notional / entry * self.config.fill.fill_ratio();
             if qty <= 0.0 {
                 continue;
             }
@@ -548,7 +557,11 @@ impl<'a> Sim<'a> {
                 score,
                 entry_index: index + 1,
                 peak: next.open,
-                liq_price: entry * (1.0 - direction * (1.0 / leverage - mmr)),
+                liq_price: self
+                    .config
+                    .margin
+                    .liquidation_price(entry, direction, leverage)
+                    .unwrap_or(0.0),
                 mean_reversion,
             });
         }
@@ -697,6 +710,11 @@ impl<'a> Sim<'a> {
         summary.insert("liquidations".into(), json!(self.liquidations));
         summary.insert("leverage".into(), json!(round(leverage, 2)));
         summary.insert("maintenance_margin_rate".into(), json!(round(mmr, 5)));
+        summary.insert(
+            "maker_rate".into(),
+            json!(round(self.config.fee.maker_rate(), 6)),
+        );
+        summary.insert("latency_bars".into(), json!(self.config.latency.bars()));
         summary.insert("final_equity".into(), json!(round(self.equity, 6)));
         summary.insert(
             "disclaimer".into(),
@@ -792,16 +810,6 @@ fn direction_of(side: &str) -> f64 {
     } else {
         -1.0
     }
-}
-
-fn fill_price(price: f64, bps: f64, direction: f64, opening: bool) -> f64 {
-    let rate = bps / 10_000.0;
-    let sign = if (opening && direction > 0.0) || (!opening && direction < 0.0) {
-        1.0
-    } else {
-        -1.0
-    };
-    price * (1.0 + sign * rate)
 }
 
 fn gap_fill(bar: HistoryBar, trigger: f64, direction: f64, adverse: bool) -> f64 {
@@ -1109,8 +1117,15 @@ pub fn run_walkforward(
         apply_params(&mut config, &params);
         let out = run(test, &config)?;
         let mut stressed_config = config.clone();
-        stressed_config.fee_bps *= 2.0;
-        stressed_config.slippage_bps *= 2.0;
+        let stressed_fee_bps = stressed_config.fee.taker_rate() * 20_000.0;
+        let stressed_slip_bps = stressed_config.fill.slip_bps() * 2.0;
+        stressed_config.fee = std::sync::Arc::new(crate::behavior::DefaultFee {
+            taker_bps: stressed_fee_bps,
+        });
+        stressed_config.fill = std::sync::Arc::new(crate::behavior::DefaultFill {
+            slippage_bps: stressed_slip_bps,
+            spread_bps: 0.0,
+        });
         let stressed = run(test, &stressed_config)?;
         let in_sample = best["summary"].clone();
         let out_sample = json!({
@@ -1442,8 +1457,15 @@ pub fn run_walkforward_basket_fixed(
             let mut train_result = run(train, base)?;
             let mut test_result = run(test, base)?;
             let mut stressed_config = base.clone();
-            stressed_config.fee_bps *= 2.0;
-            stressed_config.slippage_bps *= 2.0;
+            let stressed_fee_bps = stressed_config.fee.taker_rate() * 20_000.0;
+            let stressed_slip_bps = stressed_config.fill.slip_bps() * 2.0;
+            stressed_config.fee = std::sync::Arc::new(crate::behavior::DefaultFee {
+                taker_bps: stressed_fee_bps,
+            });
+            stressed_config.fill = std::sync::Arc::new(crate::behavior::DefaultFill {
+                slippage_bps: stressed_slip_bps,
+                spread_bps: 0.0,
+            });
             let mut stressed_result = run(test, &stressed_config)?;
             for result in [&mut train_result, &mut test_result, &mut stressed_result] {
                 tag_trades(result, &regimes, frame_ms);
@@ -1590,15 +1612,20 @@ mod tests {
     fn config() -> EngineConfig {
         EngineConfig {
             interval_ms: 900_000,
-            fee_bps: 5.0,
-            slippage_bps: 2.0,
-            spread_bps: 0.0,
+            fill: std::sync::Arc::new(crate::behavior::DefaultFill {
+                slippage_bps: 2.0,
+                spread_bps: 0.0,
+            }),
+            fee: std::sync::Arc::new(crate::behavior::DefaultFee { taker_bps: 5.0 }),
+            margin: std::sync::Arc::new(crate::behavior::DefaultMargin {
+                maintenance_margin_rate: 0.005,
+            }),
+            latency: std::sync::Arc::new(crate::behavior::NoLatency),
             funding_bps_8h: 1.0,
             initial_equity: 1_000.0,
 
             margin_pct: 50.0,
             leverage: 20.0,
-            maintenance_margin_rate: 0.005,
             max_bars_hold: None,
             policy: TradePolicy {
                 base_threshold: 0.05,
@@ -1679,14 +1706,6 @@ mod tests {
             2
         );
         assert_eq!(funding_crossings(5, 5), 0);
-    }
-
-    #[test]
-    fn slippage_moves_fills_in_the_adverse_direction() {
-        assert!((fill_price(100.0, 10.0, 1.0, true) - 100.1).abs() < 1e-9);
-        assert!((fill_price(100.0, 10.0, 1.0, false) - 99.9).abs() < 1e-9);
-        assert!((fill_price(100.0, 10.0, -1.0, true) - 99.9).abs() < 1e-9);
-        assert!((fill_price(100.0, 10.0, -1.0, false) - 100.1).abs() < 1e-9);
     }
 
     /// 重算开仓信号那一根 K 线的 ATR%，用于校验回测止损距离口径。
@@ -1966,6 +1985,20 @@ mod tests {
         )
         .expect_err("窗口不足时必须返回错误，不能 panic");
         assert!(error.contains("K 线不足"), "实际错误: {error}");
+    }
+
+    #[test]
+    fn a_stressed_fee_model_changes_the_outcome() {
+        let cfg = config();
+        let mut stressed = config();
+        stressed.fee = std::sync::Arc::new(crate::behavior::DefaultFee { taker_bps: 10.0 });
+        let base_result = run(&trending_bars(400), &cfg).unwrap();
+        let stressed_result = run(&trending_bars(400), &stressed).unwrap();
+        assert!(
+            base_result.summary["fee_total"].as_f64().unwrap()
+                < stressed_result.summary["fee_total"].as_f64().unwrap(),
+            "费用模型换挡必须真的改变回测成本"
+        );
     }
 
     fn basket_config() -> EngineConfig {
