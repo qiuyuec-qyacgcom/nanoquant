@@ -730,8 +730,6 @@ pub fn run(bars: &[HistoryBar], config: &EngineConfig) -> Result<BacktestResult,
 }
 
 /// 跑两遍回测（基线 / 信号延后 N 根），产出前视偏差结论。
-/// 当前由证据任务（J3）调用，单独的检测入口便于复现与测试。
-#[allow(dead_code)]
 pub fn run_lookahead(
     bars: &[HistoryBar],
     base: &EngineConfig,
@@ -755,8 +753,6 @@ pub fn run_lookahead(
 }
 
 /// 对序列末尾的 bar，用两种 warmup 长度算 ATR%，比较相对差异。
-/// 当前由证据任务（J3）调用。
-#[allow(dead_code)]
 pub fn measure_recursive_divergence(
     candles: &[crate::providers::CandleSnapshot],
     atr_period: usize,
@@ -1240,6 +1236,10 @@ pub struct BasketMetrics {
     pub symbols_skipped: Vec<String>,
     pub target_regime: String,
     pub timeframe: String,
+    /// 前视偏差体检是否可疑：延后信号后表现反而更好。
+    pub lookahead_suspicious: bool,
+    /// 递归指标稳定性体检是否可疑：不同 warmup 的 ATR% 不收敛。
+    pub recursive_suspicious: bool,
 }
 
 fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
@@ -1273,7 +1273,7 @@ fn timeframe_ms(timeframe: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("timeframe {timeframe} 超出范围"))
 }
 
-fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnapshot> {
+pub(crate) fn candles_from_history(bars: &[HistoryBar], interval_ms: i64) -> Vec<CandleSnapshot> {
     let step = interval_ms.max(1);
     bars.iter()
         .map(|bar| CandleSnapshot {
@@ -1529,6 +1529,8 @@ pub fn run_walkforward_basket_fixed(
         symbols_skipped: skipped,
         target_regime: target.to_string(),
         timeframe: timeframe.to_string(),
+        lookahead_suspicious: false,
+        recursive_suspicious: false,
     })
 }
 

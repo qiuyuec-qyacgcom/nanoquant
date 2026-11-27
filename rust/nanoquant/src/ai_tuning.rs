@@ -296,6 +296,12 @@ fn activate_in_savepoint(
     if !set.params.is_object() {
         return Err(format!("AI 调参 {} params 必须是对象快照", set.id));
     }
+    // 证据门通过还不够：过拟合体检不通过的一律拒绝激活。
+    if set.evidence["gate"]["lookahead_suspect"].as_bool() == Some(true)
+        || set.evidence["gate"]["recursive_suspect"].as_bool() == Some(true)
+    {
+        return Err("候选未通过过拟合体检（lookahead / recursive），拒绝激活".to_string());
+    }
     let before = crate::settings_api::group_value_public(conn, "strategy");
     let current_timeframe = before
         .get("timeframe")
@@ -1823,6 +1829,40 @@ mod tests {
         );
         assert_eq!(
             load_set(&conn, bad_id).unwrap().status,
+            "approved",
+            "失败的激活不得改状态"
+        );
+    }
+
+    #[test]
+    fn activate_rejects_candidate_with_overfit_suspicion() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let range = active_for_regime(&conn, "range").unwrap().unwrap();
+        let id = insert_candidate(
+            &conn,
+            "range-lookahead",
+            "range",
+            "1h",
+            &range.params,
+            Some(range.id),
+        )
+        .unwrap();
+        mark_evidence(
+            &conn,
+            id,
+            true,
+            &json!({"gate":{"pass":true,"lookahead_suspect":true,"recursive_suspect":false}}),
+        )
+        .unwrap();
+        let before = strategy_value(&conn);
+
+        let error = activate(&conn, id, "regime", "demo").unwrap_err();
+
+        assert!(error.contains("过拟合"), "实际错误: {error}");
+        assert_eq!(strategy_value(&conn), before, "体检失败的候选不得物化");
+        assert_eq!(
+            load_set(&conn, id).unwrap().status,
             "approved",
             "失败的激活不得改状态"
         );

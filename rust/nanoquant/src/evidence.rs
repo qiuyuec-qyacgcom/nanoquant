@@ -11,6 +11,8 @@ const MIN_RELATIVE_ADVANTAGE_PP: f64 = 0.10;
 const RELATIVE_ADVANTAGE_EPSILON: f64 = 1e-9;
 /// 止损距离至少 1 倍 ATR：低于该值说明止损落在噪音区，价格容易被扫。
 const MIN_STOP_ATR_RATIO: f64 = 1.0;
+/// 前视嫌疑：证据门直接拒绝，不给阈值 —— 有就是有。
+const BLOCK_ON_LOOKAHEAD: bool = true;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EvidenceReport {
@@ -93,6 +95,12 @@ pub(crate) fn evaluate_gate(
             metrics.max_drawdown_pct, MAX_DRAWDOWN_PCT
         ));
     }
+    if BLOCK_ON_LOOKAHEAD && metrics.lookahead_suspicious {
+        reasons.push("lookahead_suspect: 延后信号后期望显著变好，疑似前视偏差".to_string());
+    }
+    if metrics.recursive_suspicious {
+        reasons.push("recursive_unstable: 指标随 warmup 漂移，疑似递归指标失稳".to_string());
+    }
     if let Some(baseline) = baseline_oos_avg {
         let advantage = metrics.oos_avg_return_pct - baseline;
         if advantage + RELATIVE_ADVANTAGE_EPSILON < MIN_RELATIVE_ADVANTAGE_PP {
@@ -150,6 +158,8 @@ pub(crate) fn evidence_json(
         "gate": {
             "pass": report.pass,
             "reasons": report.reasons,
+            "lookahead_suspect": metrics.lookahead_suspicious,
+            "recursive_suspect": metrics.recursive_suspicious,
         },
     })
 }
@@ -166,6 +176,8 @@ fn metrics_payload(metrics: &BasketMetrics) -> Value {
         "bootstrap_p_positive": metrics.bootstrap_p_positive,
         "avg_stop_atr_ratio": metrics.avg_stop_atr_ratio,
         "min_stop_atr_ratio": metrics.min_stop_atr_ratio,
+        "lookahead_suspicious": metrics.lookahead_suspicious,
+        "recursive_suspicious": metrics.recursive_suspicious,
     })
 }
 
@@ -199,6 +211,8 @@ mod tests {
             symbols_skipped: Vec::new(),
             target_regime: "range".to_string(),
             timeframe: "1h".to_string(),
+            lookahead_suspicious: false,
+            recursive_suspicious: false,
         }
     }
 
@@ -219,11 +233,41 @@ mod tests {
             symbols_skipped: vec!["SKIPPEDUSDT".to_string()],
             target_regime: "range".to_string(),
             timeframe: "1h".to_string(),
+            lookahead_suspicious: false,
+            recursive_suspicious: false,
         }
     }
 
     fn gate(metrics: &BasketMetrics, baseline: Option<f64>) -> EvidenceReport {
         evaluate_gate(metrics, 30, "1h", baseline)
+    }
+
+    #[test]
+    fn lookahead_suspect_blocks_the_evidence_gate() {
+        let mut metrics = passing_metrics();
+        metrics.lookahead_suspicious = true;
+        let report = gate(&metrics, None);
+        assert!(!report.pass, "前视嫌疑必须挡住证据门");
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("lookahead_suspect")),
+            "拒绝原因必须点名前视嫌疑: {:?}",
+            report.reasons
+        );
+    }
+
+    #[test]
+    fn recursive_unstable_blocks_the_evidence_gate() {
+        let mut metrics = passing_metrics();
+        metrics.recursive_suspicious = true;
+        let report = gate(&metrics, None);
+        assert!(!report.pass);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("recursive_unstable")));
     }
 
     #[test]

@@ -62,6 +62,9 @@ async fn evaluate_with_history(
 struct Prepared {
     candidate: AiTuningSet,
     baseline: Option<AiTuningSet>,
+    /// 当前生效的策略参数：有 active 基线用基线，否则用线上 strategy 组。
+    /// 过拟合体检检查的是「当前参数集本身是否有偏」，与候选无关。
+    active_params: Value,
     symbols: Vec<String>,
     risk: Value,
     live_timeframe: String,
@@ -111,6 +114,14 @@ async fn run_gate(
         &prepared.risk,
         &prepared.candidate.timeframe,
     )?;
+    // 体检用当前生效参数（active 基线或线上 strategy），跑在候选之前：
+    // 体检不过的候选即使证据门算了也进不了激活。
+    let health_config = build_config(
+        &prepared.active_params,
+        &prepared.risk,
+        &prepared.candidate.timeframe,
+    )?;
+    let (lookahead_suspicious, recursive_suspicious) = overfit_checks(&basket, &health_config);
     let mut metrics = run_metrics(
         basket.clone(),
         candidate_config,
@@ -118,6 +129,8 @@ async fn run_gate(
         prepared.candidate.timeframe.clone(),
     )
     .await?;
+    metrics.lookahead_suspicious = lookahead_suspicious;
+    metrics.recursive_suspicious = recursive_suspicious;
     merge_skipped(&mut metrics, &data_skipped);
 
     let baseline = match &prepared.baseline {
@@ -183,14 +196,53 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         baseline = ai_tuning::active_for_regime(&conn, "range")?;
     }
     let symbols = pool_symbols(&conn)?;
+    let active_params = baseline
+        .as_ref()
+        .map(|set| set.params.clone())
+        .unwrap_or_else(|| strategy.clone());
     Ok(Some(Prepared {
         candidate,
         baseline,
+        active_params,
         symbols,
         risk,
         live_timeframe,
         min_oos_trades,
     }))
+}
+
+/// 过拟合体检：对每个标的跑前视偏移与递归 warmup 检测，任一不过即标记。
+fn overfit_checks(basket: &[(String, Vec<HistoryBar>)], config: &EngineConfig) -> (bool, bool) {
+    let mut lookahead_suspicious = false;
+    let mut max_divergence = 0.0_f64;
+    for (_, bars) in basket {
+        if let Ok(report) = backtest_engine::run_lookahead(bars, config, 1) {
+            if report.suspicious {
+                tracing::warn!(
+                    baseline = report.baseline_expectancy,
+                    shifted = report.shifted_expectancy,
+                    delta_pct = report.delta_pct,
+                    reason = %report.reason,
+                    "前视偏差体检可疑"
+                );
+                lookahead_suspicious = true;
+            }
+        }
+        let candles = backtest_engine::candles_from_history(bars, config.interval_ms);
+        let divergence = backtest_engine::measure_recursive_divergence(&candles, config.atr_period);
+        if divergence > max_divergence {
+            max_divergence = divergence;
+        }
+    }
+    let recursive = crate::overfit::evaluate_recursive_divergence(max_divergence);
+    if recursive.suspicious {
+        tracing::warn!(
+            divergence = recursive.max_divergence_pct,
+            reason = %recursive.reason,
+            "递归指标稳定性体检可疑"
+        );
+    }
+    (lookahead_suspicious, recursive.suspicious)
 }
 
 pub(crate) fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {

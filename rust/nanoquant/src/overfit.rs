@@ -1,7 +1,6 @@
 //! 回测过拟合体检：前视偏差与递归指标不稳定。
 
 /// 前视偏差检测结论。
-#[allow(dead_code)] // J3 接入证据门后由 evidence_task 读取全部字段
 pub(crate) struct LookaheadReport {
     pub baseline_expectancy: f64,
     pub shifted_expectancy: f64,
@@ -38,7 +37,6 @@ pub(crate) fn evaluate_lookahead(baseline: f64, shifted: f64) -> LookaheadReport
 }
 
 /// 递归指标稳定性结论。
-#[allow(dead_code)] // J3 接入证据门后由 evidence_task 读取全部字段
 pub(crate) struct RecursiveReport {
     pub max_divergence_pct: f64,
     pub suspicious: bool,
@@ -46,17 +44,22 @@ pub(crate) struct RecursiveReport {
 }
 
 /// 默认阈值：两种 warmup 窗口的 ATR% 相对差异超过该比例即判为不稳定。
-#[allow(dead_code)] // J3 接入证据门后由 evidence_task 使用
 pub(crate) const DEFAULT_RECURSIVE_DIVERGENCE_PCT: f64 = 0.05;
 
 /// 判定：同一根 bar 用两种 warmup 长度算出的指标不收敛 → 递归指标失稳。
-#[allow(dead_code)] // J3 接入证据门后由 evidence_task 使用
+/// 多标的场景由调用方先取最大漂移，再用 `evaluate_recursive_divergence` 判定。
+#[allow(dead_code)] // 单标的入口保留给调用方与测试
 pub(crate) fn evaluate_recursive(short_atr_pct: f64, long_atr_pct: f64) -> RecursiveReport {
     let max_divergence_pct = if short_atr_pct.abs() > 1e-9 {
         (long_atr_pct - short_atr_pct).abs() / short_atr_pct.abs()
     } else {
         0.0
     };
+    evaluate_recursive_divergence(max_divergence_pct)
+}
+
+/// 直接按相对漂移判定，供「多标的取最大漂移」的调用方使用。
+pub(crate) fn evaluate_recursive_divergence(max_divergence_pct: f64) -> RecursiveReport {
     let suspicious = max_divergence_pct > DEFAULT_RECURSIVE_DIVERGENCE_PCT;
     RecursiveReport {
         max_divergence_pct,
