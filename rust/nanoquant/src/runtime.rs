@@ -412,6 +412,10 @@ pub(crate) struct EngineRuntime {
     reviewing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     /// 中间区 AI 复核结果缓存：跨轮复用相同 symbol/方向/评分桶的结论。
     review_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, ReviewCache>>>,
+    /// 已确认逐仓的标的 → 缓存过期时间；避免每笔开仓都重发 marginType。
+    isolated_until: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// 已设置的杠杆 → (leverage, 过期时间)；同一标的同一杠杆不重复签名请求。
+    leverage_until: Arc<std::sync::Mutex<std::collections::HashMap<String, (i64, i64)>>>,
     /// 七段延迟样本的异步上报通道；None = 执行内核未连接。
     exec_client: Option<Arc<crate::exec_client::ExecClient>>,
 }
@@ -1375,6 +1379,9 @@ fn current_regime(tx: &rusqlite::Transaction<'_>, mode: &str) -> Result<Option<S
     Ok(None)
 }
 
+/// 逐仓/杠杆确认结果缓存时长：交易所侧这些状态很少变化，10 分钟内不重复确认。
+const VENUE_SETUP_CACHE_SEC: i64 = 600;
+
 impl EngineRuntime {
     pub(crate) fn manage_config(strategy: &Value, risk: &Value) -> crate::manage::ManageConfig {
         crate::manage::ManageConfig {
@@ -1491,6 +1498,8 @@ impl EngineRuntime {
             ai,
             reviewing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             review_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            isolated_until: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            leverage_until: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             exec_client: None,
         }
     }
@@ -4696,6 +4705,43 @@ impl EngineRuntime {
             .unwrap_or(false)
     }
 
+    fn isolated_cached(&self, symbol: &str) -> bool {
+        self.isolated_until
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(symbol).copied())
+            .is_some_and(|until| crate::now() < until)
+    }
+
+    fn mark_isolated(&self, symbol: &str) {
+        if let Ok(mut cache) = self.isolated_until.lock() {
+            cache.insert(symbol.to_string(), crate::now() + VENUE_SETUP_CACHE_SEC);
+        }
+    }
+
+    fn leverage_cached(&self, symbol: &str, leverage: i64) -> bool {
+        self.leverage_until
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(symbol).copied())
+            .is_some_and(|(cached, until)| cached == leverage && crate::now() < until)
+    }
+
+    fn mark_leverage(&self, symbol: &str, leverage: i64) {
+        if let Ok(mut cache) = self.leverage_until.lock() {
+            cache.insert(
+                symbol.to_string(),
+                (leverage, crate::now() + VENUE_SETUP_CACHE_SEC),
+            );
+        }
+    }
+
+    fn forget_leverage(&self, symbol: &str) {
+        if let Ok(mut cache) = self.leverage_until.lock() {
+            cache.remove(symbol);
+        }
+    }
+
     /// 开仓前按标的确保逐仓；已有全仓仓位时交易所会拒绝，直接跳过这笔新开仓。
     async fn ensure_isolated(
         &self,
@@ -4704,6 +4750,9 @@ impl EngineRuntime {
         gateway: &dyn crate::live::Gateway,
         symbol: &str,
     ) -> Result<(), String> {
+        if self.isolated_cached(symbol) {
+            return Ok(());
+        }
         let params = [
             ("symbol".to_string(), symbol.to_string()),
             ("marginType".to_string(), "ISOLATED".to_string()),
@@ -4716,6 +4765,7 @@ impl EngineRuntime {
             return Err("结果未知，已阻止本次开仓".to_string());
         }
         if (200..300).contains(&reply.status) || reply.body.contains("-4046") {
+            self.mark_isolated(symbol);
             return Ok(());
         }
         Err(format!(
@@ -4775,40 +4825,44 @@ impl EngineRuntime {
             }
             if let Some(entry) = &plan.entry {
                 let leverage = entry.leverage as i64;
-                let params = [
-                    ("symbol".into(), plan.symbol.clone()),
-                    ("leverage".into(), leverage.to_string()),
-                ];
-                let request = match self
-                    .build_live(&mut gate, creds, "POST", "/fapi/v1/leverage", &params)
-                    .await
-                {
-                    Ok(request) => request,
-                    Err(error) => {
-                        failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
+                if !self.leverage_cached(&plan.symbol, leverage) {
+                    let params = [
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("leverage".into(), leverage.to_string()),
+                    ];
+                    let request = match self
+                        .build_live(&mut gate, creds, "POST", "/fapi/v1/leverage", &params)
+                        .await
+                    {
+                        Ok(request) => request,
+                        Err(error) => {
+                            failures.push(format!("{} 杠杆设置被拦截：{error}", plan.symbol));
+                            self.report_segments(&[
+                                ("total", elapsed_ms(t_total)),
+                                ("plan", elapsed_ms(t_plan)),
+                            ]);
+                            continue;
+                        }
+                    };
+                    let response = gateway.send(&request).await;
+                    let body = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
+                    if body["code"].as_i64() == Some(-1003) {
+                        gate.observe(body["msg"].as_str().unwrap_or(""), crate::now_millis());
+                    }
+                    if response.transport_failed
+                        || !(200..300).contains(&response.status)
+                        || body["symbol"].as_str() != Some(plan.symbol.as_str())
+                        || body["leverage"].as_i64() != Some(leverage)
+                    {
+                        self.forget_leverage(&plan.symbol);
+                        failures.push(format!("{} 无法确认交易所杠杆，跳过开仓", plan.symbol));
                         self.report_segments(&[
                             ("total", elapsed_ms(t_total)),
                             ("plan", elapsed_ms(t_plan)),
                         ]);
                         continue;
                     }
-                };
-                let response = gateway.send(&request).await;
-                let body = serde_json::from_str::<Value>(&response.body).unwrap_or(Value::Null);
-                if body["code"].as_i64() == Some(-1003) {
-                    gate.observe(body["msg"].as_str().unwrap_or(""), crate::now_millis());
-                }
-                if response.transport_failed
-                    || !(200..300).contains(&response.status)
-                    || body["symbol"].as_str() != Some(plan.symbol.as_str())
-                    || body["leverage"].as_i64() != Some(leverage)
-                {
-                    failures.push(format!("{} 无法确认交易所杠杆，跳过开仓", plan.symbol));
-                    self.report_segments(&[
-                        ("total", elapsed_ms(t_total)),
-                        ("plan", elapsed_ms(t_plan)),
-                    ]);
-                    continue;
+                    self.mark_leverage(&plan.symbol, leverage);
                 }
             }
             let client_order_id = crate::live::client_order_id("nq", &plan.purpose, index);
@@ -8658,6 +8712,26 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             candle.low = price - 0.05;
         }
         (db, snapshot)
+    }
+
+    #[test]
+    fn venue_setup_cache_skips_repeated_leverage_but_not_changes() {
+        let db = test_db();
+        let runtime = test_runtime(&db);
+
+        assert!(!runtime.leverage_cached("BTCUSDT", 10));
+        runtime.mark_leverage("BTCUSDT", 10);
+        assert!(runtime.leverage_cached("BTCUSDT", 10), "相同杠杆应命中缓存");
+        assert!(
+            !runtime.leverage_cached("BTCUSDT", 20),
+            "杠杆变化必须重新设置"
+        );
+        runtime.forget_leverage("BTCUSDT");
+        assert!(!runtime.leverage_cached("BTCUSDT", 10), "失败后必须失效");
+
+        assert!(!runtime.isolated_cached("BTCUSDT"));
+        runtime.mark_isolated("BTCUSDT");
+        assert!(runtime.isolated_cached("BTCUSDT"));
     }
 
     #[tokio::test]
