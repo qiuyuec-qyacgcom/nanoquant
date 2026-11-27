@@ -193,8 +193,60 @@ impl AuditSignal {
                 }
             }
             object.insert("filter_trace".into(), trace);
+            // 结构化洞察：方向、幅度、置信度、有效期、否决方一眼可读。
+            object.insert("insight".into(), json!(self.insight()));
         }
         features
+    }
+
+    /// 把审计字段收敛成 Insight 对象；`signals.features.insight` 与决策日志共用同一形状。
+    pub fn insight(&self) -> crate::insight::Insight {
+        crate::insight::Insight {
+            direction: self.direction.clone(),
+            magnitude: self.score.abs().clamp(0.0, 1.0),
+            confidence: self.ai_confidence,
+            valid_bars: self.valid_bars.map(|value| value.max(0) as u64),
+            vetoed_by: self.veto_source(),
+            action: self.normalized_action(),
+            reason: if self.reject_reason.trim().is_empty() {
+                self.ai_reason.clone()
+            } else {
+                self.reject_reason.clone()
+            },
+        }
+    }
+
+    fn normalized_action(&self) -> String {
+        let action = self.ai_action.trim();
+        if !action.is_empty() && action != "none" {
+            return action.to_string();
+        }
+        if self.decision == "opened" {
+            return if self.direction == "short" {
+                "open_short".to_string()
+            } else {
+                "open_long".to_string()
+            };
+        }
+        if self.decision == "rejected" {
+            "reject".to_string()
+        } else {
+            "hold".to_string()
+        }
+    }
+
+    /// 把闸门类别映射成 Insight 的否决方枚举；无拒绝原因时为 None。
+    fn veto_source(&self) -> Option<String> {
+        let source = match classify_gate(&self.reject_reason, &self.stage) {
+            "none" => return None,
+            "funding_veto" => "funding_veto",
+            "news_veto" => "news_veto",
+            "score_split_low" => "score_split_low",
+            "ai_fail_open" => "ai_fail_open",
+            "ai_dq" | "ai_rr" | "ai_confidence" | "ai_direction" => "ai_veto",
+            _ => "risk_gate",
+        };
+        Some(source.to_string())
     }
 }
 
@@ -455,6 +507,8 @@ struct SignalMetricRow {
     queue_ms: Option<f64>,
     /// 提示词档位，来自 features.ai_prompt_profile。
     prompt_profile: Option<String>,
+    /// 是否已带结构化 insight。
+    has_insight: bool,
 }
 
 fn round2(value: f64) -> f64 {
@@ -486,9 +540,13 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         GATE_KEYS.iter().map(|key| (*key, 0_i64)).collect();
     let mut walls: Vec<f64> = Vec::new();
     let mut queues: Vec<f64> = Vec::new();
+    let mut insight_signals = 0_i64;
 
     for row in signal_metric_rows(conn, mode, since) {
         signals_total += 1;
+        if row.has_insight {
+            insight_signals += 1;
+        }
         if let Some(ms) = row.wall_ms {
             walls.push(ms);
         }
@@ -590,6 +648,11 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "high_score_skip": high_score_skip,
         "ai_prompt_full": ai_prompt_full,
         "ai_prompt_slim": ai_prompt_slim,
+        "insight_coverage": if signals_total == 0 {
+            0.0
+        } else {
+            round2(insight_signals as f64 / signals_total as f64)
+        },
         "gates": gates,
         "ai_latency_samples": latencies.len(),
         "ai_latency_p50_ms": percentile(&latencies, 0.50),
@@ -661,7 +724,8 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
              json_extract(features, '$.ai_scale'), \
              json_extract(features, '$.ai_latency.wall_ms'), \
              json_extract(features, '$.ai_latency.queue_ms'), \
-             json_extract(features, '$.ai_prompt_profile') \
+             json_extract(features, '$.ai_prompt_profile'), \
+             json_extract(features, '$.insight') IS NOT NULL \
              FROM signals WHERE ts >= ?1 AND mode = ?2",
         )
         .ok()?;
@@ -679,6 +743,10 @@ fn json_extract_rows(conn: &Connection, mode: &str, since: i64) -> Option<Vec<Si
                 wall_ms: r.get(5)?,
                 queue_ms: r.get(6)?,
                 prompt_profile: r.get(7)?,
+                has_insight: r
+                    .get::<_, Option<i64>>(8)?
+                    .map(|flag| flag != 0)
+                    .unwrap_or(false),
             })
         })
         .ok()?;
@@ -717,6 +785,7 @@ fn features_rows(conn: &Connection, mode: &str, since: i64) -> Vec<SignalMetricR
                 wall_ms: value["ai_latency"]["wall_ms"].as_f64(),
                 queue_ms: value["ai_latency"]["queue_ms"].as_f64(),
                 prompt_profile: value["ai_prompt_profile"].as_str().map(str::to_string),
+                has_insight: value.get("insight").is_some(),
             }
         })
         .collect()
@@ -778,6 +847,47 @@ mod tests {
             rusqlite::params![ts, features, ai_action, decision, mode],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn insight_is_merged_into_features_with_veto_source() {
+        let row = AuditSignal::new("BTCUSDT")
+            .with_direction("long")
+            .with_score(-0.4)
+            .with_ai("reject", 0.3, "弱势")
+            .with_decision("rejected")
+            .with_stage("gate")
+            .with_reject_reason("负面事件否决：交易所被调查");
+        let features = row.features_with_meta();
+        assert_eq!(features["insight"]["direction"], "long");
+        assert_eq!(features["insight"]["magnitude"], 0.4);
+        assert_eq!(features["insight"]["confidence"], 0.3);
+        assert_eq!(features["insight"]["action"], "reject");
+        assert_eq!(features["insight"]["vetoed_by"], "news_veto");
+        assert_eq!(features["insight"]["reason"], "负面事件否决：交易所被调查");
+    }
+
+    #[test]
+    fn half_ai_stats_reports_insight_coverage() {
+        let conn = table();
+        let now = 400_000;
+        insert_signal(
+            &conn,
+            now - 10,
+            "opened",
+            "open_long",
+            r#"{"insight":{"direction":"long","magnitude":0.8},"filter_trace":{"gate":"none"}}"#,
+        );
+        insert_signal(
+            &conn,
+            now - 20,
+            "rejected",
+            "reject",
+            r#"{"filter_trace":{"gate":"ai_dq"}}"#,
+        );
+        let value = half_ai_stats(&conn, "demo", now, 86_400);
+        assert_eq!(value["signals_total"], 2);
+        assert_eq!(value["insight_coverage"], 0.5);
     }
 
     #[test]

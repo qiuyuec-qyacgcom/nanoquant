@@ -252,6 +252,20 @@ pub(crate) fn record_decision(
     if confidence < journal_min_record_confidence(conn) {
         return None;
     }
+    // 结构化洞察与 signals.features.insight 同形，便于两张表交叉对照。
+    let insight = crate::insight::Insight {
+        direction: direction.to_string(),
+        magnitude: confidence.abs().clamp(0.0, 1.0),
+        confidence,
+        valid_bars: None,
+        vetoed_by: None,
+        action: format!("open_{direction}"),
+        reason: reason.chars().take(900).collect(),
+    };
+    let mut snapshot_with_insight = snapshot.clone();
+    if let Some(object) = snapshot_with_insight.as_object_mut() {
+        object.insert("insight".to_string(), serde_json::json!(insight));
+    }
     conn.execute(
         "INSERT INTO decision_journal(ts, symbol, direction, confidence, entry_price, target_pct, \
          reason, snapshot, decision, signal_id, injected_experience_ids, status, outcome, \
@@ -265,7 +279,7 @@ pub(crate) fn record_decision(
             entry_price,
             target_pct,
             reason.chars().take(900).collect::<String>(),
-            serde_json::to_string(snapshot).unwrap_or_else(|_| "{}".to_string()),
+            serde_json::to_string(&snapshot_with_insight).unwrap_or_else(|_| "{}".to_string()),
             format!("open_{direction}"),
             mode,
         ),

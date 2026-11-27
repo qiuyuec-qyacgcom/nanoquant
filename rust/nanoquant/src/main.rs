@@ -52,6 +52,7 @@ mod fast_risk;
 mod ga_tune;
 mod history;
 mod indicators;
+mod insight;
 mod interpreter_refs;
 mod journal;
 mod journal_api;
