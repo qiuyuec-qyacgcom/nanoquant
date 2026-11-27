@@ -187,6 +187,7 @@ const VISIBLE: &[(&str, &[&str])] = &[
         "strategy",
         &[
             "timeframe",
+            "higher_timeframe",
             "valid_bars",
             "entry_threshold",
             "min_entry_rr",

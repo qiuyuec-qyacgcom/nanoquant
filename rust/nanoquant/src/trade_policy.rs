@@ -307,6 +307,12 @@ pub(crate) fn evaluate(
     })
 }
 
+/// 高周期过滤：趋势仓只在高周期处于 Trend 时才允许开仓。
+/// 高周期不可判定（数据不足）时放行 —— 宁可少拦，不可把整个系统锁死。
+pub(crate) fn higher_timeframe_allows_trend(regime: crate::regime::Regime) -> bool {
+    regime == crate::regime::Regime::Trend
+}
+
 /// 全仓唯一 EMA 实现：以第一根收盘价播种，避免信号内核与 AI 特征快照
 /// 各用一套播种口径导致长周期下 EMA 差出现可见分叉。
 pub(crate) fn ema(values: &[f64], period: usize) -> Option<f64> {
@@ -689,6 +695,17 @@ mod tests {
             .is_none(),
             "adx_period 用尽 K 线时内核必须拒绝"
         );
+    }
+
+    #[test]
+    fn trend_entry_is_blocked_when_the_higher_timeframe_is_not_trending() {
+        // 高周期为震荡时，趋势仓不得开仓；均值回归仓不受此过滤影响。
+        assert!(
+            !higher_timeframe_allows_trend(crate::regime::Regime::Range),
+            "高周期非趋势时趋势仓必须被拦"
+        );
+        assert!(!higher_timeframe_allows_trend(crate::regime::Regime::Chaos));
+        assert!(higher_timeframe_allows_trend(crate::regime::Regime::Trend));
     }
 
     #[test]

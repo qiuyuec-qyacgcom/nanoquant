@@ -202,6 +202,60 @@ pub(crate) fn regime_series(
         .collect()
 }
 
+/// 用本周期 K 线聚合出高周期 K 线，并给出其 regime。
+///
+/// 高周期非法、不能整除本周期、聚合后不足 30 根或指标不可用时返回 None；
+/// 调用方按「不可判定即放行」处理，避免把系统整体锁死。
+pub(crate) fn higher_timeframe_regime(
+    candles: &[CandleSnapshot],
+    higher: &str,
+    base: &str,
+    atr_period: usize,
+    policy: crate::trade_policy::TradePolicy,
+) -> Option<Regime> {
+    let higher_ms = crate::history::interval_ms(higher)?;
+    let base_ms = crate::history::interval_ms(base)?;
+    if higher_ms <= base_ms || higher_ms % base_ms != 0 {
+        return None;
+    }
+    let aggregated = aggregate_candles(candles, higher_ms);
+    if aggregated.len() < MIN_BARS_FOR_REGIME {
+        return None;
+    }
+    let mark = aggregated.last()?.close;
+    let metrics = candle_metrics(&aggregated, atr_period)?;
+    crate::trade_policy::regime_for(
+        &aggregated,
+        mark,
+        metrics.atr,
+        policy,
+        crate::trade_policy::MarketFeatures::default(),
+    )
+}
+
+/// 按 close_time 所在的高周期桶聚合 K 线；输入需按时间升序。
+fn aggregate_candles(candles: &[CandleSnapshot], bucket_ms: i64) -> Vec<CandleSnapshot> {
+    let mut out: Vec<CandleSnapshot> = Vec::new();
+    let mut bucket = i64::MIN;
+    for candle in candles {
+        let key = candle.close_time / bucket_ms.max(1);
+        match out.last_mut() {
+            Some(last) if key == bucket => {
+                last.high = last.high.max(candle.high);
+                last.low = last.low.min(candle.low);
+                last.close = candle.close;
+                last.close_time = candle.close_time;
+                last.volume += candle.volume;
+            }
+            _ => {
+                bucket = key;
+                out.push(candle.clone());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +409,36 @@ mod tests {
                 .iter()
                 .any(Option::is_some),
             "稳定合成序列在 30 根后至少应有一个 regime"
+        );
+    }
+
+    #[test]
+    fn higher_timeframe_regime_aggregates_and_rejects_bad_inputs() {
+        let candles = synthesized_candles(240);
+        let policy = crate::trade_policy::TradePolicy {
+            base_threshold: 0.3,
+            volume_ratio_min: 0.8,
+            atr_pct_min: 0.05,
+            atr_pct_max: 4.0,
+            ema: crate::trade_policy::EmaPeriods { fast: 9, slow: 21 },
+            adx_period: 14,
+        };
+        assert_eq!(
+            higher_timeframe_regime(&candles, "4h", "1h", 14, policy),
+            Some(Regime::Trend),
+            "单边上涨聚合后应判为趋势"
+        );
+        assert!(
+            higher_timeframe_regime(&candles, "1h", "4h", 14, policy).is_none(),
+            "高周期必须大于本周期"
+        );
+        assert!(
+            higher_timeframe_regime(&candles, "7m", "1h", 14, policy).is_none(),
+            "非法周期必须放行"
+        );
+        assert!(
+            higher_timeframe_regime(&candles[..60], "4h", "1h", 14, policy).is_none(),
+            "聚合后不足 30 根必须放行"
         );
     }
 

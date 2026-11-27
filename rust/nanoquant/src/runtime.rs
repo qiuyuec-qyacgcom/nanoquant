@@ -2948,6 +2948,16 @@ impl EngineRuntime {
         let regime = current_regime(tx, mode)?;
         let mean_reversion_active =
             crate::mean_reversion::mean_reversion_active(regime.as_deref(), strategy);
+        // 高周期过滤：趋势仓只在高周期 Trend 下开仓；不可判定时放行。
+        let base_timeframe = strategy
+            .get("timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let higher_timeframe = strategy
+            .get("higher_timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let atr_period = crate::ai_analysis::atr_period_of(strategy);
         let filters = crate::live::load_filters(tx, scanned);
         let mut returns = Vec::new();
         for symbol in scanned {
@@ -3021,6 +3031,43 @@ impl EngineRuntime {
                 continue;
             };
             let price = market.mark_price;
+            let higher_regime = if !mean_reversion_active && higher_timeframe != base_timeframe {
+                crate::regime::higher_timeframe_regime(
+                    &market.candles,
+                    higher_timeframe,
+                    base_timeframe,
+                    atr_period,
+                    policy,
+                )
+            } else {
+                None
+            };
+            if !mean_reversion_active {
+                if let Some(higher) = higher_regime {
+                    if !crate::trade_policy::higher_timeframe_allows_trend(higher) {
+                        let reason = format!(
+                            "higher_timeframe_not_trend: {higher_timeframe} 周期 {}",
+                            higher.as_str()
+                        );
+                        let row = crate::signal_audit::AuditSignal::new(symbol)
+                            .with_direction("flat")
+                            .with_score(0.0)
+                            .with_stage("gate")
+                            .with_features(serde_json::json!({
+                                "higher_timeframe": higher_timeframe,
+                                "higher_regime": higher.as_str(),
+                            }))
+                            .with_decision("rejected")
+                            .with_reject_reason(&reason);
+                        if let Err(error) =
+                            crate::signal_audit::record(tx, mode, crate::now(), &[row])
+                        {
+                            tracing::warn!(%error, "高周期过滤审计写入失败，不影响本轮周期");
+                        }
+                        continue;
+                    }
+                }
+            }
             let features = crate::trade_policy::MarketFeatures {
                 funding_rate: market.funding_rate,
                 open_interest_change_pct: market.open_interest_change_pct,
@@ -3195,6 +3242,8 @@ impl EngineRuntime {
                 "preview_score": preview_score,
                 "quant_passed": quant_passed,
                 "mean_reversion": mean_reversion,
+                "higher_timeframe": higher_timeframe,
+                "higher_regime": higher_regime.map(|regime| regime.as_str()),
                 "mr_sl_pct": if mean_reversion { strategy["mr_sl_pct"].as_f64().unwrap_or(20.0) } else { 0.0 },
                 "mr_tp_pct": if mean_reversion { strategy["mr_tp_pct"].as_f64().unwrap_or(30.0) } else { 0.0 },
                 "signal_reason": signal_reason,

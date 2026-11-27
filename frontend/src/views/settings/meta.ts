@@ -314,6 +314,7 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     },
     valid_bars: { label: '信号有效期', unit: '根 K 线', min: 1, max: 24, step: 1, hint: 'AI 给出的判断有效期（K 线根数）；1 根 = 1 个当前 K 线周期，仅供审计展示，不改变开仓行为' },
     min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', min: 0, max: 10, step: 0.1, hint: 'AI 预期盈亏比低于该值时不开仓' },
+    higher_timeframe: { label: '高周期过滤', hint: '趋势仓只在该周期处于趋势时开仓；行情不足无法判定时放行' },
   },
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型编排由供应商列表决定' },

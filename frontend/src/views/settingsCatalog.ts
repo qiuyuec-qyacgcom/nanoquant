@@ -32,7 +32,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '下单', fields: ['order_type', 'close_on_halt', 'recv_window_ms'] },
   ],
   strategy: [
-    { title: '基础', fields: ['timeframe', 'valid_bars', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
+    { title: '基础', fields: ['timeframe', 'higher_timeframe', 'valid_bars', 'ema_fast', 'ema_slow', 'rsi_period', 'atr_period'] },
     {
       title: '入场过滤',
       hint: '任一项不达标都不开仓',
