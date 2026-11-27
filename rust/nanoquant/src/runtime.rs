@@ -2847,6 +2847,24 @@ impl EngineRuntime {
             scan_gates: &gates,
             budget: engine["max_symbols_per_cycle"].as_u64().unwrap_or(12) as usize,
         });
+        // 对账报告事件化：只记数量对不上或有裸仓的，避免每轮刷屏。
+        for status in crate::reconcile::position_status_reports(&venue, &local) {
+            if status.reconciled && !status.naked {
+                continue;
+            }
+            let message = format!(
+                "{} {} 本地 {:.8} / 交易所 {:.8}",
+                status.symbol, status.side, status.local_qty, status.venue_qty
+            );
+            let payload = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+            if let Err(error) = tx.execute(
+                "INSERT INTO engine_events(ts,level,category,message,payload) \
+                 VALUES(?1,'warn','reconcile',?2,?3)",
+                (crate::now(), message, payload),
+            ) {
+                tracing::warn!(%error, "对账事件写入失败，不影响本轮周期");
+            }
+        }
         // 止损保护是独立状态，不属于 risk 输入；熔断期间的亏损仓位仍要管，
         // 所以只拦扫描，不拦管仓。
         let risk_gate = crate::risk::global_gates(&risk);

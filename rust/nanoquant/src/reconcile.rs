@@ -104,6 +104,68 @@ pub fn reconcile(
     actions
 }
 
+/// 订单状态报告：交易所侧看到的订单状态。
+#[allow(dead_code)] // 报告模型先落形状，执行侧后续填充
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OrderStatusReport {
+    pub client_order_id: String,
+    pub venue_order_id: String,
+    pub status: String,
+    pub executed_qty: f64,
+    pub avg_price: f64,
+    pub updated_at: i64,
+}
+
+/// 成交报告：一次成交的事实。
+#[allow(dead_code)] // 报告模型先落形状，执行侧后续填充
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FillReport {
+    pub client_order_id: String,
+    pub qty: f64,
+    pub price: f64,
+    pub fee: f64,
+    pub filled_at: i64,
+}
+
+/// 持仓状态报告：本地与交易所的差异。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PositionStatusReport {
+    pub symbol: String,
+    pub side: String,
+    pub venue_qty: f64,
+    pub local_qty: f64,
+    pub qty_diff: f64,
+    pub reconciled: bool,
+    /// 裸仓：交易所侧既没有止损也没有止盈。
+    pub naked: bool,
+}
+
+/// 逐个标的比对本地与交易所持仓。
+pub fn position_status_reports(
+    venue: &[VenuePosition],
+    local: &[LocalPosition],
+) -> Vec<PositionStatusReport> {
+    venue
+        .iter()
+        .map(|venue| {
+            let matched = local
+                .iter()
+                .find(|item| item.symbol == venue.symbol && item.side == venue.side);
+            let local_qty = matched.map(|item| item.qty).unwrap_or(0.0);
+            let qty_diff = venue.qty - local_qty;
+            PositionStatusReport {
+                symbol: venue.symbol.clone(),
+                side: venue.side.clone(),
+                venue_qty: venue.qty,
+                local_qty,
+                qty_diff,
+                reconciled: qty_diff.abs() < 1e-9,
+                naked: venue.sl_price <= 0.0 && venue.tp_price <= 0.0,
+            }
+        })
+        .collect()
+}
+
 /// 平仓盈亏：价差减去开平两次手续费。方向为 long 时价格上涨盈利。
 fn realized_pnl(side: &str, entry: f64, exit: f64, qty: f64, fee_rate: f64) -> f64 {
     let direction = if side == "long" { 1.0 } else { -1.0 };
@@ -139,6 +201,27 @@ mod tests {
             qty: 1.0,
             entry_price: 100.0,
         }
+    }
+
+    #[test]
+    fn reconcile_emits_position_status_reports() {
+        let venue_rows = vec![venue("BTCUSDT", 1.0, 90.0)];
+        let mut local_row = local("BTCUSDT", "live");
+        local_row.qty = 0.5;
+        let reports = position_status_reports(&venue_rows, &[local_row]);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].reconciled, "数量不一致必须标为未对账");
+        assert!((reports[0].qty_diff - 0.5).abs() < 1e-9);
+        assert!(!reports[0].naked, "带止损的仓位不是裸仓");
+    }
+
+    #[test]
+    fn status_report_marks_naked_venue_position_without_local_row() {
+        let reports = position_status_reports(&[venue("ETHUSDT", 2.0, 0.0)], &[]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].local_qty, 0.0);
+        assert!(!reports[0].reconciled);
+        assert!(reports[0].naked, "无止损止盈的交易所仓位必须标成裸仓");
     }
 
     #[test]
