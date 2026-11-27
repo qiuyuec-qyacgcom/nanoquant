@@ -1006,6 +1006,7 @@ mod tests {
             ("POST", "/api/v1/engine/positions/1/protect"),
             ("POST", "/api/v1/engine/positions/1/close"),
             ("GET", "/api/v1/engine/orders"),
+            ("GET", "/api/v1/engine/decisions"),
             ("GET", "/api/v1/engine/protection"),
             ("DELETE", "/api/v1/engine/protection/1"),
             ("GET", "/api/v1/engine/trades"),

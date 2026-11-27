@@ -144,6 +144,12 @@ fn apply_fill_tx(
             "UPDATE positions SET trade_id=?1 WHERE id=?2",
             (id, position.0),
         );
+        // 决策溯源：成交继承开仓时的 decision_id，让「信号→订单→持仓→成交」
+        // 用同一个 ID 串起来；旧库/测试夹具缺列时忽略。
+        let _ = tx.execute(
+            "UPDATE trades SET decision_id=(SELECT decision_id FROM positions WHERE id=?1) WHERE id=?2",
+            (position.0, id),
+        );
     }
     Ok((true, trade_id))
 }
@@ -671,6 +677,47 @@ mod tests {
         assert!((roi_pct - pnl_pct * 5.0).abs() < 1e-9);
         assert_eq!(ai_confidence, 0.6);
         assert_eq!(ai_reason, "test");
+    }
+
+    #[test]
+    fn closing_fill_carries_decision_id_into_trade() {
+        // 成交继承开仓时的 decision_id，读模型才能从订单一路追到盈亏。
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,venue_unrealized,venue_ts,\
+             leverage,margin,sl_price,tp_price,peak_price,opened_at,closed_at,exit_price,exit_reason,\
+             realized_pnl,fees,ai_confidence,ai_reason,signal_score,entry_slippage_bps,initial_sl_price,\
+             partial_taken_at,mode,status,trade_id,decision_id) \
+             VALUES('BTCUSDT','long',1,100,100,0,0,5,20,95,0,100,1,0,0,'',0,0,0,'',0,0,95,0,'demo','open',0,'demo:BTCUSDT:1:long');",
+        )
+        .unwrap();
+        let fill = DemoFill {
+            client_order_id: "nq-decision-close".into(),
+            exchange_order_id: "e1".into(),
+            symbol: "BTCUSDT".into(),
+            side: "SELL".into(),
+            qty: 1.0,
+            price: 110.0,
+            reduce_only: true,
+            reason: "take_profit".into(),
+        };
+        let trade_id = apply_demo_fill(&conn, "demo", 10, 0.0005, &fill)
+            .unwrap()
+            .1
+            .expect("平仓应写入成交");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT decision_id FROM trades WHERE id=?1",
+                [trade_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("demo:BTCUSDT:1:long"),
+            "成交必须继承开仓决策 ID"
+        );
     }
 
     #[test]

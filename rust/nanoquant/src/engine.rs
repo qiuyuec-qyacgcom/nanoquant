@@ -19,6 +19,7 @@ pub fn routes() -> Router<Db> {
         .route("/engine/ai-value", get(ai_value))
         .route("/engine/positions", get(positions))
         .route("/engine/orders", get(orders))
+        .route("/engine/decisions", get(decisions))
         .route("/engine/trades", get(trades))
         .route("/engine/signals", get(signals))
         .route("/engine/equity", get(equity))
@@ -407,6 +408,154 @@ async fn orders(State(db): State<Db>, Query(q): Query<OrdersQuery>) -> Json<Valu
         .collect::<Result<_, _>>()
         .expect("order rows");
     json!({ "items": items, "source": "local" }).into()
+}
+
+#[derive(Deserialize)]
+struct DecisionsQuery {
+    #[serde(default = "default_decisions_limit")]
+    limit: i64,
+}
+
+fn default_decisions_limit() -> i64 {
+    50
+}
+
+/// 决策链路读模型：以开仓订单为锚点，按 decision_id 聚合拆单，
+/// 再补上对应的持仓与成交，回答「这笔决策最后走到哪一步」。
+/// 旧数据没有 decision_id，直接跳过，不与新链路混在一组。
+async fn decisions(State(db): State<Db>, Query(q): Query<DecisionsQuery>) -> Json<Value> {
+    let limit = q.limit.clamp(1, 200);
+    let mode = current_mode(&db);
+    let Ok(conn) = db.read() else {
+        return json!({"items": [], "mode": mode, "error": "数据库不可用"}).into();
+    };
+    // 老库/最小测试夹具没有 decision_id 列时降级为空列表，不把接口打成 500。
+    let mut stmt = match conn.prepare(
+        "SELECT decision_id, ts, symbol, side, qty, price, status, client_order_id, order_type \
+         FROM orders WHERE mode=?1 AND purpose='entry' \
+           AND decision_id IS NOT NULL AND decision_id != '' \
+         ORDER BY ts DESC, id DESC LIMIT ?2",
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            return json!({"items": [], "mode": mode, "error": error.to_string()}).into();
+        }
+    };
+    let rows = match stmt.query_map(rusqlite::params![mode, limit], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, f64>(4)?,
+            r.get::<_, f64>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return json!({"items": [], "mode": mode, "error": error.to_string()}).into();
+        }
+    };
+    // 同一决策可能拆成多笔订单：数量累加，状态与笔数一并保留。
+    let mut items: Vec<Value> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let Ok((decision_id, ts, symbol, side, qty, price, status, client_order_id, order_type)) =
+            row
+        else {
+            continue;
+        };
+        if let Some(&slot) = index.get(&decision_id) {
+            let order = &mut items[slot]["order"];
+            let orders = order["orders"].as_i64().unwrap_or(0) + 1;
+            let total_qty = order["qty"].as_f64().unwrap_or(0.0) + qty;
+            order["orders"] = json!(orders);
+            order["qty"] = json!(round_n(total_qty, 8));
+            if let Some(statuses) = order["statuses"].as_array_mut() {
+                statuses.push(json!(status));
+            }
+            continue;
+        }
+        index.insert(decision_id.clone(), items.len());
+        items.push(json!({
+            "decision_id": decision_id,
+            "symbol": symbol,
+            "side": side,
+            "order": {
+                "ts": ts,
+                "price": price,
+                "qty": round_n(qty, 8),
+                "orders": 1,
+                "statuses": [status],
+                "client_order_id": client_order_id,
+                "order_type": order_type,
+            },
+            "position": Value::Null,
+            "trade": Value::Null,
+        }));
+    }
+    for item in items.iter_mut() {
+        let decision_id = item["decision_id"].as_str().unwrap_or_default().to_string();
+        item["position"] = decision_position(&conn, &mode, &decision_id).unwrap_or(Value::Null);
+        item["trade"] = decision_trade(&conn, &mode, &decision_id).unwrap_or(Value::Null);
+    }
+    let count = items.len();
+    json!({"mode": mode, "count": count, "items": items}).into()
+}
+
+/// 某个决策对应的最新持仓；旧库缺列或没有持仓时返回 None。
+fn decision_position(conn: &Connection, mode: &str, decision_id: &str) -> Option<Value> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(status,''), COALESCE(qty,0), COALESCE(entry_price,0), \
+             COALESCE(leverage,1), COALESCE(opened_at,0), COALESCE(closed_at,0), \
+             COALESCE(exit_reason,''), COALESCE(realized_pnl,0) \
+             FROM positions WHERE mode=?1 AND decision_id=?2 ORDER BY id DESC LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row(rusqlite::params![mode, decision_id], |r| {
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "status": r.get::<_, String>(1)?,
+            "qty": round_n(r.get::<_, f64>(2)?, 8),
+            "entry_price": r.get::<_, f64>(3)?,
+            "leverage": r.get::<_, f64>(4)?,
+            "opened_at": r.get::<_, i64>(5)?,
+            "closed_at": r.get::<_, i64>(6)?,
+            "exit_reason": r.get::<_, String>(7)?,
+            "realized_pnl": round_n(r.get::<_, f64>(8)?, 8),
+        }))
+    })
+    .ok()
+}
+
+/// 某个决策对应的最新成交；持仓未平时自然为 None。
+fn decision_trade(conn: &Connection, mode: &str, decision_id: &str) -> Option<Value> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, COALESCE(qty,0), COALESCE(exit_price,0), COALESCE(pnl,0), \
+             COALESCE(pnl_pct,0), COALESCE(roi_pct,0), COALESCE(closed_at,0), \
+             COALESCE(exit_reason,''), COALESCE(fees,0) \
+             FROM trades WHERE mode=?1 AND decision_id=?2 ORDER BY id DESC LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row(rusqlite::params![mode, decision_id], |r| {
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "qty": round_n(r.get::<_, f64>(1)?, 8),
+            "exit_price": r.get::<_, f64>(2)?,
+            "pnl": round_n(r.get::<_, f64>(3)?, 8),
+            "pnl_pct": round_n(r.get::<_, f64>(4)?, 4),
+            "roi_pct": round_n(r.get::<_, f64>(5)?, 4),
+            "closed_at": r.get::<_, i64>(6)?,
+            "exit_reason": r.get::<_, String>(7)?,
+            "fees": round_n(r.get::<_, f64>(8)?, 8),
+        }))
+    })
+    .ok()
 }
 
 /// 交易所仓位快照超过这个秒数就回退到按标记价估算，对齐 `position_view.VENUE_FRESH_SEC`。
@@ -2136,6 +2285,61 @@ mod tests {
         assert_eq!(items[0]["ts"], 300, "应按时间倒序");
         assert_eq!(items[0]["reduce_only"], true);
         assert_eq!(body["source"], "local");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn decisions_join_orders_positions_and_trades_by_decision_id() {
+        let path = std::env::temp_dir().join("nq-decisions.db");
+        let db = seed(&path);
+        let conn = db.lock();
+        conn.execute_batch(
+            "ALTER TABLE orders ADD COLUMN decision_id TEXT; \
+             ALTER TABLE positions ADD COLUMN decision_id TEXT; \
+             ALTER TABLE trades ADD COLUMN decision_id TEXT; \
+             INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,\
+             exchange_order_id,reduce_only,mode,decision_id) \
+             VALUES(100,'BTCUSDT','BUY','MARKET',1,100,'FILLED','entry','demo-entry-1-BTCUSDT','e1',0,'demo','demo:BTCUSDT:1:long'); \
+             INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,\
+             exchange_order_id,reduce_only,mode,decision_id) \
+             VALUES(100,'BTCUSDT','BUY','LIMIT',1,100,'FILLED','entry','demo-entry-1-BTCUSDT-s1','e2',0,'demo','demo:BTCUSDT:1:long'); \
+             INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,\
+             exchange_order_id,reduce_only,mode,decision_id) \
+             VALUES(90,'ETHUSDT','SELL','MARKET',1,200,'FILLED','entry','demo-entry-0-ETHUSDT','e3',0,'demo',NULL); \
+             INSERT INTO positions(id,symbol,side,qty,entry_price,mark_price,leverage,margin,\
+             sl_price,tp_price,opened_at,status,mode,venue_unrealized,venue_ts,partial_taken_at,decision_id) \
+             VALUES(1,'BTCUSDT','long',2,100,100,10,10,0,0,1,'closed','demo',0,0,0,'demo:BTCUSDT:1:long'); \
+             INSERT INTO trades(symbol,side,qty,entry_price,exit_price,pnl,mode,closed_at,decision_id) \
+             VALUES('BTCUSDT','long',2,100,110,20,'demo',200,'demo:BTCUSDT:1:long');",
+        )
+        .unwrap();
+        drop(conn);
+        let app = Router::new().nest("/api/v1", routes()).with_state(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/engine/decisions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["count"], 1,
+            "没有 decision_id 的旧订单不进入读模型: {body}"
+        );
+        let item = &body["items"][0];
+        assert_eq!(item["decision_id"], "demo:BTCUSDT:1:long");
+        assert_eq!(item["order"]["orders"], 2, "拆单要聚合到同一个决策");
+        assert_eq!(item["order"]["qty"], 2.0);
+        assert_eq!(item["position"]["id"], 1);
+        assert_eq!(item["trade"]["pnl"], 20.0);
         let _ = std::fs::remove_file(&path);
     }
 

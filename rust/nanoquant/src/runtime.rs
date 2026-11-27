@@ -68,6 +68,14 @@ fn local_leverage(
         .round()
 }
 
+/// 决策 ID：mode + symbol + 信号 K 线 close_time + 方向。
+///
+/// 同一根 K 线在同一环境下重复扫描必须得到同一个 ID，用来把
+/// 信号审计、订单、持仓、成交串成一条链；方向不同视为两次不同决策。
+fn decision_id_of(mode: &str, symbol: &str, close_time: i64, side: &str) -> String {
+    format!("{mode}:{symbol}:{close_time}:{side}")
+}
+
 /// 决策日志的目标收益率：止盈价缺失时返回 0，
 /// 不能用 0 价硬算成 100% 污染日志与经验学习。
 fn journal_target_pct(entry_price: f64, take_profit: f64) -> f64 {
@@ -160,6 +168,9 @@ pub(crate) struct LivePlan {
     entry: Option<EntryTerms>,
     /// 开仓决策时的注入 ID，随成交回执写入持仓 features。
     features: Option<String>,
+    /// 决策 ID：同一次开仓信号在订单、持仓、成交三张表里共用同一个值。
+    /// 平仓/保护单没有自己的决策，保持 None。
+    decision_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -197,6 +208,9 @@ struct EntryDraft {
     features_text: String,
     journal_snapshot: Value,
     client_id: String,
+    /// 确定性决策 ID：mode + symbol + 信号 bar 的 close_time + 方向，
+    /// 同一根 K 线重复扫描不会生成第二个 ID。
+    decision_id: String,
 }
 
 impl EntryDraft {
@@ -2172,6 +2186,7 @@ impl EngineRuntime {
                     price: None,
                     entry: None,
                     features: None,
+                    decision_id: None,
                 })
             })
             .collect()
@@ -3285,12 +3300,15 @@ impl EngineRuntime {
                 "funding": market.funding_rate,
                 "oi_change_pct": market.open_interest_change_pct,
             });
+            let close_time = market.candles.last().map_or(0, |c| c.close_time);
+            let decision_id = decision_id_of(mode, symbol, close_time, &side);
             let evolution = crate::evolution_api::evolution_cfg(tx);
             let (_mantra_text, injected_mantra_ids) =
                 crate::evolution_api::injection_payload(tx, &evolution);
             let injected_experience_ids =
                 crate::journal::inject_ids(tx, symbol, &journal_snapshot, &side);
             let features_text = serde_json::to_string(&serde_json::json!({
+                "decision_id": decision_id.clone(),
                 "injected_mantra_ids": injected_mantra_ids,
                 "injected_experience_ids": injected_experience_ids,
                 "atr_pct": metric.atr_pct,
@@ -3312,10 +3330,7 @@ impl EngineRuntime {
                 "signal_reason": signal_reason,
             }))
             .unwrap_or_else(|_| "{}".to_string());
-            let client_id = format!(
-                "demo-entry-{}-{symbol}",
-                market.candles.last().map_or(0, |c| c.close_time)
-            );
+            let client_id = format!("demo-entry-{close_time}-{symbol}");
             drafts.push(EntryDraft {
                 symbol: symbol.clone(),
                 side,
@@ -3336,6 +3351,7 @@ impl EngineRuntime {
                 features_text,
                 journal_snapshot,
                 client_id,
+                decision_id,
             });
         }
         Ok(drafts)
@@ -3883,6 +3899,7 @@ impl EngineRuntime {
                         price,
                         entry: Some(entry.clone()),
                         features: Some(features_text.clone()),
+                        decision_id: Some(draft.decision_id.clone()),
                     });
                     // 实盘单还没发出去，只能记「挂单中」，成交与否由后面的结算补账。
                     let mut row = draft
@@ -3935,6 +3952,11 @@ impl EngineRuntime {
             let margin = draft.mark_price * qty / leverage;
             let fee_rate = cfg["fee_rate_taker"].as_f64().unwrap_or(0.0005);
             tx.execute("INSERT INTO orders(ts,symbol,side,order_type,qty,price,status,purpose,client_order_id,exchange_order_id,reduce_only,mode,latency_ms) VALUES(?1,?2,?3,'MARKET',?4,?5,'FILLED','entry',?6,'',0,'demo',0)", (now, &draft.symbol, side, qty, draft.mark_price, &draft.client_id)).map_err(|e| e.to_string())?;
+            // 决策溯源：订单行已落库，这里只补写 decision_id；旧库缺列时跳过。
+            let _ = tx.execute(
+                "UPDATE orders SET decision_id=?1 WHERE client_order_id=?2 AND mode=?3",
+                (&draft.decision_id, &draft.client_id, mode),
+            );
             Self::insert_entry_position(
                 tx,
                 mode,
@@ -3946,6 +3968,7 @@ impl EngineRuntime {
                 fee_rate,
                 now,
                 Some(&features_text),
+                Some(&draft.decision_id),
             )?;
             // 趋势仓没有预置止盈价时不能拿 0 价硬算，否则目标被记成 100%
             // 污染决策日志与经验学习。
@@ -3997,15 +4020,23 @@ impl EngineRuntime {
         fee_rate: f64,
         now: i64,
         features: Option<&str>,
+        decision_id: Option<&str>,
     ) -> Result<(), String> {
         tx.execute("INSERT INTO positions(symbol,side,qty,entry_price,mark_price,leverage,margin,sl_price,tp_price,peak_price,initial_sl_price,signal_score,opened_at,closed_at,exit_price,exit_reason,realized_pnl,fees,status,mode,venue_unrealized,venue_ts,partial_taken_at,ai_confidence,ai_reason,entry_slippage_bps,trade_id,invalidation_price) VALUES(?1,?2,?3,?4,?4,?5,?6,?7,?8,?4,?7,?9,?10,0,0,'',0,?11,'open',?12,0,0,0,0,'',0,0,?13)", (symbol, side, qty, price, entry.leverage, qty * price / entry.leverage, entry.stop, entry.take_profit, entry.score, now, qty * price * fee_rate, mode, entry.invalidation_price)).map_err(|e| e.to_string())?;
+        let position_id = tx.last_insert_rowid();
         if let Some(features) = features {
-            let id = tx.last_insert_rowid();
             tx.execute(
                 "UPDATE positions SET features=?1 WHERE id=?2",
-                (features, id),
+                (features, position_id),
             )
             .map_err(|e| e.to_string())?;
+        }
+        if let Some(decision_id) = decision_id {
+            // 决策溯源列在新库里一定存在；旧库/最小测试夹具缺列时忽略即可。
+            let _ = tx.execute(
+                "UPDATE positions SET decision_id=?1 WHERE id=?2",
+                (decision_id, position_id),
+            );
         }
         Ok(())
     }
@@ -4433,6 +4464,13 @@ impl EngineRuntime {
             ),
         )
         .map_err(|error| error.to_string())?;
+        if let Some(decision_id) = plan.decision_id.as_deref() {
+            // 决策溯源：订单行已落库，补写 decision_id；旧库缺列时忽略。
+            let _ = tx.execute(
+                "UPDATE orders SET decision_id=?1 WHERE client_order_id=?2 AND mode='live'",
+                (decision_id, client_order_id),
+            );
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -4519,6 +4557,7 @@ impl EngineRuntime {
                     fee_rate,
                     crate::now(),
                     features.as_deref(),
+                    plan.decision_id.as_deref(),
                 )?;
                 // 趋势仓 take_profit=0 时不得把目标记成 100%。
                 let target_pct = journal_target_pct(*avg_price, entry.take_profit);
@@ -5115,6 +5154,7 @@ impl EngineRuntime {
                 price: None,
                 entry: None,
                 features: None,
+                decision_id: None,
             };
             let fee_rate = Self::plan_fee_rate(&plan, taker_rate, maker_rate);
             match &reply {
@@ -6389,7 +6429,7 @@ mod tests {
             invalidation_price: None,
         };
         EngineRuntime::insert_entry_position(
-            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None,
+            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None, None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -6417,6 +6457,69 @@ mod tests {
     }
 
     #[test]
+    fn decision_id_is_stable_for_the_same_bar() {
+        let first = decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "long");
+        assert_eq!(
+            first,
+            decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "long"),
+            "同一根 K 线重复扫描必须得到同一个决策 ID"
+        );
+        assert_ne!(
+            first,
+            decision_id_of("live", "BTCUSDT", 1_700_000_000_000, "long"),
+            "环境不同不能共用决策 ID"
+        );
+        assert_ne!(
+            first,
+            decision_id_of("demo", "BTCUSDT", 1_700_000_000_001, "long"),
+            "下一根 K 线是新决策"
+        );
+        assert_ne!(
+            first,
+            decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "short"),
+            "方向不同是两次决策"
+        );
+    }
+
+    #[test]
+    fn entry_position_persists_decision_id() {
+        // 开仓落库要把确定性决策 ID 写进 positions，供读模型串联整条链路。
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let terms = EntryTerms {
+            leverage: 5.0,
+            stop: 95.0,
+            take_profit: 110.0,
+            score: 0.8,
+            invalidation_price: None,
+        };
+        EngineRuntime::insert_entry_position(
+            &tx,
+            "live",
+            "BTCUSDT",
+            "long",
+            2.0,
+            100.0,
+            &terms,
+            0.0005,
+            1,
+            None,
+            Some("live:BTCUSDT:1700000000000:long"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT decision_id FROM positions WHERE symbol='BTCUSDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("live:BTCUSDT:1700000000000:long"));
+    }
+
+    #[test]
     fn entry_position_persists_invalidation_price() {
         // 开仓落库必须把 AI 失效价写进 positions.invalidation_price。
         // 用真实迁移建表，避免手抄 DDL 与 schema 漂移造成假阳性。
@@ -6431,7 +6534,7 @@ mod tests {
             invalidation_price: Some(97.0),
         };
         EngineRuntime::insert_entry_position(
-            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None,
+            &tx, "live", "BTCUSDT", "long", 2.0, 100.0, &terms, 0.0005, 1, None, None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -6459,7 +6562,7 @@ mod tests {
             invalidation_price: None,
         };
         EngineRuntime::insert_entry_position(
-            &tx, "live", "ETHUSDT", "short", 1.0, 200.0, &terms, 0.0005, 1, None,
+            &tx, "live", "ETHUSDT", "short", 1.0, 200.0, &terms, 0.0005, 1, None, None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -7382,6 +7485,7 @@ mod tests {
             price: None,
             entry: None,
             features: None,
+            decision_id: None,
         };
         assert_eq!(
             EngineRuntime::plan_fee_rate(
@@ -8445,6 +8549,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             features_text: "{}".to_string(),
             journal_snapshot: serde_json::json!({}),
             client_id: "test-entry".to_string(),
+            decision_id: "demo:BTCUSDT:0:long".to_string(),
         }
     }
 
