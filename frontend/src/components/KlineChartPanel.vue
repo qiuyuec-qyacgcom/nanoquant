@@ -34,7 +34,7 @@ function cssVar(name: string, fallback: string): string {
   return value || fallback
 }
 
-/** 图表样式跟随全局主题；切换主题后通过 setStyles 重绘。 */
+/** 图表样式统一读取全局 CSS 变量。 */
 function chartStyles(): Record<string, any> {
   const line = cssVar('--line', 'rgba(148,170,200,0.10)')
   const lineStrong = cssVar('--line-strong', 'rgba(148,170,200,0.25)')
@@ -202,20 +202,14 @@ function buildChart() {
   emit('ready', chart)
 }
 
-function onTheme() {
-  chart?.setStyles(chartStyles())
-}
-
 onMounted(() => {
   if (!el.value) return
   buildChart()
-  window.addEventListener('nq-theme', onTheme)
   observer = new ResizeObserver(() => chart?.resize())
   observer.observe(el.value)
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('nq-theme', onTheme)
   observer?.disconnect()
   observer = null
   if (el.value) {

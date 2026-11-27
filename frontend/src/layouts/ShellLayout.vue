@@ -9,7 +9,6 @@ import { useSilentRefresh } from '../composables/silentRefresh'
 import CommandPalette from '../components/CommandPalette.vue'
 import type { CommandItem } from '../components/commandPalette'
 import { WORKSPACES, workspaceByPath, workspaceHome } from '../workspaces'
-import { useTheme } from '../composables/theme'
 
 const app = useAppStore()
 const auth = useAuthStore()
@@ -28,8 +27,6 @@ const pageLabel = computed(
 
 const title = computed(() => pageLabel.value || 'NanoQuant')
 
-/** 后台、前台和登录页共用的主题状态。 */
-const { theme, toggle: toggleTheme } = useTheme()
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
@@ -210,9 +207,6 @@ onBeforeUnmount(() => {
           </div>
           <button class="btn" :class="status?.enabled ? 'btn-danger' : 'btn-primary'" :disabled="!status" @click="toggleEngine">
             {{ status?.enabled ? '停止引擎' : '启动引擎' }}
-          </button>
-          <button class="btn btn-sm btn-ghost theme-toggle" type="button" @click="toggleTheme">
-            {{ theme === 'dark' ? '浅色' : '深色' }}
           </button>
           <button class="btn btn-sm btn-ghost" title="退出登录" @click="logout">退出</button>
         </div>

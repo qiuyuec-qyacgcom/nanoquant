@@ -1,12 +1,11 @@
 /* 全局设计令牌 · H Modular Studio
  *
- * 后台、登录页与公开前台共用同一套令牌；主题由 <html data-theme> 控制。
+ * 后台、登录页与公开前台共用同一套黑色主题，不再提供浅色切换。
  * 字体：Inter（Sans）+ JetBrains Mono（等宽），均为 GitHub 开源 OFL 字体，
  * 由 @fontsource 本地打包，不依赖外部 CDN。
  */
 
-:root,
-:root[data-theme="dark"] {
+:root {
   color-scheme: dark;
   --bg: #0b0f14;
   --bg-grid: rgba(255, 255, 255, 0.03);
@@ -34,36 +33,6 @@
   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35);
   --shadow-3: 0 24px 80px rgba(0, 0, 0, 0.55);
   --focus-ring: 0 0 0 3px rgba(46, 230, 166, 0.25);
-}
-
-:root[data-theme="light"] {
-  color-scheme: light;
-  --bg: #f4f6f9;
-  --bg-grid: rgba(16, 24, 40, 0.04);
-  --panel: #ffffff;
-  --panel-2: #eef1f5;
-  --panel-3: #e4e9f0;
-  --line: rgba(16, 24, 40, 0.1);
-  --line-strong: rgba(16, 24, 40, 0.2);
-  --line-soft: rgba(16, 24, 40, 0.06);
-  --text: #101828;
-  --text-dim: #344054;
-  --muted: #667085;
-  --dim: #98a2b3;
-  --accent: #0b9e6e;
-  --accent-2: #0b9e6e;
-  --accent-soft: rgba(11, 158, 110, 0.1);
-  --on-accent: #ffffff;
-  --up: #0b9e6e;
-  --up-soft: rgba(11, 158, 110, 0.1);
-  --down: #dc2626;
-  --down-soft: rgba(220, 38, 38, 0.1);
-  --warn: #b45309;
-  --warn-soft: rgba(180, 83, 9, 0.1);
-  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
-  --shadow-2: 0 8px 24px rgba(16, 24, 40, 0.12);
-  --shadow-3: 0 24px 80px rgba(16, 24, 40, 0.18);
-  --focus-ring: 0 0 0 3px rgba(11, 158, 110, 0.22);
 }
 
 :root {

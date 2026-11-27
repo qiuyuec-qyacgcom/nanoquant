@@ -156,12 +156,6 @@
 .shell .note.warn { border-color: var(--warn); color: var(--warn); }
 .shell .note.error { border-color: var(--down); color: var(--down); }
 
-.shell .theme-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
 .shell .command-trigger {
   display: inline-flex;
   align-items: center;

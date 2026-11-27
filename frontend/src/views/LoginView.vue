@@ -3,13 +3,11 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useAppStore } from '../stores/app'
-import { useTheme } from '../composables/theme'
 
 const auth = useAuthStore()
 const app = useAppStore()
 const router = useRouter()
 const route = useRoute()
-const { theme, toggle: toggleTheme } = useTheme()
 
 const username = ref('admin')
 const password = ref('')
@@ -46,9 +44,6 @@ async function submit() {
         </div>
         <div class="login-aside-foot">
           <span class="login-version">v1.1.0</span>
-          <button class="login-theme" type="button" @click="toggleTheme">
-            {{ theme === 'dark' ? '浅色' : '深色' }}
-          </button>
         </div>
       </aside>
 
@@ -185,7 +180,6 @@ async function submit() {
 .login-aside-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
 }
 .login-version {
@@ -193,19 +187,6 @@ async function submit() {
   font-family: var(--mono);
   font-size: 10px;
 }
-.login-theme {
-  padding: 5px 9px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  color: var(--muted);
-  font-size: 11px;
-  cursor: pointer;
-}
-.login-theme:hover {
-  color: var(--text);
-  border-color: var(--line-strong);
-}
-.login-theme:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 .login-panel {
   min-width: 0;
@@ -339,7 +320,6 @@ async function submit() {
     border-bottom: 1px solid var(--line);
   }
   .login-aside-foot { gap: 12px; }
-  .login-version { display: none; }
   .login-panel { padding: 22px 20px 20px; }
   .login-head h1 { font-size: 18px; }
 }

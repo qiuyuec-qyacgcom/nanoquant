@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { http } from '../api/client'
 import { publicQuotes } from '../api/public'
 import EChart from '../components/EChart.vue'
@@ -236,8 +236,7 @@ const halfAi = computed(() => {
   }
 })
 
-/** 从当前后台主题读取图表配色，切主题后由 `nq-theme` 事件触发重算。 */
-const themeTick = ref(0)
+/** 图表配色统一读取全局 CSS 变量。 */
 function cssVar(name: string, fallback: string) {
   const host = document.querySelector('.shell') as HTMLElement | null
   const value = getComputedStyle(host || document.documentElement).getPropertyValue(name).trim()
@@ -245,7 +244,6 @@ function cssVar(name: string, fallback: string) {
 }
 
 const equityOption = computed(() => {
-  themeTick.value
   const points = equity.value
   const panel = cssVar('--panel', '#11161d')
   const line = cssVar('--line', 'rgba(255,255,255,.08)')
@@ -287,10 +285,6 @@ const equityOption = computed(() => {
     ],
   }
 })
-
-function onThemeChange() {
-  themeTick.value += 1
-}
 
 async function load() {
 
@@ -344,14 +338,9 @@ async function closePosition(id: number) {
 
 
 onMounted(async () => {
-  window.addEventListener('nq-theme', onThemeChange)
   await app.loadStatus()
   await refreshQuotes()
   await load()
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('nq-theme', onThemeChange)
 })
 
 useSilentRefresh(load, 3000)
