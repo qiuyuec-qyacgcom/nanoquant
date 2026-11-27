@@ -73,7 +73,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '提示词档位', hint: '完整=14 根 K 线/8 条资讯/全部经验与心法；瘦身=8 根/4 条/3 条，仅压缩注入上下文，不改 prompt 文本与输出上限', fields: ['prompt_profile'] },
   ],
   ai_tuning: [
-    { title: '启用与限速', fields: ['enabled', 'auto_apply', 'max_auto_apply_per_24h', 'auto_apply_timeframes'] },
+    { title: '启用', fields: ['enabled'] },
     { title: 'regime 与回滚', fields: ['regime_confirm_sec', 'regime_cooldown_sec', 'no_candidate_rollback_sec'] },
     { title: '证据门', fields: ['min_oos_trades'] },
     {

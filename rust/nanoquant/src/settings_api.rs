@@ -237,13 +237,7 @@ async fn write_group(
     deep_merge(&mut candidate, &stored(&conn, &group));
     deep_merge(&mut candidate, &Value::Object(body.patch.clone()));
     drop_removed_keys(&group, &mut candidate);
-    if group == "ai_tuning" {
-        if let Some(timeframes) = candidate.get_mut("auto_apply_timeframes") {
-            if let Some(text) = timeframes.as_str() {
-                *timeframes = json!(text.trim().to_ascii_lowercase());
-            }
-        }
-    }
+
     if let Err(detail) = validate(&group, &candidate) {
         return Err((StatusCode::BAD_REQUEST, json!({ "detail": detail }).into()));
     }
@@ -564,19 +558,7 @@ fn validate(group: &str, value: &Value) -> Result<(), String> {
         if actual != meta.kind {
             return Err(format!("{key}: 类型应为 {}", meta.kind));
         }
-        if group == "ai_tuning" && key == "auto_apply_timeframes" {
-            let allowed = candidate.as_str().is_some_and(|text| {
-                let text = text.trim();
-                // 空串表示不自动切换；非空项仍只接受 1h。
-                text.is_empty()
-                    || text
-                        .split(',')
-                        .all(|part| part.trim().eq_ignore_ascii_case("1h"))
-            });
-            if !allowed {
-                return Err(format!("{key}: v1 仅允许 1h 或空串"));
-            }
-        }
+
         let (Some(low), Some(high)) = (meta.min, meta.max) else {
             continue;
         };
@@ -790,8 +772,6 @@ mod tests {
             ("enabled", json!("yes")),
             ("enabled", Value::Null),
             ("min_oos_trades", json!(-5)),
-            ("auto_apply_timeframes", json!("4h")),
-            ("auto_apply_timeframes", Value::Null),
         ] {
             let mut value = defaults_of("ai_tuning");
             value[key] = bad;
@@ -800,68 +780,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ai_tuning_validation_normalizes_and_rejects_null() {
+    async fn ai_tuning_validation_rejects_null() {
         let path = std::env::temp_dir().join("nq-settings-parameter-set.db");
         let db = fixture(&path);
         let app = Router::new()
             .nest("/api/v1", routes())
             .with_state(db.clone());
 
-        let (status, body) = put_settings(
-            app.clone(),
-            "ai_tuning",
-            r#"{"auto_apply_timeframes":"1H"}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["auto_apply_timeframes"], "1h");
-        let stored: String = db
-            .lock()
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='ai_tuning'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&stored).unwrap()["auto_apply_timeframes"],
-            "1h"
-        );
-
-        let (status, body) = put_settings(
-            app.clone(),
-            "ai_tuning",
-            r#"{"auto_apply_timeframes":" 1h "}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["auto_apply_timeframes"], "1h");
-
-        for patch in [
-            r#"{"auto_apply_timeframes":"1h, 4h"}"#,
-            r#"{"auto_apply_timeframes":null}"#,
-            r#"{"enabled":null}"#,
-        ] {
+        for patch in [r#"{"enabled":null}"#, r#"{"min_oos_trades":null}"#] {
             let (status, body) = put_settings(app.clone(), "ai_tuning", patch).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}: {body}");
         }
-
-        let (status, body) =
-            put_settings(app.clone(), "ai_tuning", r#"{"auto_apply_timeframes":""}"#).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["auto_apply_timeframes"], "");
-        let stored: String = db
-            .lock()
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='ai_tuning'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&stored).unwrap()["auto_apply_timeframes"],
-            ""
-        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -622,10 +622,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
-            [
-                json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"})
-                    .to_string(),
-            ],
+            [json!({"enabled": true}).to_string()],
         )
         .unwrap();
         conn.execute(

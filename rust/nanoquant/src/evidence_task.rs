@@ -66,7 +66,6 @@ struct Prepared {
     risk: Value,
     live_timeframe: String,
     min_oos_trades: usize,
-    auto_apply_timeframes: Vec<String>,
 }
 
 async fn run_gate(
@@ -78,12 +77,7 @@ async fn run_gate(
         return Ok(());
     };
     // 时间框架不合格时直接失败：不拉数据、不跑回测，避免为注定失败的门浪费上游配额。
-    if prepared.candidate.timeframe != prepared.live_timeframe
-        || !prepared
-            .auto_apply_timeframes
-            .iter()
-            .any(|value| value == &prepared.candidate.timeframe)
-    {
+    if prepared.candidate.timeframe != prepared.live_timeframe {
         let metrics = BasketMetrics {
             timeframe: prepared.candidate.timeframe.clone(),
             target_regime: prepared.candidate.regime.clone(),
@@ -145,17 +139,11 @@ fn finish(
     metrics: BasketMetrics,
     baseline: Option<BasketMetrics>,
 ) -> Result<(), String> {
-    let whitelist: Vec<&str> = prepared
-        .auto_apply_timeframes
-        .iter()
-        .map(String::as_str)
-        .collect();
     let baseline_oos_avg = baseline.as_ref().map(|value| value.oos_avg_return_pct);
     let report = evidence::evaluate_gate(
         &metrics,
         prepared.min_oos_trades,
         &prepared.live_timeframe,
-        &whitelist,
         baseline_oos_avg,
     );
     let baseline_set_id = prepared.baseline.as_ref().map(|set| set.id);
@@ -188,7 +176,7 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         .filter(|value| *value >= 1.0)
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_MIN_OOS_TRADES as usize);
-    let auto_apply_timeframes = parse_timeframes(&ai_tuning)?;
+
     // 同 regime 的 active 作为基线；该 regime 没有 active 时回退 range-bootstrap。
     let mut baseline = ai_tuning::active_for_regime(&conn, &candidate.regime)?;
     if baseline.is_none() {
@@ -202,40 +190,7 @@ fn prepare(state: &AiState, candidate_id: i64) -> Result<Option<Prepared>, Strin
         risk,
         live_timeframe,
         min_oos_trades,
-        auto_apply_timeframes,
     }))
-}
-
-fn parse_timeframes(ai_tuning: &Value) -> Result<Vec<String>, String> {
-    let Some(value) = ai_tuning.get("auto_apply_timeframes") else {
-        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
-    };
-    if value.is_null() {
-        return Ok(vec![DEFAULT_TIMEFRAME.to_string()]);
-    }
-    let Some(raw) = value.as_str() else {
-        return Err("ai_tuning.auto_apply_timeframes 必须是逗号分隔字符串".to_string());
-    };
-    // 显式空白名单表示「不自动切换」，不能静默补 1h；交由证据门按 §7.3 拒绝。
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut frames: Vec<String> = Vec::new();
-    for item in raw.split(',') {
-        let frame = item.trim();
-        if frame.is_empty() {
-            continue;
-        }
-        if frame != DEFAULT_TIMEFRAME {
-            return Err(format!(
-                "ai_tuning.auto_apply_timeframes 仅支持 {DEFAULT_TIMEFRAME}，发现 {frame}"
-            ));
-        }
-        if !frames.iter().any(|existing| existing == frame) {
-            frames.push(frame.to_string());
-        }
-    }
-    Ok(frames)
 }
 
 pub(crate) fn pool_symbols(conn: &Connection) -> Result<Vec<String>, String> {
@@ -684,8 +639,7 @@ mod tests {
             "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
             [json!({
                 "enabled": true,
-                "auto_apply": false,
-                "auto_apply_timeframes": "1h",
+
                 "min_oos_trades": 30
             })
             .to_string()],
@@ -921,48 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeframes_distinguishes_missing_from_empty() {
-        assert_eq!(
-            parse_timeframes(&json!({})).unwrap(),
-            vec!["1h".to_string()],
-            "缺键按默认 1h"
-        );
-        assert_eq!(
-            parse_timeframes(&json!({"auto_apply_timeframes": null})).unwrap(),
-            vec!["1h".to_string()],
-            "null 按默认 1h"
-        );
-        assert!(
-            parse_timeframes(&json!({"auto_apply_timeframes": ""}))
-                .unwrap()
-                .is_empty(),
-            "显式空串表示不自动切换"
-        );
-        assert!(
-            parse_timeframes(&json!({"auto_apply_timeframes": "   "}))
-                .unwrap()
-                .is_empty(),
-            "纯空白同样表示不自动切换"
-        );
-        assert_eq!(
-            parse_timeframes(&json!({"auto_apply_timeframes": " 1h "})).unwrap(),
-            vec!["1h".to_string()]
-        );
-        assert!(
-            parse_timeframes(&json!({"auto_apply_timeframes": "1h,4h"})).is_err(),
-            "B 期仅支持 1h，非 1h 条目必须报错"
-        );
-        assert!(
-            parse_timeframes(&json!({"auto_apply_timeframes": "4h"})).is_err(),
-            "非法周期必须报错"
-        );
-        assert!(
-            parse_timeframes(&json!({"auto_apply_timeframes": ["1h"]})).is_err(),
-            "数组不是合法白名单"
-        );
-    }
 
-    #[test]
     fn select_pending_respects_window_and_cooldown() {
         let (state, candidate_id) = setup("1h");
         let conn = state.db.lock();
@@ -1019,11 +932,7 @@ mod tests {
         let prepared = prepare(&state, candidate_id).unwrap().unwrap();
 
         assert_eq!(prepared.min_oos_trades, 30, "缺配置时默认 30 笔");
-        assert_eq!(
-            prepared.auto_apply_timeframes,
-            vec!["1h".to_string()],
-            "缺配置时默认 1h 白名单"
-        );
+        assert_eq!(prepared.live_timeframe, "1h", "实盘周期照旧读取");
     }
 
     #[tokio::test]
@@ -1124,72 +1033,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1, "失败候选同样进入 6h 冷却");
-    }
-
-    #[tokio::test]
-    async fn explicit_empty_whitelist_rejects_instead_of_defaulting() {
-        let (state, candidate_id) = setup("1h");
-        {
-            let conn = state.db.lock();
-            conn.execute(
-                "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
-                [json!({
-                    "enabled": true,
-                    "auto_apply": false,
-                    "auto_apply_timeframes": "",
-                    "min_oos_trades": 30
-                })
-                .to_string()],
-            )
-            .unwrap();
-        }
-        let history = FakeHistory::unavailable();
-
-        evaluate_with_history(&state, candidate_id, &history)
-            .await
-            .unwrap();
-
-        assert_eq!(history.calls(), 0, "空白名单应直接失败，不触网");
-        let conn = state.db.lock();
-        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
-        assert_eq!(set.status, "rejected");
-        assert_eq!(set.evidence["gate"]["pass"], false);
-        let reasons = set.evidence["gate"]["reasons"].as_array().unwrap();
-        assert!(
-            reasons.iter().any(|reason| reason
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("timeframe_not_whitelisted")),
-            "空白名单必须由 gate 拒绝"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_timeframe_whitelist_returns_error_and_keeps_candidate() {
-        let (state, candidate_id) = setup("1h");
-        {
-            let conn = state.db.lock();
-            conn.execute(
-                "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
-                [json!({
-                    "enabled": true,
-                    "auto_apply": false,
-                    "auto_apply_timeframes": "4h",
-                    "min_oos_trades": 30
-                })
-                .to_string()],
-            )
-            .unwrap();
-        }
-        let history = FakeHistory::unavailable();
-
-        let result = evaluate_with_history(&state, candidate_id, &history).await;
-
-        assert!(result.is_err(), "非法白名单必须走 evidence_failed");
-        assert_eq!(history.calls(), 0);
-        let conn = state.db.lock();
-        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
-        assert_eq!(set.status, "candidate", "配置错误不得永久拒绝候选");
-        assert_eq!(set.evidence, json!({}));
     }
 }

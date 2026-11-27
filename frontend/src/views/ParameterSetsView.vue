@@ -53,7 +53,7 @@ interface CurrentView {
   market_regime: string | null
   active: ActiveEntry[]
   guard: Record<string, GuardEntry>
-  auto_apply_since: number
+
 }
 
 const REGIME_ORDER = ['trend', 'range', 'chaos']
@@ -90,10 +90,7 @@ const activeEntries = computed(() =>
 const guardRows = computed(() =>
   Object.entries(current.value?.guard || {}).map(([regime, guard]) => ({ regime, ...guard }))
 )
-const autoApplySinceText = computed(() => {
-  const since = current.value?.auto_apply_since || 0
-  return since > 0 ? timeStr(since, false) : '未设置'
-})
+
 const marketRegimeText = computed(() => regimeLabel(current.value?.market_regime))
 
 function canActivate(item: SetItem): boolean {
@@ -218,9 +215,9 @@ useSilentRefresh(() => load(true), 30000)
           <span class="muted" style="font-size: 11px">每 30s 静默刷新 · 手动操作需确认</span>
         </div>
         <div class="hint" style="margin-top: 8px">
-          AI 每周期自动调整隐藏参数。系统按 regime 保存候选快照，approve 后通常由引擎自动启用；
-                  这里提供人工兜底：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
-                  跨 regime 的启用与回滚由自动切换处理。
+          AI 每周期自动调整隐藏参数。系统按 regime 保存候选快照并走证据门，approved 后仍需人工启用；
+                  这里提供唯一激活入口：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
+                  跨 regime 的切换仍由自动流程处理。
         </div>
         <div v-if="notice" class="hint" style="margin-top: 6px; color: var(--long)">{{ notice }}</div>
         <div v-if="error" class="hint" style="margin-top: 6px; color: var(--warn)">{{ error }}</div>
@@ -239,11 +236,7 @@ useSilentRefresh(() => load(true), 30000)
         <div class="kpi-foot">trend / range / chaos</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">自动启用起点</div>
-        <div class="kpi-value" style="font-size: 15px">{{ autoApplySinceText }}</div>
-        <div class="kpi-foot">更早的候选不参与自动启用</div>
-      </div>
-      <div class="kpi">
+
         <div class="kpi-label">无候选守卫</div>
         <div class="kpi-value">{{ guardRows.length }}</div>
         <div class="kpi-foot">已记录计时的 regime 数</div>

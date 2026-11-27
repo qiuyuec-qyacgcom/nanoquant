@@ -2,12 +2,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 const BOOTSTRAP_TIMEFRAME: &str = "1h";
-const CURRENT_SNAPSHOT_EVIDENCE: &str = "{\"kind\":\"manual\",\"reason\":\"timeframe_not_in_auto_apply_whitelist\",\"snapshot\":\"full\"}";
+const CURRENT_SNAPSHOT_EVIDENCE: &str =
+    "{\"kind\":\"manual\",\"reason\":\"non_bootstrap_timeframe\",\"snapshot\":\"full\"}";
 const INCIDENT_EVIDENCE: &str = "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\",\"incident_date\":\"2026-11-23\",\"known_keys\":[\"atr_pct_min\",\"atr_pct_max\",\"volume_ratio_min\",\"entry_threshold\"]}";
-const AUTO_SWITCH_DISABLED: &str = "strategy.timeframe 不在自动切换白名单，已禁用自动切换";
-const AUTO_SWITCH_SKIPPED: &str = "ai_tuning 配置缺失或无效，未能清空自动切换白名单";
-const C_PHASE_DISABLED: &str = "strategy.timeframe 不在 C 期自动切换白名单，已禁用AI 调参自动启用";
-const C_PHASE_DISABLED_UNBOUND: &str = "ai_tuning 配置缺失或无效，未能禁用AI 调参自动启用";
 
 /// A 期迁移种子化：只建AI 调参记录，绝不改写 `app_settings.strategy`（C 期才物化）。
 /// 幂等：`ai_tuning` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
@@ -61,7 +58,7 @@ fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(
             None,
             now,
         )?;
-        disable_auto_switch(conn, now)?;
+
         return Ok(());
     }
     let range = with_overrides(
@@ -130,110 +127,6 @@ fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(
         None,
         now,
     )?;
-    Ok(())
-}
-
-/// C 期启动启用：仅 1h 策略打开自动启用并立即物化当前 regime 的 bootstrap 集。
-///
-/// 幂等：`ai_tuning.auto_apply_since` 已存在时直接返回，不重复物化或新增激活记录。
-/// 非 1h 只关闭自动启用并写 warn，不写 `auto_apply_since`，也不阻断启动。
-/// 写入失败整体回滚；启动层只告警，保证服务可起。
-pub(crate) fn enable_c_phase(conn: &Connection) -> Result<(), String> {
-    let strategy = crate::settings_api::group_value_public(conn, "strategy");
-    let timeframe = strategy
-        .get("timeframe")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if timeframe != BOOTSTRAP_TIMEFRAME {
-        return disable_c_phase_auto_apply(conn, timeframe);
-    }
-    if engine_state(conn, "ai_tuning.auto_apply_since").is_some() {
-        return Ok(());
-    }
-    let mode = engine_mode(conn);
-    let regime = engine_state(conn, &format!("market_regime.{mode}"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "range".to_string());
-    let now = crate::now();
-    conn.execute_batch("SAVEPOINT ai_tuning_enable_c_phase")
-        .map_err(|error| format!("开启 C 期AI 调参启用事务失败: {error}"))?;
-    let result = (|| {
-        let updated = conn
-            .execute(
-                "UPDATE app_settings \
-                 SET value=json_patch(value,'{\"auto_apply\":true}'), updated_at=?1 \
-                 WHERE key='ai_tuning' AND json_valid(value)",
-                [now],
-            )
-            .map_err(|error| format!("启用AI 调参自动切换失败: {error}"))?;
-        if updated == 0 {
-            return Err("ai_tuning 配置缺失或无效，无法启用自动切换".to_string());
-        }
-        upsert_engine_state(conn, "ai_tuning.auto_apply_since", &now.to_string())?;
-        activate_for_regime(conn, &regime, "bootstrap", &mode)
-    })();
-    match result {
-        Ok(()) => conn
-            .execute_batch("RELEASE ai_tuning_enable_c_phase")
-            .map_err(|error| format!("提交 C 期AI 调参启用事务失败: {error}")),
-        Err(error) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK TO ai_tuning_enable_c_phase; RELEASE ai_tuning_enable_c_phase",
-            );
-            Err(error)
-        }
-    }
-}
-
-fn disable_c_phase_auto_apply(conn: &Connection, timeframe: &str) -> Result<(), String> {
-    let updated = conn
-        .execute(
-            "UPDATE app_settings \
-             SET value=json_patch(value,'{\"auto_apply\":false}') \
-             WHERE key='ai_tuning' AND json_valid(value)",
-            [],
-        )
-        .map_err(|error| format!("禁用 C 期AI 调参自动启用失败: {error}"))?;
-    let message = if updated > 0 {
-        C_PHASE_DISABLED
-    } else {
-        C_PHASE_DISABLED_UNBOUND
-    };
-    conn.execute(
-        "INSERT INTO engine_events(ts,level,category,message,payload) VALUES(?1,'warn','ai_tuning',?2,?3)",
-        params![
-            crate::now(),
-            message,
-            json!({ "timeframe": timeframe, "auto_apply_disabled": updated > 0 }).to_string()
-        ],
-    )
-    .map_err(|error| format!("写入 C 期AI 调参告警失败: {error}"))?;
-    Ok(())
-}
-
-/// 非白名单 timeframe 下按规格关闭自动切换，并留下一条告警事件。
-fn disable_auto_switch(conn: &Connection, now: i64) -> Result<(), String> {
-    let updated = conn
-        .execute(
-            "UPDATE app_settings \
-             SET value = json_patch(value, '{\"auto_apply\":false,\"auto_apply_timeframes\":\"\"}') \
-             WHERE key='ai_tuning' AND json_valid(value)",
-            [],
-        )
-        .map_err(|e| format!("禁用AI 调参自动切换失败: {e}"))?;
-    // 0 行说明配置缺失或非法：不能谎报“已禁用”，但同样不能阻断启动。
-    let message = if updated > 0 {
-        AUTO_SWITCH_DISABLED
-    } else {
-        AUTO_SWITCH_SKIPPED
-    };
-    conn.execute(
-        "INSERT INTO engine_events(ts,level,category,message,payload) \
-         VALUES(?1,'warn','ai_tuning',?2,?3)",
-        params![now, message, "{}"],
-    )
-    .map_err(|e| format!("写入AI 调参告警事件失败: {e}"))?;
     Ok(())
 }
 
@@ -525,152 +418,7 @@ pub(crate) fn activate_for_regime(
 const DEFAULT_NO_CANDIDATE_ROLLBACK_SEC: i64 = 1_800;
 const GUARD_EVENT_THROTTLE_SEC: i64 = 3_600;
 
-/// C 期自动启用：只处理 `source='ai'` 且 `status='approved'` 的候选。
-///
-/// 门槛：`enabled`/`auto_apply` 为真、当前 timeframe 在白名单、`auto_apply_since`
-/// 已由 C6 写入、滚动 24 小时内未超过限速。返回被启用的 set_id。
-pub(crate) fn auto_apply_approved(
-    conn: &Connection,
-    current_regime: &str,
-    mode: &str,
-    live_timeframe: &str,
-    now: i64,
-) -> Result<Option<i64>, String> {
-    let config = crate::settings_api::group_value_public(conn, "ai_tuning");
-    if config.get("enabled").and_then(Value::as_bool) != Some(true)
-        || config.get("auto_apply").and_then(Value::as_bool) != Some(true)
-    {
-        return Ok(None);
-    }
-    if !configured_auto_apply_timeframes(&config)
-        .iter()
-        .any(|frame| frame == live_timeframe)
-    {
-        return Ok(None);
-    }
-    let Some(since) = engine_state(conn, "ai_tuning.auto_apply_since")
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-    else {
-        // C6 才写入起点；缺失时不能拿 A/B 期旧候选抢先覆盖 bootstrap。
-        return Ok(None);
-    };
-    let per_24h = config
-        .get("max_auto_apply_per_24h")
-        .and_then(Value::as_i64)
-        .unwrap_or(1)
-        .max(1);
-    let applied_recently: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ai_tuning_activations \
-             WHERE trigger='auto_apply' AND ts > ?1",
-            [now - 86_400],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("统计自动启用次数失败: {error}"))?;
-    if applied_recently >= per_24h {
-        return Ok(None);
-    }
-    let candidate = match conn.query_row(
-        &format!(
-            "SELECT {SET_COLUMNS} FROM ai_tuning_sets \
-             WHERE status='approved' AND source='ai' AND created_at > ?1 AND timeframe=?2 \
-             ORDER BY id ASC LIMIT 1"
-        ),
-        params![since, live_timeframe],
-        row_to_set,
-    ) {
-        Ok(set) => set,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-        Err(error) => return Err(format!("读取 approved 候选失败: {error}")),
-    };
-    if candidate.regime == current_regime {
-        activate(conn, candidate.id, "auto_apply", mode)?;
-    } else {
-        // 非当前 regime：只切换 active 状态，strategy 等 regime 切换时再物化。
-        activate_without_materializing(conn, &candidate, mode, now)?;
-    }
-    Ok(Some(candidate.id))
-}
-
-fn configured_auto_apply_timeframes(config: &Value) -> Vec<String> {
-    // 空串/空白/null 都表示不自动启用；v1 仅接受 1h。
-    config
-        .get("auto_apply_timeframes")
-        .and_then(Value::as_str)
-        .map(|raw| {
-            raw.split(',')
-                .map(|item| item.trim().to_ascii_lowercase())
-                .filter(|item| item == BOOTSTRAP_TIMEFRAME)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn activate_without_materializing(
-    conn: &Connection,
-    set: &AiTuningSet,
-    mode: &str,
-    now: i64,
-) -> Result<(), String> {
-    if !set.params.is_object() {
-        return Err(format!("AI 调参 {} params 必须是对象快照", set.id));
-    }
-    crate::settings_api::validate_group(
-        "strategy",
-        &crate::settings_api::normalized_group_value("strategy", &set.params),
-    )?;
-    conn.execute_batch("SAVEPOINT ai_tuning_auto_apply")
-        .map_err(|error| format!("开启自动启用事务失败: {error}"))?;
-    let result = (|| {
-        let previous_id: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM ai_tuning_sets \
-                 WHERE regime=?1 AND status='active' AND id<>?2 ORDER BY id DESC LIMIT 1",
-                params![set.regime, set.id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| format!("读取 {} active AI 调参失败: {error}", set.regime))?;
-        conn.execute(
-            "UPDATE ai_tuning_sets SET status='retired' \
-             WHERE regime=?1 AND status='active' AND id<>?2",
-            params![set.regime, set.id],
-        )
-        .map_err(|error| format!("退役旧AI 调参失败: {error}"))?;
-        conn.execute(
-            "UPDATE ai_tuning_sets SET status='active', activated_at=?1 WHERE id=?2",
-            params![now, set.id],
-        )
-        .map_err(|error| format!("激活AI 调参 {} 失败: {error}", set.id))?;
-        insert_activation(conn, set.id, &set.regime, previous_id, "auto_apply", now)?;
-        record_event(
-            conn,
-            "info",
-            &format!("AI 调参 {} 已自动启用，等待 regime 切换物化", set.name),
-            json!({
-                "set_id": set.id,
-                "regime": set.regime,
-                "mode": mode,
-                "trigger": "auto_apply",
-                "previous_set_id": previous_id,
-                "materialized": false,
-            }),
-            now,
-        )
-    })();
-    match result {
-        Ok(()) => conn
-            .execute_batch("RELEASE ai_tuning_auto_apply")
-            .map_err(|error| format!("提交自动启用事务失败: {error}")),
-        Err(error) => {
-            let _ = conn
-                .execute_batch("ROLLBACK TO ai_tuning_auto_apply; RELEASE ai_tuning_auto_apply");
-            Err(error)
-        }
-    }
-}
-
-/// 每次 regime/auto_apply/manual 激活后初始化守卫；`last_candidate_at=started_at=now`。
+/// 每次 regime/manual 激活后初始化守卫；`last_candidate_at=started_at=now`。
 ///
 /// 新激活必须清除 `rollback_done`，否则新集第一轮零候选就会永久停摆。
 pub(crate) fn set_guard(
@@ -1002,7 +750,7 @@ fn record_event(
     Ok(())
 }
 
-/// 只写候选记录：不激活、不写配置，应用AI 调参属于 C 期行为。
+/// 只写候选记录：不激活、不写配置；激活必须由人工触发。
 pub(crate) fn insert_candidate(
     conn: &Connection,
     name: &str,
@@ -1015,7 +763,7 @@ pub(crate) fn insert_candidate(
 }
 
 /// GA 离线搜索结果同样只写候选：`source='ga'`，证据字段留空，待证据门评估。
-/// 自动启用只扫 `source='ai'`，因此 GA 候选即使 approved 也不会自动激活。
+/// 证据门只落 approved/rejected，任何候选都必须人工激活。
 pub(crate) fn insert_ga_candidate(
     conn: &Connection,
     name: &str,
@@ -1213,15 +961,9 @@ mod tests {
             .to_string()],
         )
         .unwrap();
-        // 非 1h 分支需要既有 ai_tuning 配置来验证白名单被清空。
         conn.execute(
             "INSERT INTO app_settings VALUES('ai_tuning',?1,0)",
-            [serde_json::json!({
-                "enabled": true,
-                "auto_apply": true,
-                "auto_apply_timeframes": "1h"
-            })
-            .to_string()],
+            [serde_json::json!({"enabled": true}).to_string()],
         )
         .unwrap();
         crate::schema::migrate(&conn).unwrap();
@@ -1420,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn non_1h_seeds_only_retired_snapshot_and_disables_auto_switch() {
+    fn non_1h_seeds_only_retired_snapshot() {
         let conn = conn_with_strategy("4h");
         seed_bootstrap(&conn).unwrap();
         let sets = all_sets(&conn);
@@ -1431,10 +1173,7 @@ mod tests {
         assert_eq!(snapshot.source, "manual");
         assert_eq!(snapshot.evidence["kind"], "manual");
         assert_eq!(snapshot.evidence["snapshot"], "full");
-        assert_eq!(
-            snapshot.evidence["reason"],
-            "timeframe_not_in_auto_apply_whitelist"
-        );
+        assert_eq!(snapshot.evidence["reason"], "non_bootstrap_timeframe");
         assert!(
             snapshot.evidence.get("historical").is_none(),
             "非 1h 快照不是历史审计，不应带 historical"
@@ -1442,33 +1181,12 @@ mod tests {
         assert!(snapshot.parent_id.is_none());
         assert_eq!(snapshot.params["timeframe"], snapshot.timeframe);
 
-        let raw: String = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key='ai_tuning'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let config: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(config["auto_apply"], false);
-        assert_eq!(config["auto_apply_timeframes"], "");
-
         let activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(activations, 0);
-
-        let warnings: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM engine_events \
-                 WHERE level='warn' AND category='ai_tuning' AND message=?1",
-                [AUTO_SWITCH_DISABLED],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(warnings, 1);
     }
 
     #[test]
@@ -1491,16 +1209,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(activations, 0);
-
-        let warnings: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM engine_events \
-                 WHERE level='warn' AND category='ai_tuning' AND message LIKE '%缺失或无效%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(warnings, 1);
         let value: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
@@ -1511,7 +1219,10 @@ mod tests {
         assert_eq!(value, "not-json", "脏配置保持原样，不做半更新");
     }
 
-    fn ai_tuning_config(conn: &Connection) -> Value {
+    #[test]
+    fn ai_tuning_has_no_auto_apply_path() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
         let raw: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
@@ -1519,139 +1230,39 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        serde_json::from_str(&raw).unwrap()
-    }
-
-    fn activation_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |r| {
-            r.get(0)
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn enable_c_phase_materializes_bootstrap_and_is_idempotent() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        set_state(&conn, "market_regime.demo", "range");
-        let before_activations = activation_count(&conn);
-
-        enable_c_phase(&conn).unwrap();
-
-        let config = ai_tuning_config(&conn);
-        assert_eq!(config["auto_apply"], true, "1h 应打开自动启用");
-        assert_eq!(config["auto_apply_timeframes"], "1h", "应保留其它键");
+        let config: Value = serde_json::from_str(&raw).unwrap();
         assert!(
-            state_value(&conn, "ai_tuning.auto_apply_since").is_some(),
-            "应写入自动启用起点"
-        );
-        let strategy = strategy_value(&conn);
-        assert_eq!(strategy["atr_pct_min"], json!(0.6));
-        assert_eq!(strategy["atr_pct_max"], json!(10.0));
-        assert_eq!(strategy["volume_ratio_min"], json!(0.8));
-        assert_eq!(strategy["entry_threshold"], json!(0.45));
-        assert_eq!(
-            active_for_regime(&conn, "range").unwrap().unwrap().status,
-            "active",
-            "当前 regime 的 bootstrap 集应保持 active"
-        );
-        let after_first = activation_count(&conn);
-        assert_eq!(
-            after_first,
-            before_activations + 1,
-            "当前 regime bootstrap 应新增一条激活记录"
-        );
-
-        enable_c_phase(&conn).unwrap();
-        assert_eq!(
-            activation_count(&conn),
-            after_first,
-            "重复启用不得新增激活记录"
-        );
-        assert_eq!(strategy_value(&conn), strategy, "重复启用不得再次物化");
-    }
-
-    #[test]
-    fn enable_c_phase_disables_auto_apply_for_non_1h_without_since() {
-        let conn = conn_with_strategy("4h");
-        seed_bootstrap(&conn).unwrap();
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
-        );
-        let before = strategy_value(&conn);
-
-        enable_c_phase(&conn).unwrap();
-
-        let config = ai_tuning_config(&conn);
-        assert_eq!(config["auto_apply"], false, "非 1h 必须关闭自动启用");
-        assert_eq!(
-            config["auto_apply_timeframes"], "1h",
-            "只改 auto_apply，保留其它键"
+            config.get("auto_apply").is_none(),
+            "不得再存在 auto_apply 键"
         );
         assert!(
-            state_value(&conn, "ai_tuning.auto_apply_since").is_none(),
-            "非 1h 不得写自动启用起点"
+            config.get("auto_apply_timeframes").is_none(),
+            "不得再存在 auto_apply_timeframes 键"
         );
-        assert_eq!(strategy_value(&conn), before, "非 1h 不得物化 strategy");
-        let warnings: i64 = conn
+        assert!(
+            config.get("max_auto_apply_per_24h").is_none(),
+            "不得再存在 max_auto_apply_per_24h 键"
+        );
+        let since: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM engine_events \
-                 WHERE level='warn' AND category='ai_tuning' AND message=?1",
-                [C_PHASE_DISABLED],
+                "SELECT COUNT(*) FROM engine_state WHERE key='ai_tuning.auto_apply_since'",
+                [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(warnings, 1, "应留下可观测的 C 期禁用告警");
-    }
-
-    #[test]
-    fn enable_c_phase_missing_market_regime_falls_back_to_range() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-
-        enable_c_phase(&conn).unwrap();
-
-        let strategy = strategy_value(&conn);
-        assert_eq!(
-            strategy["atr_pct_min"],
-            json!(0.6),
-            "缺失 regime 应回退 range"
-        );
-        assert_eq!(strategy["entry_threshold"], json!(0.45));
-        assert_eq!(
-            active_for_regime(&conn, "range").unwrap().unwrap().name,
-            "range-bootstrap"
-        );
-    }
-
-    #[test]
-    fn enable_c_phase_rolls_back_all_writes_when_activation_fails() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
-        );
-        conn.execute_batch(
-            "CREATE TRIGGER c_phase_boom BEFORE INSERT ON ai_tuning_activations \
-             WHEN NEW.trigger='bootstrap' BEGIN SELECT RAISE(ABORT,'boom'); END;",
-        )
-        .unwrap();
-        let before = strategy_value(&conn);
-
-        assert!(enable_c_phase(&conn).is_err(), "激活失败必须传播错误");
-
-        assert_eq!(
-            ai_tuning_config(&conn)["auto_apply"],
-            false,
-            "事务失败不得留下 auto_apply=true"
+        assert_eq!(since, 0, "不得再写入 ai_tuning.auto_apply_since");
+        assert!(
+            crate::param_registry::find("ai_tuning", "auto_apply").is_none(),
+            "auto_apply 不得再注册为配置键"
         );
         assert!(
-            state_value(&conn, "ai_tuning.auto_apply_since").is_none(),
-            "事务失败不得留下 auto_apply_since"
+            crate::param_registry::find("ai_tuning", "auto_apply_timeframes").is_none(),
+            "auto_apply_timeframes 不得再注册为配置键"
         );
-        assert_eq!(strategy_value(&conn), before, "事务失败不得物化 strategy");
+        assert!(
+            crate::param_registry::find("ai_tuning", "max_auto_apply_per_24h").is_none(),
+            "max_auto_apply_per_24h 不得再注册为配置键"
+        );
     }
 
     #[test]
@@ -1816,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn ga_candidate_is_not_auto_applied() {
+    fn ga_candidate_requires_manual_activation() {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
         let parent = active_for_regime(&conn, "range").unwrap().unwrap();
@@ -1831,21 +1442,17 @@ mod tests {
         assert!(candidate.activated_at.is_none(), "GA 候选不得被激活");
 
         mark_evidence(&conn, id, true, &json!({"gate": {"pass": true}})).unwrap();
-        conn.execute(
-            "INSERT INTO engine_state(key,value,updated_at) \
-             VALUES('ai_tuning.auto_apply_since',?1,?1)",
-            [crate::now().to_string()],
-        )
-        .unwrap();
-        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now() + 1).unwrap();
-        assert!(applied.is_none(), "GA 候选不得被自动应用");
 
         let after = load_set(&conn, id).unwrap();
         assert_eq!(after.status, "approved");
         assert_eq!(after.source, "ga");
-        assert!(after.activated_at.is_none(), "自动启用不得触碰 GA 候选");
+        assert!(after.activated_at.is_none(), "证据门通过后必须等待人工激活");
         let active = active_for_regime(&conn, "range").unwrap().unwrap();
         assert_eq!(active.id, parent.id, "GA 候选不得替换 active");
+
+        activate(&conn, id, "manual", "demo").unwrap();
+        assert_eq!(load_set(&conn, id).unwrap().status, "active");
+        assert_eq!(load_set(&conn, parent.id).unwrap().status, "retired");
     }
 
     #[test]
@@ -2679,15 +2286,6 @@ mod tests {
         id
     }
 
-    fn set_state(conn: &Connection, key: &str, value: &str) {
-        conn.execute(
-            "INSERT INTO engine_state(key,value,updated_at) VALUES(?1,?2,0) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        .unwrap();
-    }
-
     fn state_value(conn: &Connection, key: &str) -> Option<String> {
         conn.query_row(
             "SELECT value FROM engine_state WHERE key=?1",
@@ -2696,248 +2294,6 @@ mod tests {
         )
         .optional()
         .unwrap()
-    }
-
-    fn set_ai_tuning_config(conn: &Connection, value: Value) {
-        conn.execute(
-            "UPDATE app_settings SET value=?1 WHERE key='ai_tuning'",
-            [value.to_string()],
-        )
-        .unwrap();
-    }
-
-    fn auto_apply_activations(conn: &Connection) -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM ai_tuning_activations WHERE trigger='auto_apply'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn auto_apply_activates_approved_candidate_for_current_regime() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        let bootstrap_id = set_id_by_name(&conn, "range-bootstrap");
-        let candidate_id = approved_candidate(&conn, "range-ai-auto", "range");
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-
-        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now()).unwrap();
-
-        assert_eq!(applied, Some(candidate_id));
-        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
-        assert_eq!(load_set(&conn, bootstrap_id).unwrap().status, "retired");
-        let strategy = strategy_value(&conn);
-        assert_eq!(
-            strategy["entry_threshold"],
-            json!(0.40),
-            "当前 regime 必须物化"
-        );
-        assert_eq!(auto_apply_activations(&conn), 1);
-        let previous_id: Option<i64> = conn
-            .query_row(
-                "SELECT previous_set_id FROM ai_tuning_activations WHERE trigger='auto_apply'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(previous_id, Some(bootstrap_id));
-    }
-
-    #[test]
-    fn auto_apply_non_current_regime_waits_for_regime_switch() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        let candidate_id = approved_candidate(&conn, "trend-ai-auto", "trend");
-        let before_strategy = strategy_value(&conn);
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-
-        let applied = auto_apply_approved(&conn, "range", "demo", "1h", crate::now()).unwrap();
-
-        assert_eq!(applied, Some(candidate_id));
-        assert_eq!(load_set(&conn, candidate_id).unwrap().status, "active");
-        assert!(
-            load_set(&conn, candidate_id)
-                .unwrap()
-                .activated_at
-                .is_some(),
-            "非当前 regime 仍要记录激活时刻"
-        );
-        assert_eq!(
-            strategy_value(&conn),
-            before_strategy,
-            "非当前 regime 不得提前物化 strategy"
-        );
-        assert_eq!(auto_apply_activations(&conn), 1);
-        let changes: i64 = conn
-            .query_row("SELECT COUNT(*) FROM parameter_changes", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(changes, 0, "非当前 regime 不得写 strategy 变更记录");
-    }
-
-    #[test]
-    fn auto_apply_requires_since_enabled_whitelist_and_approved() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        let candidate_id = approved_candidate(&conn, "range-ai-gates", "range");
-        let now = crate::now();
-
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
-            None,
-            "auto_apply_since 缺失时不得自动启用"
-        );
-
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": true, "auto_apply": false, "auto_apply_timeframes": "1h"}),
-        );
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
-            None,
-            "auto_apply=false 不得启用"
-        );
-
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": false, "auto_apply": true, "auto_apply_timeframes": "1h"}),
-        );
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
-            None,
-            "enabled=false 不得启用"
-        );
-
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": ""}),
-        );
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
-            None,
-            "空白名单表示不自动启用"
-        );
-
-        set_ai_tuning_config(
-            &conn,
-            json!({"enabled": true, "auto_apply": true, "auto_apply_timeframes": "1h"}),
-        );
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "4h", now).unwrap(),
-            None,
-            "白名单与当前 timeframe 不匹配时不得启用"
-        );
-        assert_eq!(
-            load_set(&conn, candidate_id).unwrap().status,
-            "approved",
-            "未启用时候选保持 approved"
-        );
-    }
-
-    #[test]
-    fn auto_apply_ignores_non_approved_or_non_ai_sources() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        let parent = active_for_regime(&conn, "range").unwrap().unwrap();
-        let snapshot = validate_candidate(
-            &parent.params,
-            &[param_update("entry_threshold", json!(0.40))],
-        )
-        .unwrap();
-        let pending_id =
-            insert_candidate(&conn, "range-ai-pending", "range", "1h", &snapshot, None).unwrap();
-        let manual_id = insert_set(
-            &conn,
-            "range-manual-approved",
-            "range",
-            "1h",
-            &snapshot,
-            "approved",
-            "manual",
-            "{}",
-            None,
-            crate::now(),
-        )
-        .unwrap();
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-
-        let now = crate::now();
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now).unwrap(),
-            None
-        );
-        assert_eq!(load_set(&conn, pending_id).unwrap().status, "candidate");
-        assert_eq!(load_set(&conn, manual_id).unwrap().status, "approved");
-    }
-
-    #[test]
-    fn auto_apply_respects_rolling_24h_limit() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        approved_candidate(&conn, "range-ai-first", "range");
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-        let now = crate::now();
-
-        assert!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now)
-                .unwrap()
-                .is_some(),
-            "首个候选应被自动启用"
-        );
-        approved_candidate(&conn, "range-ai-second", "range");
-        assert_eq!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now + 60).unwrap(),
-            None,
-            "滚动 24 小时内已启用一次，不得再启用"
-        );
-        assert_eq!(auto_apply_activations(&conn), 1);
-    }
-
-    fn insert_activation_row(conn: &Connection, set_id: i64, regime: &str, trigger: &str, ts: i64) {
-        conn.execute(
-            "INSERT INTO ai_tuning_activations(set_id,regime,previous_set_id,ts,trigger) \
-             VALUES(?1,?2,NULL,?3,?4)",
-            (set_id, regime, ts, trigger),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn auto_apply_rate_limit_ignores_regime_activations() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        approved_candidate(&conn, "range-ai-quota", "range");
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-        let now = crate::now();
-        insert_activation_row(&conn, 1, "range", "regime", now);
-
-        assert!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now)
-                .unwrap()
-                .is_some(),
-            "regime 激活不占自动启用配额"
-        );
-    }
-
-    #[test]
-    fn auto_apply_rate_limit_recovers_after_window() {
-        let conn = conn_with_strategy("1h");
-        seed_bootstrap(&conn).unwrap();
-        approved_candidate(&conn, "range-ai-window", "range");
-        set_state(&conn, "ai_tuning.auto_apply_since", "0");
-        let now = crate::now();
-        insert_activation_row(&conn, 1, "range", "auto_apply", now - 86_401);
-
-        assert!(
-            auto_apply_approved(&conn, "range", "demo", "1h", now)
-                .unwrap()
-                .is_some(),
-            "超过 24 小时窗口后应恢复自动启用"
-        );
     }
 
     fn guard_fixture() -> (Connection, i64, i64) {

@@ -22,7 +22,6 @@ pub(crate) fn evaluate_gate(
     metrics: &BasketMetrics,
     min_oos_trades: usize,
     live_timeframe: &str,
-    auto_apply_timeframes: &[&str],
     baseline_oos_avg: Option<f64>,
 ) -> EvidenceReport {
     let mut reasons = Vec::new();
@@ -31,9 +30,6 @@ pub(crate) fn evaluate_gate(
             "timeframe_mismatch: {} != {}",
             metrics.timeframe, live_timeframe
         ));
-    }
-    if !auto_apply_timeframes.contains(&metrics.timeframe.as_str()) {
-        reasons.push(format!("timeframe_not_whitelisted: {}", metrics.timeframe));
     }
     if metrics.oos_trades < min_oos_trades {
         reasons.push(format!(
@@ -213,7 +209,7 @@ mod tests {
     }
 
     fn gate(metrics: &BasketMetrics, baseline: Option<f64>) -> EvidenceReport {
-        evaluate_gate(metrics, 30, "1h", &["1h"], baseline)
+        evaluate_gate(metrics, 30, "1h", baseline)
     }
 
     #[test]
@@ -312,17 +308,6 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.starts_with("timeframe_mismatch")));
-        assert!(report
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("timeframe_not_whitelisted")));
-
-        let report = evaluate_gate(&passing_metrics(), 30, "1h", &[], None);
-        assert!(!report.pass);
-        assert!(report
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("timeframe_not_whitelisted")));
     }
 
     #[test]
@@ -333,7 +318,7 @@ mod tests {
         metrics.timeframe = "4h".to_string();
         let report = gate(&metrics, Some(0.301));
         assert!(!report.pass);
-        assert_eq!(report.reasons.len(), 5, "reasons: {:?}", report.reasons);
+        assert_eq!(report.reasons.len(), 4, "reasons: {:?}", report.reasons);
         assert!(report
             .reasons
             .iter()

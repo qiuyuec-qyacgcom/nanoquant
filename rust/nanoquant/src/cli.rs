@@ -733,25 +733,10 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
         .and_then(Value::as_str)
         .ok_or_else(|| (1, "strategy.timeframe 缺失或非法".to_string()))?
         .to_string();
-    let gate_timeframes: Vec<String> = ai_tuning
-        .get("auto_apply_timeframes")
-        .and_then(Value::as_str)
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|frame| !frame.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
     // 默认按实盘周期回测；`--interval` 允许在部署周期未对齐时做离线诊断。
-    let timeframe = crate::ga_tune::resolve_timeframe(
-        &live_timeframe,
-        &gate_timeframes,
-        options.interval.as_deref(),
-    );
-    let evidence_gate_compatible =
-        timeframe == live_timeframe && gate_timeframes.iter().any(|frame| frame == &timeframe);
+    let timeframe = crate::ga_tune::resolve_timeframe(&live_timeframe, options.interval.as_deref());
+    // 证据门只接受与实盘一致的周期。
+    let evidence_gate_compatible = timeframe == live_timeframe;
     let interval_ms = crate::history::interval_ms(&timeframe)
         .ok_or_else(|| (2, format!("不支持的回测周期: {timeframe}")))?;
     let regime_name = options.regime.as_deref().unwrap_or(GA_REGIME);
@@ -797,7 +782,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
                 "regime": regime_name,
                 "timeframe": timeframe,
                 "live_timeframe": live_timeframe,
-                "gate_timeframes": gate_timeframes,
+
                 "evidence_gate_compatible": evidence_gate_compatible,
                 "symbols_requested": symbols.len(),
                 "basket": basket.len(),
@@ -838,7 +823,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
                 "regime": regime_name,
                 "timeframe": timeframe,
                 "live_timeframe": live_timeframe,
-                "gate_timeframes": gate_timeframes,
+
                 "evidence_gate_compatible": evidence_gate_compatible,
                 "basket": basket.len(),
                 "orders": order_trades.0,
@@ -880,7 +865,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
             "regime": regime_name,
             "timeframe": timeframe,
             "live_timeframe": live_timeframe,
-            "gate_timeframes": gate_timeframes,
+
             "evidence_gate_compatible": evidence_gate_compatible,
             "symbols_used": basket.iter().map(|(symbol, _)| symbol.clone()).collect::<Vec<_>>(),
             "skipped": skipped_json,
@@ -892,7 +877,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
             "best": result.best,
             "history": result.history,
             "candidate_id": candidate_id,
-            "auto_apply": false,
+            "auto_activated": false,
             "detail": "GA 候选已写入 ai_tuning_sets（source=ga），待证据门评估，不自动应用",
         }),
     ))

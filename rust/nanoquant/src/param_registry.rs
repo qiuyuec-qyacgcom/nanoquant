@@ -93,7 +93,6 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("strategy", "min_entry_rr", 0.0, 10.0, 0.1),
     // v2 信号有效期：AI 未给出有效期时使用的 K 线根数，默认 6；整数语义。
     ("strategy", "valid_bars", 1.0, 24.0, 1.0),
-    ("ai_tuning", "max_auto_apply_per_24h", 1.0, 100.0, 1.0),
     (
         "ai_tuning",
         "no_candidate_rollback_sec",
@@ -212,13 +211,10 @@ const VISIBLE: &[(&str, &[&str])] = &[
         "ai_tuning",
         &[
             "enabled",
-            "auto_apply",
-            "max_auto_apply_per_24h",
             "no_candidate_rollback_sec",
             "regime_confirm_sec",
             "regime_cooldown_sec",
             "min_oos_trades",
-            "auto_apply_timeframes",
             "ga_enabled",
             "ga_population",
             "ga_generations",
@@ -626,13 +622,10 @@ mod tests {
         assert_eq!(group["writable"], serde_json::json!([]));
         for key in [
             "enabled",
-            "auto_apply",
-            "max_auto_apply_per_24h",
             "no_candidate_rollback_sec",
             "regime_confirm_sec",
             "regime_cooldown_sec",
             "min_oos_trades",
-            "auto_apply_timeframes",
         ] {
             assert_eq!(
                 group["meta"][key]["visible"],

@@ -176,13 +176,6 @@ fn guard_view(conn: &Connection) -> Result<Value, ApiError> {
     Ok(Value::Object(guard))
 }
 
-fn auto_apply_since(conn: &Connection) -> Result<i64, ApiError> {
-    Ok(read_engine_state(conn, "ai_tuning.auto_apply_since")
-        .map_err(server_error)?
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .unwrap_or(0))
-}
-
 /// 当前视图：`market_regime` 只读诊断键，不触发任何切换；active 缺失按 null 呈现。
 async fn current_view(State(db): State<Db>) -> Result<Json<Value>, ApiError> {
     let conn = lock(&db)?;
@@ -206,7 +199,7 @@ async fn current_view(State(db): State<Db>) -> Result<Json<Value>, ApiError> {
         "market_regime": market_regime,
         "active": active,
         "guard": guard_view(&conn)?,
-        "auto_apply_since": auto_apply_since(&conn)?,
+
     })
     .into())
 }
@@ -581,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_includes_guard_and_auto_apply_since() {
+    async fn current_includes_guard_only() {
         let db = memory_db();
         insert_set(
             &db,
@@ -597,13 +590,15 @@ mod tests {
             "ai_tuning.guard.range",
             "{\"set_id\":1,\"last_candidate_at\":123}",
         );
-        set_engine_state(&db, "ai_tuning.auto_apply_since", "1700000000");
 
         let (status, body) = get(app(db), "/api/v1/ai-tuning/current").await;
         assert_eq!(status, StatusCode::OK, "当前视图应成功: {body}");
         assert_eq!(body["guard"]["range"]["set_id"], 1);
         assert_eq!(body["guard"]["range"]["last_candidate_at"], 123);
-        assert_eq!(body["auto_apply_since"], 1_700_000_000);
+        assert!(
+            body.get("auto_apply_since").is_none(),
+            "不得再返回自动启用起点"
+        );
     }
 
     #[tokio::test]
