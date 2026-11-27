@@ -72,6 +72,7 @@ mod performance;
 mod protection_api;
 mod providers;
 mod public;
+mod quant;
 mod reasoning;
 mod reconcile;
 mod regime;

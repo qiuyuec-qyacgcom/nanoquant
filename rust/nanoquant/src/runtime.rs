@@ -45,37 +45,6 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-/// 半 AI 模式下由本地规则决定杠杆：ATR% 相对波动目标给出 0.5–2 倍缩放，
-/// 评分相对中性值 0.5 再做加减，最后夹到全局上下限并取整。
-fn local_leverage(
-    atr_pct: f64,
-    score: f64,
-    base: f64,
-    vol_target: f64,
-    score_weight: f64,
-    min_lev: f64,
-    max_lev: f64,
-) -> f64 {
-    // 无评分（如非 fusion 预览信号）按中性 0.5 处理，避免被当成 0 分压低杠杆。
-    let score = if score > 0.0 { score } else { 0.5 };
-    let vol = if atr_pct > 0.0 {
-        (vol_target / atr_pct).clamp(0.5, 2.0)
-    } else {
-        1.0
-    };
-    (base * vol + (score - 0.5) * score_weight)
-        .clamp(min_lev, max_lev)
-        .round()
-}
-
-/// 决策 ID：mode + symbol + 信号 K 线 close_time + 方向。
-///
-/// 同一根 K 线在同一环境下重复扫描必须得到同一个 ID，用来把
-/// 信号审计、订单、持仓、成交串成一条链；方向不同视为两次不同决策。
-fn decision_id_of(mode: &str, symbol: &str, close_time: i64, side: &str) -> String {
-    format!("{mode}:{symbol}:{close_time}:{side}")
-}
-
 /// 决策日志的目标收益率：止盈价缺失时返回 0，
 /// 不能用 0 价硬算成 100% 污染日志与经验学习。
 fn journal_target_pct(entry_price: f64, take_profit: f64) -> f64 {
@@ -3145,108 +3114,8 @@ impl EngineRuntime {
                     }
                 }
             }
-            let features = crate::trade_policy::MarketFeatures {
-                funding_rate: market.funding_rate,
-                open_interest_change_pct: market.open_interest_change_pct,
-                relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
-                relative_strength_available: relative_strength.contains_key(symbol),
-            };
-            // range 市启用均值回归后，趋势信号不再作为开仓来源：
-            // 有 MR 信号就用它，没有就只留审计草稿，避免震荡市被趋势假突破带偏。
-            let mr_signal = if mean_reversion_active {
-                crate::mean_reversion::mean_reversion_signal(&market.candles, strategy)
-            } else {
-                None
-            };
-            let trend_signal = if mean_reversion_active {
-                None
-            } else {
-                crate::trade_policy::evaluate(&market.candles, price, metric.atr, policy, features)
-            };
-            let (
-                side,
-                score,
-                quant_side,
-                quant_score,
-                preview_side,
-                preview_score,
-                quant_passed,
-                mean_reversion,
-                signal_reason,
-            ) = if let Some(signal) = mr_signal {
-                (
-                    signal.side.to_string(),
-                    signal.score,
-                    Some(signal.side.to_string()),
-                    Some(signal.score),
-                    Some(signal.side.to_string()),
-                    Some(signal.score),
-                    true,
-                    true,
-                    Some(signal.reason),
-                )
-            } else if mean_reversion_active {
-                let preview = crate::trade_policy::preview(
-                    &market.candles,
-                    price,
-                    metric.atr,
-                    policy,
-                    features,
-                );
-                let preview_side = preview
-                    .filter(|item| item.side != "flat")
-                    .map(|item| item.side.to_string());
-                let preview_score = preview.map(|item| item.score);
-                (
-                    "long".to_string(),
-                    0.0,
-                    None,
-                    None,
-                    preview_side,
-                    preview_score,
-                    false,
-                    true,
-                    None,
-                )
-            } else {
-                match trend_signal {
-                    Some(signal) => (
-                        signal.side.to_string(),
-                        signal.score,
-                        Some(signal.side.to_string()),
-                        Some(signal.score),
-                        Some(signal.side.to_string()),
-                        Some(signal.score),
-                        true,
-                        false,
-                        Some(signal.reason),
-                    ),
-                    None => {
-                        let preview = crate::trade_policy::preview(
-                            &market.candles,
-                            price,
-                            metric.atr,
-                            policy,
-                            features,
-                        );
-                        let preview_side = preview
-                            .filter(|item| item.side != "flat")
-                            .map(|item| item.side.to_string());
-                        let preview_score = preview.map(|item| item.score);
-                        (
-                            "long".to_string(),
-                            0.0,
-                            None,
-                            None,
-                            preview_side,
-                            preview_score,
-                            false,
-                            false,
-                            None,
-                        )
-                    }
-                }
-            };
+            // 量化内核只接收已加载好的行情与参数，输出候选信号；
+            // 取数（配置/交易所上限/注入 ID）与落库仍留在 runtime。
             let Some(exchange_max): Option<Option<i64>> = tx
                 .query_row(
                     "SELECT max_leverage FROM trading_symbols WHERE symbol=?1 AND enabled!=0",
@@ -3258,100 +3127,64 @@ impl EngineRuntime {
             else {
                 continue;
             };
-            let upper = cfg["max_leverage"]
-                .as_i64()
-                .unwrap_or(100)
-                .min(exchange_max.filter(|v| *v > 0).unwrap_or(100))
-                .clamp(1, 100);
-            let lower = cfg["min_leverage"].as_i64().unwrap_or(1).clamp(1, upper);
-            // 杠杆由本地规则按 ATR 与评分计算，AI 复核不再决定杠杆。
-            let leverage = local_leverage(
-                metric.atr_pct,
-                score,
-                cfg["local_leverage_base"].as_f64().unwrap_or(10.0),
-                cfg["local_leverage_vol_target"].as_f64().unwrap_or(2.0),
-                cfg["local_leverage_score_weight"].as_f64().unwrap_or(10.0),
-                lower as f64,
-                upper as f64,
-            );
-            // 保证金以参数值为量化中枢，AI 不再调整该比例。
-            let margin_base = cfg["margin_pct"].as_f64().unwrap_or(20.0);
-            // 仓位止盈止损率是运行时的账户风险预算（保证金收益率），
-            // 由 0.5 秒快平任务实时判定，不再在开仓时换算成价格距离。
-            // 趋势仓止损距离只由 ATR 决定，与杠杆解耦。
-            let atr_stop_mult = cfg["stop_distance_atr_mult"].as_f64().unwrap_or(1.3);
-            // 均值回归仓使用独立的保证金止损止盈率，不继承趋势仓的全局阈值。
-            let (stop_price, take_profit) = if mean_reversion {
-                crate::mean_reversion::mean_reversion_stops(&side, price, leverage, strategy)
-            } else {
-                let stop_price =
-                    crate::risk::atr_stop_price(&side, price, metric.atr_pct, atr_stop_mult);
-                // 趋势仓止盈交给 ROI 阶梯与快平任务；开仓不预置固定止盈价。
-                (stop_price, 0.0)
-            };
-            let target = cfg["vol_target_atr_pct"].as_f64().unwrap_or(0.0);
-            let scale = if target > 0.0 && metric.atr_pct > 0.0 {
-                (target / metric.atr_pct).clamp(0.25, 2.0)
-            } else {
-                1.0
-            };
-            let journal_snapshot = serde_json::json!({
-                "atr_pct": metric.atr_pct,
-                "funding": market.funding_rate,
-                "oi_change_pct": market.open_interest_change_pct,
+            let signal = crate::quant::evaluate_entry(&crate::quant::EntrySignalInput {
+                candles: &market.candles,
+                mark_price: price,
+                atr: metric.atr,
+                atr_pct: metric.atr_pct,
+                funding_rate: market.funding_rate,
+                open_interest_change_pct: market.open_interest_change_pct,
+                relative_strength: relative_strength.get(symbol).copied().unwrap_or(0.0),
+                relative_strength_available: relative_strength.contains_key(symbol),
+                strategy,
+                policy,
+                mean_reversion_active,
+                risk: &cfg,
+                exchange_max_leverage: exchange_max,
             });
-            let close_time = market.candles.last().map_or(0, |c| c.close_time);
-            let decision_id = decision_id_of(mode, symbol, close_time, &side);
             let evolution = crate::evolution_api::evolution_cfg(tx);
             let (_mantra_text, injected_mantra_ids) =
                 crate::evolution_api::injection_payload(tx, &evolution);
             let injected_experience_ids =
-                crate::journal::inject_ids(tx, symbol, &journal_snapshot, &side);
-            let features_text = serde_json::to_string(&serde_json::json!({
-                "decision_id": decision_id.clone(),
-                "injected_mantra_ids": injected_mantra_ids,
-                "injected_experience_ids": injected_experience_ids,
-                "atr_pct": metric.atr_pct,
-                "vol_ratio": metric.vol_ratio,
-                "quote_volume": market.quote_volume,
-                "spread_bps": market.spread_bps,
-                "journal_snapshot": journal_snapshot,
-                "quant_side": quant_side,
-                "quant_score": quant_score,
-                "preview_side": preview_side,
-                "preview_score": preview_score,
-                "quant_passed": quant_passed,
-                "mean_reversion": mean_reversion,
-                "higher_timeframe": higher_timeframe,
-                "higher_regime": higher_regime.map(|regime| regime.as_str()),
-                "htf_status": htf_gate.status(),
-                "mr_sl_pct": if mean_reversion { strategy["mr_sl_pct"].as_f64().unwrap_or(20.0) } else { 0.0 },
-                "mr_tp_pct": if mean_reversion { strategy["mr_tp_pct"].as_f64().unwrap_or(30.0) } else { 0.0 },
-                "signal_reason": signal_reason,
-            }))
-            .unwrap_or_else(|_| "{}".to_string());
-            let client_id = format!("demo-entry-{close_time}-{symbol}");
+                crate::journal::inject_ids(tx, symbol, &signal.journal_snapshot, &signal.side);
+            let close_time = market.candles.last().map_or(0, |c| c.close_time);
+            let entry = crate::quant::entry_features(crate::quant::EntryFeatureInput {
+                mode,
+                symbol,
+                close_time,
+                atr_pct: metric.atr_pct,
+                vol_ratio: metric.vol_ratio,
+                quote_volume: market.quote_volume,
+                spread_bps: market.spread_bps,
+                higher_timeframe,
+                higher_regime,
+                htf_gate,
+                strategy,
+                signal: &signal,
+                injected_mantra_ids,
+                injected_experience_ids,
+            });
             drafts.push(EntryDraft {
                 symbol: symbol.clone(),
-                side,
-                quant_side,
-                quant_score,
-                preview_side,
-                preview_score,
-                quant_passed,
-                leverage,
-                margin_pct: margin_base,
-                stop_price,
-                take_profit,
-                mean_reversion,
-                score,
+                side: signal.side,
+                quant_side: signal.quant_side,
+                quant_score: signal.quant_score,
+                preview_side: signal.preview_side,
+                preview_score: signal.preview_score,
+                quant_passed: signal.quant_passed,
+                leverage: signal.leverage,
+                margin_pct: signal.margin_pct,
+                stop_price: signal.stop_price,
+                take_profit: signal.take_profit,
+                mean_reversion: signal.mean_reversion,
+                score: signal.score,
                 mark_price: price,
                 filter: *filter,
-                scale,
-                features_text,
-                journal_snapshot,
-                client_id,
-                decision_id,
+                scale: signal.scale,
+                features_text: entry.features_text,
+                journal_snapshot: signal.journal_snapshot,
+                client_id: entry.client_id,
+                decision_id: entry.decision_id,
             });
         }
         Ok(drafts)
@@ -6346,50 +6179,6 @@ mod tests {
     }
 
     #[test]
-    fn local_leverage_rises_for_low_atr_high_score() {
-        let leverage = local_leverage(1.0, 0.9, 10.0, 2.0, 10.0, 1.0, 100.0);
-        assert_eq!(leverage, 24.0, "低波动 + 高评分应放大到基准之上");
-    }
-
-    #[test]
-    fn local_leverage_falls_for_high_atr_low_score() {
-        let leverage = local_leverage(4.0, 0.1, 10.0, 2.0, 10.0, 1.0, 100.0);
-        assert_eq!(leverage, 1.0, "高波动 + 低评分应压到基准之下");
-    }
-
-    #[test]
-    fn local_leverage_clamps_to_bounds() {
-        assert_eq!(
-            local_leverage(0.5, 1.0, 10.0, 2.0, 10.0, 1.0, 5.0),
-            5.0,
-            "超过上限时夹到全局杠杆上限"
-        );
-        assert_eq!(
-            local_leverage(8.0, 0.0, 10.0, 2.0, 10.0, 8.0, 100.0),
-            8.0,
-            "低于下限时夹到全局杠杆下限"
-        );
-    }
-
-    #[test]
-    fn local_leverage_treats_zero_score_as_neutral() {
-        assert_eq!(
-            local_leverage(1.0, 0.0, 10.0, 2.0, 10.0, 1.0, 100.0),
-            local_leverage(1.0, 0.5, 10.0, 2.0, 10.0, 1.0, 100.0),
-            "无评分应与中性评分 0.5 等价"
-        );
-    }
-
-    #[test]
-    fn local_leverage_handles_zero_atr() {
-        assert_eq!(
-            local_leverage(0.0, 0.5, 10.0, 2.0, 10.0, 1.0, 100.0),
-            10.0,
-            "ATR 缺失时波动倍率回落到 1，按评分中性值给基准杠杆"
-        );
-    }
-
-    #[test]
     fn journal_target_pct_not_fake_when_take_profit_zero() {
         assert_eq!(
             journal_target_pct(100.0, 0.0),
@@ -6454,31 +6243,6 @@ mod tests {
         assert_eq!(unrealized, (105.0 - 100.0) * 2.0);
         assert!(ts > 0);
         assert_eq!(status, "open", "未触发风控时不得改变持仓状态");
-    }
-
-    #[test]
-    fn decision_id_is_stable_for_the_same_bar() {
-        let first = decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "long");
-        assert_eq!(
-            first,
-            decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "long"),
-            "同一根 K 线重复扫描必须得到同一个决策 ID"
-        );
-        assert_ne!(
-            first,
-            decision_id_of("live", "BTCUSDT", 1_700_000_000_000, "long"),
-            "环境不同不能共用决策 ID"
-        );
-        assert_ne!(
-            first,
-            decision_id_of("demo", "BTCUSDT", 1_700_000_000_001, "long"),
-            "下一根 K 线是新决策"
-        );
-        assert_ne!(
-            first,
-            decision_id_of("demo", "BTCUSDT", 1_700_000_000_000, "short"),
-            "方向不同是两次决策"
-        );
     }
 
     #[test]
