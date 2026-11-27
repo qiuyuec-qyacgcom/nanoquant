@@ -46,7 +46,7 @@
   "tables": [
     {
       "name": "ai_call_logs",
-      "sql": "CREATE TABLE ai_call_logs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tprovider VARCHAR(64) NOT NULL, \n\tmodel VARCHAR(128) NOT NULL, \n\tpurpose VARCHAR(32) NOT NULL, \n\tok BOOLEAN NOT NULL, \n\tlatency_ms INTEGER NOT NULL, \n\tprompt_tokens INTEGER NOT NULL, \n\tcompletion_tokens INTEGER NOT NULL, \n\tcost_usd FLOAT NOT NULL, \n\terror VARCHAR(500) NOT NULL, \n\traw_text TEXT NOT NULL, \n\tPRIMARY KEY (id)\n)",
+      "sql": "CREATE TABLE ai_call_logs (\n\tid INTEGER NOT NULL, \n\tts INTEGER NOT NULL, \n\tprovider VARCHAR(64) NOT NULL, \n\tmodel VARCHAR(128) NOT NULL, \n\tpurpose VARCHAR(32) NOT NULL, \n\tok BOOLEAN NOT NULL, \n\tlatency_ms INTEGER NOT NULL, \n\tprompt_tokens INTEGER NOT NULL, \n\tcompletion_tokens INTEGER NOT NULL, \n\tcost_usd FLOAT NOT NULL, \n\terror VARCHAR(500) NOT NULL, \n\traw_text TEXT NOT NULL, \n\tmode VARCHAR(8), \n\tPRIMARY KEY (id)\n)",
       "row_count": 0,
       "columns": [
         {
@@ -142,6 +142,14 @@
           "name": "raw_text",
           "type": "TEXT",
           "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 12,
+          "name": "mode",
+          "type": "VARCHAR(8)",
+          "notnull": false,
           "default": null,
           "pk": false
         }

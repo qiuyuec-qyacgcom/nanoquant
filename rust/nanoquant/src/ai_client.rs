@@ -520,7 +520,36 @@ fn log_call(
     {
         return 0;
     }
-    conn.last_insert_rowid()
+    let id = conn.last_insert_rowid();
+    // 迁移前的老库或测试夹具可能没有 mode 列：补写失败只忽略，不影响主日志。
+    let _ = conn.execute(
+        "UPDATE ai_call_logs SET mode=?1 WHERE id=?2",
+        (current_log_mode(&conn), id),
+    );
+    id
+}
+
+/// AI 日志归属环境：优先 engine_state，其次 engine 配置，最后按 demo。
+fn current_log_mode(conn: &rusqlite::Connection) -> String {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM engine_state WHERE key='mode'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(mode) = stored.filter(|mode| !mode.trim().is_empty()) {
+        return mode;
+    }
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key='engine'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|value| value["mode"].as_str().map(str::to_string))
+    .unwrap_or_else(|| "demo".to_string())
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1803,6 +1832,34 @@ mod tests {
             timeout_sec: 5,
             json_mode: true,
         }
+    }
+
+    #[test]
+    fn log_call_records_the_current_trade_mode() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, model TEXT, \
+               purpose TEXT, ok INTEGER, latency_ms INTEGER, prompt_tokens INTEGER, \
+               completion_tokens INTEGER, cost_usd REAL, error TEXT, raw_text TEXT, mode TEXT); \
+             CREATE TABLE engine_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER); \
+             INSERT INTO engine_state VALUES('mode','live',0);",
+        )
+        .unwrap();
+        let db = Db {
+            path: String::new(),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
+        };
+
+        let id = log_call(&db, &provider(), "review", true, 120, 10, 5, 0.01, "", "");
+
+        assert!(id > 0);
+        let mode: String = db
+            .lock()
+            .query_row("SELECT mode FROM ai_call_logs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mode, "live", "AI 日志必须带上当时的交易环境");
     }
 
     #[test]

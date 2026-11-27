@@ -597,22 +597,15 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
 
     let mut latencies: Vec<f64> = Vec::new();
     let mut by_provider: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    if let Ok(mut stmt) = conn
-        .prepare("SELECT latency_ms, provider FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
-    {
-        if let Ok(rows) = stmt.query_map([since], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-        }) {
-            for (latency, provider) in rows.flatten() {
-                let ms = latency as f64;
-                // 空 provider 归入 unknown，避免分供应商视图出现空 key。
-                let key = provider
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| "unknown".to_string());
-                latencies.push(ms);
-                by_provider.entry(key).or_default().push(ms);
-            }
-        }
+    let (latency_rows, latency_scoped) = latency_samples(conn, since, mode);
+    for (latency, provider) in latency_rows {
+        let ms = latency as f64;
+        // 空 provider 归入 unknown，避免分供应商视图出现空 key。
+        let key = provider
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        latencies.push(ms);
+        by_provider.entry(key).or_default().push(ms);
     }
     latencies.sort_by(f64::total_cmp);
     walls.sort_by(f64::total_cmp);
@@ -661,7 +654,7 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "ai_latency_max_ms": max_latency,
         "ai_latency_percentile_method": "nearest_rank",
         "ai_latency_by_provider": provider_stats,
-        "ai_latency_scope": "all_modes",
+        "ai_latency_scope": if latency_scoped { "mode" } else { "all_modes" },
         "ai_wall_samples": walls.len(),
         "ai_wall_p50_ms": percentile(&walls, 0.50),
         "ai_wall_p95_ms": percentile(&walls, 0.95),
@@ -673,6 +666,34 @@ pub fn half_ai_stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) -
         "book_stale_pct": book_stale_pct,
         "book": book,
     })
+}
+
+/// 读取 AI 调用延迟样本：优先按 mode 过滤；老库/测试夹具缺 mode 列时回退全环境。
+///
+/// 返回 `(样本, 是否按 mode 过滤)`；调用方用后者标注 `ai_latency_scope`。
+fn latency_samples(
+    conn: &Connection,
+    since: i64,
+    mode: &str,
+) -> (Vec<(i64, Option<String>)>, bool) {
+    let row =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?));
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT latency_ms, provider FROM ai_call_logs \
+         WHERE ts >= ?1 AND latency_ms > 0 AND mode = ?2",
+    ) {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![since, mode], row) {
+            return (rows.flatten().collect(), true);
+        }
+    }
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT latency_ms, provider FROM ai_call_logs WHERE ts >= ?1 AND latency_ms > 0")
+    {
+        if let Ok(rows) = stmt.query_map([since], row) {
+            return (rows.flatten().collect(), false);
+        }
+    }
+    (Vec::new(), false)
 }
 
 /// 一组已排序延迟样本的分位数摘要；`samples` 用来看清尾分位在小样本下的可信度。
@@ -1080,6 +1101,27 @@ mod tests {
             value["ai_veto_rate_pct"], 50.0,
             "分母取 ai_reviewed，而不是全部信号"
         );
+    }
+
+    #[test]
+    fn half_ai_stats_scopes_ai_latency_by_mode_when_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_call_logs(id INTEGER PRIMARY KEY, ts INTEGER, provider TEXT, \
+               latency_ms INTEGER, mode TEXT); \
+             INSERT INTO ai_call_logs VALUES(1, 100, 'p', 50, 'demo'); \
+             INSERT INTO ai_call_logs VALUES(2, 100, 'p', 400, 'live');",
+        )
+        .unwrap();
+
+        let demo = half_ai_stats(&conn, "demo", 200, 1_000);
+        assert_eq!(demo["ai_latency_scope"], "mode");
+        assert_eq!(demo["ai_latency_samples"], 1);
+        assert_eq!(demo["ai_latency_p95_ms"], 50.0);
+
+        let live = half_ai_stats(&conn, "live", 200, 1_000);
+        assert_eq!(live["ai_latency_samples"], 1);
+        assert_eq!(live["ai_latency_p95_ms"], 400.0);
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub(crate) fn stats(conn: &Connection, mode: &str, now: i64, window_sec: i64) ->
     let since = now.saturating_sub(window);
     let counterfactual = counterfactual_stats(conn, mode, since, DEFAULT_HORIZON_SEC);
     let confidence = confidence_calibration(conn, mode, since);
-    let cost = cost_stats(conn, since);
+    let cost = cost_stats(conn, mode, since);
     let avoided_usd = counterfactual["avoided_loss_usd"].as_f64().unwrap_or(0.0);
     let cost_usd = cost["cost_usd"].as_f64().unwrap_or(0.0);
     let net_usd = avoided_usd - cost_usd;
@@ -245,22 +245,24 @@ fn bin_index(confidence: f64) -> usize {
         .unwrap_or(CONFIDENCE_BINS.len() - 1)
 }
 
-/// AI 调用成本与延迟；`ai_call_logs` 没有 mode 列，按全环境统计。
-fn cost_stats(conn: &Connection, since: i64) -> Value {
+/// AI 调用成本与延迟；优先按 mode 过滤，老库缺 mode 列时回退全环境。
+fn cost_stats(conn: &Connection, mode: &str, since: i64) -> Value {
     let mut calls = 0_i64;
     let mut ok_calls = 0_i64;
     let mut cost_usd = 0.0_f64;
     let mut latencies = Vec::new();
+    let mapper = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
+    };
+    let mut scoped = false;
     if let Ok(mut stmt) =
-        conn.prepare("SELECT ok, latency_ms, cost_usd FROM ai_call_logs WHERE ts>=?1")
+        conn.prepare("SELECT ok, latency_ms, cost_usd FROM ai_call_logs WHERE ts>=?1 AND mode=?2")
     {
-        if let Ok(rows) = stmt.query_map([since], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        }) {
+        if let Ok(rows) = stmt.query_map(params![since, mode], mapper) {
             for (ok, latency_ms, cost) in rows.flatten() {
                 calls += 1;
                 if ok != 0 {
@@ -271,6 +273,27 @@ fn cost_stats(conn: &Connection, since: i64) -> Value {
                 }
                 if latency_ms > 0 {
                     latencies.push(latency_ms as f64);
+                }
+            }
+            scoped = true;
+        }
+    }
+    if !scoped {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT ok, latency_ms, cost_usd FROM ai_call_logs WHERE ts>=?1")
+        {
+            if let Ok(rows) = stmt.query_map([since], mapper) {
+                for (ok, latency_ms, cost) in rows.flatten() {
+                    calls += 1;
+                    if ok != 0 {
+                        ok_calls += 1;
+                    }
+                    if cost.is_finite() {
+                        cost_usd += cost;
+                    }
+                    if latency_ms > 0 {
+                        latencies.push(latency_ms as f64);
+                    }
                 }
             }
         }
@@ -293,7 +316,7 @@ fn cost_stats(conn: &Connection, since: i64) -> Value {
         "cost_usd": round4(cost_usd),
         "avg_latency_ms": round2(avg),
         "p95_latency_ms": round2(p95),
-        "scope": "all_modes",
+        "scope": if scoped { "mode" } else { "all_modes" },
     })
 }
 
@@ -331,6 +354,23 @@ mod tests {
             params![ts, direction, features],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cost_stats_scopes_by_mode_when_the_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_call_logs(ts INTEGER, ok INTEGER, latency_ms INTEGER, cost_usd REAL, mode TEXT); \
+             INSERT INTO ai_call_logs VALUES(100, 1, 120, 0.01, 'demo'); \
+             INSERT INTO ai_call_logs VALUES(100, 1, 480, 0.03, 'live');",
+        )
+        .unwrap();
+
+        let demo = cost_stats(&conn, "demo", 0);
+        assert_eq!(demo["scope"], "mode");
+        assert_eq!(demo["calls"], 1);
+        assert_eq!(demo["cost_usd"], 0.01);
+        assert_eq!(demo["p95_latency_ms"], 120.0);
     }
 
     #[test]
