@@ -3314,6 +3314,98 @@
         }
       ],
       "foreign_keys": []
+    },
+    {
+      "name": "market_metrics",
+      "sql": "CREATE TABLE market_metrics (\n\tsymbol TEXT NOT NULL, \n\tts INTEGER NOT NULL, \n\tfunding_rate FLOAT NOT NULL, \n\topen_interest FLOAT NOT NULL, \n\topen_interest_change_pct FLOAT NOT NULL, \n\tbid FLOAT NOT NULL, \n\task FLOAT NOT NULL, \n\tspread_bps FLOAT NOT NULL, \n\tPRIMARY KEY (symbol, ts)\n)",
+      "row_count": 0,
+      "columns": [
+        {
+          "cid": 0,
+          "name": "symbol",
+          "type": "TEXT",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 1,
+          "name": "ts",
+          "type": "INTEGER",
+          "notnull": true,
+          "default": null,
+          "pk": true
+        },
+        {
+          "cid": 2,
+          "name": "funding_rate",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 3,
+          "name": "open_interest",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 4,
+          "name": "open_interest_change_pct",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 5,
+          "name": "bid",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 6,
+          "name": "ask",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        },
+        {
+          "cid": 7,
+          "name": "spread_bps",
+          "type": "FLOAT",
+          "notnull": true,
+          "default": null,
+          "pk": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ix_market_metrics_symbol_ts",
+          "unique": false,
+          "origin": "c",
+          "partial": false,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "symbol"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "ts"
+            }
+          ]
+        }
+      ],
+      "foreign_keys": []
     }
   ]
 }

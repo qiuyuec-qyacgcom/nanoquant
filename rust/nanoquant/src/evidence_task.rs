@@ -392,6 +392,7 @@ pub(crate) fn build_config(
         }),
         latency: std::sync::Arc::new(crate::behavior::NoLatency),
         funding_bps_8h: 1.0,
+        funding_points: Vec::new(),
         initial_equity: 100.0,
 
         margin_pct: risk

@@ -418,24 +418,27 @@ async fn load_series(
             .conn
             .lock()
             .map_err(|_| internal("数据库锁不可用"))?;
-        crate::market_store::load_history_bar(
+        let bars = crate::market_store::load_history_bar(
             &conn,
             &prepared.symbol,
             &input.interval,
             start,
             end,
             1000,
-        )
+        );
+        // 本地回放同样使用落库的资金费快照，避免回退到静态常数。
+        let funding = crate::market_store::load_funding_points(&conn, &prepared.symbol, start, end);
+        (bars, funding)
     };
     let local_series = || HistorySeries {
-        bars: stored.clone(),
+        bars: stored.0.clone(),
         gaps: Vec::new(),
-        funding: Vec::new(),
+        funding: stored.1.clone(),
         truncated: false,
         funding_error: String::new(),
     };
     // 本地库已经覆盖本次窗口就直接回放；不够才取远端，远端不可用时用已有本地数据兜底。
-    let series = if stored.len() >= input.limit.min(1000) as usize {
+    let series = if stored.0.len() >= input.limit.min(1000) as usize {
         local_series()
     } else {
         let source = history::BinanceHistory::new(prepared.live);
@@ -444,7 +447,7 @@ async fn load_series(
             .await
         {
             Ok(loaded) => loaded,
-            Err(error) if stored.len() >= 100 => {
+            Err(error) if stored.0.len() >= 100 => {
                 tracing::warn!(
                     %error,
                     symbol = %prepared.symbol,
@@ -475,7 +478,7 @@ async fn load_series(
     Ok(series)
 }
 
-fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
+fn engine_config(prepared: &Prepared, input: &BacktestIn, series: &HistorySeries) -> EngineConfig {
     let policy = crate::runtime::EngineRuntime::trade_policy(&prepared.strategy);
     let manage = crate::runtime::EngineRuntime::manage_config(&prepared.strategy, &prepared.risk);
     let taker = prepared.risk["fee_rate_taker"].as_f64().unwrap_or(0.0005);
@@ -493,6 +496,8 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
         }),
         latency: std::sync::Arc::new(crate::behavior::NoLatency),
         funding_bps_8h: input.funding_bps_8h,
+        // 远端历史已带资金费事件时优先按事件结算；本地回放则用落库快照兜底。
+        funding_points: series.funding.clone(),
         initial_equity: input.initial_equity,
 
         margin_pct: prepared.risk["margin_pct"].as_f64().unwrap_or(50.0),
@@ -567,6 +572,7 @@ fn attach_meta(
             "slippage_bps": input.slippage_bps,
             "spread_bps": input.spread_bps,
             "funding_bps_8h": input.funding_bps_8h,
+            "funding_source": if series.funding.is_empty() { "constant" } else { "history" },
         }),
     );
 }
@@ -587,7 +593,7 @@ async fn run(
     }
     let (guard, cancel) = begin_run(&run_id)?;
     let series = load_series(&prepared, &input).await?;
-    let config = engine_config(&prepared, &input);
+    let config = engine_config(&prepared, &input, &series);
     let bars = series.bars.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         backtest_engine::run_with_cancel(&bars, &config, &cancel)
@@ -638,7 +644,7 @@ async fn grid(
     }
     let (guard, cancel) = begin_run(&run_id)?;
     let series = load_series(&prepared, &input.base).await?;
-    let config = engine_config(&prepared, &input.base);
+    let config = engine_config(&prepared, &input.base, &series);
     let bars = series.bars.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         backtest_engine::run_grid(&bars, &config, &spec, &cancel)
@@ -702,7 +708,7 @@ pub async fn final_verdict(
         };
         let prepared = prepare(&db, &input).map_err(detail_of)?;
         let series = load_series(&prepared, &input).await.map_err(detail_of)?;
-        let config = engine_config(&prepared, &input);
+        let config = engine_config(&prepared, &input, &series);
         let grid: Vec<(&'static str, Vec<f64>)> = vec![
             ("entry_threshold", vec![0.45, 0.50, 0.55]),
             ("trailing_pct", vec![0.0]),
@@ -768,7 +774,7 @@ async fn walkforward(
             &format!("K 线不足: 至少需要 241 根 (当前 {})", series.bars.len()),
         ));
     }
-    let config = engine_config(&prepared, &input.base);
+    let config = engine_config(&prepared, &input.base, &series);
     let bars = series.bars.clone();
     let folds = input.folds;
     let train_bars = input.train_bars;

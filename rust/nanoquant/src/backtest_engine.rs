@@ -37,6 +37,9 @@ pub struct EngineConfig {
     /// 延迟模型（当前默认 0 根）。
     pub latency: std::sync::Arc<dyn crate::behavior::LatencyModel>,
     pub funding_bps_8h: f64,
+    /// 历史资金费结算事件（ts 毫秒）；非空时按事件结算，为空时回退 `funding_bps_8h` 常数。
+    /// 只影响持仓成本与 funding 特征，不改变信号方向。
+    pub funding_points: Vec<crate::history::FundingPoint>,
     pub initial_equity: f64,
 
     pub margin_pct: f64,
@@ -269,7 +272,6 @@ impl<'a> Sim<'a> {
         let bar_minutes = (self.config.interval_ms as f64 / 60_000.0).max(1.0);
         let at_r = self.config.manage.partial_tp_at_r;
         let ratio = self.config.manage.partial_tp_ratio;
-        let funding_rate = self.config.funding_bps_8h / 10_000.0;
         let leverage = self.config.leverage.max(1.0);
         let mmr = self.config.margin.maintenance_margin_rate().max(0.0);
         let hold_limit = self.config.max_bars_hold.unwrap_or(0);
@@ -304,10 +306,15 @@ impl<'a> Sim<'a> {
                 };
 
                 let previous_ts = self.bars[index - 1].open_time;
-                let crossings = funding_crossings(previous_ts, bar.open_time);
-                if crossings > 0 && funding_rate != 0.0 && qty > 0.0 {
+                let funding_rate = funding_rate_between(
+                    &self.config.funding_points,
+                    self.config.funding_bps_8h,
+                    previous_ts,
+                    bar.open_time,
+                );
+                if funding_rate != 0.0 && qty > 0.0 {
                     let notional = bar.open * qty;
-                    let delta = -direction * funding_rate * notional * crossings as f64;
+                    let delta = -direction * funding_rate * notional;
                     self.book(delta);
                     self.funding_total += delta;
                     if let Some(position) = self.position.as_mut() {
@@ -484,7 +491,11 @@ impl<'a> Sim<'a> {
                 0.0
             };
             let features = MarketFeatures {
-                funding_rate: self.config.funding_bps_8h / 10_000.0,
+                funding_rate: funding_rate_at(
+                    &self.config.funding_points,
+                    self.config.funding_bps_8h,
+                    signal_bar.close_time,
+                ),
                 open_interest_change_pct: f64::NAN,
                 relative_strength,
                 relative_strength_available: true,
@@ -826,6 +837,37 @@ pub fn funding_crossings(previous_ts: i64, ts: i64) -> i64 {
         return 0;
     }
     ts / FUNDING_INTERVAL_MS - previous_ts / FUNDING_INTERVAL_MS
+}
+
+/// 结算窗口 `(previous_ts, ts]` 内的资金费率和（小数）。
+///
+/// 有历史事件时按事件求和；没有时回退 `funding_bps_8h` 常数并按 8 小时边界计数。
+fn funding_rate_between(
+    points: &[crate::history::FundingPoint],
+    funding_bps_8h: f64,
+    previous_ts: i64,
+    ts: i64,
+) -> f64 {
+    if points.is_empty() {
+        return funding_bps_8h / 10_000.0 * funding_crossings(previous_ts, ts) as f64;
+    }
+    let start = points.partition_point(|point| point.ts <= previous_ts);
+    let end = points.partition_point(|point| point.ts <= ts);
+    points[start..end].iter().map(|point| point.rate).sum()
+}
+
+/// 信号时点可见的资金费率：历史序列里最后一个不晚于 `ts` 的结算点；
+/// 没有历史事件时回退常数。
+fn funding_rate_at(points: &[crate::history::FundingPoint], funding_bps_8h: f64, ts: i64) -> f64 {
+    if points.is_empty() {
+        return funding_bps_8h / 10_000.0;
+    }
+    let index = points.partition_point(|point| point.ts <= ts);
+    if index == 0 {
+        0.0
+    } else {
+        points[index - 1].rate
+    }
 }
 
 fn direction_of(side: &str) -> f64 {
@@ -1663,6 +1705,7 @@ mod tests {
             }),
             latency: std::sync::Arc::new(crate::behavior::NoLatency),
             funding_bps_8h: 1.0,
+            funding_points: Vec::new(),
             initial_equity: 1_000.0,
 
             margin_pct: 50.0,
@@ -1747,6 +1790,33 @@ mod tests {
             2
         );
         assert_eq!(funding_crossings(5, 5), 0);
+    }
+
+    #[test]
+    fn historical_funding_points_replace_the_constant_rate() {
+        let points = vec![
+            crate::history::FundingPoint {
+                ts: FUNDING_INTERVAL_MS,
+                rate: 0.0001,
+            },
+            crate::history::FundingPoint {
+                ts: 2 * FUNDING_INTERVAL_MS,
+                rate: -0.0002,
+            },
+        ];
+        // 窗口跨过两个事件：按历史费率求和 = -0.0001。
+        assert!(
+            (funding_rate_between(&points, 1.0, 0, 2 * FUNDING_INTERVAL_MS + 1) + 0.0001).abs()
+                < 1e-12
+        );
+        // 空历史回退常数：2 次结算 × 1bp。
+        assert!(
+            (funding_rate_between(&[], 1.0, 0, 2 * FUNDING_INTERVAL_MS + 1) - 0.0002).abs() < 1e-12
+        );
+        // 信号时点只看已发生的结算。
+        assert!((funding_rate_at(&points, 1.0, FUNDING_INTERVAL_MS + 1) - 0.0001).abs() < 1e-12);
+        assert_eq!(funding_rate_at(&points, 1.0, FUNDING_INTERVAL_MS - 1), 0.0);
+        assert!((funding_rate_at(&[], 1.0, FUNDING_INTERVAL_MS + 1) - 0.0001).abs() < 1e-12);
     }
 
     /// 重算开仓信号那一根 K 线的 ATR%，用于校验回测止损距离口径。

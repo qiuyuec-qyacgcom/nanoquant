@@ -1684,6 +1684,12 @@ impl EngineRuntime {
         }
         // 本轮已经拉到手的收盘 K 线顺手落库，供离线回放与复盘回看。
         crate::market_store::upsert_candles(&tx, interval, &snapshot.markets)?;
+        // 资金费/OI/盘口快照只做留存；写失败只告警，不能阻断交易周期。
+        if let Err(error) =
+            crate::market_store::upsert_metrics(&tx, &snapshot.markets, crate::now_millis())
+        {
+            tracing::warn!(%error, "资金费/OI/盘口快照写入失败，不影响本轮周期");
+        }
         upsert_state(
             &tx,
             &format!("open_orders.{mode}"),
@@ -8655,7 +8661,7 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[tokio::test]
-    async fn persist_snapshot_writes_market_candles() {
+    async fn persist_snapshot_writes_market_candles_and_metrics() {
         let (db, snapshot) = entry_fixture().await;
         let runtime = test_runtime(&db);
         runtime.persist_snapshot("demo", &snapshot).unwrap();
@@ -8664,6 +8670,20 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             .query_row("SELECT COUNT(*) FROM market_candles", [], |r| r.get(0))
             .unwrap();
         assert!(rows > 0, "快照里的 K 线必须落库");
+        let (metric_rows, funding): (i64, f64) = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(CASE WHEN symbol='BTCUSDT' THEN funding_rate END), 0) \
+                 FROM market_metrics",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(metric_rows > 0, "资金费/OI/盘口快照必须落库");
+        assert!(
+            (funding + 0.001).abs() < 1e-12,
+            "落库资金费率必须与快照一致"
+        );
     }
 
     #[tokio::test]

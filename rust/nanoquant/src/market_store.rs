@@ -3,6 +3,7 @@
 //! 本模块只做存取，不含任何业务判断；取数频率由调用方决定。
 use rusqlite::{params, Connection};
 
+use crate::history::FundingPoint;
 use crate::providers::{CandleSnapshot, MarketSnapshot};
 
 pub(crate) const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS market_candles(\
@@ -17,6 +18,19 @@ pub(crate) const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS market_candles
     PRIMARY KEY(symbol, interval, close_time)\
 )";
 
+/// 资金费/OI/盘口快照：每轮引擎已经拿到的市场状态，供离线回放与复盘。
+pub(crate) const CREATE_METRICS_TABLE: &str = "CREATE TABLE IF NOT EXISTS market_metrics(\
+    symbol TEXT NOT NULL,\
+    ts INTEGER NOT NULL,\
+    funding_rate FLOAT NOT NULL,\
+    open_interest FLOAT NOT NULL,\
+    open_interest_change_pct FLOAT NOT NULL,\
+    bid FLOAT NOT NULL,\
+    ask FLOAT NOT NULL,\
+    spread_bps FLOAT NOT NULL,\
+    PRIMARY KEY(symbol, ts)\
+)";
+
 pub(crate) fn ensure_table(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(CREATE_TABLE)
         .map_err(|e| format!("建表 market_candles 失败: {e}"))?;
@@ -26,6 +40,79 @@ pub(crate) fn ensure_table(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建索引 market_candles 失败: {e}"))?;
     Ok(())
+}
+
+pub(crate) fn ensure_metrics_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(CREATE_METRICS_TABLE)
+        .map_err(|e| format!("建表 market_metrics 失败: {e}"))?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ix_market_metrics_symbol_ts \
+         ON market_metrics(symbol, ts)",
+    )
+    .map_err(|e| format!("建索引 market_metrics 失败: {e}"))?;
+    Ok(())
+}
+
+/// 写入一轮资金费/OI/盘口快照；同一 (symbol, ts) 覆盖写，保持幂等。
+pub(crate) fn upsert_metrics(
+    conn: &Connection,
+    markets: &[MarketSnapshot],
+    ts_ms: i64,
+) -> Result<usize, String> {
+    ensure_metrics_table(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO market_metrics(symbol, ts, funding_rate, open_interest, \
+             open_interest_change_pct, bid, ask, spread_bps) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8) \
+             ON CONFLICT(symbol, ts) DO UPDATE SET \
+               funding_rate=excluded.funding_rate, open_interest=excluded.open_interest, \
+               open_interest_change_pct=excluded.open_interest_change_pct, \
+               bid=excluded.bid, ask=excluded.ask, spread_bps=excluded.spread_bps",
+        )
+        .map_err(|e| format!("准备写入资金费快照失败: {e}"))?;
+    for market in markets {
+        stmt.execute(params![
+            market.symbol,
+            ts_ms,
+            market.funding_rate,
+            market.open_interest,
+            market.open_interest_change_pct,
+            market.bid,
+            market.ask,
+            market.spread_bps,
+        ])
+        .map_err(|e| format!("写入 {} 资金费快照失败: {e}", market.symbol))?;
+    }
+    Ok(markets.len())
+}
+
+/// 读回资金费率快照，转成回测引擎使用的结算点（按 ts 升序）。
+///
+/// 旧库没有该表时返回空，不影响回测；调用方会回退静态资金费率。
+pub(crate) fn load_funding_points(
+    conn: &Connection,
+    symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<FundingPoint> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT ts, funding_rate FROM market_metrics \
+         WHERE symbol=?1 AND ts>=?2 AND ts<=?3 ORDER BY ts ASC",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![symbol, start_ms, end_ms], |row| {
+        Ok(FundingPoint {
+            ts: row.get(0)?,
+            rate: row.get(1)?,
+        })
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter(|point| point.rate.is_finite())
+        .collect()
 }
 
 /// 写入一轮快照里的 K 线。同一根 K 线重复写入是幂等的（覆盖写）。
@@ -100,14 +187,22 @@ pub(crate) fn load_candles(
     Ok(out)
 }
 
-/// 删除早于 `cutoff_ms` 的行，返回删除行数。
+/// 删除早于 `cutoff_ms` 的行，返回删除行数（K 线与资金费快照合计）。
 pub(crate) fn purge_before(conn: &Connection, cutoff_ms: i64) -> Result<usize, String> {
+    ensure_table(conn)?;
+    ensure_metrics_table(conn)?;
     conn.execute(
         "DELETE FROM market_candles WHERE close_time < ?1",
         params![cutoff_ms],
     )
     .map_err(|e| format!("清理过期行情失败: {e}"))?;
-    Ok(conn.changes() as usize)
+    let candles = conn.changes() as usize;
+    conn.execute(
+        "DELETE FROM market_metrics WHERE ts < ?1",
+        params![cutoff_ms],
+    )
+    .map_err(|e| format!("清理过期资金费快照失败: {e}"))?;
+    Ok(candles + conn.changes() as usize)
 }
 
 /// 把库里的收盘 K 线转回 `HistoryBar`；`open_time` 由 `close_time` 与周期反推。
@@ -262,5 +357,56 @@ mod tests {
             1,
             "超期数据必须被清掉"
         );
+    }
+
+    #[test]
+    fn upsert_metrics_is_idempotent_by_timestamp() {
+        let conn = conn();
+        let mut market = market("BTCUSDT", Vec::new());
+        market.funding_rate = 0.0002;
+        market.open_interest = 123_456.0;
+        market.spread_bps = 1.5;
+        upsert_metrics(&conn, std::slice::from_ref(&market), 1_700_000_000_000).unwrap();
+        upsert_metrics(&conn, std::slice::from_ref(&market), 1_700_000_000_000).unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_metrics", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "同一时点重复写入必须幂等");
+        let points = load_funding_points(&conn, "BTCUSDT", 0, i64::MAX);
+        assert_eq!(points.len(), 1);
+        assert!((points[0].rate - 0.0002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn load_funding_points_filters_window_and_orders_ascending() {
+        let conn = conn();
+        let mut market = market("ETHUSDT", Vec::new());
+        for (ts, rate) in [(3_000_i64, 0.0003), (1_000, 0.0001), (2_000, 0.0002)] {
+            market.funding_rate = rate;
+            upsert_metrics(&conn, std::slice::from_ref(&market), ts).unwrap();
+        }
+
+        let points = load_funding_points(&conn, "ETHUSDT", 1_000, 2_000);
+        assert_eq!(
+            points.iter().map(|point| point.ts).collect::<Vec<_>>(),
+            vec![1_000, 2_000],
+            "必须按时间升序且只保留窗口内"
+        );
+        assert!((points[1].rate - 0.0002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn purge_before_removes_expired_metrics_too() {
+        let conn = conn();
+        let market = market("BTCUSDT", Vec::new());
+        upsert_metrics(&conn, std::slice::from_ref(&market), 1_000).unwrap();
+        upsert_metrics(&conn, std::slice::from_ref(&market), 2_000_000_000_000).unwrap();
+
+        assert_eq!(purge_before(&conn, 1_000_000_000_000).unwrap(), 1);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM market_metrics", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "未过期的资金费快照必须留下");
     }
 }
