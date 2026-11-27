@@ -742,6 +742,19 @@ pub async fn chat(
     outcome
 }
 
+/// 单供应商超时：配置值与最近 p95×3 取小，保底 2 秒、封顶 15 秒。
+///
+/// 目的是让一个已经变慢的供应商尽早失败、把预算让给 fallback，
+/// 而不是用 45 秒配置把整个复核拖到外层 `review_timeout_sec`。
+fn capped_timeout_sec(configured: i64, p95_ms: Option<f64>) -> i64 {
+    let configured = configured.max(1);
+    let Some(p95_ms) = p95_ms.filter(|value| value.is_finite() && *value > 0.0) else {
+        return configured;
+    };
+    let capped = ((p95_ms * 3.0) / 1000.0).ceil() as i64;
+    configured.min(capped.clamp(2, 15))
+}
+
 /// 预算内按优先级链调用；任一供应商成功即返回，全部失败时把最后一次错误带出去。
 pub async fn chat_with_fallback(
     transport: &dyn AiTransport,
@@ -767,6 +780,13 @@ pub async fn chat_with_fallback(
     let mut merged: Vec<Value> = Vec::new();
     let mut last = ChatOutcome::default();
     let now = crate::now();
+    // 最近 24h 的成功延迟分布：样本不足 5 次的供应商不参与封顶。
+    let p95 = db
+        .conn
+        .lock()
+        .ok()
+        .map(|conn| crate::ai_providers::provider_p95_latency(&conn, now - 86_400, 5))
+        .unwrap_or_default();
     let mut blocked = 0usize;
     for provider in chain {
         if !circuit_allow(&provider.name, now) {
@@ -774,7 +794,10 @@ pub async fn chat_with_fallback(
             blocked += 1;
             continue;
         }
-        let mut outcome = chat(transport, db, provider, call).await;
+        let mut effective = provider.clone();
+        effective.timeout_sec =
+            capped_timeout_sec(provider.timeout_sec, p95.get(&provider.name).copied());
+        let mut outcome = chat(transport, db, &effective, call).await;
         if outcome.ok {
             circuit_success(&provider.name);
         } else {
@@ -1859,6 +1882,23 @@ mod tests {
         let prose = "answer: {\"action\":\"hold\"} tail";
         assert_eq!(extract_json(prose).unwrap().get("action").unwrap(), "hold");
         assert!(extract_json("   ").is_err());
+    }
+
+    #[test]
+    fn provider_timeout_is_capped_by_recent_p95() {
+        assert_eq!(capped_timeout_sec(45, None), 45, "没有样本时保持配置值");
+        assert_eq!(
+            capped_timeout_sec(45, Some(500.0)),
+            2,
+            "p95×3 低于 2 秒时按 2 秒保底"
+        );
+        assert_eq!(capped_timeout_sec(45, Some(3_000.0)), 9, "p95×3 = 9 秒");
+        assert_eq!(capped_timeout_sec(45, Some(60_000.0)), 15, "封顶 15 秒");
+        assert_eq!(
+            capped_timeout_sec(5, Some(3_000.0)),
+            5,
+            "封顶只能收紧，不能放大配置值"
+        );
     }
 
     #[test]
