@@ -416,6 +416,10 @@ pub(crate) struct EngineRuntime {
     isolated_until: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// 已设置的杠杆 → (leverage, 过期时间)；同一标的同一杠杆不重复签名请求。
     leverage_until: Arc<std::sync::Mutex<std::collections::HashMap<String, (i64, i64)>>>,
+    /// 本轮周期各阶段耗时（毫秒），周期结束时落 engine_state 环形样本。
+    cycle_phases: Arc<std::sync::Mutex<Vec<(&'static str, f64)>>>,
+    /// 本轮周期实际使用的交易环境，用于给样本分 key。
+    cycle_mode: Arc<std::sync::Mutex<String>>,
     /// 七段延迟样本的异步上报通道；None = 执行内核未连接。
     exec_client: Option<Arc<crate::exec_client::ExecClient>>,
 }
@@ -1500,6 +1504,8 @@ impl EngineRuntime {
             review_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             isolated_until: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             leverage_until: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cycle_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cycle_mode: Arc::new(std::sync::Mutex::new("demo".to_string())),
             exec_client: None,
         }
     }
@@ -1879,6 +1885,7 @@ impl EngineRuntime {
         } else {
             None
         };
+        let t_review = Instant::now();
         let reviewed = run_blocking_review(|| {
             Self::review_drafts(
                 reviewer,
@@ -1894,7 +1901,9 @@ impl EngineRuntime {
                 crate::now(),
             )
         });
+        self.record_phase("review", elapsed_ms(t_review));
 
+        let t_apply = Instant::now();
         let mut conn = self
             .db
             .conn
@@ -1934,7 +1943,7 @@ impl EngineRuntime {
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         drop(conn);
-        // 事务提交后再推事件：没落库的账不能出现在前端。
+        self.record_phase("apply", elapsed_ms(t_apply));
         self.publish_cycle_events(mode, snapshot, &executed, &order_differences);
         if halt_flatten {
             self.events.record(
@@ -4700,6 +4709,65 @@ impl EngineRuntime {
             .unwrap_or(false)
     }
 
+    fn begin_cycle_phases(&self) {
+        if let Ok(mut phases) = self.cycle_phases.lock() {
+            phases.clear();
+        }
+    }
+
+    fn set_cycle_mode(&self, mode: &str) {
+        if let Ok(mut current) = self.cycle_mode.lock() {
+            *current = mode.to_string();
+        }
+    }
+
+    fn record_phase(&self, name: &'static str, ms: f64) {
+        if let Ok(mut phases) = self.cycle_phases.lock() {
+            if phases.len() < 32 {
+                phases.push((name, ms));
+            }
+        }
+    }
+
+    /// 周期结束后把本轮耗时并入 `engine_state.cycle_phases.{mode}` 环形样本。
+    fn flush_cycle_phases(&self) {
+        let phases: Vec<(&'static str, f64)> = {
+            let Ok(mut current) = self.cycle_phases.lock() else {
+                return;
+            };
+            std::mem::take(&mut *current)
+        };
+        if phases.is_empty() {
+            return;
+        }
+        let mode = self
+            .cycle_mode
+            .lock()
+            .map(|mode| mode.clone())
+            .unwrap_or_else(|_| "demo".to_string());
+        let key = format!("cycle_phases.{mode}");
+        let Ok(conn) = self.db.conn.lock() else {
+            return;
+        };
+        let mut samples: Vec<Value> = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key=?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        let ring =
+            crate::cycle_timing::append(&mut samples, &phases, crate::cycle_timing::SAMPLE_CAP);
+        if let Err(error) = upsert_state(&conn, &key, &ring.to_string()) {
+            tracing::warn!(%error, "周期阶段耗时写入失败");
+        }
+    }
+
     fn isolated_cached(&self, symbol: &str) -> bool {
         self.isolated_until
             .lock()
@@ -5336,6 +5404,7 @@ impl EngineRuntime {
         provider: &dyn crate::providers::SnapshotProvider,
     ) -> Result<Vec<LivePlan>, String> {
         use crate::providers::ProviderError;
+        let t_snapshot = Instant::now();
         let snapshot = tokio::time::timeout(Duration::from_secs(30), provider.snapshot())
             .await
             .map_err(|_| "交易所快照超时".to_string())?
@@ -5345,7 +5414,11 @@ impl EngineRuntime {
                     message
                 }
             })?;
-        self.persist_snapshot(mode, &snapshot)
+        self.record_phase("snapshot", elapsed_ms(t_snapshot));
+        let t_persist = Instant::now();
+        let plans = self.persist_snapshot(mode, &snapshot)?;
+        self.record_phase("persist", elapsed_ms(t_persist));
+        Ok(plans)
     }
 
     async fn sync_exchange(&self) -> Result<(String, Vec<LivePlan>), String> {
@@ -5379,6 +5452,7 @@ impl EngineRuntime {
             "live" => ("live", "https://fapi.binance.com"),
             _ => return Err("交易环境无效".into()),
         };
+        self.set_cycle_mode(mode);
         let credentials = match self.exchange_credentials(mode) {
             Ok(credentials) => Some(credentials),
             Err(error) if mode == "demo" => {
@@ -5611,13 +5685,16 @@ impl EngineRuntime {
             match self.sync_exchange().await {
                 Ok((mode, plans)) => {
                     let mut outcome = if mode == "live" {
-                        match self.run_live(plans).await {
+                        let t_submit = Instant::now();
+                        let submitted = match self.run_live(plans).await {
                             Ok(items) => {
                                 failures = items;
                                 Ok(())
                             }
                             Err(error) => Err(error),
-                        }
+                        };
+                        self.record_phase("submit", elapsed_ms(t_submit));
+                        submitted
                     } else {
                         Ok(())
                     };
@@ -5751,11 +5828,15 @@ impl EngineRuntime {
             if Instant::now() >= due {
                 let config = RuntimeConfig::from_db(&self.db);
                 self.cycle_busy.store(true, Ordering::SeqCst);
+                self.begin_cycle_phases();
+                let t_cycle = Instant::now();
                 // 周期里 panic 不能把整个后台任务带走：崩了就记账并停下来。
                 // 否则面板只会显示「引擎未运行」，没人知道后台任务已经死了。
                 let outcome = std::panic::AssertUnwindSafe(self.tick(&config))
                     .catch_unwind()
                     .await;
+                self.record_phase("cycle", elapsed_ms(t_cycle));
+                self.flush_cycle_phases();
                 self.cycle_busy.store(false, Ordering::SeqCst);
                 match outcome {
                     Ok(Ok(())) => {}
@@ -8779,6 +8860,33 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_blocking_review_offloads_the_worker_on_multi_thread_runtime() {
         assert_eq!(run_blocking_review(|| 7), 7);
+    }
+
+    #[test]
+    fn flush_cycle_phases_writes_a_ring_sample_and_clears_buffers() {
+        let db = test_db();
+        let runtime = test_runtime(&db);
+        runtime.set_cycle_mode("demo");
+        runtime.begin_cycle_phases();
+        runtime.record_phase("cycle", 12.5);
+        runtime.record_phase("review", 3.0);
+        runtime.flush_cycle_phases();
+
+        let raw: String = db
+            .lock()
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='cycle_phases.demo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rows: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(rows.last().unwrap()["cycle"], 12.5);
+        assert_eq!(rows.last().unwrap()["review"], 3.0);
+        assert!(
+            runtime.cycle_phases.lock().unwrap().is_empty(),
+            "落库后必须清空本轮缓冲"
+        );
     }
 
     #[test]

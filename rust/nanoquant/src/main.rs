@@ -37,6 +37,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod cycle;
+mod cycle_timing;
 mod db;
 mod engine;
 mod engine_actions;

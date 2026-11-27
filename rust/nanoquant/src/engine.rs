@@ -670,7 +670,12 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         Some(client) => client.query_segments().await.ok().unwrap_or(Value::Null),
         None => Value::Null,
     };
-    let (rows, half_ai, risk): (Vec<(String, f64, i64, String)>, Value, (f64, f64, f64)) = {
+    let (rows, half_ai, risk, cycle_phases): (
+        Vec<(String, f64, i64, String)>,
+        Value,
+        (f64, f64, f64),
+        Value,
+    ) = {
         let Ok(conn) = db.read() else {
             return json!({
                 "trades": 0,
@@ -688,6 +693,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
                 "engine": read_status(&db),
                 "execution": execution_view(&segments),
                 "half_ai": {},
+                "cycle_phases": Value::Null,
                 "error": "数据库不可用",
             })
             .into();
@@ -707,7 +713,18 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
             .collect();
         let half_ai = crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400);
         let risk = risk_adjusted(&conn, &mode);
-        (rows, half_ai, risk)
+        let cycle_phases = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key=?1",
+                [format!("cycle_phases.{mode}")],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.as_array().cloned())
+            .map(|rows| crate::cycle_timing::summary(&rows))
+            .unwrap_or(Value::Null);
+        (rows, half_ai, risk, cycle_phases)
     };
     let mut wins = 0_i64;
     let mut losses = 0_i64;
@@ -776,6 +793,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         "engine": read_status(&db),
         "execution": execution_view(&segments),
         "half_ai": half_ai,
+        "cycle_phases": cycle_phases,
     }))
 }
 
@@ -1911,7 +1929,9 @@ mod tests {
                 "INSERT INTO trades(symbol,pnl,hold_seconds,exit_reason,mode,closed_at) VALUES \
              ('BTCUSDT',10,100,'tp','demo',300), \
              ('ETHUSDT',-4,50,'sl','demo',200), \
-             ('BTCUSDT',90,80,'tp','live',400);",
+             ('BTCUSDT',90,80,'tp','live',400); \
+             INSERT OR REPLACE INTO engine_state VALUES \
+             ('cycle_phases.demo','[{\"cycle\":10.0,\"snapshot\":5.0},{\"cycle\":30.0,\"snapshot\":7.0}]',0);",
             )
             .unwrap();
         let app = Router::new().nest("/api/v1", routes()).with_state(db);
@@ -1945,6 +1965,9 @@ mod tests {
         }
         assert_eq!(body["by_symbol"]["BTCUSDT"]["n"], 1);
         assert_eq!(body["engine"]["mode"], "demo");
+        assert_eq!(body["cycle_phases"]["cycle"]["samples"], 2);
+        assert_eq!(body["cycle_phases"]["cycle"]["p95_ms"], 30.0);
+        assert_eq!(body["cycle_phases"]["snapshot"]["max_ms"], 7.0);
         let _ = std::fs::remove_file(&path);
     }
 
