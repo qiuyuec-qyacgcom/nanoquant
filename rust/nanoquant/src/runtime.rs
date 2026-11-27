@@ -3545,37 +3545,30 @@ impl EngineRuntime {
                 results[idx] = Some(ReviewedDraft { draft, result });
             }
         } else {
-            // 中间区按硬件并发上限分桶，每桶串行、桶间并行；结果按原 idx 还原顺序。
-            let mut buckets: Vec<Vec<(usize, EntryDraft, Option<CachedReviewer<'_>>)>> =
-                (0..workers).map(|_| Vec::new()).collect();
-            for (offset, item) in pending.into_iter().enumerate() {
-                buckets[offset % workers].push(item);
-            }
-            let mut collected: Vec<(usize, ReviewedDraft)> = Vec::with_capacity(buckets.len());
+            // 共享工作队列：谁先完成谁取下一单，避免静态分桶里「一慢拖两单」。
+            let pending = std::sync::Mutex::new(std::collections::VecDeque::from(pending));
+            let collected = std::sync::Mutex::new(Vec::with_capacity(workers * 2));
             let resolve = &resolve;
             std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(workers);
-                for bucket in buckets {
-                    handles.push(scope.spawn(move || {
-                        bucket
-                            .into_iter()
-                            .map(|(idx, draft, cached)| {
-                                let active = cached
-                                    .as_ref()
-                                    .map(|inner| inner as &dyn crate::review::AiReviewer);
-                                let result = resolve(&draft, active.or(reviewer));
-                                (idx, ReviewedDraft { draft, result })
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                for handle in handles {
-                    match handle.join() {
-                        Ok(items) => collected.extend(items),
-                        Err(_) => panic!("AI 复核工作线程异常退出"),
-                    }
+                for _ in 0..workers {
+                    let pending = &pending;
+                    let collected = &collected;
+                    scope.spawn(move || loop {
+                        let item = pending.lock().ok().and_then(|mut queue| queue.pop_front());
+                        let Some((idx, draft, cached)) = item else {
+                            break;
+                        };
+                        let active = cached
+                            .as_ref()
+                            .map(|inner| inner as &dyn crate::review::AiReviewer);
+                        let result = resolve(&draft, active.or(reviewer));
+                        if let Ok(mut items) = collected.lock() {
+                            items.push((idx, ReviewedDraft { draft, result }));
+                        }
+                    });
                 }
             });
+            let collected = collected.into_inner().unwrap_or_default();
             for (idx, reviewed) in collected {
                 results[idx] = Some(reviewed);
             }
@@ -8410,6 +8403,55 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
                 draft
             })
             .collect()
+    }
+
+    /// 交替快慢：偶数序号慢、奇数序号快，用于验证共享工作队列不会队头阻塞。
+    struct AlternatingReviewer;
+
+    impl crate::review::AiReviewer for AlternatingReviewer {
+        fn review(
+            &self,
+            proposal: &crate::review::EntryProposal,
+        ) -> Result<crate::review::ReviewDecision, String> {
+            let rank = proposal
+                .symbol
+                .trim_start_matches("BTCUSDT")
+                .parse::<u64>()
+                .unwrap_or(0);
+            if rank % 2 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Ok(crate::review::ReviewDecision {
+                action: crate::review::ReviewAction::Agree,
+                reason: "alternating approve".to_string(),
+                confidence: 0.8,
+                invalidation_price: None,
+                valid_bars: None,
+                data_quality: None,
+                rr_target: None,
+                entry_price: None,
+                invalidation_text: None,
+                risk_text: None,
+                scale: None,
+                latency: Default::default(),
+                prompt_profile: None,
+            })
+        }
+    }
+
+    #[test]
+    fn work_queue_does_not_let_slow_bucket_block_fast_items() {
+        let reviewer = AlternatingReviewer;
+        let drafts = labeled_drafts(4, 0.6);
+        let started = std::time::Instant::now();
+        let reviewed = split_review_with_concurrency(&reviewer, drafts, None, 1_000, 2);
+        let elapsed = started.elapsed();
+
+        assert_eq!(reviewed.len(), 4);
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "共享队列应让快单先完成，而不是被 2 个慢单串成 400ms，实际 {elapsed:?}"
+        );
     }
 
     #[test]
