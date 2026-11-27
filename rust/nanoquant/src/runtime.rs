@@ -1879,19 +1879,21 @@ impl EngineRuntime {
         } else {
             None
         };
-        let reviewed = Self::review_drafts(
-            reviewer,
-            drafts,
-            mode,
-            ai_required,
-            ai_cfg.fail_open_scale,
-            high_score_threshold,
-            low_score_threshold,
-            Some(self.review_cache.as_ref()),
-            review_cache_ttl_sec,
-            review_concurrency,
-            crate::now(),
-        );
+        let reviewed = run_blocking_review(|| {
+            Self::review_drafts(
+                reviewer,
+                drafts,
+                mode,
+                ai_required,
+                ai_cfg.fail_open_scale,
+                high_score_threshold,
+                low_score_threshold,
+                Some(self.review_cache.as_ref()),
+                review_cache_ttl_sec,
+                review_concurrency,
+                crate::now(),
+            )
+        });
 
         let mut conn = self
             .db
@@ -5825,6 +5827,19 @@ async fn wait_cycle_signal(signal: &Option<Arc<Notify>>) {
     }
 }
 
+/// 同步 AI 复核会阻塞 OS 线程：多线程 runtime 下用 `block_in_place` 让出 worker，
+/// 避免复核期间拖住同线程的 HTTP/WS 请求；current_thread（测试）直接执行。
+fn run_blocking_review<T>(task: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi_thread {
+        tokio::task::block_in_place(task)
+    } else {
+        task()
+    }
+}
+
 fn truncate_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() > 200 {
@@ -8754,6 +8769,16 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
             candle.low = price - 0.05;
         }
         (db, snapshot)
+    }
+
+    #[tokio::test]
+    async fn run_blocking_review_works_on_current_thread_runtime() {
+        assert_eq!(run_blocking_review(|| 42), 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_review_offloads_the_worker_on_multi_thread_runtime() {
+        assert_eq!(run_blocking_review(|| 7), 7);
     }
 
     #[test]
