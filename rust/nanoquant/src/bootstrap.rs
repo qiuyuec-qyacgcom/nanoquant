@@ -304,11 +304,11 @@ mod tests {
         let report = initialize(&db, &key, Some("test-password")).unwrap();
         assert!(report.created_database);
         assert!(report.created_master_key);
-        assert_eq!(report.tables, 26);
+        assert_eq!(report.tables, 27);
         assert_eq!(report.generated_password, None);
 
         let conn = Connection::open(&db).unwrap();
-        assert_eq!(table_count(&conn), 26);
+        assert_eq!(table_count(&conn), 27);
         let schema_version: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='schema_version'",
@@ -377,7 +377,7 @@ mod tests {
         let report = initialize(&db, &key, Some("second-password")).unwrap();
         assert!(!report.created_database);
         assert!(!report.created_master_key);
-        assert_eq!(report.tables, 26);
+        assert_eq!(report.tables, 27);
         assert_eq!(std::fs::read(&key).unwrap(), first_key);
         let conn = Connection::open(&db).unwrap();
         assert_eq!(
