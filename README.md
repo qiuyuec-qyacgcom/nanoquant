@@ -78,6 +78,7 @@
 | Node.js | **20+** | 仅构建前端时需要；已有 `frontend/dist` 时可用 `--no-frontend` |
 | 系统 | **Linux** | Debian/Ubuntu、RHEL/Fedora、Alpine、Arch、openSUSE |
 | 构建依赖 | gcc / make / perl / curl / git / pkg-config / acl | 默认自动安装；离线环境可预装 |
+| 内存 | ≥ 2 GB（推荐） | 低于 2 GB 建议先加 2 GB swap；release 编译含 thin LTO，低配机器会明显更慢 |
 | 磁盘 | ≥ 2 GB 可用 | SQLite、日志、备份均在 `data/` 下 |
 
 ### 方式一：一条命令在线安装

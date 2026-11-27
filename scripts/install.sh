@@ -601,6 +601,60 @@ backup_binary() {
   fi
 }
 
+configure_build_env() {
+  local mem_mb cpus jobs cgu
+  mem_mb="$(awk '/MemTotal/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  cpus="$(nproc 2>/dev/null || echo 2)"
+  case "$cpus" in ''|*[!0-9]*) cpus=2 ;; esac
+  [ "$cpus" -ge 1 ] || cpus=1
+  if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    jobs="$cpus"
+    if [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -lt 2048 ] && [ "$jobs" -gt 1 ]; then
+      jobs=1
+    elif [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -lt 4096 ] && [ "$jobs" -gt 2 ]; then
+      jobs=2
+    fi
+    export CARGO_BUILD_JOBS="$jobs"
+  fi
+  if [ -z "${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}" ]; then
+    cgu=8
+    if [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -lt 2048 ]; then
+      cgu=2
+    elif [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -lt 4096 ]; then
+      cgu=4
+    fi
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$cgu"
+  fi
+  log INFO "构建参数: jobs=${CARGO_BUILD_JOBS:-auto}, codegen-units=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-auto}（CPU $cpus / 内存 ${mem_mb:-未知} MB）"
+  if [ "$mem_mb" -gt 0 ] && [ "$mem_mb" -lt 2048 ]; then
+    log WARN "可用内存低于 2GB：release 构建会很慢甚至卡在链接；建议先增加 2GB swap 再重试"
+  fi
+}
+
+run_build_with_heartbeat() {
+  local label="$1"
+  shift
+  local start last elapsed rc=0 hint=0
+  start="$(date +%s)"
+  last=0
+  run_logged "$@" &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge $((last + 30)) ]; then
+      last="$elapsed"
+      log INFO "$label 仍在编译：已 ${elapsed}s（release + LTO，首次构建较慢，请勿中断）"
+    fi
+    if [ "$hint" -eq 0 ] && [ "$elapsed" -ge 600 ]; then
+      hint=1
+      log WARN "构建已超过 10 分钟：多为内存不足或 swap 抖动；可 Ctrl-C 后增加 swap 重试（已编译部分会复用）"
+    fi
+  done
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
 build_backend() {
   if [ "$SKIP_BUILD" -eq 1 ]; then
     [ -x "$BIN" ] || die "--skip-build 但未找到可执行二进制: $BIN"
@@ -610,8 +664,9 @@ build_backend() {
   backup_binary
   local args=(build --release --locked --manifest-path "$ROOT/rust/nanoquant/Cargo.toml")
   if [ "$OFFLINE" -eq 1 ]; then args+=(--offline); fi
-  log INFO "构建 Rust 后端（release, locked）"
-  run_logged cargo "${args[@]}"
+  configure_build_env
+  log INFO "构建 Rust 后端（release, locked；低配机器首次构建可能需要 10-20 分钟）"
+  run_build_with_heartbeat "Rust 后端" cargo "${args[@]}"
   [ -x "$BIN" ] || die "构建后未找到二进制: $BIN"
   chmod 755 "$BIN"
   log OK "Rust 二进制已构建"

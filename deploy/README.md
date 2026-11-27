@@ -11,6 +11,9 @@
 - Rust 1.88+、Node.js 20+、gcc/make/perl/curl/git/pkg-config/acl；安装脚本会默认自动补齐缺失工具。
 - 仓库可直接放在 `/root` 下；安装脚本会自动为 `nanoquant` 授予路径穿越权限（ACL 优先，失败回退最小 chmod）。
 - systemd 模式默认创建 `nanoquant` 系统用户；执行内核必须使用同一用户。
+- release 构建开启 thin LTO，源码约 7.7 万行；安装脚本会按 CPU/内存限制并行度并每 30 秒输出编译心跳。
+  低配机器停在 `Compiling nanoquant` 通常只是编译慢，不是死锁；内存低于 2GB 建议先加 2GB swap，
+  或用 `--skip-build` 复用已编译二进制。
 
 ## 已部署机器如何更新
 
