@@ -29,7 +29,8 @@ sudo bash scripts/update.sh               # 拉代码 + 可选备份 + 构建 + 
 | `--check` | 只预览远端版本与工作树状态，不动文件 |
 | `--no-backup` | 跳过更新前备份（默认在 `data/backups/` 建 `pre-update` 备份） |
 | `--no-frontend` | 只更新后端（已有可用 dist 时） |
-| `--with-exec-core` | 顺带重编并重装执行内核 exec-core（之前装过才需要） |
+| `--with-exec-core` | 强制重编并重装执行内核 exec-core（默认已安装则自动重建） |
+| `--no-exec-core` | 跳过执行内核；仅更新 Web 主服务，交易引擎不会启动 |
 | `--force` | 已是最新也强制重建前端并重启 |
 
 安全边界：有未提交改动会**中止**；`data/`、`.master_key` 与数据库从不覆盖；
@@ -52,8 +53,19 @@ if [ -f /usr/bin/curl ];then curl -fsSL --proto '=https' --tlsv1.2 https://raw.g
 
 ### 安装目标
 
-安装只部署 Rust 二进制 `nanoquant`（主服务），运行阶段不需要任何解释器。`deploy/nanoquant.service`
-的 `ExecStart` 直接指向该二进制。
+安装会部署 Rust 主服务 `nanoquant` 和默认执行内核 `exec-core`，运行阶段不需要任何解释器。
+`deploy/nanoquant.service` 的 `ExecStart` 直接指向主服务二进制。
+
+交互安装进行到 exec-core 步骤时会提示填写交易所 API Key 与 API Secret（Secret 不回显），
+直接回车跳过。填写后凭证加密写入后台并自动切换为实盘 live；未填写时 exec-core 只预装并设为开机启动，
+不会立即运行，交易引擎保持关闭。配置 API 凭证后执行：
+
+```bash
+sudo bash scripts/setup_core.sh --from-settings
+sudo systemctl restart nanoquant
+```
+
+只想安装 Web 主服务可加 `--no-exec-core`。
 
 非交互场景用参数：
 
@@ -81,7 +93,9 @@ bash install.sh --password-stdin --systemd < /root/nq-password
 | `--port <p>` | 覆盖端口；未指定时保留已有 `data/.port`，否则 8899 |
 | `--no-frontend` | 只处理后端；要求已有 `frontend/dist/index.html` |
 | `--force-frontend` | 即使 dist 已存在也重新构建前端 |
-| `--skip-build` | 复用已编译的 Rust 二进制 |
+| `--skip-build` | 复用已编译的 Rust 二进制与 exec-core |
+| `--no-exec-core` | 跳过执行内核；仅安装/更新 Web 主服务 |
+| `--with-exec-core` | 强制重建执行内核（默认已安装则自动重建） |
 | `--skip-deps` | 跳过工具链检查（已知环境） |
 | `--offline` | cargo/npm 离线模式（依赖需已缓存） |
 | `--user <name>` | systemd 运行用户；需已存在，默认自动创建 `nanoquant` |
@@ -92,16 +106,26 @@ bash install.sh --password-stdin --systemd < /root/nq-password
 > 执行内核与主服务共用 0600 的 UDS；systemd 模式下两者必须使用同一用户。`scripts/setup_core.sh`
 > 默认复用已存在的 `nanoquant` 用户；自定义 `--user` 时也要给执行内核传同一个 `--user`。
 
-## 执行内核 exec-core（补装 / 重建）
+## 执行内核 exec-core（预装 / 补装 / 重建）
 
+安装脚本默认会构建并预装 exec-core；没有 Secret 时只安装 unit，不启动。
 面板填好 API 凭证后，一条命令即可（自动读取**当前交易环境**的 Secret，不必手工复制）：
 
 ```bash
 sudo bash scripts/setup_core.sh --from-settings
+sudo systemctl restart nanoquant
+```
+
+nohup 部署使用 TCP 模式，不注册 systemd：
+
+```bash
+bash scripts/setup_core.sh --no-systemd --from-settings
+bash scripts/start.sh --no-systemd
 ```
 
 > 默认复用 systemd 主服务的 `nanoquant` 用户；自定义用户时传 `--user <name>`，且必须与主服务一致。
 > UDS 权限为 0600，两个服务不同用户时主服务无法连接。
+> `--no-start` 只安装/启用，不重启旧进程；`--skip-build` 复用已编译二进制。
 
 也可以显式给密钥（与面板「参数配置 → 数据源」保存的交易所 API secret 是同一把）：
 
@@ -109,9 +133,10 @@ sudo bash scripts/setup_core.sh --from-settings
 sudo bash scripts/setup_core.sh --secret '<base64 PKCS#8 或 HMAC secret>'
 ```
 
-脚本会检测/安装 Rust、`cargo build --release`（已编译可加 `--skip-build` 复用），
-把二进制装到 clone 目录 `exec-core`，写 `/etc/nanoquant/exec.env`（0600），
-并生成 `/etc/systemd/system/nanoquant-exec-core.service`。
+脚本会检测/安装 Rust、执行 `cargo test --release --locked` 与 `cargo build --release --locked`
+（已编译可加 `--skip-build` 复用），把二进制装到 clone 目录 `exec-core`。
+systemd 模式写 `/etc/nanoquant/exec.env`（0600）并生成
+`/etc/systemd/system/nanoquant-exec-core.service`；nohup 模式写 `data/exec.env` 并使用 TCP。
 
 > unit 带 `ConditionPathExists=/etc/nanoquant/exec.env`：**没写密钥就不会启动**，
 > 而不是启动后 panic 被 `Restart=always` 无限拉起。主服务启动时连不上内核则交易引擎不启动。

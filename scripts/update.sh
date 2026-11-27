@@ -7,6 +7,7 @@ CHECK=0
 NO_BACKUP=0
 NO_FRONTEND=0
 WITH_EXEC_CORE=0
+NO_EXEC_CORE=0
 FORCE=0
 
 usage() {
@@ -17,7 +18,8 @@ usage() {
   --check          只预览远端版本与工作树状态，不修改文件
   --no-backup      跳过更新前备份
   --no-frontend    只更新后端；要求已有 frontend/dist
-  --with-exec-core 顺带重编并重装执行内核 exec-core（需要 root）
+  --with-exec-core 强制重编并重装执行内核（默认已安装则自动重建）
+  --no-exec-core   跳过执行内核；仅更新 Web 主服务
   --force          已是最新也强制重建前端并重启
   -h, --help       显示帮助
 
@@ -31,11 +33,18 @@ while [ "$#" -gt 0 ]; do
     --no-backup) NO_BACKUP=1; shift ;;
     --no-frontend) NO_FRONTEND=1; shift ;;
     --with-exec-core) WITH_EXEC_CORE=1; shift ;;
+    --no-exec-core) NO_EXEC_CORE=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
+
+if [ "$WITH_EXEC_CORE" -eq 1 ] && [ "$NO_EXEC_CORE" -eq 1 ]; then
+  usage >&2
+  echo "--with-exec-core 与 --no-exec-core 不能同时使用" >&2
+  exit 1
+fi
 
 cd "$ROOT"
 command -v git >/dev/null 2>&1 || { echo "缺少 git" >&2; exit 1; }
@@ -78,15 +87,12 @@ args=(--force-frontend)
 if [ "$NO_FRONTEND" -eq 1 ]; then
   args=(--no-frontend)
 fi
+if [ "$NO_EXEC_CORE" -eq 1 ]; then
+  args+=(--no-exec-core)
+elif [ "$WITH_EXEC_CORE" -eq 1 ]; then
+  args+=(--with-exec-core)
+fi
 echo "[INFO] 构建并重启（install.sh ${args[*]}）"
 bash "$ROOT/scripts/install.sh" "${args[@]}"
-
-if [ "$WITH_EXEC_CORE" -eq 1 ]; then
-  [ "$(id -u)" -eq 0 ] || { echo "--with-exec-core 需要 root" >&2; exit 1; }
-  command -v cargo >/dev/null 2>&1 || { echo "缺少 cargo，无法重建执行内核" >&2; exit 1; }
-  echo "[INFO] 重建执行内核"
-  cargo build --release --locked --manifest-path "$ROOT/rust/exec-core/Cargo.toml"
-  bash "$ROOT/scripts/setup_core.sh" --skip-build
-fi
 
 echo "[OK] 更新完成"

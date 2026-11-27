@@ -42,6 +42,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "输出当前交易环境的交易所 Secret（部署执行内核用，只打到标准输出）",
     ),
     (
+        "set-exchange-credentials",
+        "写入交易所 API Key/Secret 并切换交易环境（--api-key/--api-secret 或 --from-stdin 两行；默认 live）",
+    ),
+    (
         "seed-symbols",
         "为既有数据库补默认标的池（默认 dry-run，--apply 才写入）",
     ),
@@ -102,6 +106,9 @@ struct Options {
     seconds: Option<i64>,
     port: Option<u16>,
     secret: Option<String>,
+    api_key: Option<String>,
+    api_secret: Option<String>,
+    from_stdin: bool,
     baseline: Option<String>,
     episodes: Option<u32>,
     alpha: Option<f64>,
@@ -147,6 +154,9 @@ fn parse(argv: &[String], config: &Config) -> Options {
     let mut seconds = None;
     let mut port = None;
     let mut secret = None;
+    let mut api_key = None;
+    let mut api_secret = None;
+    let mut from_stdin = false;
     let mut baseline = None;
     let mut episodes: Option<u32> = None;
     let mut alpha: Option<f64> = None;
@@ -300,6 +310,15 @@ fn parse(argv: &[String], config: &Config) -> Options {
                 index += 1;
                 secret = argv.get(index).cloned();
             }
+            "--api-key" => {
+                index += 1;
+                api_key = argv.get(index).cloned();
+            }
+            "--api-secret" => {
+                index += 1;
+                api_secret = argv.get(index).cloned();
+            }
+            "--from-stdin" => from_stdin = true,
             "--baseline" => {
                 index += 1;
                 baseline = argv.get(index).cloned();
@@ -372,6 +391,9 @@ fn parse(argv: &[String], config: &Config) -> Options {
         seconds,
         port,
         secret,
+        api_key,
+        api_secret,
+        from_stdin,
         baseline,
         episodes,
         alpha,
@@ -433,6 +455,7 @@ pub fn run(argv: &[String], config: &Config) -> i32 {
         "mock-exec-core" => mock_service(&options, false),
         "verify-exec-core" => verify_exec_core_command(&options),
         "show-exec-secret" => show_exec_secret(&options, config),
+        "set-exchange-credentials" => set_exchange_credentials(&options, config),
         "seed-symbols" => seed_symbols(&options),
         "rl-replay" => rl_replay(&options),
         "ga-tune" => ga_tune_command(&options),
@@ -1026,6 +1049,124 @@ fn show_exec_secret(options: &Options, config: &Config) -> Result<(i32, Value), 
         ));
     }
     Ok((0, json!({"ok": true, "mode": mode, "raw_secret": secret})))
+}
+
+/// 写入指定交易环境的交易所 API 凭证，并把交易环境切过去。
+///
+/// 安装脚本在服务首次启动后调用：密钥走标准输入（`--from-stdin` 两行）或参数，
+/// 加密后写入 `data` 配置组；不会打印明文。
+fn set_exchange_credentials(
+    options: &Options,
+    config: &Config,
+) -> Result<(i32, Value), (i32, String)> {
+    let (raw_key, raw_secret) = if options.from_stdin {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        let key = lines.next().and_then(Result::ok).unwrap_or_default();
+        let secret = lines.next().and_then(Result::ok).unwrap_or_default();
+        (key, secret)
+    } else {
+        (
+            options.api_key.clone().unwrap_or_default(),
+            options.api_secret.clone().unwrap_or_default(),
+        )
+    };
+    let api_key = raw_key.trim().to_string();
+    let api_secret = raw_secret.trim().to_string();
+    if api_key.is_empty() || api_secret.is_empty() {
+        return Err((
+            1,
+            "需要同时提供 API Key 与 API Secret（--api-key/--api-secret，或 --from-stdin 读取两行）"
+                .to_string(),
+        ));
+    }
+    let mode = options
+        .mode
+        .clone()
+        .unwrap_or_else(|| "live".to_string())
+        .trim()
+        .to_lowercase();
+    if mode != "live" && mode != "demo" {
+        return Err((1, "交易环境只能是 live 或 demo".to_string()));
+    }
+    let master_key = std::fs::read_to_string(&config.key_file)
+        .map_err(|error| (1, format!("读取主密钥失败: {error}")))?;
+    let master_key = master_key.trim();
+    let key_enc = crate::secret::encrypt_secret(master_key, &api_key)
+        .map_err(|error| (1, format!("加密 API Key 失败: {error}")))?;
+    let secret_enc = crate::secret::encrypt_secret(master_key, &api_secret)
+        .map_err(|error| (1, format!("加密 API Secret 失败: {error}")))?;
+
+    let db = open_db(&options.db_path)?;
+    let conn = db.lock();
+    let mut data: Value = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='data'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let object = data
+        .as_object_mut()
+        .ok_or((1, "data 配置不是对象".to_string()))?;
+    object.insert(format!("{mode}_api_key_enc"), json!(key_enc));
+    object.insert(format!("{mode}_api_secret_enc"), json!(secret_enc));
+    let payload = serde_json::to_string(&data).map_err(|error| (1, error.to_string()))?;
+    let now = crate::now();
+    conn.execute(
+        "INSERT INTO app_settings(key, value, updated_at) VALUES('data', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (&payload, now),
+    )
+    .map_err(|error| (1, format!("写入交易所凭证失败: {error}")))?;
+    conn.execute(
+        "INSERT INTO engine_state(key, value, updated_at) VALUES('mode', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (&mode, now),
+    )
+    .map_err(|error| (1, format!("切换交易环境失败: {error}")))?;
+    // 与面板的「交易环境」开关一致：engine 配置组同步 mode，公开站与状态页才不会仍显示 demo。
+    let mut engine: Value = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='engine'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = engine.as_object_mut() {
+        object.insert("mode".to_string(), json!(mode));
+    } else {
+        engine = json!({"mode": mode});
+    }
+    conn.execute(
+        "INSERT INTO app_settings(key, value, updated_at) VALUES('engine', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (engine.to_string(), now),
+    )
+    .map_err(|error| (1, format!("同步交易环境配置失败: {error}")))?;
+    let audit = json!({
+        format!("{mode}_api_key_enc"): {"from": null, "to": "***"},
+        format!("{mode}_api_secret_enc"): {"from": null, "to": "***"},
+    });
+    let _ = conn.execute(
+        "INSERT INTO settings_audit(ts, user, group_name, changes, ip) \
+         VALUES(?1, '', 'data', ?2, '')",
+        (now, audit.to_string()),
+    );
+    Ok((
+        0,
+        json!({
+            "ok": true,
+            "mode": mode,
+            "api_key_masked": crate::system::mask_secret(&api_key),
+            "detail": format!("{mode} 环境凭证已保存，交易环境已切换为 {mode}"),
+        }),
+    ))
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -2179,7 +2320,7 @@ mod tests {
     #[test]
     fn help_lists_all_commands() {
         let text = COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-        assert_eq!(text.len(), 24);
+        assert_eq!(text.len(), 25);
         for name in [
             "preflight",
             "reconcile",
@@ -2197,6 +2338,7 @@ mod tests {
             "rtt-probe",
             "verify-exec-core",
             "show-exec-secret",
+            "set-exchange-credentials",
             "seed-symbols",
             "rl-replay",
             "ga-tune",
@@ -2250,6 +2392,73 @@ mod tests {
         ));
         assert_eq!(security["token_version"], 1);
         assert_eq!(security["password_is_default"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_exchange_credentials_encrypts_and_switches_mode() {
+        let dir = std::env::temp_dir().join(format!("nq-cli-credentials-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("nanoquant.db");
+        let key_path = dir.join(".master_key");
+        crate::bootstrap::initialize(&db_path, &key_path, Some("test-password")).unwrap();
+        let mut cfg = config();
+        cfg.db_path = db_path.to_string_lossy().into_owned();
+        cfg.key_file = key_path.clone();
+        let code = run(
+            &[
+                "ops".to_string(),
+                "set-exchange-credentials".to_string(),
+                "--api-key".to_string(),
+                "key-12345678".to_string(),
+                "--api-secret".to_string(),
+                "secret-12345678".to_string(),
+                "--mode".to_string(),
+                "live".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            &cfg,
+        );
+        assert_eq!(code, 0);
+        let db = Db::open(&cfg.db_path).unwrap();
+        let data = db.setting("data").unwrap().unwrap();
+        let master = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(
+            crate::secret::decrypt_secret(
+                master.trim(),
+                data["live_api_key_enc"].as_str().unwrap()
+            )
+            .unwrap(),
+            "key-12345678"
+        );
+        assert_eq!(
+            crate::secret::decrypt_secret(
+                master.trim(),
+                data["live_api_secret_enc"].as_str().unwrap()
+            )
+            .unwrap(),
+            "secret-12345678"
+        );
+        let conn = db.lock();
+        let mode: String = conn
+            .query_row(
+                "SELECT value FROM engine_state WHERE key='mode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "live");
+        let engine: Value = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='engine'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap();
+        assert_eq!(engine["mode"], "live", "engine 配置组应同步为 live");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

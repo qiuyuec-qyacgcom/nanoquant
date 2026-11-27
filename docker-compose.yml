@@ -1,9 +1,23 @@
 services:
+  # 执行内核：默认交易组件。没有 EXEC_SECRET 时容器会退出 78（而不是无限重启），
+  # 主服务仍可启动 Web，但交易引擎不会启动。
+  exec-core:
+    image: nanoquant:latest
+    container_name: nanoquant-exec-core
+    command: ["/usr/local/bin/exec-core"]
+    restart: "no"
+    environment:
+      EXEC_TCP: "0.0.0.0:9101"
+      EXEC_SECRET: "${EXEC_SECRET:-}"
+
   nanoquant:
     build: .
     image: nanoquant:latest
     container_name: nanoquant
     restart: unless-stopped
+    depends_on:
+      exec-core:
+        condition: service_started
     ports:
       - "8899:8899"
     environment:
@@ -12,6 +26,8 @@ services:
 
       NANOQUANT_DB: /app/data/nanoquant.db
       NANOQUANT_FRONTEND: /app/frontend/dist
+      # 容器内用 TCP 连接执行内核；裸机 systemd 部署默认用 UDS。
+      EXEC_TCP: "exec-core:9101"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

@@ -1684,7 +1684,7 @@ fn tcp_reachable(address: &str) -> bool {
     })
 }
 
-fn mask_secret(plain: &str) -> String {
+pub(crate) fn mask_secret(plain: &str) -> String {
     if plain.is_empty() {
         return String::new();
     }

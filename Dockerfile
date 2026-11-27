@@ -20,7 +20,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY rust/nanoquant/Cargo.toml rust/nanoquant/Cargo.lock ./
 COPY rust/nanoquant/src ./src
-RUN cargo build --release --locked
+COPY rust/exec-core/Cargo.toml rust/exec-core/Cargo.lock ./exec-core/
+COPY rust/exec-core/src ./exec-core/src
+RUN cargo build --release --locked \
+    && cargo build --release --locked --manifest-path exec-core/Cargo.toml
 
 # ---- 运行时 ----
 FROM debian:bookworm-slim
@@ -33,6 +36,7 @@ WORKDIR /app
 RUN useradd --create-home --uid 1000 nanoquant
 
 COPY --from=backend /build/target/release/nanoquant /usr/local/bin/nanoquant
+COPY --from=backend /build/exec-core/target/release/exec-core /usr/local/bin/exec-core
 COPY --from=frontend /build/dist /app/frontend/dist
 
 RUN mkdir -p /app/data /app/logs && chown -R nanoquant:nanoquant /app

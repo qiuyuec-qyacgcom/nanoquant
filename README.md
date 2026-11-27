@@ -97,9 +97,21 @@ NANOQUANT_ADMIN_PASSWORD='你的密码' sudo -E bash install.sh --systemd
 ```
 
 `install.sh` 下载代码后转交 `scripts/install.sh`：自动安装缺失的构建工具、Rust 与 Node.js，
-检查工具链、构建 Rust/前端，创建 `data/`、`logs/` 与权限、按需创建 `nanoquant` 系统用户并生成 systemd unit，
-最后通过 `/api/v1/health` 验证。仓库位于 `/root` 下也可直接安装，脚本会自动为服务用户授予路径穿越权限。
-失败时会尝试恢复旧二进制/旧 unit。
+检查工具链、构建 Rust/前端与默认执行内核 exec-core，创建 `data/`、`logs/` 与权限、
+按需创建 `nanoquant` 系统用户并生成 systemd unit，最后通过 `/api/v1/health` 验证。
+仓库位于 `/root` 下也可直接安装，脚本会自动为服务用户授予路径穿越权限；失败时会尝试恢复旧二进制/旧 unit。
+
+交互安装进行到 exec-core 步骤时会提示填写交易所 API Key 与 API Secret，直接回车可跳过。
+填写后凭证会加密写入后台并自动切换为实盘 live；未填写时 exec-core 只预装不启动，交易引擎保持关闭。
+配置 API 凭证后执行：
+
+```bash
+sudo bash scripts/setup_core.sh --from-settings
+sudo systemctl restart nanoquant
+```
+
+只想安装 Web 主服务可加 `--no-exec-core`；执行内核由 `scripts/start.sh`、`scripts/stop.sh`、
+`scripts/status.sh` 与主服务一起管理。
 
 ### 方式二：本地脚本
 
@@ -114,17 +126,30 @@ bash scripts/update.sh --check                          # 只读检查更新
 
 ### 方式三：Docker
 
+`docker-compose.yml` 包含主服务与 `exec-core` sidecar。没有 `EXEC_SECRET` 时 exec-core 会退出，
+主服务仍可打开 Web，但交易引擎不会启动：
+
 ```bash
-docker compose up -d
+# 先设置与交易所 API secret 相同的执行内核密钥
+EXEC_SECRET='<base64 PKCS#8 或 HMAC secret>' docker compose up -d
 # http://127.0.0.1:8899
+```
+
+配置好面板 API 凭证后再启动/重启执行内核：
+
+```bash
+EXEC_SECRET='<secret>' docker compose up -d exec-core
+docker compose restart nanoquant
 ```
 
 ### 方式四：手动
 
 ```bash
 cargo build --release --locked --manifest-path rust/nanoquant/Cargo.toml
+cargo build --release --locked --manifest-path rust/exec-core/Cargo.toml
 npm --prefix frontend ci
 npm --prefix frontend run build
+bash scripts/setup_core.sh --no-systemd --from-settings
 scripts/start.sh        # 有 systemd unit 自动 systemctl start；--no-systemd 前台启动
 ```
 
@@ -235,6 +260,23 @@ exec-core 是默认执行内核：负责签名校验与七段下单延迟指标�
 内核只持有 Secret，不接触账户、持仓与订单。协议见 `docs/EXEC_PROTOCOL.md`。
 systemd 模式下主服务与执行内核必须使用同一用户，才能访问权限 0600 的 UDS；
 `scripts/setup_core.sh` 默认复用已存在的 `nanoquant` 用户。
+
+首次配置或重建：
+
+```bash
+# 面板填好 API 凭证后，自动读取当前交易环境的 Secret
+sudo bash scripts/setup_core.sh --from-settings
+
+# 显式传入 Secret（与交易所 API secret 相同）
+sudo bash scripts/setup_core.sh --secret '<base64 PKCS#8 或 HMAC secret>'
+
+# nohup 部署（不注册 systemd，使用 EXEC_TCP=127.0.0.1:9101）
+bash scripts/setup_core.sh --no-systemd --from-settings
+bash scripts/start.sh --no-systemd
+```
+
+`start.sh` 会先启动 exec-core 再启动主服务；`stop.sh` 会先停主服务再停 exec-core；
+`status.sh` 同时展示两者状态与 Secret 是否已配置。
 
 ---
 

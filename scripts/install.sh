@@ -26,6 +26,11 @@ SKIP_DEPS=0
 INSTALL_DEPS=0
 INSTALL_RUST=0
 INSTALL_NODE=0
+INSTALL_EXEC_CORE=1
+FORCE_EXEC_CORE=0
+EXEC_API_KEY=""
+EXEC_API_SECRET=""
+PROVISION_CREDENTIALS=0
 AUTO_DEPS="${NANOQUANT_AUTO_DEPS:-1}"
 case "$AUTO_DEPS" in
   1|true|TRUE|yes|YES|on|ON) AUTO_DEPS=1 ;;
@@ -81,6 +86,11 @@ Linux 专用安装脚本：构建并就地安装 NanoQuant Rust 内核与前端�
   --offline             cargo/npm 使用离线模式（依赖需已缓存，且不联网装工具）
   --skip-deps           跳过工具链检查
   --skip-disk-check     跳过磁盘空间检查
+
+执行内核:
+  默认                   构建并安装 exec-core；交互安装提示填写 API Key/Secret（回车跳过）
+  --no-exec-core        跳过执行内核；仅安装 Web 主服务，交易引擎不会启动
+  --with-exec-core      强制重建执行内核（默认已安装则重建）
 
 构建与产物:
   --password <密码>     管理员初始密码；会进入 shell 历史，建议用 stdin/env
@@ -239,6 +249,8 @@ parse_args() {
       --port=*) [ -n "${1#*=}" ] || die "--port 需要非空值"; PORT="${1#*=}"; PORT_EXPLICIT=1; shift ;;
       --no-frontend) NO_FRONTEND=1; shift ;;
       --force-frontend) FORCE_FRONTEND=1; shift ;;
+      --no-exec-core) INSTALL_EXEC_CORE=0; shift ;;
+      --with-exec-core|--force-exec-core) INSTALL_EXEC_CORE=1; FORCE_EXEC_CORE=1; shift ;;
       --skip-build) SKIP_BUILD=1; shift ;;
       --no-start) NO_START=1; shift ;;
       --no-restart) NO_RESTART=1; shift ;;
@@ -631,6 +643,137 @@ build_frontend() {
   log OK "前端 dist 已构建"
 }
 
+install_exec_core() {
+  if [ "$INSTALL_EXEC_CORE" -ne 1 ]; then
+    log WARN "--no-exec-core：跳过执行内核，交易引擎不会启动"
+    return 0
+  fi
+  [ -f "$ROOT/scripts/setup_core.sh" ] || die "缺少 scripts/setup_core.sh"
+  local args=(--home "$ROOT")
+  if [ "$SYSTEMD" -eq 1 ]; then
+    args+=(--systemd)
+    [ -n "$RUN_USER" ] && args+=(--user "$RUN_USER")
+  else
+    args+=(--no-systemd)
+  fi
+  if [ "$NO_START" -eq 1 ] || [ "$NO_RESTART" -eq 1 ]; then
+    args+=(--no-start)
+  fi
+  [ "$OFFLINE" -eq 1 ] && args+=(--offline)
+  [ "$SKIP_DEPS" -eq 1 ] && args+=(--skip-deps)
+  if [ "$SKIP_BUILD" -eq 1 ] && [ "$FORCE_EXEC_CORE" -eq 0 ]; then
+    [ -x "$ROOT/rust/exec-core/target/release/exec-core" ] \
+      || die "--skip-build 但未找到已编译的 exec-core；请先构建执行内核或去掉 --skip-build"
+    args+=(--skip-build)
+  fi
+  local exec_secret="${EXEC_SECRET:-}"
+  if [ -z "$exec_secret" ] && [ "$PROVISION_CREDENTIALS" -eq 0 ] && [ -t 0 ] \
+    && [ ! -f "$ROOT/data/exec.env" ] && [ ! -f /etc/nanoquant/exec.env ] \
+    && [ ! -f "$ROOT/data/nanoquant.db" ]; then
+    local prompt_key="" prompt_secret=""
+    printf '\n' >&2
+    log INFO "可在此填写交易所 API Key 与 API Secret；填写后写入后台并自动切换实盘 live"
+    log INFO "直接回车跳过，安装完成后在后台「参数配置 → 交易所」填写"
+    printf '交易所 API Key（回车跳过）: ' >&2
+    IFS= read -r prompt_key || true
+    if [ -n "$prompt_key" ]; then
+      printf '交易所 API Secret（输入不回显）: ' >&2
+      IFS= read -r -s prompt_secret || true
+      printf '\n' >&2
+      if [ -n "$prompt_secret" ]; then
+        EXEC_API_KEY="$prompt_key"
+        EXEC_API_SECRET="$prompt_secret"
+        PROVISION_CREDENTIALS=1
+        exec_secret="$prompt_secret"
+        log OK "已读取 API Key 与 Secret（Secret 不回显、不写入日志）"
+      else
+        log WARN "API Secret 为空；本次不写入凭证，安装完成后在后台配置"
+      fi
+    else
+      log INFO "已跳过凭证；安装完成后在后台配置 API Key 与 Secret"
+    fi
+  fi
+  log INFO "安装执行内核 exec-core（默认交易组件）"
+  if [ -n "$exec_secret" ]; then
+    printf '%s\n' "$exec_secret" | bash "$ROOT/scripts/setup_core.sh" "${args[@]}" --secret-stdin
+  else
+    bash "$ROOT/scripts/setup_core.sh" "${args[@]}"
+  fi
+}
+
+exec_core_state() {
+  if [ "$INSTALL_EXEC_CORE" -ne 1 ]; then
+    echo "skipped"
+    return
+  fi
+  if [ "$SYSTEMD" -eq 1 ]; then
+    if [ -f /etc/systemd/system/nanoquant-exec-core.service ] \
+      && systemctl is-active --quiet nanoquant-exec-core.service 2>/dev/null; then
+      echo "running"
+    else
+      echo "inactive"
+    fi
+  elif [ -f "$ROOT/data/exec-core.pid" ] \
+    && kill -0 "$(cat "$ROOT/data/exec-core.pid")" 2>/dev/null; then
+    echo "running"
+  elif [ -x "$ROOT/exec-core" ]; then
+    echo "installed"
+  else
+    echo "missing"
+  fi
+}
+
+provision_exchange_credentials() {
+  [ "$PROVISION_CREDENTIALS" -eq 1 ] || return 0
+  if [ "$NO_START" -eq 1 ]; then
+    log WARN "按 --no-start 未启动服务；API 凭证未写入，启动后在后台「参数配置 → 交易所」填写"
+    return 0
+  fi
+  local db="${NANOQUANT_DB:-$ROOT/data/nanoquant.db}"
+  if [ ! -f "$db" ]; then
+    log WARN "数据库尚未创建；API 凭证未写入，请在后台「参数配置 → 交易所」填写"
+    return 0
+  fi
+  local cmd=(env "NANOQUANT_HOME=$ROOT" "$BIN" ops set-exchange-credentials --db "$db" --mode live --from-stdin)
+  local rc=0
+  log INFO "写入交易所 API 凭证并将交易环境切换为实盘 live"
+  if [ "$SYSTEMD" -eq 1 ] && [ -n "$RUN_USER" ] && [ "$RUN_USER" != "root" ] \
+    && command -v runuser >/dev/null 2>&1; then
+    printf '%s\n%s\n' "$EXEC_API_KEY" "$EXEC_API_SECRET" | runuser -u "$RUN_USER" -- "${cmd[@]}" || rc=$?
+  else
+    printf '%s\n%s\n' "$EXEC_API_KEY" "$EXEC_API_SECRET" | "${cmd[@]}" || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    log OK "API 凭证已写入，交易环境已切换为实盘 live；后台「参数配置 → 交易所」可查看"
+  else
+    log WARN "API 凭证写入失败（退出码 $rc）；请在后台「参数配置 → 交易所」手动填写"
+  fi
+}
+
+report_exec_core_state() {
+  local state
+  state="$(exec_core_state)"
+  case "$state" in
+    running)
+      log OK "执行内核 exec-core 已运行"
+      ;;
+    skipped)
+      log WARN "执行内核已跳过：交易引擎不会启动"
+      ;;
+    inactive|installed)
+      log WARN "执行内核已安装但未运行，交易引擎当前不会启动"
+      if [ "$SYSTEMD" -eq 1 ]; then
+        log WARN "配置 API 凭证后执行: sudo bash scripts/setup_core.sh --from-settings && sudo systemctl restart nanoquant"
+      else
+        log WARN "配置 API 凭证后执行: bash scripts/setup_core.sh --no-systemd --from-settings && bash scripts/start.sh --no-systemd"
+      fi
+      ;;
+    *)
+      log WARN "未找到执行内核；交易引擎不会启动"
+      ;;
+  esac
+}
+
 create_service_user() {
   if [ "$SYSTEMD" -eq 0 ]; then
     if [ -n "$RUN_USER" ]; then
@@ -977,6 +1120,21 @@ check_only() {
   else
     log WARN "前端 dist 尚需构建"
   fi
+  if [ "$INSTALL_EXEC_CORE" -eq 1 ]; then
+    if [ -x "$ROOT/exec-core" ]; then log OK "执行内核二进制已存在"; else log WARN "执行内核二进制尚需安装"; fi
+    if [ "$SYSTEMD" -eq 1 ]; then
+      if [ -f /etc/systemd/system/nanoquant-exec-core.service ]; then
+        log OK "执行内核 unit 已存在"
+      else
+        log WARN "执行内核 unit 尚需安装"
+      fi
+    fi
+    if [ "$SYSTEMD" -eq 0 ] && [ ! -f "$ROOT/data/exec.env" ]; then
+      log WARN "执行内核 Secret 未配置；交易引擎不会启动"
+    fi
+  else
+    log WARN "--no-exec-core：安装时跳过执行内核"
+  fi
   log OK "环境检查通过；未修改任何文件"
   exit 0
 }
@@ -1035,6 +1193,7 @@ main() {
     grant_service_access
   fi
   prepare_dirs
+  install_exec_core
   if [ -z "$ADMIN_PASSWORD" ]; then
     case "$(admin_password_state)" in
       present)
@@ -1055,7 +1214,9 @@ main() {
   else
     install_nohup
   fi
+  provision_exchange_credentials
   log OK "安装完成"
+  report_exec_core_state
   if [ -n "$BACKUP_BIN" ] && [ -f "$BACKUP_BIN" ]; then log INFO "回滚二进制: $BACKUP_BIN"; fi
   log INFO "端口: $PORT；模式: $([ "$SYSTEMD" -eq 1 ] && echo systemd || echo nohup)"
   log INFO "日志: ${LOG_FILE:-未写入（--check）}"

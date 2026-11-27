@@ -26,9 +26,11 @@ const emit = defineEmits<{
             {{ env === 'demo' ? '模拟盘 · 测试网' : '实盘 · 主网' }}
           </span>
           <div class="spacer" />
-          <span class="tag" :class="credentials?.[env]?.configured ? 'tag-long' : 'tag-warn'">
-            {{ credentials?.[env]?.configured ? '已配置 ' + credentials[env].api_key_masked : '未配置' }}
+          <span v-if="credentials?.[env]?.configured" class="tag tag-long">
+            已配置 · Key {{ credentials[env].api_key_masked }}
           </span>
+          <span v-else class="tag tag-warn">未配置</span>
+          <span v-if="credentials?.[env]?.has_secret" class="tag tag-dim">Secret 已保存</span>
         </div>
         <div class="field" style="margin-top: 8px">
           <span class="label">API Key</span>
