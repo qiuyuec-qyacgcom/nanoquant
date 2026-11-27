@@ -316,7 +316,7 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     min_entry_rr: { label: '最低开仓盈亏比', unit: 'R', min: 0, max: 10, step: 0.1, hint: 'AI 预期盈亏比低于该值时不开仓' },
   },
   ai: {
-    mode: { label: '模型编排', hint: 'single=单模型；多模型共识请配合 require_agreement' },
+    mode: { label: '模型编排', hint: 'single=单模型；多模型编排由供应商列表决定' },
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
     use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓' },
     use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 或方向不符（BUY 高于现价 / SELL 低于现价）时忽略' },

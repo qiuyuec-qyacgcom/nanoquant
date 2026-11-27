@@ -130,7 +130,6 @@
     "provider_id": 0,
     "fallback_provider_ids": [],
     "min_confidence": 0.45,
-    "require_agreement": true,
 
     "scale_on_confidence": true,
     "fail_open_scale": 0.5,

@@ -35,6 +35,11 @@ pub(crate) fn liveness_threshold_sec(interval_sec: u64) -> i64 {
     (interval_sec as i64 * 2 + 60).max(MIN_THRESHOLD_SEC)
 }
 
+/// AI 复核固定启用：只受 AI 总开关控制，不再有独立的 require_agreement 开关。
+fn ai_review_required(cfg: &crate::ai_client::AiConfig) -> bool {
+    cfg.enabled
+}
+
 /// Instant 到现在的毫秒数（f64，用于七段延迟样本）。
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -1824,8 +1829,8 @@ impl EngineRuntime {
         };
         tx.commit().map_err(|error| error.to_string())?;
         drop(conn);
-        // AI 关闭或未要求同向时，量化信号独立开仓，只按 fail-open 系数降仓。
-        let ai_required = ai_cfg.enabled && ai_cfg.require_agreement;
+        // AI 总开关开启时，复核固定启用；关闭时量化信号独立开仓，只按 fail-open 系数降仓。
+        let ai_required = ai_review_required(&ai_cfg);
         let reviewer = if ai_required {
             self.reviewer.as_deref()
         } else {
@@ -5956,6 +5961,35 @@ fn correlated_symbols(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn ai_review_is_always_required_when_enabled() {
+        let cfg = crate::ai_client::AiConfig {
+            enabled: true,
+            ..crate::ai_client::AiConfig::default()
+        };
+        assert!(ai_review_required(&cfg), "AI 总开关开启时复核固定启用");
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings(key, value) VALUES('ai', ?1)",
+            [r#"{"enabled":true,"require_agreement":false}"#],
+        )
+        .unwrap();
+        let legacy = crate::ai_client::read_ai_config_conn(&conn);
+        assert!(
+            ai_review_required(&legacy),
+            "旧配置的 require_agreement=false 不再生效，AI 开启即复核"
+        );
+
+        let disabled = crate::ai_client::AiConfig {
+            enabled: false,
+            ..crate::ai_client::AiConfig::default()
+        };
+        assert!(!ai_review_required(&disabled), "AI 总开关关闭时不进入复核");
+    }
 
     #[test]
     fn local_leverage_rises_for_low_atr_high_score() {

@@ -30,7 +30,6 @@ const aiCfg = reactive<any>({
   provider_id: 0,
   fallback_provider_ids: [] as number[],
   min_confidence: 0.45,
-  require_agreement: true,
 
   scale_on_confidence: true,
   fail_open_scale: 0.5,
@@ -416,10 +415,7 @@ onMounted(loadAll)
 
         <div class="row row-wrap" style="gap: 18px">
           <div class="row" style="gap: 6px">
-            <div class="switch" :class="{ on: aiCfg.require_agreement }" @click="aiCfg.require_agreement = !aiCfg.require_agreement" />
-            <span class="label">启用 AI 复核</span>
-          </div>
-          <div class="row" style="gap: 6px">
+
             <div class="switch" :class="{ on: aiCfg.scale_on_confidence }" @click="aiCfg.scale_on_confidence = !aiCfg.scale_on_confidence" />
             <span class="label">按置信度缩放仓位</span>
           </div>

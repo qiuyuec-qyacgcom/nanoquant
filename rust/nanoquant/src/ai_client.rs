@@ -832,8 +832,7 @@ pub struct AiConfig {
     pub decision_schema_version: i64,
     pub inject_news: bool,
     pub inject_mantras: bool,
-    /// 是否启用 AI 复核；false 时纯量化，不调用 AI。
-    pub require_agreement: bool,
+
     /// 是否按 AI 置信度缩放仓位（0.5 + 0.5 * c）。
     pub scale_on_confidence: bool,
     /// AI 不可用/复核失败时的降仓系数。
@@ -867,7 +866,6 @@ impl Default for AiConfig {
             decision_schema_version: 2,
             inject_news: true,
             inject_mantras: true,
-            require_agreement: true,
 
             scale_on_confidence: true,
             fail_open_scale: 0.5,
@@ -937,9 +935,6 @@ pub fn read_ai_config_conn(conn: &rusqlite::Connection) -> AiConfig {
     }
     if let Some(item) = value.get("inject_mantras").and_then(Value::as_bool) {
         cfg.inject_mantras = item;
-    }
-    if let Some(item) = value.get("require_agreement").and_then(Value::as_bool) {
-        cfg.require_agreement = item;
     }
 
     if let Some(item) = value.get("scale_on_confidence").and_then(Value::as_bool) {
@@ -1733,7 +1728,7 @@ mod tests {
     #[test]
     fn ai_config_default_scales_on_confidence() {
         let cfg = AiConfig::default();
-        assert!(cfg.require_agreement, "默认启用 AI 复核");
+
         assert!(cfg.scale_on_confidence, "默认必须按置信度降仓");
         assert_eq!(cfg.fail_open_scale, 0.5);
     }

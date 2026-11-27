@@ -492,6 +492,11 @@ fn drop_removed_keys(group: &str, value: &mut Value) {
             object.remove("default_leverage");
         }
     }
+    if group == "ai" {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("require_agreement");
+        }
+    }
 }
 
 /// 只记变化的字段。命中注册表敏感词的值写成 "***"，审计日志不能变成泄密源。

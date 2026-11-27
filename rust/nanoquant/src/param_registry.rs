@@ -581,6 +581,22 @@ mod tests {
     }
 
     #[test]
+    fn require_agreement_is_removed_from_defaults() {
+        let defaults: Value = serde_json::from_str(include_str!("default_settings.json")).unwrap();
+        assert!(
+            defaults
+                .get("ai")
+                .and_then(|ai| ai.get("require_agreement"))
+                .is_none(),
+            "default_settings.json 不应再包含 ai.require_agreement"
+        );
+        assert!(
+            find("ai", "require_agreement").is_none(),
+            "param_registry 不应再注册 ai.require_agreement"
+        );
+    }
+
+    #[test]
     fn ai_cannot_write_its_own_config_or_engine_mode() {
         assert!(!is_ai_writable("ai", "enabled"));
         assert!(!is_ai_writable("engine", "mode"));
