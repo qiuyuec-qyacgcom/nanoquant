@@ -13,7 +13,7 @@ async function login(page: import('@playwright/test').Page) {
   await page.locator('input[autocomplete="username"]').fill(USER)
   await page.locator('input[type="password"]').fill(PASS)
   await page.getByRole('button', { name: /进入终端/ }).click()
-  await expect(page).toHaveURL(/#\/admin\/dashboard/, { timeout: 15_000 })
+  await expect(page).toHaveURL(/#\/admin\/overview\/dashboard/, { timeout: 15_000 })
 }
 
 test('公开首页可访问', async ({ page }) => {
@@ -31,11 +31,11 @@ test('后台核心页面均有关键面板', async ({ page }) => {
   await login(page)
 
   const pages: Array<[string, string]> = [
-    ['/#/admin/system', '一键诊断'],
-    ['/#/admin/symbols', '当前标的池'],
-    ['/#/admin/backtest', '回测（纯量化粗筛）'],
-    ['/#/admin/evolution', '心法效果对照'],
-    ['/#/admin/ai', '决策演练'],
+    ['/#/admin/overview/system', '一键诊断'],
+    ['/#/admin/trading/symbols', '当前标的池'],
+    ['/#/admin/research/backtest', '回测（纯量化粗筛）'],
+    ['/#/admin/ai/evolution', '心法效果对照'],
+    ['/#/admin/ai/models', '决策演练'],
   ]
   for (const [path, text] of pages) {
     await page.goto(path)

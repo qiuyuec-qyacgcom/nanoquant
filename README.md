@@ -56,18 +56,13 @@
 | 前台 | `/charts` | 池内标的 K 线工作台、周期切换、24H 概览 |
 | 前台 | `/insights` | 资讯流、情绪指数、脱敏观点 |
 | 前台 | `/about` | 执行链路、技术栈与风险声明 |
-| 后台 | `/admin/dashboard` | 权益曲线、账户、持仓、事件流、引擎控制 |
-| 后台 | `/admin/signals` | 信号审计、拒绝原因、扫描密度 |
-| 后台 | `/admin/symbols` | 标的池：币安合约校验、真实中文合约、自定义标的、删除确认 |
-| 后台 | `/admin/strategy` | 参数配置：交易执行 / 策略 / 风控 / 交易所 / 资讯 / 通知与系统 / 备份 / 安全 |
-| 后台 | `/admin/backtest` | 回测、参数网格、walk-forward |
-| 后台 | `/admin/ai` | 模型接入、诊断、决策演练、思考强度 |
-| 后台 | `/admin/news` | 资讯情绪与源检测 |
-| 后台 | `/admin/evolution` | 心法库、注入预览、效果对照 |
-| 后台 | `/admin/journal` | 决策日志、回访打标、经验库 |
-| 后台 | `/admin/backup` | 备份 / 还原 / 下载 / 上传 |
-| 后台 | `/admin/dead-letters` | 落库死信查看与重放 |
-| 后台 | `/admin/system` | 诊断、执行内核、告警、归档与日志 |
+| 后台 | `/admin/overview/*` | 总览（权益、持仓、事件流、引擎控制）、系统诊断、开仓检查 |
+| 后台 | `/admin/trading/*` | 信号审计（拒绝原因、扫描密度）、标的池管理 |
+| 后台 | `/admin/research/*` | 全局策略、回测 / 参数网格 / walk-forward、资讯情绪 |
+| 后台 | `/admin/ai/*` | AI 模型接入与诊断、AI 调参、自进化心法、决策经验 |
+| 后台 | `/admin/settings/*` | 参数配置、备份还原、落库补偿 |
+
+后台按 5 个工作区组织，工作区内用页签切换；旧地址（如 `/admin/dashboard`、`/admin/strategy`）会自动重定向到对应工作区并保留 `query/hash`。
 
 视觉概念稿见 `docs/design/ui-redesign/`（6 张截图 + HTML 预览）。
 

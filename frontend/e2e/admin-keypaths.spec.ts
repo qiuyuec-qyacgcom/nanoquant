@@ -18,12 +18,12 @@ async function login(page: import('@playwright/test').Page) {
   await page.locator('input[autocomplete="username"]').fill(USER)
   await page.locator('input[type="password"]').fill(PASS)
   await page.getByRole('button', { name: /进入终端/ }).click()
-  await expect(page).toHaveURL(/#\/admin\/dashboard/, { timeout: 15_000 })
+  await expect(page).toHaveURL(/#\/admin\/overview\/dashboard/, { timeout: 15_000 })
 }
 
 test('参数配置：跨分组搜索能定位并高亮字段', async ({ page }) => {
   await login(page)
-  await page.goto('/#/admin/strategy')
+  await page.goto('/#/admin/settings/params')
   // 等首屏参数渲染完再操作：配置是异步拉的，抢跑会点到空分组
   await expect(page.locator('.field-row').first()).toBeVisible()
 
@@ -43,7 +43,7 @@ test('参数配置：跨分组搜索能定位并高亮字段', async ({ page }) 
 
 test('参数配置：常用直达一键跳到指定参数', async ({ page }) => {
   await login(page)
-  await page.goto('/#/admin/strategy')
+  await page.goto('/#/admin/settings/params')
   await expect(page.locator('.field-row').first()).toBeVisible()
 
   await page.getByRole('button', { name: 'K 线周期' }).click()
@@ -53,7 +53,7 @@ test('参数配置：常用直达一键跳到指定参数', async ({ page }) => 
 
 test('参数配置：改动后出现保存条，放弃修改后消失（不落库）', async ({ page }) => {
   await login(page)
-  await page.goto('/#/admin/strategy')
+  await page.goto('/#/admin/settings/params')
   await expect(page.locator('.field-row').first()).toBeVisible()
 
   await page.getByRole('button', { name: /风控/ }).first().click()
@@ -73,7 +73,7 @@ test('参数配置：改动后出现保存条，放弃修改后消失（不落�
 
 test('风控分组：日亏基准区块与重置入口存在', async ({ page }) => {
   await login(page)
-  await page.goto('/#/admin/strategy?group=risk')
+  await page.goto('/#/admin/settings/params?group=risk')
 
   await expect(page.locator('body')).toContainText('日亏基准')
   await expect(page.getByRole('button', { name: /重置基准/ })).toBeVisible()
@@ -82,7 +82,7 @@ test('风控分组：日亏基准区块与重置入口存在', async ({ page }) 
 test('总览：关键面板可渲染', async ({ page }) => {
   await login(page)
 
-  await page.goto('/#/admin/dashboard')
+  await page.goto('/#/admin/overview/dashboard')
   await expect(page.locator('body')).toContainText('引擎控制')
 })
 
@@ -93,7 +93,7 @@ test('交易环境提供紧急全平入口，取消确认不会执行', async ({
     await d.dismiss() // 点取消：绝不能真的清仓
   })
   await login(page)
-  await page.goto('/#/admin/strategy')
+  await page.goto('/#/admin/settings/params')
 
   await page.getByRole('button', { name: '紧急全平' }).click()
   await expect(page.getByRole('button', { name: '紧急全平' })).toBeVisible()
