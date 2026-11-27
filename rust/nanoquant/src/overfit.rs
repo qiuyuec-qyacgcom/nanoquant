@@ -37,6 +37,41 @@ pub(crate) fn evaluate_lookahead(baseline: f64, shifted: f64) -> LookaheadReport
     }
 }
 
+/// 递归指标稳定性结论。
+#[allow(dead_code)] // J3 接入证据门后由 evidence_task 读取全部字段
+pub(crate) struct RecursiveReport {
+    pub max_divergence_pct: f64,
+    pub suspicious: bool,
+    pub reason: String,
+}
+
+/// 默认阈值：两种 warmup 窗口的 ATR% 相对差异超过该比例即判为不稳定。
+#[allow(dead_code)] // J3 接入证据门后由 evidence_task 使用
+pub(crate) const DEFAULT_RECURSIVE_DIVERGENCE_PCT: f64 = 0.05;
+
+/// 判定：同一根 bar 用两种 warmup 长度算出的指标不收敛 → 递归指标失稳。
+#[allow(dead_code)] // J3 接入证据门后由 evidence_task 使用
+pub(crate) fn evaluate_recursive(short_atr_pct: f64, long_atr_pct: f64) -> RecursiveReport {
+    let max_divergence_pct = if short_atr_pct.abs() > 1e-9 {
+        (long_atr_pct - short_atr_pct).abs() / short_atr_pct.abs()
+    } else {
+        0.0
+    };
+    let suspicious = max_divergence_pct > DEFAULT_RECURSIVE_DIVERGENCE_PCT;
+    RecursiveReport {
+        max_divergence_pct,
+        suspicious,
+        reason: if suspicious {
+            format!(
+                "recursive_unstable: warmup 差异导致 ATR 漂移 {:.1}%",
+                max_divergence_pct * 100.0
+            )
+        } else {
+            String::new()
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +96,18 @@ mod tests {
             !evaluate_lookahead(0.0, 0.0).suspicious,
             "没有样本时不得判为可疑"
         );
+    }
+
+    #[test]
+    fn recursive_divergence_is_flagged_when_warmup_changes_the_indicator() {
+        // 同一根 bar，warmup 30 与 120 算出的 ATR% 差 40% → 不收敛，判为不稳定。
+        let report = evaluate_recursive(0.40, 0.56);
+        assert!(report.suspicious, "指标随 warmup 大幅漂移必须判为不稳定");
+    }
+
+    #[test]
+    fn recursive_divergence_is_small_for_a_converged_series() {
+        let report = evaluate_recursive(0.40, 0.402);
+        assert!(!report.suspicious);
     }
 }

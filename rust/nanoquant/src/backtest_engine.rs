@@ -754,6 +754,35 @@ pub fn run_lookahead(
     ))
 }
 
+/// 对序列末尾的 bar，用两种 warmup 长度算 ATR%，比较相对差异。
+/// 当前由证据任务（J3）调用。
+#[allow(dead_code)]
+pub fn measure_recursive_divergence(
+    candles: &[crate::providers::CandleSnapshot],
+    atr_period: usize,
+) -> f64 {
+    let end = candles.len();
+    let short = end.saturating_sub(30);
+    let long = end.saturating_sub(120);
+    if short == 0 || long == 0 || short == long {
+        return 0.0;
+    }
+    let short_atr = crate::providers::candle_metrics(&candles[short..], atr_period);
+    let long_atr = crate::providers::candle_metrics(&candles[long..], atr_period);
+    match (short_atr, long_atr) {
+        (Some(short), Some(long)) => {
+            let a = short.atr_pct;
+            let b = long.atr_pct;
+            if a.abs() > 1e-9 {
+                (b - a).abs() / a.abs()
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
 pub fn funding_crossings(previous_ts: i64, ts: i64) -> i64 {
     if ts <= previous_ts {
         return 0;
