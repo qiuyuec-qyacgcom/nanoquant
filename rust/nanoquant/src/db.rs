@@ -2,10 +2,14 @@
 
 use rusqlite::{Connection, OpenFlags};
 
-/// 只读查询连接：文件库走独立连接，内存库或打开失败时回退主连接锁。
+/// 只读查询连接：文件库走独立连接池，内存库或打开失败时回退主连接锁。
 pub enum DbRead<'a> {
     Shared(std::sync::MutexGuard<'a, Connection>),
-    Owned(Connection),
+    /// 从进程内只读池借出的连接；Drop 时归还，避免每次请求都重新打开 SQLite。
+    Pooled {
+        conn: Option<Connection>,
+        pool: std::sync::Arc<ReadPool>,
+    },
 }
 
 impl std::ops::Deref for DbRead<'_> {
@@ -14,9 +18,59 @@ impl std::ops::Deref for DbRead<'_> {
     fn deref(&self) -> &Connection {
         match self {
             DbRead::Shared(guard) => guard,
-            DbRead::Owned(conn) => conn,
+            DbRead::Pooled { conn, .. } => conn.as_ref().expect("池化读取连接已被取走"),
         }
     }
+}
+
+impl Drop for DbRead<'_> {
+    fn drop(&mut self) {
+        if let DbRead::Pooled { conn, pool } = self {
+            if let Some(conn) = conn.take() {
+                if let Ok(mut conns) = pool.conns.lock() {
+                    if conns.len() < READ_POOL_LIMIT {
+                        conns.push(conn);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 每个库最多保留的只读连接数。
+const READ_POOL_LIMIT: usize = 4;
+
+pub(crate) struct ReadPool {
+    conns: std::sync::Mutex<Vec<Connection>>,
+}
+
+fn read_pools(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ReadPool>>> {
+    static POOLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ReadPool>>>,
+    > = std::sync::OnceLock::new();
+    POOLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn open_read_conn(path: &str) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.execute_batch(
+        "PRAGMA query_only=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
+    )
+    .ok()?;
+    let has_settings: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_settings'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    has_settings.then_some(conn)
 }
 
 #[derive(Clone)]
@@ -55,8 +109,14 @@ impl Db {
             return Err(DbError::Missing(path.to_string()));
         }
         let conn = Connection::open(path).map_err(|e| DbError::Sqlite(e.to_string()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL; \
+             PRAGMA busy_timeout=5000; \
+             PRAGMA wal_autocheckpoint=1000; \
+             PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let exists: bool = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_settings'",
@@ -82,7 +142,8 @@ impl Db {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// 只读查询入口。文件库新开一个 `query_only` 连接，避免和写事务抢主连接锁；
+    /// 只读查询入口。文件库从进程内 `query_only` 连接池借出连接，
+    /// 避免每次请求都重新打开 SQLite、也避免和写事务抢主连接锁；
     /// 内存库、文件不存在、打开失败或 schema 不匹配时回退主连接，绝不 panic。
     pub fn read(&self) -> Result<DbRead<'_>, String> {
         if self.path.is_empty()
@@ -91,30 +152,26 @@ impl Db {
         {
             return self.shared();
         }
-        let Ok(conn) = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
+        let Ok(mut pools) = read_pools().lock() else {
             return self.shared();
         };
-        if conn
-            .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
-            .is_err()
-        {
+        let pool = pools
+            .entry(self.path.clone())
+            .or_insert_with(|| {
+                std::sync::Arc::new(ReadPool {
+                    conns: std::sync::Mutex::new(Vec::new()),
+                })
+            })
+            .clone();
+        drop(pools);
+        let cached = pool.conns.lock().ok().and_then(|mut conns| conns.pop());
+        let Some(conn) = cached.or_else(|| open_read_conn(&self.path)) else {
             return self.shared();
-        }
-        let has_settings = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_settings'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if !has_settings {
-            return self.shared();
-        }
-        Ok(DbRead::Owned(conn))
+        };
+        Ok(DbRead::Pooled {
+            conn: Some(conn),
+            pool,
+        })
     }
 
     fn shared(&self) -> Result<DbRead<'_>, String> {
@@ -280,12 +337,40 @@ mod tests {
     fn read_uses_separate_connection_for_file_db() {
         let (path, db) = seeded_file_db("read-separate");
         let read = db.read().expect("文件库应能开独立只读连接");
-        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        assert!(
+            matches!(&read, DbRead::Pooled { .. }),
+            "文件库应使用独立连接"
+        );
         let label: String = read
             .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(label, "alpha");
         drop(read);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_connections_are_returned_to_the_pool() {
+        let (path, db) = seeded_file_db("read-pool");
+        drop(db.read().unwrap());
+        let pooled = read_pools()
+            .lock()
+            .unwrap()
+            .get(&db.path)
+            .expect("读取后应注册连接池")
+            .conns
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(pooled, 1, "只读连接 Drop 后必须归还池中");
+
+        let again = db.read().unwrap();
+        assert!(matches!(&again, DbRead::Pooled { .. }));
+        let label: String = again
+            .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label, "alpha");
+        drop(again);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -313,7 +398,10 @@ mod tests {
     fn read_connection_is_query_only() {
         let (path, db) = seeded_file_db("read-query-only");
         let read = db.read().expect("文件库应能开独立只读连接");
-        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        assert!(
+            matches!(&read, DbRead::Pooled { .. }),
+            "文件库应使用独立连接"
+        );
         assert!(
             read.execute("INSERT INTO probe(id, label) VALUES(2, 'nope')", [])
                 .is_err(),
@@ -328,7 +416,10 @@ mod tests {
         let (path, db) = seeded_file_db("read-not-block");
         let guard = db.lock();
         let read = db.read().expect("主连接持锁时仍应取出独立连接");
-        assert!(matches!(&read, DbRead::Owned(_)), "文件库应使用独立连接");
+        assert!(
+            matches!(&read, DbRead::Pooled { .. }),
+            "文件库应使用独立连接"
+        );
         let label: String = read
             .query_row("SELECT label FROM probe WHERE id = 1", [], |r| r.get(0))
             .unwrap();
