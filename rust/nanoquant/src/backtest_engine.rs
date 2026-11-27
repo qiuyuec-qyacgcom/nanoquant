@@ -47,6 +47,8 @@ pub struct EngineConfig {
     /// 策略参数快照：range 市均值回归的开关、阈值与独立止损止盈。
     /// 缺省 `Value::Null` 时均值回归关闭，保持既有回测语义。
     pub mr: Value,
+    /// 信号偏移根数：>0 时把入场信号整体延后这么多根，用于前视偏差体检。
+    pub signal_shift_bars: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -427,8 +429,14 @@ impl<'a> Sim<'a> {
             if self.equity <= 0.0 {
                 continue;
             }
-            let slice_start = index.saturating_sub(180);
-            let slice = &self.candles[slice_start..=index];
+            let signal_end = index.saturating_sub(self.config.signal_shift_bars);
+            if signal_end < 30 {
+                continue;
+            }
+            // 信号窗口整体回退 shift 根：评估用当时可见的数据，成交仍在本根之后。
+            let signal_bar = &self.candles[signal_end];
+            let slice_start = signal_end.saturating_sub(180);
+            let slice = &self.candles[slice_start..=signal_end];
             let Some(metrics) = candle_metrics(slice, self.config.atr_period) else {
                 continue;
             };
@@ -442,7 +450,7 @@ impl<'a> Sim<'a> {
                 / 20.0)
                 .sqrt();
             let relative_strength = if sd > 0.0 {
-                ((bar.close - mean) / sd).clamp(-1.0, 1.0)
+                ((signal_bar.close - mean) / sd).clamp(-1.0, 1.0)
             } else {
                 0.0
             };
@@ -455,7 +463,7 @@ impl<'a> Sim<'a> {
             // 与实盘同路由：range 且启用均值回归时，趋势信号不参与开仓。
             let regime = trade_policy::regime_for(
                 slice,
-                bar.close,
+                signal_bar.close,
                 metrics.atr,
                 self.config.policy,
                 features,
@@ -474,7 +482,7 @@ impl<'a> Sim<'a> {
             } else {
                 let Some(signal) = trade_policy::evaluate(
                     slice,
-                    bar.close,
+                    signal_bar.close,
                     metrics.atr,
                     self.config.policy,
                     features,
@@ -719,6 +727,31 @@ pub fn run_with_cancel(
 
 pub fn run(bars: &[HistoryBar], config: &EngineConfig) -> Result<BacktestResult, String> {
     run_with_cancel(bars, config, &AtomicBool::new(false))
+}
+
+/// 跑两遍回测（基线 / 信号延后 N 根），产出前视偏差结论。
+/// 当前由证据任务（J3）调用，单独的检测入口便于复现与测试。
+#[allow(dead_code)]
+pub fn run_lookahead(
+    bars: &[HistoryBar],
+    base: &EngineConfig,
+    shift_bars: usize,
+) -> Result<crate::overfit::LookaheadReport, String> {
+    let baseline = run(bars, base)?;
+    let mut shifted = base.clone();
+    shifted.signal_shift_bars = shift_bars;
+    let shifted = run(bars, &shifted)?;
+    let expectancy = |result: &BacktestResult| {
+        result
+            .summary
+            .get("expectancy")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+    };
+    Ok(crate::overfit::evaluate_lookahead(
+        expectancy(&baseline),
+        expectancy(&shifted),
+    ))
 }
 
 pub fn funding_crossings(previous_ts: i64, ts: i64) -> i64 {
@@ -1561,6 +1594,7 @@ mod tests {
             stop_distance_atr_mult: 1.3,
             atr_period: 14,
             mr: Value::Null,
+            signal_shift_bars: 0,
         }
     }
 

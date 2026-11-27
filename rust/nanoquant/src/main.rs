@@ -60,6 +60,7 @@ mod mean_reversion;
 mod news;
 mod oi_regime;
 mod ops_tools;
+mod overfit;
 mod param_registry;
 mod performance;
 mod protection_api;

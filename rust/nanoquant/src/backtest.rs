@@ -499,6 +499,7 @@ fn engine_config(prepared: &Prepared, input: &BacktestIn) -> EngineConfig {
             .unwrap_or(1.3),
         atr_period: crate::ai_analysis::atr_period_of(&prepared.strategy),
         mr: prepared.strategy.clone(),
+        signal_shift_bars: 0,
     }
 }
 

@@ -328,6 +328,7 @@ pub(crate) fn build_config(
             .unwrap_or(1.3),
         atr_period: crate::ai_analysis::atr_period_of(params),
         mr: params.clone(),
+        signal_shift_bars: 0,
     })
 }
 
