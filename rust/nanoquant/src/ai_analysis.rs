@@ -598,7 +598,6 @@ async fn decision_preview(
         "constraints": {
             "max_leverage": risk.get("max_leverage").and_then(Value::as_f64).unwrap_or(50.0),
             "min_leverage": risk.get("min_leverage").and_then(Value::as_f64).unwrap_or(1.0),
-            "atr_stop_mult": risk.get("atr_stop_mult").and_then(Value::as_f64).unwrap_or(1.3),
             "margin_pct": risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0),
             "margin_min_pct": (risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0) - 5.0).max(0.0),
             "margin_max_pct": (risk.get("margin_pct").and_then(Value::as_f64).unwrap_or(20.0) + 5.0).min(100.0),
@@ -761,6 +760,70 @@ mod tests {
             atr_period_of(&json!({"atr_period": 14.5})),
             14,
             "非整数回退 14"
+        );
+    }
+
+    #[test]
+    fn every_integer_semantics_strategy_param_changes_the_features() {
+        // strategy 组里所有「整数语义」的周期参数，改值必须改变特征输出。
+        // 这条断言锁死「注册了却不被计算」的装饰参数不会再出现。
+        let closes: Vec<f64> = (0..80)
+            .map(|i| 100.0 + (i as f64 * 1.7).sin() * 3.0)
+            .collect();
+        let candles: Vec<CandleSnapshot> = closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| CandleSnapshot {
+                close_time: 1_700_000_000 + index as i64 * 900_000,
+                open: *close,
+                high: close + 1.0,
+                low: close - 1.0,
+                close: *close,
+                volume: 10.0,
+            })
+            .collect();
+        let market = MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            mark_price: *closes.last().unwrap(),
+            timestamp: 1_700_000_000,
+            quote_volume: 5_000_000.0,
+            funding_rate: 0.0001,
+            open_interest: 1000.0,
+            open_interest_change_pct: 1.5,
+            bid: 100.0,
+            ask: 100.01,
+            spread_bps: 1.0,
+            candles,
+        };
+        let feature = |rsi: usize, atr: usize, fast: usize, slow: usize| {
+            feature_snapshot(
+                &market,
+                "15m",
+                rsi,
+                atr,
+                crate::trade_policy::EmaPeriods { fast, slow },
+            )
+        };
+        let base = feature(14, 14, 9, 21);
+        assert_ne!(
+            base["rsi"],
+            feature(7, 14, 9, 21)["rsi"],
+            "rsi_period 必须影响 rsi"
+        );
+        assert_ne!(
+            base["atr"],
+            feature(14, 7, 9, 21)["atr"],
+            "atr_period 必须影响 atr"
+        );
+        assert_ne!(
+            base["ema_fast"],
+            feature(14, 14, 5, 21)["ema_fast"],
+            "ema_fast 必须影响 ema_fast"
+        );
+        assert_ne!(
+            base["ema_slow"],
+            feature(14, 14, 9, 30)["ema_slow"],
+            "ema_slow 必须影响 ema_slow"
         );
     }
 

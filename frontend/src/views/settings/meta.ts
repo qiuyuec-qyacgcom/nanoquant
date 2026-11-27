@@ -79,11 +79,6 @@ export const BASE_META: Record<string, FieldMeta> = {
     unit: '%',
     hint: '中心值 = 权益 × 该比例；AI 按波动率在 ±5 个百分点内调整（如 20% → 15%–25%），最终仍受可用余额与最小名义额约束',
   },
-  atr_stop_mult: {
-    label: '止损 ATR 倍数',
-    unit: '×',
-    hint: '提示 AI：止损保证金比例 ≥ 该倍数 × ATR% × 杠杆；只做提示词引导，不强制校验',
-  },
   stop_distance_atr_mult: {
     label: '开仓止损 ATR 倍数',
     unit: '×',

@@ -112,7 +112,6 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
         'max_same_direction',
         'correlation_limit',
         'direction_exposure_limit_pct',
-        'atr_stop_mult',
       ],
     },
     {

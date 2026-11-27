@@ -58,7 +58,6 @@ pub(crate) const RANGES: &[(&str, &str, f64, f64, f64)] = &[
     ("risk", "cooldown_minutes", 0.0, 1440.0, 1.0),
     ("risk", "symbol_cooldown_minutes", 0.0, 1440.0, 1.0),
     ("risk", "min_notional_buffer", 1.0, 10.0, 0.01),
-    ("risk", "atr_stop_mult", 1.0, 4.0, 0.1),
     // 开仓止损距离下限：价格距离 = 该倍数 × ATR%，与杠杆无关。
     ("risk", "stop_distance_atr_mult", 1.0, 4.0, 0.1),
     ("risk", "min_equity_usdt", 0.0, 100000.0, 0.1),
@@ -266,7 +265,6 @@ const VISIBLE: &[(&str, &[&str])] = &[
             "max_same_direction",
             "correlation_limit",
             "direction_exposure_limit_pct",
-            "atr_stop_mult",
             "stop_distance_atr_mult",
             "global_stop_loss_pct",
             "global_take_profit_pct",
@@ -640,8 +638,10 @@ mod tests {
             Some(15.0)
         );
         assert_eq!(find("risk", "max_leverage").unwrap().max, Some(100.0));
-        assert_eq!(find("risk", "atr_stop_mult").unwrap().min, Some(1.0));
-        assert_eq!(find("risk", "atr_stop_mult").unwrap().max, Some(4.0));
+        assert_eq!(
+            find("risk", "stop_distance_atr_mult").unwrap().min,
+            Some(1.0)
+        );
         assert_eq!(
             find("risk", "daily_loss_limit_pct").unwrap().min,
             Some(0.01)

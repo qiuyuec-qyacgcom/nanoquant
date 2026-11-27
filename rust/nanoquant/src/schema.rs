@@ -292,7 +292,8 @@ fn backfill_sort_order(conn: &Connection) -> Result<(), String> {
 /// 已退役的参数必须从存量库清掉：否则参数页会把它们落到「其他参数」继续展示。
 fn drop_legacy_removed_params(conn: &Connection) -> Result<(), String> {
     conn.execute(
-        "UPDATE app_settings SET value = json_remove(value, '$.sl_atr_mult', '$.tp_atr_mult', '$.min_risk_reward') \
+        "UPDATE app_settings SET value = json_remove(value, '$.sl_atr_mult', '$.tp_atr_mult', \
+         '$.min_risk_reward', '$.atr_stop_mult') \
          WHERE key='strategy' AND json_valid(value)",
         [],
     )
@@ -465,7 +466,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER); \
-             INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\",\"sl_atr_mult\":1.2,\"tp_atr_mult\":2.0,\"min_risk_reward\":2.0}',0); \
+             INSERT INTO app_settings VALUES('strategy','{\"timeframe\":\"1h\",\"sl_atr_mult\":1.2,\"tp_atr_mult\":2.0,\"min_risk_reward\":2.0,\"atr_stop_mult\":1.3}',0); \
              INSERT INTO app_settings VALUES('risk','{\"margin_pct\":50,\"risk_per_trade_pct\":2.0}',0);",
         )
         .unwrap();
@@ -484,7 +485,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        for removed in ["sl_atr_mult", "tp_atr_mult", "min_risk_reward"] {
+        for removed in [
+            "sl_atr_mult",
+            "tp_atr_mult",
+            "min_risk_reward",
+            "atr_stop_mult",
+        ] {
             assert!(!strategy.contains(removed), "strategy 仍残留 {removed}");
         }
         assert!(
