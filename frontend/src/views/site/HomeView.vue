@@ -163,9 +163,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
 .landing-hero {
   overflow: hidden;
   background:
-    radial-gradient(120% 140% at 0% 0%, rgba(77, 163, 255, 0.14), transparent 55%),
-    radial-gradient(90% 120% at 100% 0%, rgba(77, 163, 255, 0.07), transparent 60%),
-    #07101b;
+    radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 55%),
+    radial-gradient(90% 120% at 100% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+    var(--panel);
 }
 .landing-grid {
   display: grid;
@@ -266,16 +266,16 @@ onBeforeUnmount(() => window.clearInterval(timer))
   justify-content: space-between;
   margin-top: 4px;
   padding: 9px 11px;
-  border-radius: 2px;
+  border-radius: var(--r-sm);
   background: var(--accent-soft);
-  border: 1px solid rgba(77, 163, 255, 0.3);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--accent);
   font-family: var(--mono);
   font-size: 10px;
   text-decoration: none;
 }
 .status-cta:hover {
-  background: rgba(77, 163, 255, 0.15);
+  background: var(--accent-soft);
 }
 .entry {
   text-decoration: none;
@@ -283,7 +283,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
   transition: border-color 0.15s, transform 0.15s;
 }
 .entry:hover {
-  border-color: rgba(77, 163, 255, 0.42);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
   transform: translateY(-1px);
 }
 .entry-ico {

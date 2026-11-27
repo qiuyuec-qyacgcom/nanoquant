@@ -151,7 +151,7 @@ async function confirmLive() {
   display: inline-flex;
   padding: 3px;
   gap: 3px;
-  background: #070d18;
+  background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 10px;
 }
@@ -171,21 +171,21 @@ async function confirmLive() {
 }
 .env-opt:hover:not(:disabled) {
   color: var(--text);
-  background: rgba(59, 130, 246, 0.06);
+  background: var(--accent-soft);
 }
 .env-opt:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
 .env-opt.on {
-  background: rgba(59, 130, 246, 0.14);
-  border-color: rgba(59, 130, 246, 0.4);
-  color: #dbe9ff;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .env-opt.live.on {
-  background: rgba(240, 75, 90, 0.14);
-  border-color: rgba(240, 75, 90, 0.42);
-  color: #ffd9dd;
+  background: var(--down-soft);
+  border-color: var(--down);
+  color: var(--down);
 }
 .env-main {
   font-weight: 600;

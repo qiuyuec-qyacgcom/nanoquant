@@ -109,7 +109,7 @@ const usageOption = computed(() => {
         type: 'bar',
         barMaxWidth: 18,
         data: rows.map((r: any) => r.calls),
-        itemStyle: { color: '#3b82f6', borderRadius: [4, 4, 0, 0] },
+        itemStyle: { color: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2ee6a6', borderRadius: [4, 4, 0, 0] },
       },
       {
         name: '失败',

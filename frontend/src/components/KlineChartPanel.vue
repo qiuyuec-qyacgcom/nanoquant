@@ -29,65 +29,81 @@ let chart: Chart | null = null
 let observer: ResizeObserver | null = null
 let rendered = { length: 0, first: 0 }
 
-const STYLES: Record<string, any> = {
-  grid: {
-    horizontal: { color: 'rgba(148,170,200,0.10)' },
-    vertical: { color: 'rgba(148,170,200,0.10)' },
-  },
-  candle: {
-    bar: {
-      upColor: '#12c48b',
-      downColor: '#f04b5a',
-      noChangeColor: '#7c8ba1',
-      upBorderColor: '#12c48b',
-      downBorderColor: '#f04b5a',
-      upWickColor: '#12c48b',
-      downWickColor: '#f04b5a',
+function cssVar(name: string, fallback: string): string {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return value || fallback
+}
+
+/** 图表样式跟随全局主题；切换主题后通过 setStyles 重绘。 */
+function chartStyles(): Record<string, any> {
+  const line = cssVar('--line', 'rgba(148,170,200,0.10)')
+  const lineStrong = cssVar('--line-strong', 'rgba(148,170,200,0.25)')
+  const text = cssVar('--text', '#dbe6f6')
+  const muted = cssVar('--muted', '#7c8ba1')
+  const panel = cssVar('--panel', '#0b1220')
+  const panel3 = cssVar('--panel-3', '#1f3557')
+  const up = cssVar('--up', '#12c48b')
+  const down = cssVar('--down', '#f04b5a')
+  return {
+    grid: {
+      horizontal: { color: line },
+      vertical: { color: line },
     },
-    priceMark: {
-      high: { text: { color: '#dbe6f6' } },
-      low: { text: { color: '#dbe6f6' } },
-      last: {
-        text: { color: '#0b1220' },
-        line: { style: 'dashed' },
+    candle: {
+      bar: {
+        upColor: up,
+        downColor: down,
+        noChangeColor: muted,
+        upBorderColor: up,
+        downBorderColor: down,
+        upWickColor: up,
+        downWickColor: down,
+      },
+      priceMark: {
+        high: { text: { color: text } },
+        low: { text: { color: text } },
+        last: {
+          text: { color: panel },
+          line: { style: 'dashed' },
+        },
+      },
+      tooltip: {
+        text: { color: text, size: 11 },
+        rect: {
+          color: panel,
+          borderColor: lineStrong,
+          borderSize: 1,
+          borderRadius: 4,
+        },
       },
     },
-    tooltip: {
-      text: { color: '#dbe6f6', size: 11 },
-      rect: {
-        color: 'rgba(9,16,28,0.92)',
-        borderColor: 'rgba(148,170,200,0.25)',
-        borderSize: 1,
-        borderRadius: 4,
+    indicator: {
+      lines: [{ color: cssVar('--warn', '#f2c94c') }, { color: cssVar('--accent-2', '#56ccf2') }, { color: cssVar('--accent', '#bb6bd9') }],
+      tooltip: { text: { color: muted, size: 11 } },
+      lastValueMark: { text: { color: text } },
+    },
+    xAxis: {
+      axisLine: { color: lineStrong },
+      tickLine: { color: lineStrong },
+      tickText: { color: muted, size: 10 },
+    },
+    yAxis: {
+      axisLine: { color: lineStrong },
+      tickLine: { color: lineStrong },
+      tickText: { color: muted, size: 10 },
+    },
+    separator: { color: lineStrong },
+    crosshair: {
+      horizontal: {
+        line: { color: lineStrong },
+        text: { backgroundColor: panel3, color: text },
+      },
+      vertical: {
+        line: { color: lineStrong },
+        text: { backgroundColor: panel3, color: text },
       },
     },
-  },
-  indicator: {
-    lines: [{ color: '#f2c94c' }, { color: '#56ccf2' }, { color: '#bb6bd9' }],
-    tooltip: { text: { color: '#a9bad2', size: 11 } },
-    lastValueMark: { text: { color: '#dbe6f6' } },
-  },
-  xAxis: {
-    axisLine: { color: 'rgba(148,170,200,0.25)' },
-    tickLine: { color: 'rgba(148,170,200,0.25)' },
-    tickText: { color: '#7c8ba1', size: 10 },
-  },
-  yAxis: {
-    axisLine: { color: 'rgba(148,170,200,0.25)' },
-    tickLine: { color: 'rgba(148,170,200,0.25)' },
-    tickText: { color: '#7c8ba1', size: 10 },
-  },
-  separator: { color: 'rgba(148,170,200,0.25)' },
-  crosshair: {
-    horizontal: {
-      line: { color: 'rgba(200,214,235,0.45)' },
-      text: { backgroundColor: '#1f3557', color: '#ffffff' },
-    },
-    vertical: {
-      line: { color: 'rgba(200,214,235,0.45)' },
-      text: { backgroundColor: '#1f3557', color: '#ffffff' },
-    },
-  },
+  }
 }
 
 function toData(items: Candle[]) {
@@ -171,7 +187,7 @@ function syncData() {
 
 function buildChart() {
   if (!el.value) return
-  chart = init(el.value, { styles: STYLES })
+  chart = init(el.value, { styles: chartStyles() })
   if (!chart) return
   appliedPrecision = -1 // 新实例必须重新设一次精度
   if (props.main && props.main !== 'NONE') {
@@ -186,14 +202,20 @@ function buildChart() {
   emit('ready', chart)
 }
 
+function onTheme() {
+  chart?.setStyles(chartStyles())
+}
+
 onMounted(() => {
   if (!el.value) return
   buildChart()
+  window.addEventListener('nq-theme', onTheme)
   observer = new ResizeObserver(() => chart?.resize())
   observer.observe(el.value)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('nq-theme', onTheme)
   observer?.disconnect()
   observer = null
   if (el.value) {
@@ -215,7 +237,7 @@ watch(() => props.items, syncData)
   width: 100%;
   border-radius: 8px;
   border: 1px solid var(--line);
-  background: radial-gradient(120% 120% at 0% 0%, rgba(24, 38, 60, 0.55), rgba(7, 12, 22, 0.9));
+  background: var(--panel);
   overflow: hidden;
 }
 </style>

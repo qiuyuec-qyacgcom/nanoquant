@@ -27,12 +27,12 @@ const rising = computed(() => {
   <svg :viewBox="`0 0 100 34`" preserveAspectRatio="none" class="spark" :style="{ height: (height || 40) + 'px' }">
     <defs>
       <linearGradient :id="rising ? 'sparkUp' : 'sparkDown'" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" :stop-color="rising ? '#12c48b' : '#f04b5a'" stop-opacity="0.35" />
-        <stop offset="100%" :stop-color="rising ? '#12c48b' : '#f04b5a'" stop-opacity="0" />
+        <stop offset="0%" :stop-color="rising ? 'var(--up)' : 'var(--down)'" stop-opacity="0.35" />
+        <stop offset="100%" :stop-color="rising ? 'var(--up)' : 'var(--down)'" stop-opacity="0" />
       </linearGradient>
     </defs>
     <path v-if="path" :d="`${path} L100,34 L0,34 Z`" :fill="rising ? 'url(#sparkUp)' : 'url(#sparkDown)'" />
-    <path v-if="path" :d="path" fill="none" :stroke="rising ? '#12c48b' : '#f04b5a'" stroke-width="1.4" />
+    <path v-if="path" :d="path" fill="none" :stroke="rising ? 'var(--up)' : 'var(--down)'" stroke-width="1.4" />
   </svg>
 </template>
 

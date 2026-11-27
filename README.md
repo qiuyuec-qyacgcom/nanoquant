@@ -64,7 +64,7 @@
 
 后台按 5 个工作区组织，工作区内用页签切换；旧地址（如 `/admin/dashboard`、`/admin/strategy`）会自动重定向到对应工作区并保留 `query/hash`。
 
-当前后台界面为 H · Modular Studio；历史视觉概念稿已归档到 `docs/archive/design/`。
+当前前后台与登录页统一为 H · Modular Studio，字体使用开源 Inter + JetBrains Mono（本地打包）；历史视觉概念稿已归档到 `docs/archive/design/`。
 
 ---
 

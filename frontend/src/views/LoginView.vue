@@ -3,11 +3,13 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useAppStore } from '../stores/app'
+import { useTheme } from '../composables/theme'
 
 const auth = useAuthStore()
 const app = useAppStore()
 const router = useRouter()
 const route = useRoute()
+const { theme, toggle: toggleTheme } = useTheme()
 
 const username = ref('admin')
 const password = ref('')
@@ -32,6 +34,9 @@ async function submit() {
 
 <template>
   <div class="login-page">
+    <button class="login-theme btn btn-sm btn-ghost" type="button" @click="toggleTheme">
+      {{ theme === 'dark' ? '浅色' : '深色' }}
+    </button>
     <section class="login-visual">
       <div class="login-brand">
         <div class="brand-mark">N</div>
@@ -94,12 +99,20 @@ async function submit() {
 
 <style scoped>
 .login-page {
+  position: relative;
   min-height: 100vh;
   display: grid;
   grid-template-columns: 57% 43%;
-  background: #05080d;
+  background: var(--bg);
   color: var(--text);
   overflow: hidden;
+}
+
+.login-theme {
+  position: absolute;
+  top: 18px;
+  right: 20px;
+  z-index: 5;
 }
 
 .login-visual {
@@ -245,7 +258,7 @@ async function submit() {
   align-items: center;
   justify-content: center;
   padding: 60px 80px;
-  background: #07101b;
+  background: var(--panel);
   color: var(--text);
 }
 
@@ -321,8 +334,8 @@ async function submit() {
 .login-error {
   margin-top: 10px;
   padding: 8px 10px;
-  border: 1px solid rgba(255, 95, 126, 0.28);
-  background: rgba(255, 95, 126, 0.06);
+  border: 1px solid var(--down);
+  background: var(--down-soft);
   color: var(--down);
   font-size: 11px;
 }
@@ -334,7 +347,7 @@ async function submit() {
   border: 0;
   border-radius: 2px;
   background: var(--accent);
-  color: #04101f;
+  color: var(--on-accent);
   font-family: var(--mono);
   font-size: 11px;
   font-weight: 700;
@@ -342,7 +355,7 @@ async function submit() {
 }
 
 .login-submit span {
-  color: #04101f;
+  color: var(--on-accent);
   margin-left: 8px;
 }
 

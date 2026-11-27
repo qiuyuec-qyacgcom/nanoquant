@@ -646,8 +646,8 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 .kb-chip.on {
-  background: rgba(59, 130, 246, 0.18);
-  color: #9dc1ff;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 .kb-tabs {
   display: flex;
@@ -668,11 +668,11 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 .kb-tab:hover {
-  border-color: #2f5fa8;
+  border-color: var(--line-strong);
 }
 .kb-tab.on {
-  border-color: #3b82f6;
-  background: rgba(59, 130, 246, 0.14);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 .kb-tab-order {
   width: 16px;
@@ -680,7 +680,7 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   border-radius: 4px;
-  background: rgba(148, 170, 200, 0.14);
+  background: var(--line);
   font-size: 9.5px;
   color: var(--muted);
 }
@@ -734,7 +734,7 @@ onBeforeUnmount(() => {
   font-size: 10.5px;
   color: var(--muted);
   border-bottom: 1px solid var(--line);
-  background: rgba(148, 170, 200, 0.05);
+  background: var(--line-soft);
 }
 .kb-side-row {
   width: 100%;
@@ -745,16 +745,16 @@ onBeforeUnmount(() => {
   padding: 7px 10px;
   background: transparent;
   border: 0;
-  border-bottom: 1px solid rgba(148, 170, 200, 0.06);
+  border-bottom: 1px solid var(--line-soft);
   color: var(--text);
   cursor: pointer;
   text-align: left;
 }
 .kb-side-row:hover {
-  background: rgba(148, 170, 200, 0.06);
+  background: var(--line-soft);
 }
 .kb-side-row.on {
-  background: rgba(59, 130, 246, 0.12);
+  background: var(--accent-soft);
 }
 .kb-side-order {
   font-size: 9.5px;

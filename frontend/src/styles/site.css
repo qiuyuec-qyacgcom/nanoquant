@@ -1,162 +1,196 @@
-/* 公开前台站点皮肤
+/* 公开前台 · 与后台共用 H Modular Studio 令牌
  *
- * 从旧 redesign.css 中剥离出的前台专属样式：只作用于 `.site`，
- * 不参与后台 shell 与登录页。后台主题见 studio.css。
+ * 只保留站点布局与少量站点级覆盖；颜色、圆角、间距全部来自 tokens.css。
+ * 旧蓝色前台主题已移除，主题跟随 <html data-theme>。
  */
 
 .site {
-  --bg: #05080d;
-  --bg-grid: rgba(77, 163, 255, 0.055);
-  --panel: #0a111c;
-  --panel-2: #0d1726;
-  --panel-3: #111f33;
-  --line: rgba(104, 160, 255, 0.16);
-  --line-strong: rgba(104, 160, 255, 0.34);
-  --line-soft: rgba(104, 160, 255, 0.09);
-  --text: #e8f0fb;
-  --text-dim: #a6b6ce;
-  --muted: #8193ad;
-  --dim: #52647e;
-  --accent: #4da3ff;
-  --accent-2: #84c4ff;
-  --up: #4ad6a4;
-  --down: #ff5f7e;
-  --warn: #ffb84d;
-  --focus-ring: 0 0 0 3px rgba(77, 163, 255, 0.26);
-  background-color: var(--bg);
-  background-image:
-    radial-gradient(circle at 84% -10%, rgba(77, 163, 255, 0.12), transparent 34%),
-    linear-gradient(var(--line-soft) 1px, transparent 1px),
-    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
-  background-size: auto, 42px 42px, 42px 42px;
+  min-height: 100%;
+  background: var(--bg);
   color: var(--text);
 }
 
 .site a { color: var(--accent-2); }
 
 .site-header {
-  height: 68px;
-  padding: 0 42px;
-  background: rgba(5, 8, 13, 0.9);
-  border-bottom-color: var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  height: 64px;
+  padding: 0 32px;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border-bottom: 1px solid var(--line);
   backdrop-filter: blur(12px);
 }
 
-.site-brand { color: var(--text); }
-.site-brand-text b { font-family: var(--sans); font-size: 18px; font-weight: 600; }
+.site-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+}
+.site-brand-text b {
+  display: block;
+  font-family: var(--sans);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
 .site-brand-text small {
+  display: block;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 0.18em;
+  font-size: 9px;
+  letter-spacing: 0.14em;
 }
 .site .brand-mark {
-  background: transparent;
-  color: var(--accent);
-  border: 1px solid var(--accent);
-  box-shadow: inset 0 0 0 4px var(--bg);
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: var(--on-accent);
+  box-shadow: none;
 }
 
-.site-nav { display: flex; gap: 24px; margin-left: 20px; }
+.site-nav {
+  display: flex;
+  gap: 4px;
+  margin-left: 12px;
+}
 .site-nav a {
-  padding: 24px 0 22px;
-  border-bottom: 1px solid transparent;
+  padding: 7px 12px;
+  border-radius: var(--r-sm);
   color: var(--muted);
   font-size: 12px;
 }
-.site-nav a:hover { color: var(--text); }
-.site-nav a.active { color: var(--text); border-bottom-color: var(--accent); }
-.site-actions { margin-left: auto; }
-.site-body { display: block; }
-.site-main { max-width: 1440px; padding: 28px 42px 56px; }
-.site-footer {
-  padding: 16px 42px;
-  border-top-color: var(--line);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 9px;
+.site-nav a:hover { color: var(--text); background: var(--panel-2); }
+.site-nav a.active { color: var(--accent); background: var(--accent-soft); }
+
+.site-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
+.site-body { display: block; }
+.site-main {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 28px 32px 56px;
+}
+
+.site-footer {
+  padding: 18px 32px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+/* 站点内的通用组件跟随后台卡片 */
 .site .panel {
-  border-radius: 2px;
-  border-color: var(--line);
-  background: linear-gradient(180deg, rgba(13, 23, 38, 0.9), rgba(10, 17, 28, 0.96));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
   box-shadow: none;
-  backdrop-filter: none;
 }
 .site .panel-hd {
-  background: rgba(255, 255, 255, 0.015);
-  border-bottom-color: var(--line);
+  background: transparent;
+  border-bottom: 1px solid var(--line);
 }
-.site .panel-title { font-family: var(--sans); font-size: 16px; font-weight: 600; }
+.site .panel-title { font-family: var(--sans); font-size: 15px; font-weight: 600; }
 .site .kpi {
-  border-radius: 2px;
-  border-color: var(--line);
-  background: linear-gradient(180deg, rgba(13, 23, 38, 0.9), rgba(10, 17, 28, 0.96));
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
   box-shadow: none;
 }
-.site .kpi::after {
-  background: radial-gradient(circle at top right, rgba(77, 163, 255, 0.11), transparent 65%);
-}
-.site .btn {
-  border-radius: 2px;
-  border-color: var(--line);
-  background: var(--panel-2);
-  color: var(--text-dim);
-}
-.site .btn:hover:not(:disabled) {
-  border-color: rgba(77, 163, 255, 0.42);
-  background: var(--accent-soft);
-  color: var(--text);
-}
+.site .kpi::after { display: none; }
+.site .btn { border-radius: var(--r-sm); }
 .site .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #04101f;
-  font-weight: 700;
+  color: var(--on-accent);
+  font-weight: 600;
 }
-.site .btn-primary:hover:not(:disabled) { background: #6fb6ff; border-color: #6fb6ff; }
-.site .btn-ghost { background: transparent; border-color: var(--line); color: var(--text-dim); }
-.site .tag {
-  border-radius: 2px;
-  border-color: var(--line);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 9px;
+.site .btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text));
+  border-color: var(--accent);
 }
-.site .tag-blue {
-  background: var(--accent-soft);
-  border-color: rgba(77, 163, 255, 0.32);
-  color: var(--accent);
-}
+.site .btn-ghost { background: transparent; border-color: var(--line); color: var(--muted); }
+.site .btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--line-strong); }
+.site .tag { border-radius: var(--r-pill); }
 .site .table th {
-  background: rgba(255, 255, 255, 0.018);
+  background: transparent;
   color: var(--muted);
   border-bottom-color: var(--line);
 }
-.site .table td { border-bottom-color: rgba(255, 255, 255, 0.045); }
-.site .table tbody tr:hover td { background: rgba(77, 163, 255, 0.035); }
+.site .table td { border-bottom-color: var(--line); }
+.site .table tbody tr:hover td { background: var(--panel-2); }
 .site .input,
-.site .select { background: #08111d; border-color: var(--line); color: var(--text); }
+.site .select {
+  border-radius: var(--r-sm);
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+}
 .site .input:focus-visible,
-.site .select:focus-visible { border-color: var(--accent); box-shadow: var(--focus-ring); }
+.site .select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
 .site .section-title {
+  border-left-color: var(--accent);
   font-family: var(--sans);
   font-weight: 600;
   font-size: 17px;
-  border-left-color: var(--accent);
 }
-.site-tabbar { background: rgba(5, 8, 13, 0.96); border-top-color: var(--line); }
+
+.site-tabbar {
+  display: none;
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  border-top: 1px solid var(--line);
+}
 .site-tabbar a.active { color: var(--accent); }
+
+@media (max-width: 1100px) {
+  .site-tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 70;
+    display: flex;
+    height: calc(58px + env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    backdrop-filter: blur(12px);
+  }
+  .site-tabbar a {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    color: var(--muted);
+    font-size: 10px;
+  }
+  .site-tabbar .tab-ico { font-size: 15px; line-height: 1; }
+  .site-main { padding-bottom: 84px; }
+}
 
 @media (max-width: 900px) {
   .site-nav { display: none; }
+  .site-header { height: 60px; padding: 0 18px; gap: 12px; }
   .site-main { padding: 20px 18px 44px; }
-  .site-header { padding: 0 18px; }
 }
 
 @media (max-width: 760px) {
-  .site-header { height: 62px; background: rgba(5, 8, 13, 0.96); }
-  .site-main { padding: 16px 14px 36px; }
-  .site-footer { padding: 14px 16px; }
+  .site-header { height: 56px; padding: 0 14px; }
+  .site-main { padding: 16px 14px 34px; }
+  .site-footer { padding: 14px 16px calc(80px + env(safe-area-inset-bottom)); }
+  .site-brand-text small { display: none; }
 }

@@ -207,7 +207,7 @@ const equityOption = computed(() => {
         type: 'line',
         data: curve,
         showSymbol: false,
-        lineStyle: { color: '#3b82f6', width: 1.6 },
+        lineStyle: { color: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2ee6a6', width: 1.6 },
         areaStyle: { color: 'rgba(59,130,246,0.16)' },
       },
     ],

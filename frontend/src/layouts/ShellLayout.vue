@@ -9,6 +9,7 @@ import { useSilentRefresh } from '../composables/silentRefresh'
 import CommandPalette from '../components/CommandPalette.vue'
 import type { CommandItem } from '../components/commandPalette'
 import { WORKSPACES, workspaceByPath, workspaceHome } from '../workspaces'
+import { useTheme } from '../composables/theme'
 
 const app = useAppStore()
 const auth = useAuthStore()
@@ -27,14 +28,8 @@ const pageLabel = computed(
 
 const title = computed(() => pageLabel.value || 'NanoQuant')
 
-/** H 版主题：默认深色，可切浅色；只作用于登录后的后台 shell。 */
-const theme = ref<'dark' | 'light'>(localStorage.getItem('nq-theme') === 'light' ? 'light' : 'dark')
-function toggleTheme() {
-  theme.value = theme.value === 'dark' ? 'light' : 'dark'
-  localStorage.setItem('nq-theme', theme.value)
-  // 等 class 落到 DOM 后再通知图表重读 CSS 变量
-  requestAnimationFrame(() => window.dispatchEvent(new Event('nq-theme')))
-}
+/** 后台、前台和登录页共用的主题状态。 */
+const { theme, toggle: toggleTheme } = useTheme()
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
@@ -152,7 +147,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="shell" :class="['theme-' + theme, { 'nav-open': navOpen }]">
+  <div class="shell" :class="{ 'nav-open': navOpen }">
     <div v-if="navOpen" class="drawer-mask" @click="navOpen = false" />
     <aside class="sidebar">
       <button class="drawer-close" type="button" aria-label="关闭菜单" @click="navOpen = false">×</button>

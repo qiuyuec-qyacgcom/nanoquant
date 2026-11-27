@@ -1,0 +1,109 @@
+/* 全局设计令牌 · H Modular Studio
+ *
+ * 后台、登录页与公开前台共用同一套令牌；主题由 <html data-theme> 控制。
+ * 字体：Inter（Sans）+ JetBrains Mono（等宽），均为 GitHub 开源 OFL 字体，
+ * 由 @fontsource 本地打包，不依赖外部 CDN。
+ */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --bg-grid: rgba(255, 255, 255, 0.03);
+  --panel: #11161d;
+  --panel-2: #171f29;
+  --panel-3: #1d2733;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --line-soft: rgba(255, 255, 255, 0.05);
+  --text: #e8edf4;
+  --text-dim: #c8d1dc;
+  --muted: #8b98a9;
+  --dim: #667085;
+  --accent: #2ee6a6;
+  --accent-2: #7cf0c4;
+  --accent-soft: rgba(46, 230, 166, 0.12);
+  --on-accent: #04120d;
+  --up: #2ee6a6;
+  --up-soft: rgba(46, 230, 166, 0.12);
+  --down: #ff6b6b;
+  --down-soft: rgba(255, 107, 107, 0.12);
+  --warn: #f5b44a;
+  --warn-soft: rgba(245, 180, 74, 0.12);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-3: 0 24px 80px rgba(0, 0, 0, 0.55);
+  --focus-ring: 0 0 0 3px rgba(46, 230, 166, 0.25);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6f9;
+  --bg-grid: rgba(16, 24, 40, 0.04);
+  --panel: #ffffff;
+  --panel-2: #eef1f5;
+  --panel-3: #e4e9f0;
+  --line: rgba(16, 24, 40, 0.1);
+  --line-strong: rgba(16, 24, 40, 0.2);
+  --line-soft: rgba(16, 24, 40, 0.06);
+  --text: #101828;
+  --text-dim: #344054;
+  --muted: #667085;
+  --dim: #98a2b3;
+  --accent: #0b9e6e;
+  --accent-2: #0b9e6e;
+  --accent-soft: rgba(11, 158, 110, 0.1);
+  --on-accent: #ffffff;
+  --up: #0b9e6e;
+  --up-soft: rgba(11, 158, 110, 0.1);
+  --down: #dc2626;
+  --down-soft: rgba(220, 38, 38, 0.1);
+  --warn: #b45309;
+  --warn-soft: rgba(180, 83, 9, 0.1);
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
+  --shadow-2: 0 8px 24px rgba(16, 24, 40, 0.12);
+  --shadow-3: 0 24px 80px rgba(16, 24, 40, 0.18);
+  --focus-ring: 0 0 0 3px rgba(11, 158, 110, 0.22);
+}
+
+:root {
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --fs-xs: 10px;
+  --fs-sm: 11px;
+  --fs-md: 12px;
+  --fs-lg: 13px;
+  --fs-xl: 15px;
+  --fs-2xl: 20px;
+  --fs-3xl: 28px;
+
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+  --radius: var(--r-lg);
+
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-1: 0.12s;
+  --dur-2: 0.2s;
+
+  --z-nav: 30;
+  --z-drawer: 60;
+  --z-modal: 80;
+  --z-toast: 200;
+
+  --content-max: 1440px;
+  --sidebar-w: 216px;
+  --topbar-h: 58px;
+
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono',
+    monospace;
+}

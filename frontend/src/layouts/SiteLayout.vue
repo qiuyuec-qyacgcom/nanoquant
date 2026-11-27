@@ -2,10 +2,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { publicConfig, type PublicConfig } from '../api/public'
+import { useTheme } from '../composables/theme'
 
 const cfg = ref<PublicConfig | null>(null)
 const error = ref('')
 const route = useRoute()
+const { theme, toggle: toggleTheme } = useTheme()
 
 const nav = [
   { path: '/', label: '首页', ico: '⌂' },
@@ -57,6 +59,9 @@ onMounted(async () => {
         <span v-if="cfg" class="tag" :class="cfg.mode === 'live' ? 'tag-short' : 'tag-long'">
           {{ cfg.mode === 'live' ? 'LIVE 实盘' : 'DEMO 模拟盘' }}
         </span>
+        <button class="btn btn-sm btn-ghost" type="button" @click="toggleTheme">
+          {{ theme === 'dark' ? '浅色' : '深色' }}
+        </button>
         <router-link to="/admin/overview/dashboard" class="btn btn-sm btn-primary">进入后台</router-link>
       </div>
     </header>
