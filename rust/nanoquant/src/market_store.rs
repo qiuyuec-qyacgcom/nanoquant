@@ -69,8 +69,6 @@ pub(crate) fn upsert_candles(
 }
 
 /// 读回某个标的某个周期的 K 线，按 close_time 升序，最多 `limit` 根。
-/// 当前由离线回放（M2）与测试使用，引擎写入路径不读它。
-#[allow(dead_code)]
 pub(crate) fn load_candles(
     conn: &Connection,
     symbol: &str,
@@ -110,6 +108,32 @@ pub(crate) fn purge_before(conn: &Connection, cutoff_ms: i64) -> Result<usize, S
     )
     .map_err(|e| format!("清理过期行情失败: {e}"))?;
     Ok(conn.changes() as usize)
+}
+
+/// 把库里的收盘 K 线转回 `HistoryBar`；`open_time` 由 `close_time` 与周期反推。
+pub(crate) fn load_history_bar(
+    conn: &Connection,
+    symbol: &str,
+    interval: &str,
+    start_ms: i64,
+    end_ms: i64,
+    limit: usize,
+) -> Vec<crate::history::HistoryBar> {
+    let step = crate::history::interval_ms(interval).unwrap_or(60_000);
+    load_candles(conn, symbol, interval, limit)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.close_time >= start_ms && c.close_time <= end_ms)
+        .map(|c| crate::history::HistoryBar {
+            open_time: c.close_time - step + 1,
+            close_time: c.close_time,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume,
+        })
+        .collect()
 }
 
 /// 行情保留期清理任务：每 6 小时一次，删掉超过 `data.keep_days` 的行。

@@ -134,6 +134,7 @@ struct Prepared {
     live: bool,
     strategy: Value,
     risk: Value,
+    db: Db,
 }
 
 fn setting(conn: &Connection, key: &str) -> Value {
@@ -164,6 +165,7 @@ fn prepare(db: &Db, input: &BacktestIn) -> Result<Prepared, (StatusCode, Json<Va
         live: matches!(engine_mode(&conn).as_str(), "live" | "mainnet"),
         strategy: setting(&conn, "strategy"),
         risk: setting(&conn, "risk"),
+        db: db.clone(),
     })
 }
 
@@ -410,16 +412,54 @@ async fn load_series(
     let now = crate::now_millis();
     let end = (now / step) * step;
     let start = end - input.limit * step;
-    let source = history::BinanceHistory::new(prepared.live);
-    let series = source
-        .load(&prepared.symbol, &input.interval, start, end)
-        .await
-        .map_err(|error| {
-            bad(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("历史 K 线不可用: {error}"),
-            )
-        })?;
+    let stored = {
+        let conn = prepared
+            .db
+            .conn
+            .lock()
+            .map_err(|_| internal("数据库锁不可用"))?;
+        crate::market_store::load_history_bar(
+            &conn,
+            &prepared.symbol,
+            &input.interval,
+            start,
+            end,
+            1000,
+        )
+    };
+    let local_series = || HistorySeries {
+        bars: stored.clone(),
+        gaps: Vec::new(),
+        funding: Vec::new(),
+        truncated: false,
+        funding_error: String::new(),
+    };
+    // 本地库已经覆盖本次窗口就直接回放；不够才取远端，远端不可用时用已有本地数据兜底。
+    let series = if stored.len() >= input.limit.min(1000) as usize {
+        local_series()
+    } else {
+        let source = history::BinanceHistory::new(prepared.live);
+        match source
+            .load(&prepared.symbol, &input.interval, start, end)
+            .await
+        {
+            Ok(loaded) => loaded,
+            Err(error) if stored.len() >= 100 => {
+                tracing::warn!(
+                    %error,
+                    symbol = %prepared.symbol,
+                    "历史 K 线远端不可用，改用本地行情库回放"
+                );
+                local_series()
+            }
+            Err(error) => {
+                return Err(bad(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("历史 K 线不可用: {error}"),
+                ))
+            }
+        }
+    };
     if series.bars.len() < 100 {
         return Err(bad(
             StatusCode::BAD_REQUEST,
@@ -813,6 +853,55 @@ async fn cancel_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backtest_reads_candles_from_the_local_market_store() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::market_store::ensure_table(&conn).unwrap();
+        let bars: Vec<crate::history::HistoryBar> = (0..120)
+            .map(|i| crate::history::HistoryBar {
+                open_time: i * 900_000,
+                close_time: i * 900_000 + 899_999,
+                open: 100.0 + i as f64,
+                high: 101.0 + i as f64,
+                low: 99.0 + i as f64,
+                close: 100.5 + i as f64,
+                volume: 10.0,
+            })
+            .collect();
+        let candles: Vec<crate::providers::CandleSnapshot> = bars
+            .iter()
+            .map(|bar| crate::providers::CandleSnapshot {
+                close_time: bar.close_time,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            })
+            .collect();
+        let market = crate::providers::MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            mark_price: 220.0,
+            timestamp: 1_700_000_000,
+            quote_volume: 1.0,
+            funding_rate: 0.0,
+            open_interest: 0.0,
+            open_interest_change_pct: 0.0,
+            bid: 219.9,
+            ask: 220.1,
+            spread_bps: 1.0,
+            candles,
+        };
+        crate::market_store::upsert_candles(&conn, "15m", &[market]).unwrap();
+        let loaded = crate::market_store::load_candles(&conn, "BTCUSDT", "15m", 120).unwrap();
+        assert_eq!(loaded.len(), 120, "本地库必须能喂满一根回测窗口");
+        let converted =
+            crate::market_store::load_history_bar(&conn, "BTCUSDT", "15m", 0, 120 * 900_000, 120);
+        assert_eq!(converted.len(), 120);
+        assert_eq!(converted[1].open_time, 900_000, "open_time 由周期反推");
+        assert_eq!(converted[1].close_time, 900_000 + 899_999);
+    }
 
     #[test]
     fn an_unknown_interval_is_rejected() {
