@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "nanoquant"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

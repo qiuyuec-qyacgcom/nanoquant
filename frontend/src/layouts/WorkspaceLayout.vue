@@ -87,6 +87,6 @@ const workspace = computed<Workspace | undefined>(() =>
 .workspace-tab.active {
   color: var(--accent);
   border-color: var(--accent);
-  background: var(--accent-soft, rgba(77, 163, 255, 0.09));
+  background: var(--accent-soft, rgba(46, 230, 166, 0.09));
 }
 </style>

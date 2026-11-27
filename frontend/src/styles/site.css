@@ -1,0 +1,162 @@
+/* 公开前台站点皮肤
+ *
+ * 从旧 redesign.css 中剥离出的前台专属样式：只作用于 `.site`，
+ * 不参与后台 shell 与登录页。后台主题见 studio.css。
+ */
+
+.site {
+  --bg: #05080d;
+  --bg-grid: rgba(77, 163, 255, 0.055);
+  --panel: #0a111c;
+  --panel-2: #0d1726;
+  --panel-3: #111f33;
+  --line: rgba(104, 160, 255, 0.16);
+  --line-strong: rgba(104, 160, 255, 0.34);
+  --line-soft: rgba(104, 160, 255, 0.09);
+  --text: #e8f0fb;
+  --text-dim: #a6b6ce;
+  --muted: #8193ad;
+  --dim: #52647e;
+  --accent: #4da3ff;
+  --accent-2: #84c4ff;
+  --up: #4ad6a4;
+  --down: #ff5f7e;
+  --warn: #ffb84d;
+  --focus-ring: 0 0 0 3px rgba(77, 163, 255, 0.26);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle at 84% -10%, rgba(77, 163, 255, 0.12), transparent 34%),
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: auto, 42px 42px, 42px 42px;
+  color: var(--text);
+}
+
+.site a { color: var(--accent-2); }
+
+.site-header {
+  height: 68px;
+  padding: 0 42px;
+  background: rgba(5, 8, 13, 0.9);
+  border-bottom-color: var(--line);
+  backdrop-filter: blur(12px);
+}
+
+.site-brand { color: var(--text); }
+.site-brand-text b { font-family: var(--sans); font-size: 18px; font-weight: 600; }
+.site-brand-text small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.18em;
+}
+.site .brand-mark {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  box-shadow: inset 0 0 0 4px var(--bg);
+}
+
+.site-nav { display: flex; gap: 24px; margin-left: 20px; }
+.site-nav a {
+  padding: 24px 0 22px;
+  border-bottom: 1px solid transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+.site-nav a:hover { color: var(--text); }
+.site-nav a.active { color: var(--text); border-bottom-color: var(--accent); }
+.site-actions { margin-left: auto; }
+.site-body { display: block; }
+.site-main { max-width: 1440px; padding: 28px 42px 56px; }
+.site-footer {
+  padding: 16px 42px;
+  border-top-color: var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.site .panel {
+  border-radius: 2px;
+  border-color: var(--line);
+  background: linear-gradient(180deg, rgba(13, 23, 38, 0.9), rgba(10, 17, 28, 0.96));
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.site .panel-hd {
+  background: rgba(255, 255, 255, 0.015);
+  border-bottom-color: var(--line);
+}
+.site .panel-title { font-family: var(--sans); font-size: 16px; font-weight: 600; }
+.site .kpi {
+  border-radius: 2px;
+  border-color: var(--line);
+  background: linear-gradient(180deg, rgba(13, 23, 38, 0.9), rgba(10, 17, 28, 0.96));
+  box-shadow: none;
+}
+.site .kpi::after {
+  background: radial-gradient(circle at top right, rgba(77, 163, 255, 0.11), transparent 65%);
+}
+.site .btn {
+  border-radius: 2px;
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--text-dim);
+}
+.site .btn:hover:not(:disabled) {
+  border-color: rgba(77, 163, 255, 0.42);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.site .btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #04101f;
+  font-weight: 700;
+}
+.site .btn-primary:hover:not(:disabled) { background: #6fb6ff; border-color: #6fb6ff; }
+.site .btn-ghost { background: transparent; border-color: var(--line); color: var(--text-dim); }
+.site .tag {
+  border-radius: 2px;
+  border-color: var(--line);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+.site .tag-blue {
+  background: var(--accent-soft);
+  border-color: rgba(77, 163, 255, 0.32);
+  color: var(--accent);
+}
+.site .table th {
+  background: rgba(255, 255, 255, 0.018);
+  color: var(--muted);
+  border-bottom-color: var(--line);
+}
+.site .table td { border-bottom-color: rgba(255, 255, 255, 0.045); }
+.site .table tbody tr:hover td { background: rgba(77, 163, 255, 0.035); }
+.site .input,
+.site .select { background: #08111d; border-color: var(--line); color: var(--text); }
+.site .input:focus-visible,
+.site .select:focus-visible { border-color: var(--accent); box-shadow: var(--focus-ring); }
+.site .section-title {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 17px;
+  border-left-color: var(--accent);
+}
+.site-tabbar { background: rgba(5, 8, 13, 0.96); border-top-color: var(--line); }
+.site-tabbar a.active { color: var(--accent); }
+
+@media (max-width: 900px) {
+  .site-nav { display: none; }
+  .site-main { padding: 20px 18px 44px; }
+  .site-header { padding: 0 18px; }
+}
+
+@media (max-width: 760px) {
+  .site-header { height: 62px; background: rgba(5, 8, 13, 0.96); }
+  .site-main { padding: 16px 14px 36px; }
+  .site-footer { padding: 14px 16px; }
+}

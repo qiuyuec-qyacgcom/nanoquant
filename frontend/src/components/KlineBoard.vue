@@ -662,7 +662,7 @@ onBeforeUnmount(() => {
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--line);
-  background: #0a1220;
+  background: var(--panel-2);
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;

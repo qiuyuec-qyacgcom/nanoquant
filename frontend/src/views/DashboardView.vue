@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { http } from '../api/client'
 import { publicQuotes } from '../api/public'
 import EChart from '../components/EChart.vue'
@@ -26,6 +26,35 @@ const protection = ref<any[]>([])
 const orders = ref<any[]>([])
 const busy = ref(false)
 const showPosHelp = ref(false)
+/** H 工作台：工作预设、持仓视图与行内抽屉。 */
+type StudioPreset = 'monitor' | 'research' | 'ops'
+const preset = ref<StudioPreset>('monitor')
+const positionView = ref<'list' | 'table'>('list')
+const selectedPosition = ref<any | null>(null)
+const initialLoading = ref(true)
+
+const PRESET_TEXT: Record<StudioPreset, string> = {
+  monitor: '监控视图 · 聚焦持仓与执行',
+  research: '研究视图 · 权益、AI 与信号优先',
+  ops: '运维视图 · 风控与订单链路优先',
+}
+const presetCopy = computed(() => PRESET_TEXT[preset.value])
+
+function selectPosition(position: any) {
+  selectedPosition.value =
+    positionProtectionRows.value.find((row) => row.id === position.id) || position
+}
+
+function closeDrawer() {
+  selectedPosition.value = null
+}
+
+async function closeSelected() {
+  const position = selectedPosition.value
+  if (!position) return
+  await closePosition(position.id)
+  closeDrawer()
+}
 
 const status = computed(() => app.status)
 const stats = computed(() => status.value?.stats || ({} as any))
@@ -207,28 +236,42 @@ const halfAi = computed(() => {
   }
 })
 
+/** 从当前后台主题读取图表配色，切主题后由 `nq-theme` 事件触发重算。 */
+const themeTick = ref(0)
+function cssVar(name: string, fallback: string) {
+  const host = document.querySelector('.shell') as HTMLElement | null
+  const value = getComputedStyle(host || document.documentElement).getPropertyValue(name).trim()
+  return value || fallback
+}
+
 const equityOption = computed(() => {
+  themeTick.value
   const points = equity.value
+  const panel = cssVar('--panel', '#11161d')
+  const line = cssVar('--line', 'rgba(255,255,255,.08)')
+  const muted = cssVar('--muted', '#8b98a9')
+  const text = cssVar('--text', '#e8edf4')
+  const accent = cssVar('--accent', '#2ee6a6')
   return {
     grid: { left: 54, right: 18, top: 22, bottom: 28 },
     tooltip: {
       trigger: 'axis',
-      backgroundColor: '#0a111c',
-      borderColor: 'rgba(77,163,255,.28)',
-      textStyle: { color: '#e8f0fb', fontSize: 11 },
+      backgroundColor: panel,
+      borderColor: line,
+      textStyle: { color: text, fontSize: 11 },
       valueFormatter: (v: number) => `${Number(v).toFixed(4)}`,
     },
     xAxis: {
       type: 'category',
       data: points.map((p) => timeStr(p.ts, false)),
-      axisLine: { lineStyle: { color: 'rgba(104,160,255,.16)' } },
-      axisLabel: { color: '#8193ad', fontSize: 10, interval: Math.ceil(points.length / 8) },
+      axisLine: { lineStyle: { color: line } },
+      axisLabel: { color: muted, fontSize: 10, interval: Math.ceil(points.length / 8) },
     },
     yAxis: {
       type: 'value',
       scale: true,
-      splitLine: { lineStyle: { color: 'rgba(104,160,255,.09)' } },
-      axisLabel: { color: '#8193ad', fontSize: 10, formatter: (v: number) => v.toFixed(3) },
+      splitLine: { lineStyle: { color: line } },
+      axisLabel: { color: muted, fontSize: 10, formatter: (v: number) => v.toFixed(3) },
     },
     series: [
       {
@@ -237,21 +280,17 @@ const equityOption = computed(() => {
         smooth: true,
         showSymbol: false,
         data: points.map((p) => Number((p.wallet + p.unrealized).toFixed(6))),
-        lineStyle: { width: 1.8, color: '#4da3ff' },
-        itemStyle: { color: '#4da3ff' },
-        areaStyle: {
-          color: {
-            type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [
-              { offset: 0, color: 'rgba(77,163,255,0.24)' },
-              { offset: 1, color: 'rgba(77,163,255,0.015)' },
-            ],
-          },
-        },
+        lineStyle: { width: 1.8, color: accent },
+        itemStyle: { color: accent },
+        areaStyle: { color: accent, opacity: 0.12 },
       },
     ],
   }
 })
+
+function onThemeChange() {
+  themeTick.value += 1
+}
 
 async function load() {
 
@@ -274,6 +313,7 @@ async function load() {
   if (pr.status === 'fulfilled') protection.value = pr.value.items || []
   if (od.status === 'fulfilled') orders.value = od.value.items || []
   if (hs.status === 'fulfilled') halfAiRaw.value = hs.value
+  initialLoading.value = false
 }
 
 async function cycleNow() {
@@ -304,9 +344,14 @@ async function closePosition(id: number) {
 
 
 onMounted(async () => {
+  window.addEventListener('nq-theme', onThemeChange)
   await app.loadStatus()
   await refreshQuotes()
   await load()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('nq-theme', onThemeChange)
 })
 
 useSilentRefresh(load, 3000)
@@ -314,8 +359,23 @@ useSilentRefresh(refreshQuotes, 3000)
 </script>
 
 <template>
-  <div class="stack">
-    <div class="kpi-grid">
+  <div class="studio">
+    <div class="studio-bar">
+      <div class="studio-heading">
+        <h2>概览工作台</h2>
+        <p>{{ presetCopy }}</p>
+      </div>
+      <div class="studio-actions">
+        <div class="studio-seg" role="group" aria-label="工作视图">
+          <button type="button" :class="{ on: preset === 'monitor' }" @click="preset = 'monitor'">监控</button>
+          <button type="button" :class="{ on: preset === 'research' }" @click="preset = 'research'">研究</button>
+          <button type="button" :class="{ on: preset === 'ops' }" @click="preset = 'ops'">运维</button>
+        </div>
+        <span class="tag tag-dim">{{ status?.mode === 'live' ? 'LIVE' : 'DEMO' }} · {{ status?.cycle_interval_sec || 15 }}s</span>
+      </div>
+    </div>
+
+    <div class="kpi-grid studio-kpis">
       <div class="kpi">
         <div class="kpi-label">账户权益 <span class="tag" :class="status?.mode === 'live' ? 'tag-short' : 'tag-long'">{{ status?.mode === 'live' ? '实盘' : '模拟盘' }}</span></div>
         <div class="kpi-value">{{ fmt(account.equity, 4) }}</div>
@@ -348,8 +408,9 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="grid g2">
-      <div class="panel">
+    <div class="studio-grid" :data-preset="preset" :class="{ 'is-loading': initialLoading }">
+    <div class="grid g2 studio-row">
+      <div class="panel studio-card span2" data-card="equity">
         <div class="panel-hd">
           <span class="panel-title">权益曲线 · 48H</span>
           <div class="right"><span class="tag tag-dim">{{ equity.length }} 个采样点</span></div>
@@ -360,7 +421,7 @@ useSilentRefresh(refreshQuotes, 3000)
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel studio-card" data-card="engine">
         <div class="panel-hd">
           <span class="panel-title">引擎控制</span>
           <div class="right">
@@ -421,7 +482,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card" data-card="execution">
       <div class="panel-hd">
         <span class="panel-title">超短线执行</span>
         <div class="right">
@@ -509,7 +570,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card" data-card="halfai">
       <div class="panel-hd">
         <span class="panel-title">半 AI 运行 · 24H</span>
         <div class="right">
@@ -619,10 +680,14 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card span2" data-card="positions">
       <div class="panel-hd">
         <span class="panel-title">当前持仓</span>
         <div class="right">
+          <div class="studio-views" role="group" aria-label="持仓视图">
+            <button type="button" :class="{ on: positionView === 'list' }" @click="positionView = 'list'">列表</button>
+            <button type="button" :class="{ on: positionView === 'table' }" @click="positionView = 'table'">表格</button>
+          </div>
           <span class="tag tag-dim">{{ positions.length }} 个</span>
           <button class="btn btn-xs" @click="showPosHelp = !showPosHelp">{{ showPosHelp ? '收起说明' : '口径说明' }}</button>
         </div>
@@ -638,7 +703,30 @@ useSilentRefresh(refreshQuotes, 3000)
           <b>强平价</b>为按逐仓近似公式估算，仅供参考，实际以交易所为准。
         </div>
       </div>
-      <div class="panel-body flush table-scroll">
+      <div v-if="positionView === 'list'" class="panel-body">
+        <div class="pos-list">
+          <button
+            v-for="p in positionProtectionRows"
+            :key="p.id"
+            type="button"
+            class="pos-row"
+            @click="selectPosition(p)"
+          >
+            <span class="pos-symbol"><i :class="{ short: p.side !== 'long' }" />{{ p.symbol }}</span>
+            <span class="tag pos-side" :class="p.side === 'long' ? 'tag-long' : 'tag-short'">
+              {{ p.side === 'long' ? '做多' : '做空' }}
+            </span>
+            <span class="mono pos-qty">{{ p.qty }}</span>
+            <span class="mono" :class="numClass(p.unrealized)">{{ usdt(p.unrealized, 4) }}</span>
+            <span class="tag pos-state" :class="p.protection_status === '已挂' ? 'tag-long' : p.protection_status === '部分' ? 'tag-warn' : 'tag-dim'">
+              {{ p.protection_status }}
+            </span>
+          </button>
+          <div v-if="!positionProtectionRows.length" class="empty">暂无持仓 · 引擎会在信号与风控同时满足时自动开仓</div>
+        </div>
+        <div class="hint" style="margin-top: 10px">点击行在右侧查看详情并可直接平仓；切到「表格」查看全部字段。</div>
+      </div>
+      <div v-else class="panel-body flush table-scroll">
         <table class="table" style="min-width: 1080px">
           <thead>
             <tr>
@@ -659,7 +747,7 @@ useSilentRefresh(refreshQuotes, 3000)
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in positions" :key="p.id">
+            <tr v-for="p in positions" :key="p.id" style="cursor: pointer" @click="selectPosition(p)">
               <td>
                 <b>{{ p.symbol }}</b>
                 <span
@@ -695,7 +783,7 @@ useSilentRefresh(refreshQuotes, 3000)
                 </span>
                 <span v-else class="muted">-</span>
               </td>
-              <td class="right"><button class="btn btn-xs btn-danger" @click="closePosition(p.id)">平仓</button></td>
+              <td class="right"><button class="btn btn-xs btn-danger" @click.stop="closePosition(p.id)">平仓</button></td>
             </tr>
             <tr v-if="!positions.length">
               <td colspan="14" class="empty">暂无持仓 · 引擎会在信号与风控同时满足时自动开仓</td>
@@ -705,7 +793,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card span2" data-card="protection">
       <div class="panel-hd">
         <span class="panel-title">当前持仓止盈止损</span>
         <div class="right">
@@ -741,7 +829,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card span2" data-card="maker">
       <div class="panel-hd">
         <span class="panel-title">当前 Maker 挂单</span>
         <div class="right">
@@ -773,8 +861,8 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="grid g2">
-      <div class="panel">
+    <div class="grid g2 studio-row">
+      <div class="panel studio-card" data-card="trades">
         <div class="panel-hd">
           <span class="panel-title">最近成交</span>
           <div class="right"><span class="tag tag-dim">近 10 笔</span></div>
@@ -799,7 +887,7 @@ useSilentRefresh(refreshQuotes, 3000)
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel studio-card" data-card="events">
         <div class="panel-hd">
           <span class="panel-title">实时事件</span>
           <div class="right"><span class="tag tag-dim">{{ visibleAppEvents.length }}</span></div>
@@ -808,7 +896,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card span2" data-card="orderflow">
       <div class="panel-hd">
         <span class="panel-title">委托流水</span>
         <div class="right">
@@ -847,7 +935,7 @@ useSilentRefresh(refreshQuotes, 3000)
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel studio-card span2" data-card="signals">
       <div class="panel-hd">
         <span class="panel-title">信号审计 · 为什么开/不开仓</span>
         <div class="right"><span class="tag tag-dim">最近 {{ signals.length }} 条</span></div>
@@ -883,5 +971,46 @@ useSilentRefresh(refreshQuotes, 3000)
         </table>
       </div>
     </div>
+    </div>
+
+    <template v-if="selectedPosition">
+      <div class="studio-mask" @click="closeDrawer" />
+      <aside class="studio-drawer" role="dialog" aria-modal="true" aria-label="持仓详情">
+        <div class="studio-drawer-head">
+          <h3>{{ selectedPosition.symbol }}</h3>
+          <button class="btn btn-xs btn-ghost" type="button" @click="closeDrawer">关闭</button>
+        </div>
+        <p class="studio-drawer-sub">
+          {{ selectedPosition.side === 'long' ? 'LONG' : 'SHORT' }} · {{ selectedPosition.leverage }}× ·
+          {{ selectedPosition.protection_status }}
+        </p>
+        <div class="studio-kv"><span>入场价</span><b>{{ px(selectedPosition.entry_price) }}</b></div>
+        <div class="studio-kv"><span>标记价</span><b>{{ px(selectedPosition.mark_price) }}</b></div>
+        <div class="studio-kv"><span>数量</span><b>{{ selectedPosition.qty }}</b></div>
+        <div class="studio-kv"><span>止损 / 止盈</span><b>{{ px(selectedPosition.sl_price) }} / {{ px(selectedPosition.tp_price) }}</b></div>
+        <div class="studio-kv">
+          <span>交易所保护价</span>
+          <b>
+            {{ selectedPosition.exchange_sl_price > 0 ? px(selectedPosition.exchange_sl_price) : '--' }} /
+            {{ selectedPosition.exchange_tp_price > 0 ? px(selectedPosition.exchange_tp_price) : '--' }}
+          </b>
+        </div>
+        <div class="studio-kv">
+          <span>浮盈亏 (ROI)</span>
+          <b :class="numClass(selectedPosition.unrealized)">
+            {{ usdt(selectedPosition.unrealized, 4) }} ({{ (selectedPosition.roi_pct ?? 0).toFixed(1) }}%)
+          </b>
+        </div>
+        <div class="studio-kv">
+          <span>持仓时长</span>
+          <b>{{ duration((Date.now() / 1000) - selectedPosition.opened_at) }}</b>
+        </div>
+        <div class="studio-drawer-actions">
+          <button class="btn btn-xs btn-danger" type="button" @click="closeSelected">平仓</button>
+          <router-link class="btn btn-xs" to="/admin/trading/signals">查看信号</router-link>
+        </div>
+        <p class="studio-drawer-note">行内下钻，不跳页；字段与持仓表同源。移动端自动变为全屏抽屉。</p>
+      </aside>
+    </template>
   </div>
 </template>

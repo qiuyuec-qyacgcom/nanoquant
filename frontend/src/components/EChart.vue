@@ -36,8 +36,12 @@ function render() {
   if (!el.value) return
   if (!chart) chart = echarts.init(el.value, undefined, { renderer: 'canvas' })
   chart.setOption(props.option || {}, true)
-  if (props.loading) chart.showLoading('default', { text: '', color: '#3b82f6', maskColor: 'rgba(5,8,15,0.5)' })
-  else chart.hideLoading()
+  if (props.loading) {
+    const accent = getComputedStyle(el.value).getPropertyValue('--accent').trim() || '#2ee6a6'
+    chart.showLoading('default', { text: '', color: accent, maskColor: 'rgba(0,0,0,0.25)' })
+  } else {
+    chart.hideLoading()
+  }
 }
 
 function resize() {

@@ -26,6 +26,15 @@ const pageLabel = computed(
 )
 
 const title = computed(() => pageLabel.value || 'NanoQuant')
+
+/** H 版主题：默认深色，可切浅色；只作用于登录后的后台 shell。 */
+const theme = ref<'dark' | 'light'>(localStorage.getItem('nq-theme') === 'light' ? 'light' : 'dark')
+function toggleTheme() {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark'
+  localStorage.setItem('nq-theme', theme.value)
+  // 等 class 落到 DOM 后再通知图表重读 CSS 变量
+  requestAnimationFrame(() => window.dispatchEvent(new Event('nq-theme')))
+}
 const status = computed(() => app.status)
 const equity = computed(() => status.value?.account?.equity ?? 0)
 const pnl = computed(() => status.value?.account?.unrealized ?? 0)
@@ -143,7 +152,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="shell" :class="{ 'nav-open': navOpen }">
+  <div class="shell" :class="['theme-' + theme, { 'nav-open': navOpen }]">
     <div v-if="navOpen" class="drawer-mask" @click="navOpen = false" />
     <aside class="sidebar">
       <button class="drawer-close" type="button" aria-label="关闭菜单" @click="navOpen = false">×</button>
@@ -179,7 +188,7 @@ onBeforeUnmount(() => {
           <span>{{ status?.running ? (status?.enabled ? '引擎运行中' : '引擎待命') : (status?.enabled ? '引擎已开启但无心跳' : '引擎未运行') }}</span>
         </div>
         <div class="mono" style="margin-top: 6px; font-size: 10px">
-          v1.0.0 · {{ status?.mode === 'live' ? '实盘' : '模拟盘' }} · {{ status?.last_cycle_ms || 0 }}ms
+          v1.1.0 · {{ status?.mode === 'live' ? '实盘' : '模拟盘' }} · {{ status?.last_cycle_ms || 0 }}ms
         </div>
       </div>
     </aside>
@@ -206,6 +215,9 @@ onBeforeUnmount(() => {
           </div>
           <button class="btn" :class="status?.enabled ? 'btn-danger' : 'btn-primary'" :disabled="!status" @click="toggleEngine">
             {{ status?.enabled ? '停止引擎' : '启动引擎' }}
+          </button>
+          <button class="btn btn-sm btn-ghost theme-toggle" type="button" @click="toggleTheme">
+            {{ theme === 'dark' ? '浅色' : '深色' }}
           </button>
           <button class="btn btn-sm btn-ghost" title="退出登录" @click="logout">退出</button>
         </div>

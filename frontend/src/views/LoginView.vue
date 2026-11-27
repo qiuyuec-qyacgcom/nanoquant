@@ -85,7 +85,7 @@ async function submit() {
         <div class="login-security"><i></i> TLS · 会话令牌 · 登录失败锁定</div>
         <div class="login-links">
           <router-link to="/">← 返回公开站点</router-link>
-          <span>v1.0.0</span>
+          <span>v1.1.0</span>
         </div>
       </div>
     </section>
@@ -106,9 +106,9 @@ async function submit() {
   position: relative;
   padding: 46px 54px;
   background:
-    radial-gradient(circle at 78% 20%, rgba(77, 163, 255, 0.22), transparent 32%),
-    radial-gradient(circle at 20% 80%, rgba(77, 163, 255, 0.07), transparent 35%),
-    #060b14;
+    radial-gradient(circle at 78% 20%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 32%),
+    radial-gradient(circle at 20% 80%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 35%),
+    var(--bg);
   overflow: hidden;
 }
 
@@ -116,8 +116,8 @@ async function submit() {
   content: '';
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgba(77, 163, 255, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(77, 163, 255, 0.055) 1px, transparent 1px);
+  background-image: linear-gradient(color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px);
   background-size: 48px 48px;
 }
 
@@ -128,9 +128,10 @@ async function submit() {
   bottom: -280px;
   width: 620px;
   height: 620px;
-  border: 1px solid rgba(77, 163, 255, 0.14);
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
   border-radius: 50%;
-  box-shadow: 0 0 0 70px rgba(77, 163, 255, 0.025), 0 0 0 140px rgba(77, 163, 255, 0.018);
+  box-shadow: 0 0 0 70px color-mix(in srgb, var(--accent) 3%, transparent),
+    0 0 0 140px color-mix(in srgb, var(--accent) 2%, transparent);
 }
 
 .login-brand,
@@ -306,7 +307,7 @@ async function submit() {
   padding: 0 13px;
   border: 1px solid var(--line);
   border-radius: 2px;
-  background: #08111d;
+  background: var(--panel-2);
   color: var(--text);
   font-size: 11px;
   outline: none;
@@ -314,7 +315,7 @@ async function submit() {
 
 .login-input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.12);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
 .login-error {

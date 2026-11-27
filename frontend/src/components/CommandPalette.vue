@@ -185,7 +185,7 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 .command-item.active {
-  border-color: rgba(77, 163, 255, 0.26);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   background: var(--accent-soft);
   color: var(--text);
 }
