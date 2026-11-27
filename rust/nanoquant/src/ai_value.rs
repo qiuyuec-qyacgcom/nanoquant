@@ -4,7 +4,7 @@
 //! 不发请求、不写库，供 `/engine/ai-value` 与复盘使用。
 //! 反事实 PnL 基于本地已落库 K 线，未计滑点与手续费。
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 /// 反事实评估窗口：AI 否决后观察多久的价格变化。
@@ -55,6 +55,9 @@ fn counterfactual_stats(conn: &Connection, mode: &str, since: i64, horizon_sec: 
     let mut hits = 0_i64;
     let mut sum_pct = 0.0_f64;
     let mut avoided_loss_pct = 0.0_f64;
+    // 先按标的归组：每个标的只查两次价格区间，避免每条信号两次 SQL 的 N+1。
+    let mut by_symbol: std::collections::BTreeMap<String, Vec<(i64, f64)>> =
+        std::collections::BTreeMap::new();
 
     if let Ok(mut stmt) = conn.prepare(
         "SELECT ts, symbol, direction, decision, ai_action, features FROM signals \
@@ -80,23 +83,38 @@ fn counterfactual_stats(conn: &Connection, mode: &str, since: i64, horizon_sec: 
                     continue;
                 }
                 vetoed += 1;
-                let Some(entry) = close_at_or_before(conn, &symbol, ts.saturating_mul(1000)) else {
-                    skipped += 1;
-                    continue;
-                };
-                let Some(exit) =
-                    close_at_or_before(conn, &symbol, ts.saturating_add(horizon_sec) * 1000)
-                else {
-                    skipped += 1;
-                    continue;
-                };
-                let pct = (exit / entry - 1.0) * 100.0 * sign;
-                samples += 1;
-                sum_pct += pct;
-                if pct < 0.0 {
-                    hits += 1;
-                    avoided_loss_pct += -pct;
-                }
+                by_symbol.entry(symbol).or_default().push((ts, sign));
+            }
+        }
+    }
+
+    for (symbol, signals) in by_symbol {
+        let first_ms = signals
+            .iter()
+            .map(|(ts, _)| ts.saturating_mul(1000))
+            .min()
+            .unwrap_or(0);
+        let last_ms = signals
+            .iter()
+            .map(|(ts, _)| ts.saturating_add(horizon_sec).saturating_mul(1000))
+            .max()
+            .unwrap_or(0);
+        let series = load_price_window(conn, &symbol, first_ms, last_ms);
+        for (ts, sign) in signals {
+            let entry_ms = ts.saturating_mul(1000);
+            let exit_ms = ts.saturating_add(horizon_sec).saturating_mul(1000);
+            let (Some(entry), Some(exit)) =
+                (price_at(&series, entry_ms), price_at(&series, exit_ms))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let pct = (exit / entry - 1.0) * 100.0 * sign;
+            samples += 1;
+            sum_pct += pct;
+            if pct < 0.0 {
+                hits += 1;
+                avoided_loss_pct += -pct;
             }
         }
     }
@@ -135,17 +153,49 @@ fn is_ai_veto(decision: &str, ai_action: &str, features: Option<&str>) -> bool {
     decision == "rejected" && matches!(ai_action.trim(), "hold" | "reject")
 }
 
-fn close_at_or_before(conn: &Connection, symbol: &str, ts_ms: i64) -> Option<f64> {
-    conn.query_row(
+/// 一个标的在 `[first_ms, last_ms]` 内的收盘价序列。
+///
+/// 额外取 `first_ms` 之前最近的一根作为入场价哨兵；区间最多保留 6000 根，
+/// 避免一次把整段历史拉进内存。
+fn load_price_window(
+    conn: &Connection,
+    symbol: &str,
+    first_ms: i64,
+    last_ms: i64,
+) -> Vec<(i64, f64)> {
+    let mut series = Vec::new();
+    if let Ok(close) = conn.query_row(
         "SELECT close FROM market_candles WHERE symbol=?1 AND close_time<=?2 \
          ORDER BY close_time DESC LIMIT 1",
-        params![symbol, ts_ms],
+        params![symbol, first_ms],
         |row| row.get::<_, f64>(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-    .filter(|value| value.is_finite() && *value > 0.0)
+    ) {
+        if close.is_finite() && close > 0.0 {
+            // 哨兵时间用 first_ms：它小于等于该组内所有信号的入场时间。
+            series.push((first_ms, close));
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT close_time, close FROM market_candles \
+         WHERE symbol=?1 AND close_time>?2 AND close_time<=?3 \
+         ORDER BY close_time ASC LIMIT 6000",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![symbol, first_ms, last_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        }) {
+            series.extend(
+                rows.flatten()
+                    .filter(|(_, close)| close.is_finite() && *close > 0.0),
+            );
+        }
+    }
+    series
+}
+
+/// 最后一个不晚于 `ts_ms` 的收盘价。
+fn price_at(series: &[(i64, f64)], ts_ms: i64) -> Option<f64> {
+    let index = series.partition_point(|(close_time, _)| *close_time <= ts_ms);
+    index.checked_sub(1).map(|index| series[index].1)
 }
 
 fn average_notional(conn: &Connection, mode: &str, since: i64) -> f64 {

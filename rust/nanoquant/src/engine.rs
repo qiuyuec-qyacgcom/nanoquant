@@ -639,13 +639,53 @@ async fn status(State(db): State<Db>) -> Json<Value> {
     Json(read_status(&db))
 }
 
+struct CachedValue {
+    at: i64,
+    value: Value,
+}
+
+fn value_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedValue>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedValue>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 看板类聚合结果的短 TTL 缓存：轮询不会每次重扫 24h 信号与历史表。
+fn cached_value(key: String, ttl_sec: i64, compute: impl FnOnce() -> Value) -> Value {
+    let now = crate::now();
+    if let Ok(cache) = value_cache().lock() {
+        if let Some(hit) = cache.get(&key) {
+            if ttl_sec > 0 && now - hit.at < ttl_sec {
+                return hit.value.clone();
+            }
+        }
+    }
+    let value = compute();
+    if let Ok(mut cache) = value_cache().lock() {
+        cache.retain(|_, hit| now - hit.at < 60);
+        cache.insert(
+            key,
+            CachedValue {
+                at: now,
+                value: value.clone(),
+            },
+        );
+    }
+    value
+}
+
 /// AI 增量价值：否决信号的反事实收益、置信度校准、成本/延迟对比。
 async fn ai_value(State(db): State<Db>) -> Json<Value> {
     let mode = current_mode(&db);
     let Ok(conn) = db.read() else {
         return json!({"error": "数据库不可用"}).into();
     };
-    Json(crate::ai_value::stats(&conn, &mode, crate::now(), 86_400))
+    // 看板轮询频率高，聚合结果缓存 10 秒。
+    let value = cached_value(format!("ai_value:{}:{mode}", db.path), 10, || {
+        crate::ai_value::stats(&conn, &mode, crate::now(), 86_400)
+    });
+    Json(value)
 }
 
 fn round2(value: f64) -> f64 {
@@ -711,7 +751,9 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
             .expect("query stats")
             .flatten()
             .collect();
-        let half_ai = crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400);
+        let half_ai = cached_value(format!("half_ai:{}:{mode}", db.path), 5, || {
+            crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400)
+        });
         let risk = risk_adjusted(&conn, &mode);
         let cycle_phases = conn
             .query_row(
@@ -1774,6 +1816,30 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn cached_value_reuses_within_ttl_and_recomputes_for_zero_ttl() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let key = format!("nq-test-cache:{}", std::process::id());
+        let first = cached_value(key.clone(), 60, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!(1)
+        });
+        let second = cached_value(key.clone(), 60, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!(2)
+        });
+        assert_eq!(first, json!(1));
+        assert_eq!(second, json!(1), "TTL 内必须复用第一次结果");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let third = cached_value(key, 0, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!(3)
+        });
+        assert_eq!(third, json!(3), "TTL=0 必须重新计算");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     async fn post(app: Router, uri: &str, payload: &str) -> (StatusCode, Value) {
         let response = app
