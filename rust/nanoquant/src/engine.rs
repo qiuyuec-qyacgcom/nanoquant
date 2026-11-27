@@ -660,7 +660,7 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         Some(client) => client.query_segments().await.ok().unwrap_or(Value::Null),
         None => Value::Null,
     };
-    let (rows, half_ai): (Vec<(String, f64, i64, String)>, Value) = {
+    let (rows, half_ai, risk): (Vec<(String, f64, i64, String)>, Value, (f64, f64, f64)) = {
         let Ok(conn) = db.read() else {
             return json!({
                 "trades": 0,
@@ -670,6 +670,9 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
                 "pnl": 0.0,
                 "avg_hold_seconds": 0.0,
                 "profit_factor": Value::Null,
+                "sharpe": 0.0,
+                "sortino": 0.0,
+                "calmar": 0.0,
                 "by_symbol": {},
                 "by_reason": {},
                 "engine": read_status(&db),
@@ -693,7 +696,8 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
             .flatten()
             .collect();
         let half_ai = crate::signal_audit::half_ai_stats(&conn, &mode, crate::now(), 86_400);
-        (rows, half_ai)
+        let risk = risk_adjusted(&conn, &mode);
+        (rows, half_ai, risk)
     };
     let mut wins = 0_i64;
     let mut losses = 0_i64;
@@ -754,6 +758,9 @@ async fn stats(State(db): State<Db>) -> Json<Value> {
         "pnl": round2(rows.iter().map(|row| row.1).sum()),
         "avg_hold_seconds": if count == 0.0 { 0.0 } else { round2(hold as f64 / count) },
         "profit_factor": profit_factor,
+        "sharpe": risk.0,
+        "sortino": risk.1,
+        "calmar": risk.2,
         "by_symbol": symbols,
         "by_reason": reasons,
         "engine": read_status(&db),
@@ -1520,6 +1527,32 @@ fn open_positions(conn: &rusqlite::Connection, mode: &str) -> Vec<Value> {
     }
 }
 
+/// 风险调整指标：与回测共用 performance 实现，口径只由权益采样点决定。
+/// 样本不足或库缺 equity_points 表时返回全 0，不 panic。
+fn risk_adjusted(conn: &rusqlite::Connection, mode: &str) -> (f64, f64, f64) {
+    let mut points: Vec<(i64, f64)> = Vec::new();
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT ts, wallet + unrealized FROM equity_points WHERE mode=?1 ORDER BY ts ASC")
+    {
+        if let Ok(rows) = stmt.query_map([mode], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+        {
+            points = rows.flatten().collect();
+        }
+    }
+    let returns = crate::performance::returns_from_equity(&points);
+    let periods_per_year = crate::performance::periods_per_year(&points);
+    let drawdown_pct = crate::performance::max_drawdown_pct(&points);
+    (
+        round4(crate::performance::sharpe(&returns, periods_per_year)),
+        round4(crate::performance::sortino(&returns, periods_per_year)),
+        round4(crate::performance::calmar(
+            &returns,
+            periods_per_year,
+            drawdown_pct,
+        )),
+    )
+}
+
 /// 总览用的统计：已实现盈亏、胜率、连亏、冷却、死信、执行质量。
 fn stats_view(conn: &rusqlite::Connection, mode: &str) -> Value {
     let mut trades = 0_i64;
@@ -1648,12 +1681,17 @@ fn stats_view(conn: &rusqlite::Connection, mode: &str) -> Value {
         let sum: f64 = values.iter().sum();
         (sum / values.len() as f64 * 100.0).round() / 100.0
     };
+    // 风险调整指标与回测共用同一套 performance 实现，口径只由权益采样点决定。
+    let (sharpe, sortino, calmar) = risk_adjusted(conn, mode);
     json!({
         "trades": trades,
         "wins": wins,
         "losses": losses,
         "win_rate": win_rate,
         "realized_pnl": round4(realized_pnl),
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
         "consecutive_losses": consecutive_losses,
         "cooldowns": cooldowns,
         "stoploss_guard_remaining": stoploss_guard_remaining,
@@ -1852,6 +1890,12 @@ mod tests {
         assert_eq!(body["win_rate"], 50.0);
         assert_eq!(body["pnl"], 6.0);
         assert_eq!(body["profit_factor"], 2.5);
+        for key in ["sharpe", "sortino", "calmar"] {
+            assert!(
+                body[key].is_number(),
+                "统计必须带风险调整指标 {key}: {body}"
+            );
+        }
         assert_eq!(body["by_symbol"]["BTCUSDT"]["n"], 1);
         assert_eq!(body["engine"]["mode"], "demo");
         let _ = std::fs::remove_file(&path);

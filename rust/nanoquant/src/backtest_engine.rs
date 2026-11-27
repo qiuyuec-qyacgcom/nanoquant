@@ -583,6 +583,29 @@ impl<'a> Sim<'a> {
                 1,
             )
         };
+        // 风险调整指标与实盘统计共用 performance 实现：这里按「每笔平仓一次采样」
+        // 取收益率，年化周期数 = 年成交笔数（用回测区间长度折算）。
+        let (trade_returns, trade_periods_per_year) = {
+            let start_ts = self.bars.first().map(|bar| bar.open_time).unwrap_or(0);
+            let end_ts = self.bars.last().map(|bar| bar.open_time).unwrap_or(0);
+            let mut points: Vec<(i64, f64)> = Vec::with_capacity(self.curve.len() + 1);
+            points.push((start_ts, self.config.initial_equity));
+            for (index, equity) in self.curve.iter().enumerate() {
+                let ts = trades
+                    .get(index)
+                    .map(|trade| trade.exit_ts)
+                    .unwrap_or(start_ts + index as i64);
+                points.push((ts, *equity));
+            }
+            let returns = crate::performance::returns_from_equity(&points);
+            let span_ms = (end_ts - start_ts).max(0);
+            let per_year = if span_ms > 0 && !returns.is_empty() {
+                returns.len() as f64 * 365.0 * 24.0 * 3600.0 * 1000.0 / span_ms as f64
+            } else {
+                0.0
+            };
+            (returns, per_year)
+        };
         let mut summary = Map::new();
         summary.insert("trades".into(), json!(trades.len()));
         summary.insert("wins".into(), json!(wins));
@@ -634,6 +657,31 @@ impl<'a> Sim<'a> {
         summary.insert(
             "max_drawdown_pct".into(),
             json!(round(self.max_drawdown, 3)),
+        );
+        summary.insert(
+            "sharpe".into(),
+            json!(round(
+                crate::performance::sharpe(&trade_returns, trade_periods_per_year),
+                3
+            )),
+        );
+        summary.insert(
+            "sortino".into(),
+            json!(round(
+                crate::performance::sortino(&trade_returns, trade_periods_per_year),
+                3
+            )),
+        );
+        summary.insert(
+            "calmar".into(),
+            json!(round(
+                crate::performance::calmar(
+                    &trade_returns,
+                    trade_periods_per_year,
+                    self.max_drawdown
+                ),
+                3
+            )),
         );
         summary.insert("fee_total".into(), json!(round(self.fee_total, 6)));
         summary.insert("funding_total".into(), json!(round(self.funding_total, 6)));

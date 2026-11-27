@@ -49,7 +49,6 @@ async function submit() {
 
       <div class="login-stats">
         <div><b>5–30m</b><span>主执行周期</span></div>
-        <div><b>2.41</b><span>Sharpe / 90D</span></div>
         <div><b>0600</b><span>UDS / 执行侧车</span></div>
       </div>
     </section>
