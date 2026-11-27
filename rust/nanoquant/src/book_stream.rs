@@ -120,13 +120,50 @@ impl BookCounters {
 
 /// 全局计数器的快照，供 `/engine/stats` 读取。
 pub fn stats() -> Value {
+    counters().snapshot()
+}
+
+/// 进程内共享的盘口健康度计数器。
+///
+/// 必须是同一个静态实例：之前 `stats()` 与 `resolve_for_symbol()` 各持一份，
+/// 导致面板永远读到 0。
+fn counters() -> &'static BookCounters {
     static COUNTERS: OnceLock<BookCounters> = OnceLock::new();
-    COUNTERS.get_or_init(BookCounters::default).snapshot()
+    COUNTERS.get_or_init(BookCounters::default)
+}
+
+pub fn record_source(source: QuoteSource) {
+    counters().record(source);
 }
 
 pub fn quote(symbol: &str) -> Option<BookState> {
     let books = book_map().read().ok()?;
     books.get(&symbol.to_uppercase()).cloned()
+}
+
+/// 新鲜且合法的本地买一/卖一。
+///
+/// 返回 `Some((bid, ask, spread_bps))` 时调用方不必再打 REST `bookTicker`；
+/// 命中会按 `Local` 计入盘口健康度。
+pub fn fresh_quote(
+    enabled: bool,
+    stale_ms: i64,
+    symbol: &str,
+    now_ms: i64,
+) -> Option<(f64, f64, f64)> {
+    if !enabled {
+        return None;
+    }
+    let book = quote(symbol)?;
+    let age = now_ms.saturating_sub(book.ts);
+    let fresh = stale_ms > 0 && book.ts > 0 && age <= stale_ms;
+    let valid =
+        book.bid.is_finite() && book.ask.is_finite() && book.bid > 0.0 && book.ask >= book.bid;
+    if !(fresh && valid) {
+        return None;
+    }
+    record_source(QuoteSource::Local);
+    Some((book.bid, book.ask, spread_bps(book.bid, book.ask)))
 }
 
 /// 交易环境归一化：只有 live 走主网，其余一律当模拟盘。
@@ -258,8 +295,7 @@ pub fn resolve_for_symbol(
     let book = quote(symbol);
     let (quote, source) =
         resolve_quote_source(enabled, book.as_ref(), rest_bid, rest_ask, now_ms, stale_ms);
-    static COUNTERS: OnceLock<BookCounters> = OnceLock::new();
-    COUNTERS.get_or_init(BookCounters::default).record(source);
+    record_source(source);
     quote
 }
 
@@ -535,6 +571,37 @@ mod tests {
             BookCounters::default().snapshot()["queries"],
             0,
             "无数据时计数保持 0"
+        );
+    }
+
+    #[test]
+    fn fresh_quote_skips_rest_only_within_the_stale_window() {
+        store(&BookTicker {
+            symbol: "NQFRESHUSDT".into(),
+            state: book(1_000),
+        });
+
+        assert!(
+            fresh_quote(false, 3_000, "NQFRESHUSDT", 1_500).is_none(),
+            "开关关闭时不得用本地盘口"
+        );
+        let (bid, ask, _) =
+            fresh_quote(true, 3_000, "NQFRESHUSDT", 1_500).expect("窗口内的本地盘口应直接命中");
+        assert_eq!((bid, ask), (99.5, 100.5));
+        assert!(
+            fresh_quote(true, 3_000, "NQFRESHUSDT", 10_000).is_none(),
+            "过期盘口必须回退 REST"
+        );
+    }
+
+    #[test]
+    fn stale_stats_reads_the_same_counters_as_resolution() {
+        let before = stats()["queries"].as_u64().unwrap_or(0);
+        record_source(QuoteSource::Rest);
+        assert_eq!(
+            stats()["queries"].as_u64().unwrap_or(0),
+            before + 1,
+            "stats 与 resolve 必须共享同一份计数器"
         );
     }
 

@@ -124,6 +124,45 @@ impl Default for DemoProvider {
 /// 因此信号内核实际可用条数最多为 `SNAPSHOT_KLINE_LIMIT - 1`。
 pub(crate) const SNAPSHOT_KLINE_LIMIT: usize = 250;
 
+/// 一轮快照里同时抓取的标的数。控制突发权重，避免一次性打满交易所限频。
+const SNAPSHOT_SYMBOL_CONCURRENCY: usize = 6;
+
+/// 同一标的/周期/条数的原始 K 线缓存：只在下一根 bar 收盘前复用。
+#[derive(Clone)]
+struct CachedKlines {
+    raw: Value,
+    expires_ms: i64,
+}
+
+fn kline_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedKlines>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedKlines>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_klines(key: &str, now_ms: i64) -> Option<Value> {
+    let cache = kline_cache().lock().ok()?;
+    let entry = cache.get(key)?;
+    (now_ms < entry.expires_ms).then(|| entry.raw.clone())
+}
+
+fn store_klines(key: String, raw: &Value, expires_ms: i64) {
+    if let Ok(mut cache) = kline_cache().lock() {
+        // 标的池可能换池，超过上限直接清空，避免缓存无界增长。
+        if cache.len() >= 1_024 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CachedKlines {
+                raw: raw.clone(),
+                expires_ms,
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 impl SnapshotProvider for DemoProvider {
     fn snapshot(
@@ -548,6 +587,141 @@ impl BinanceProvider {
         parse_closed_candles(&value, crate::now_millis())
     }
 
+    /// 快照用原始 K 线：按 bar 收盘时间缓存，盘中重复扫描不再重复拉 250 根。
+    async fn klines_for_snapshot(&self, symbol: &str, now_ms: i64) -> Result<Value, ProviderError> {
+        let key = format!(
+            "{}|{}|{}|{}",
+            self.base_url, self.timeframe, symbol, SNAPSHOT_KLINE_LIMIT
+        );
+        if let Some(raw) = cached_klines(&key, now_ms) {
+            return Ok(raw);
+        }
+        let value = self
+            .get_json(
+                "/fapi/v1/klines",
+                &[
+                    ("symbol".into(), symbol.to_string()),
+                    ("interval".into(), self.timeframe.clone()),
+                    ("limit".into(), SNAPSHOT_KLINE_LIMIT.to_string()),
+                ],
+                false,
+            )
+            .await?;
+        if let Some(interval) = crate::history::interval_ms(&self.timeframe) {
+            // 用「不按当前时间过滤」的解析取最后一根收盘时间，仅用于缓存过期；
+            // 真正返回给调用方的 candles 仍按交易所时间戳过滤。
+            if let Ok(all) = parse_closed_candles(&value, i64::MAX) {
+                if let Some(last) = all.last() {
+                    store_klines(key, &value, last.close_time.saturating_add(interval.max(1)));
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    /// 单个标的的完整快照：5 个公开接口并发拉取，WS 盘口新鲜时省掉 bookTicker。
+    async fn market_snapshot(&self, symbol: &str) -> Result<MarketSnapshot, ProviderError> {
+        let now_ms = crate::now_millis();
+        let local_book =
+            crate::book_stream::fresh_quote(self.book_enabled, self.book_stale_ms, symbol, now_ms);
+        let symbol_param = vec![("symbol".to_string(), symbol.to_string())];
+        let ticker_fut = self.get_json("/fapi/v1/premiumIndex", &symbol_param, false);
+        let quote_fut = self.get_json("/fapi/v1/ticker/24hr", &symbol_param, false);
+        let oi_fut = async {
+            Ok::<_, ProviderError>(
+                self.get_json(
+                    "/futures/data/openInterestHist",
+                    &[
+                        ("symbol".into(), symbol.to_string()),
+                        ("period".into(), self.timeframe.clone()),
+                        ("limit".into(), "2".into()),
+                    ],
+                    false,
+                )
+                .await
+                .ok(),
+            )
+        };
+        let klines_fut = self.klines_for_snapshot(symbol, now_ms);
+        let book_fut = async {
+            match local_book {
+                Some(_) => Ok(None),
+                None => self
+                    .get_json("/fapi/v1/ticker/bookTicker", &symbol_param, false)
+                    .await
+                    .map(Some),
+            }
+        };
+        let (ticker, quote, oi, klines, book) =
+            tokio::try_join!(ticker_fut, quote_fut, oi_fut, klines_fut, book_fut)?;
+
+        let mark_price = number(&ticker, "markPrice")?;
+        let timestamp = ticker["time"]
+            .as_i64()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| ProviderError::InvalidData("标记价格时间无效".into()))?
+            / 1_000;
+        if mark_price <= 0.0 || ticker["symbol"].as_str() != Some(symbol) {
+            return Err(ProviderError::InvalidData(format!(
+                "{symbol} 标记价格或交易对无效"
+            )));
+        }
+        let candles = parse_closed_candles(&klines, timestamp * 1_000)?;
+        if quote["symbol"].as_str() != Some(symbol) {
+            return Err(ProviderError::InvalidData(format!(
+                "{symbol} 24 小时成交额标的无效"
+            )));
+        }
+        let quote_volume = number(&quote, "quoteVolume")?;
+        let funding_rate = number(&ticker, "lastFundingRate")?;
+        let (bid, ask, spread_bps) = match (local_book, book) {
+            (Some((bid, ask, spread_bps)), _) => (bid, ask, spread_bps),
+            (None, Some(book)) => {
+                let bid = number(&book, "bidPrice")?;
+                let ask = number(&book, "askPrice")?;
+                if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
+                    return Err(ProviderError::InvalidData(format!(
+                        "{symbol} 盘口买一/卖一无效"
+                    )));
+                }
+                crate::book_stream::resolve_for_symbol(
+                    self.book_enabled,
+                    self.book_stale_ms,
+                    symbol,
+                    bid,
+                    ask,
+                    now_ms,
+                )
+            }
+            (None, None) => {
+                return Err(ProviderError::InvalidData(format!("{symbol} 盘口数据缺失")))
+            }
+        };
+        let (open_interest, open_interest_change_pct) = oi
+            .as_ref()
+            .and_then(|payload| payload.as_array())
+            .and_then(|rows| parse_open_interest_history(rows))
+            .unwrap_or((0.0, f64::NAN));
+        if quote_volume < 0.0 || candles.is_empty() {
+            return Err(ProviderError::InvalidData(format!(
+                "{symbol} 行情数据无效或 K 线不足"
+            )));
+        }
+        Ok(MarketSnapshot {
+            symbol: symbol.to_string(),
+            mark_price,
+            timestamp,
+            quote_volume,
+            funding_rate,
+            open_interest,
+            open_interest_change_pct,
+            bid,
+            ask,
+            spread_bps,
+            candles,
+        })
+    }
+
     async fn get_json(
         &self,
         path: &str,
@@ -683,111 +857,20 @@ impl SnapshotProvider for BinanceProvider {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<TradingSnapshot, ProviderError>> + Send + '_>> {
         Box::pin(async move {
-            let mut markets = Vec::with_capacity(self.symbols.len());
-            for symbol in &self.symbols {
-                let ticker = self
-                    .get_json(
-                        "/fapi/v1/premiumIndex",
-                        &[("symbol".into(), symbol.clone())],
-                        false,
-                    )
-                    .await?;
-                let mark_price = number(&ticker, "markPrice")?;
-                let timestamp = ticker["time"]
-                    .as_i64()
-                    .filter(|time| *time > 0)
-                    .ok_or_else(|| ProviderError::InvalidData("标记价格时间无效".into()))?
-                    / 1_000;
-                if mark_price <= 0.0 || ticker["symbol"].as_str() != Some(symbol.as_str()) {
-                    return Err(ProviderError::InvalidData(format!(
-                        "{symbol} 标记价格或交易对无效"
-                    )));
-                }
-                let quote = self
-                    .get_json(
-                        "/fapi/v1/ticker/24hr",
-                        &[("symbol".into(), symbol.clone())],
-                        false,
-                    )
-                    .await?;
-                if quote["symbol"].as_str() != Some(symbol.as_str()) {
-                    return Err(ProviderError::InvalidData(format!(
-                        "{symbol} 24 小时成交额标的无效"
-                    )));
-                }
-                let quote_volume = number(&quote, "quoteVolume")?;
-                let funding_rate = number(&ticker, "lastFundingRate")?;
-                let book = self
-                    .get_json(
-                        "/fapi/v1/ticker/bookTicker",
-                        &[("symbol".into(), symbol.clone())],
-                        false,
-                    )
-                    .await?;
-                let bid = number(&book, "bidPrice")?;
-                let ask = number(&book, "askPrice")?;
-                if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || ask < bid {
-                    return Err(ProviderError::InvalidData(format!(
-                        "{symbol} 盘口买一/卖一无效"
-                    )));
-                }
-                let (bid, ask, spread_bps) = crate::book_stream::resolve_for_symbol(
-                    self.book_enabled,
-                    self.book_stale_ms,
-                    symbol,
-                    bid,
-                    ask,
-                    crate::now_millis(),
-                );
-                let (open_interest, open_interest_change_pct) = match self
-                    .get_json(
-                        "/futures/data/openInterestHist",
-                        &[
-                            ("symbol".into(), symbol.clone()),
-                            ("period".into(), self.timeframe.clone()),
-                            ("limit".into(), "2".into()),
-                        ],
-                        false,
-                    )
-                    .await
-                {
-                    Ok(payload) => payload
-                        .as_array()
-                        .and_then(|rows| parse_open_interest_history(rows))
-                        .unwrap_or((0.0, f64::NAN)),
-                    Err(_) => (0.0, f64::NAN),
-                };
-                let klines = self
-                    .get_json(
-                        "/fapi/v1/klines",
-                        &[
-                            ("symbol".into(), symbol.clone()),
-                            ("interval".into(), self.timeframe.clone()),
-                            ("limit".into(), SNAPSHOT_KLINE_LIMIT.to_string()),
-                        ],
-                        false,
-                    )
-                    .await?;
-                let candles = parse_closed_candles(&klines, timestamp * 1_000)?;
-                if quote_volume < 0.0 || candles.is_empty() {
-                    return Err(ProviderError::InvalidData(format!(
-                        "{symbol} 行情数据无效或 K 线不足"
-                    )));
-                }
-                markets.push(MarketSnapshot {
-                    symbol: symbol.clone(),
-                    mark_price,
-                    timestamp,
-                    quote_volume,
-                    funding_rate,
-                    open_interest,
-                    open_interest_change_pct,
-                    bid,
-                    ask,
-                    spread_bps,
-                    candles,
-                });
-            }
+            use futures_util::StreamExt;
+            let mut indexed: Vec<(usize, Result<MarketSnapshot, ProviderError>)> =
+                futures_util::stream::iter(self.symbols.iter().cloned().enumerate().map(
+                    |(index, symbol)| async move { (index, self.market_snapshot(&symbol).await) },
+                ))
+                .buffer_unordered(SNAPSHOT_SYMBOL_CONCURRENCY)
+                .collect()
+                .await;
+            // 并发完成顺序不稳定：按配置顺序还原，保持快照可复现。
+            indexed.sort_by_key(|(index, _)| *index);
+            let markets = indexed
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect::<Result<Vec<_>, _>>()?;
             if self.public_book.is_some() {
                 let (account, positions, open_orders) = self.local_book("demo")?;
                 return Ok(TradingSnapshot {
@@ -797,11 +880,14 @@ impl SnapshotProvider for BinanceProvider {
                     open_orders,
                 });
             }
-            let account = self.get_json("/fapi/v3/account", &[], true).await?;
+            let (account, positions_value, orders) = tokio::try_join!(
+                self.get_json("/fapi/v3/account", &[], true),
+                self.get_json("/fapi/v3/positionRisk", &[], true),
+                self.get_json("/fapi/v1/openOrders", &[], true),
+            )?;
             let equity = number(&account, "totalMarginBalance")?;
             let available_balance = number(&account, "availableBalance")?;
             let wallet = number(&account, "totalWalletBalance").unwrap_or(equity);
-            let positions_value = self.get_json("/fapi/v3/positionRisk", &[], true).await?;
             let rows = positions_value
                 .as_array()
                 .ok_or_else(|| ProviderError::InvalidData("持仓响应不是数组".into()))?;
@@ -811,7 +897,6 @@ impl SnapshotProvider for BinanceProvider {
                     positions.push(position);
                 }
             }
-            let orders = self.get_json("/fapi/v1/openOrders", &[], true).await?;
             let open_orders = orders
                 .as_array()
                 .ok_or_else(|| ProviderError::InvalidData("未结订单响应不是数组".into()))?
@@ -1226,6 +1311,9 @@ mod tests {
             }))
             .route("/fapi/v3/positionRisk", axum::routing::get(|| async {
                 axum::Json(serde_json::json!([{"symbol":"BTCUSDT","positionAmt":"invalid"}]))
+            }))
+            .route("/fapi/v1/openOrders", axum::routing::get(|| async {
+                axum::Json(serde_json::json!([]))
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1459,6 +1547,30 @@ mod tests {
         assert_eq!(snapshot.open_orders[0].status, "PARTIALLY_FILLED");
         assert_eq!(snapshot.open_orders[0].executed_qty, 1.0);
         assert!(snapshot.open_orders[0].reduce_only);
+    }
+
+    #[test]
+    fn kline_cache_reuses_bars_until_the_next_close() {
+        let raw = serde_json::json!([[
+            1_700_000_000_000_i64,
+            "100",
+            "110",
+            "95",
+            "105",
+            "8",
+            1_700_000_900_000_i64
+        ]]);
+        let key = "cache-test|15m|BTCUSDT|250".to_string();
+        store_klines(key.clone(), &raw, 1_700_000_900_000 + 900_000);
+
+        assert!(
+            cached_klines(&key, 1_700_000_900_001).is_some(),
+            "下一根 bar 收盘前应复用缓存"
+        );
+        assert!(
+            cached_klines(&key, 1_700_000_900_000 + 900_000).is_none(),
+            "跨过下一根收盘必须失效"
+        );
     }
 
     #[test]
