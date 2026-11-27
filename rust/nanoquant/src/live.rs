@@ -362,7 +362,8 @@ pub(crate) struct HttpGateway {
 impl HttpGateway {
     pub(crate) fn new() -> Self {
         Self {
-            transport: crate::submit::Transport::new(),
+            // 跨周期复用连接池：否则每 15 秒都要重新 TCP/TLS 握手，尾延迟不可控。
+            transport: crate::submit::Transport::shared(),
         }
     }
 }

@@ -163,6 +163,24 @@ fn store_klines(key: String, raw: &Value, expires_ms: i64) {
     }
 }
 
+/// 行情请求共享客户端：跨周期复用 TCP/TLS 连接池。
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_millis(800))
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .pool_max_idle_per_host(8)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 #[cfg(test)]
 impl SnapshotProvider for DemoProvider {
     fn snapshot(
@@ -217,6 +235,8 @@ impl SnapshotProvider for DemoProvider {
 #[derive(Clone)]
 pub struct BinanceProvider {
     client: reqwest::Client,
+    /// 单次请求超时：不同接口的合理等待时间不同，共享客户端上按请求设置。
+    request_timeout: Duration,
     base_url: String,
     /// 主域名不可用（传输失败/超时/5xx）时依次重试的备用域名。
     backup_urls: Vec<String>,
@@ -259,13 +279,10 @@ impl BinanceProvider {
                 "必须配置至少一个有效交易对".into(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let client = shared_http_client();
         Ok(Self {
             client,
+            request_timeout: Duration::from_secs(5),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             backup_urls: Vec::new(),
             symbols,
@@ -282,13 +299,10 @@ impl BinanceProvider {
 
     /// 全市场行情读取：无 API 凭证，只访问币安公开接口。
     pub fn public(base_url: impl Into<String>) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let client = shared_http_client();
         Ok(Self {
             client,
+            request_timeout: Duration::from_secs(10),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             backup_urls: Vec::new(),
             symbols: Vec::new(),
@@ -311,13 +325,10 @@ impl BinanceProvider {
         if api_key.trim().is_empty() || secret.trim().is_empty() {
             return Err(ProviderError::Unavailable("未配置交易所 API 凭证".into()));
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let client = shared_http_client();
         Ok(Self {
             client,
+            request_timeout: Duration::from_secs(5),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             backup_urls: Vec::new(),
             symbols: Vec::new(),
@@ -360,13 +371,10 @@ impl BinanceProvider {
                 "必须配置至少一个有效交易对".into(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        let client = shared_http_client();
         Ok(Self {
             client,
+            request_timeout: Duration::from_secs(5),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             backup_urls: Vec::new(),
             symbols,
@@ -776,7 +784,7 @@ impl BinanceProvider {
                 .join("&")
         };
         let url = format!("{host}{path}?{query}");
-        let mut request = self.client.get(url);
+        let mut request = self.client.get(url).timeout(self.request_timeout);
         if signed {
             request = request.header("X-MBX-APIKEY", &self.api_key);
         }

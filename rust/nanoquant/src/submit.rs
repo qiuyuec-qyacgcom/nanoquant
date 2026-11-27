@@ -238,17 +238,37 @@ pub fn protection_plan(method: &str, status: u16, body: &str) -> ProtectionPlan 
 }
 
 /// 真正把请求发到交易所。传输失败（超时、连接中断）对写请求是结果未知。
+#[derive(Clone)]
 pub struct Transport {
     client: reqwest::Client,
 }
 
 impl Transport {
+    /// 独立客户端：基准测试用，避免被线上连接池状态干扰。
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        Self::build(false)
+    }
+
+    /// 进程内共享客户端：复用 TCP/TLS 与连接池，避免每轮周期重新握手。
+    pub fn shared() -> Self {
+        static SHARED: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| Self::build(true)).clone()
+    }
+
+    fn build(shared: bool) -> Self {
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // 下单写请求不能无限等：5 秒仍未回包就按「结果未知」走查询消解。
             .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .connect_timeout(std::time::Duration::from_millis(800))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_nodelay(true);
+        if shared {
+            builder = builder
+                .pool_max_idle_per_host(8)
+                .pool_idle_timeout(std::time::Duration::from_secs(90));
+        }
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
         Self { client }
     }
 
