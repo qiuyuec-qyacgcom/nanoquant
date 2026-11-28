@@ -395,7 +395,7 @@ a {
 
 /* ------------------------------------------------------------------ form */
 .btn {
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   background: var(--panel-2);
   color: var(--text);
   padding: 7px 13px;
@@ -410,7 +410,7 @@ a {
   gap: 6px;
 }
 .btn:hover {
-  border-color: var(--line-strong);
+  border-color: var(--line-soft);
   background: var(--panel-3);
 }
 .btn:disabled {
@@ -426,6 +426,7 @@ a {
 }
 .btn-primary:hover {
   background: color-mix(in srgb, var(--accent) 88%, var(--text));
+  border-color: var(--accent);
 }
 .btn-danger {
   background: var(--down-soft);
@@ -434,11 +435,15 @@ a {
 }
 .btn-danger:hover {
   background: color-mix(in srgb, var(--down) 18%, transparent);
+  border-color: var(--down);
 }
 .btn-ok {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent);
+}
+.btn-ok:hover {
+  border-color: var(--accent);
 }
 .btn-sm {
   padding: 4px 9px;

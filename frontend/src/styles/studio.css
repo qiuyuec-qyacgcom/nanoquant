@@ -197,14 +197,18 @@
   gap: 2px;
   padding: 3px;
   background: var(--panel-2);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-soft);
   border-radius: 999px;
 }
 .studio-seg button {
   padding: 5px 12px;
+  border: 0;
+  background: transparent;
   border-radius: 999px;
   color: var(--muted);
+  font: inherit;
   font-size: 12px;
+  cursor: pointer;
 }
 .studio-seg button.on { background: var(--panel); color: var(--text); }
 
@@ -223,14 +227,18 @@
   gap: 2px;
   padding: 2px;
   background: var(--panel-2);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-soft);
   border-radius: 999px;
 }
 .studio-views button {
   padding: 3px 9px;
+  border: 0;
+  background: transparent;
   border-radius: 999px;
   color: var(--muted);
+  font: inherit;
   font-size: 11px;
+  cursor: pointer;
 }
 .studio-views button.on { background: var(--panel); color: var(--text); }
 
@@ -281,8 +289,14 @@
   width: 100%;
   padding: 10px 8px;
   text-align: left;
-  border-bottom: 1px solid var(--line);
+  appearance: none;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
   font-size: 12px;
+  cursor: pointer;
 }
 .pos-row:last-child { border-bottom: 0; }
 .pos-row:hover { background: var(--panel-2); border-radius: 8px; }
