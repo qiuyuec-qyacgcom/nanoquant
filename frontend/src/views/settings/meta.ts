@@ -35,7 +35,7 @@ export const PLAIN_HINTS: Record<string, string> = {
 
 export const BASE_META: Record<string, FieldMeta> = {
 
-  label_after_sec: { label: '回访窗口', unit: '秒', hint: '决策满这么久才回访打标；86400=24h。超短线可调到 3600-14400，让经验更快产生' },
+  label_after_sec: { label: '补打标窗口', unit: '秒', hint: '仅用于手动补打标历史待处理记录；新决策在对应仓位平仓后自动打标' },
   inject_experiences: { label: '注入经验', hint: '关闭后经验库照常积累，但不会进入 AI 决策上下文' },
   retrieve_top_k: { label: '注入条数', unit: '条', hint: '每次决策最多注入几条相似经验（经验库是 evolution 心法之外的场景化补充，不宜过多）' },
   correct_threshold_pct: { label: '判对阈值', unit: '%', hint: '方向收益超过该值才算判对，低于视为 partial（partial 不归档成经验）' },

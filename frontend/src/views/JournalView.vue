@@ -4,7 +4,7 @@
  * -----------------------------------------------------------------
  * 借鉴「会自我学习的 Agent」的闭环骨架，但去掉收益叙事、只留可验证工程：
  * 1. 日志 —— AI 每次方向判断留一份快照；
- * 2. 打标 —— 24h 后回访，把预测方向 vs 实际价格对齐成对/错/部分；
+ * 2. 打标 —— 每笔仓位平仓后，用实际成交价把预测方向 vs 实际对齐成对/错/部分；
  * 3. 经验库 —— 打标结论带标签归档，下次相似场景检索 Top-k 注入 AI 决策。
  * 与「自进化心法」互补：那里是平仓复盘 → 规则级心法，这里是决策级 + 场景化。
  */
@@ -25,7 +25,7 @@ const accuracy = computed(() => journalStats.value?.accuracy ?? 0)
 
 /**
  * 闭环状态说明：这条链最常见的困惑是"经验库一直是空的，是不是没接上"。
- * 空库有两种完全不同的原因（AI 没参与 / 还没到回访时间），必须在这里说清楚，
+ * 空库有两种完全不同的原因（AI 没参与 / 仓位还没平仓），必须在这里说清楚，
  * 否则只能靠翻 ai_call_logs 猜。
  */
 const loopHint = computed(() => {
@@ -38,15 +38,15 @@ const loopHint = computed(() => {
       '如果 AI 已开启却长期是 0，问题在决策链而不在这里 —— 去「信号审计」看 flat 行是否从未被 AI 复核。'
   }
   if (enabled === 0) {
-    return `已有 ${total} 条决策日志、${pending} 条待回访，但经验库仍为空：` +
-      '经验要等决策满「回访窗口」后打标，且只有判对/判错才归档（partial 不入库）。'
+    return `已有 ${total} 条决策日志、${pending} 条待平仓，但经验库仍为空：` +
+      '经验要等对应仓位平仓打标后再手动归档（只有判对/判错才归档，partial 不入库）。'
   }
   return `闭环运行中：${enabled} 条经验会在相似场景下注入 AI 决策上下文（每次最多 ${topk} 条）。`
 })
 
 const DIR_LABEL: Record<string, string> = { long: '做多', short: '做空', flat: '观望' }
 const OUTCOME_LABEL: Record<string, string> = { correct: '判断正确', wrong: '判断错误', partial: '部分正确' }
-const STATUS_LABEL: Record<string, string> = { pending: '待回访', labeled: '已打标', skipped: '留痕' }
+const STATUS_LABEL: Record<string, string> = { pending: '待平仓', labeled: '已打标', skipped: '留痕' }
 
 async function load() {
   const qs = filterStatus.value ? `&status=${filterStatus.value}` : ''
@@ -72,7 +72,7 @@ async function labelNow() {
   busy.value = true
   try {
     const res = await http.post('/journal/label?force=true')
-    app.notify(`即时打标完成: ${res.labeled ?? 0} 条（缺价待回访 ${res.missing_price ?? 0}）`, 'ok')
+    app.notify(`即时打标完成: ${res.labeled ?? 0} 条（缺价未标 ${res.missing_price ?? 0}）`, 'ok')
     await load()
   } catch (err: any) {
     app.notify(err.message, 'error')
@@ -114,7 +114,7 @@ onMounted(load)
       <div class="kpi">
         <div class="kpi-label">决策总数</div>
         <div class="kpi-value">{{ journalStats?.total ?? 0 }}</div>
-        <div class="kpi-foot">待回访 {{ journalStats?.pending ?? 0 }} · 已打标 {{ journalStats?.labeled ?? 0 }}</div>
+        <div class="kpi-foot">待平仓 {{ journalStats?.pending ?? 0 }} · 已打标 {{ journalStats?.labeled ?? 0 }}</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">方向判断准确率</div>
@@ -135,11 +135,11 @@ onMounted(load)
 
     <div class="panel">
       <div class="panel-hd">
-        <span class="panel-title">决策日志（回访打标）</span>
+        <span class="panel-title">决策日志（平仓打标）</span>
         <div class="right" style="gap: 6px; flex-wrap: wrap">
           <select v-model="filterStatus" class="select" style="width: 110px; padding: 4px 8px" @change="onFilter">
             <option value="">全部状态</option>
-            <option value="pending">待回访</option>
+            <option value="pending">待平仓</option>
             <option value="labeled">已打标</option>
             <option value="skipped">留痕</option>
           </select>
@@ -148,7 +148,7 @@ onMounted(load)
         </div>
       </div>
       <div class="hint" style="padding: 8px 12px 0">
-        每次决策给出方向判断都会留一份快照；24h 后自动回访实际价格，把「预测方向 vs 实际」对齐成对/错。
+        每次决策给出方向判断都会留一份快照；对应仓位平仓后自动用实际成交价打标，把「预测方向 vs 实际」对齐成对/错。
         hold（否决）只留痕不参与对赌，以免把「不追多」误判成可验证的方向预测。
       </div>
       <div class="panel-body flush table-scroll" style="max-height: 440px">

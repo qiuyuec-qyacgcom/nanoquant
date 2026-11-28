@@ -1512,46 +1512,6 @@ impl EngineRuntime {
         }
     }
 
-    /// 周期结束后按当前环境的标记价回访到期决策；5 分钟节流，缺价的保持 pending。
-    fn maybe_label_journal(&self, mode: &str, snapshot: &crate::providers::TradingSnapshot) {
-        let now = crate::now();
-        {
-            let Ok(conn) = self.db.conn.lock() else {
-                return;
-            };
-            let last: Option<i64> = conn
-                .query_row(
-                    "SELECT value FROM engine_state WHERE key='journal_label_ts'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|value| value.parse().ok());
-            if last.is_some_and(|ts| now - ts < 300) {
-                return;
-            }
-            let _ = conn.execute(
-                "INSERT INTO engine_state(key,value,updated_at) VALUES('journal_label_ts',?1,?2) \
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (now.to_string(), now),
-            );
-        }
-        let mut prices = std::collections::BTreeMap::new();
-        for market in &snapshot.markets {
-            if market.mark_price.is_finite() && market.mark_price > 0.0 {
-                prices.insert(market.symbol.clone(), market.mark_price);
-            }
-        }
-        if prices.is_empty() {
-            return;
-        }
-        let result = crate::journal::label_due(&self.db, &prices, mode, now, false);
-        let labeled = result["labeled"].as_i64().unwrap_or(0);
-        if labeled > 0 {
-            tracing::info!(mode, labeled, "决策回访打标完成");
-        }
-    }
-
     pub(crate) fn with_reviewer(mut self, reviewer: Arc<dyn crate::review::AiReviewer>) -> Self {
         self.reviewer = Some(reviewer);
         self
@@ -1948,7 +1908,6 @@ impl EngineRuntime {
             );
         }
         self.spawn_reviews(&review_ids);
-        self.maybe_label_journal(mode, snapshot);
         Ok(plans)
     }
 

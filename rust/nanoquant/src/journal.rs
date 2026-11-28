@@ -123,8 +123,8 @@ pub(crate) fn outcome_of(signed_pct: f64, threshold: f64) -> &'static str {
     }
 }
 
-/// 回访 pending 方向性决策。默认只标到期项；`force` 时忽略回访窗口，立即标当前环境全部
-/// pending（仅 long/short）。价格缺失的保持 pending。
+/// 手动补打标 pending 方向性决策（主要给历史数据兜底）。默认只标到期项；
+/// `force` 时忽略回访窗口，立即标当前环境全部 pending（仅 long/short）。价格缺失的保持 pending。
 pub(crate) fn label_due(
     db: &Db,
     prices: &std::collections::BTreeMap<String, f64>,
@@ -211,6 +211,59 @@ pub(crate) fn label_due(
     })
 }
 
+/// 平仓即打标：直接用本笔实际出场价结算对应的 pending 决策。
+///
+/// 不再等时间窗口或周期快照价；决策行与仓位在同一事务里写入，所以按
+/// 「环境 + 标的 + 方向 + 开仓价」匹配、再用开仓时间就近消歧即可。
+/// 低置信度未留痕、历史数据或测试夹具缺表时静默跳过，绝不能影响平仓事务。
+pub(crate) fn label_on_close(
+    conn: &Connection,
+    mode: &str,
+    symbol: &str,
+    direction: &str,
+    entry_price: f64,
+    exit_price: f64,
+    opened_at: i64,
+    closed_at: i64,
+) -> bool {
+    if !matches!(direction, "long" | "short")
+        || !entry_price.is_finite()
+        || entry_price <= 0.0
+        || !exit_price.is_finite()
+        || exit_price <= 0.0
+    {
+        return false;
+    }
+    let (enabled, _, threshold) = label_config(conn);
+    if !enabled {
+        return false;
+    }
+    let signed = signed_actual_pct(direction, entry_price, exit_price);
+    let outcome = outcome_of(signed, threshold);
+    let updated = conn
+        .execute(
+            "UPDATE decision_journal SET status='labeled', outcome=?1, actual_price=?2, \
+             actual_pct=?3, labeled_at=?4 WHERE id = ( \
+                 SELECT id FROM decision_journal \
+                 WHERE mode=?5 AND symbol=?6 AND direction=?7 AND status='pending' \
+                   AND ABS(entry_price - ?8) <= ABS(?8) * 0.000001 + 0.000000001 \
+                 ORDER BY ABS(ts - ?9) ASC, id DESC LIMIT 1)",
+            (
+                outcome,
+                exit_price,
+                (signed * 10_000.0).round() / 10_000.0,
+                closed_at,
+                mode,
+                symbol,
+                direction,
+                entry_price,
+                opened_at,
+            ),
+        )
+        .unwrap_or(0);
+    updated > 0
+}
+
 fn record_label_event(db: &Db, result: &Value) {
     if let Ok(conn) = db.conn.lock() {
         let _ = conn.execute(
@@ -229,7 +282,7 @@ fn record_label_event(db: &Db, result: &Value) {
     }
 }
 
-/// 开仓时写决策快照，供 24h 回访打标与经验沉淀。
+/// 开仓时写决策快照，供平仓打标与经验沉淀。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_decision(
     conn: &Connection,
@@ -1047,6 +1100,66 @@ mod tests {
             body["labeled"], 1,
             "force 端点应立刻打标最近的 pending: {body}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn closing_a_position_labels_only_the_matching_pending_decision() {
+        let path = std::env::temp_dir().join("nq-journal-close-label.db");
+        let db = label_db(&path);
+        let now = crate::now();
+        {
+            let conn = db.lock();
+            insert_pending(&conn, 1, "BTCUSDT", 100.0, "demo", now - 600);
+            insert_pending(&conn, 2, "BTCUSDT", 100.0, "live", now - 600);
+            insert_pending(&conn, 3, "BTCUSDT", 105.0, "demo", now - 600);
+            conn.execute(
+                "INSERT INTO decision_journal(id,ts,symbol,direction,confidence,entry_price,target_pct,reason,\
+                 snapshot,decision,signal_id,injected_experience_ids,status,outcome,actual_price,actual_pct,\
+                 labeled_at,archived,mode) \
+                 VALUES(4,?1,'BTCUSDT','short',0.8,100,1,'r','{}','open_short',0,'[]','pending','',0,0,0,0,'demo')",
+                [now - 600],
+            )
+            .unwrap();
+        }
+        let labeled = {
+            let conn = db.lock();
+            label_on_close(
+                &conn,
+                "demo",
+                "BTCUSDT",
+                "long",
+                100.0,
+                101.0,
+                now - 600,
+                now,
+            )
+        };
+        assert!(labeled, "平仓应打标同环境同方向同开仓价的 pending 决策");
+        {
+            let conn = db.lock();
+            let (status, outcome, price, pct): (String, String, f64, f64) = conn
+                .query_row(
+                    "SELECT status, outcome, actual_price, actual_pct FROM decision_journal WHERE id=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "labeled");
+            assert_eq!(outcome, "correct");
+            assert!((price - 101.0).abs() < 1e-9);
+            assert!((pct - 1.0).abs() < 1e-9);
+            for id in [2, 3, 4] {
+                let status: String = conn
+                    .query_row(
+                        "SELECT status FROM decision_journal WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(status, "pending", "id={id} 不应被这笔平仓误标");
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 

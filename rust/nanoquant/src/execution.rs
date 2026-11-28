@@ -344,6 +344,35 @@ fn write_close(
 ) -> Result<(), String> {
     let remaining = qty_before - qty_closed;
     if remaining <= 1e-12 {
+        // 平仓即打标：先在仓位仍可读时取出方向与开仓信息，再用实际出场价
+        // 结算对应决策；缺表/缺决策只跳过，不能影响平仓事务。
+        let meta = tx
+            .query_row(
+                "SELECT mode, symbol, side, entry_price, opened_at FROM positions WHERE id=?1",
+                [position_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional();
+        if let Ok(Some((mode, symbol, side, entry_price, opened_at))) = meta {
+            crate::journal::label_on_close(
+                tx,
+                &mode,
+                &symbol,
+                &side,
+                entry_price,
+                exit_price,
+                opened_at,
+                now,
+            );
+        }
         tx.execute(
             "UPDATE positions SET qty=0,status='closed',mark_price=?1,closed_at=?2,exit_price=?1,exit_reason=?3,\
              realized_pnl=COALESCE(realized_pnl,0)+?4,fees=COALESCE(fees,0)+?5 WHERE id=?6",
@@ -718,6 +747,50 @@ mod tests {
             Some("demo:BTCUSDT:1:long"),
             "成交必须继承开仓决策 ID"
         );
+    }
+
+    #[test]
+    fn closing_fill_labels_the_matching_decision_journal_row() {
+        // 平仓事务内直接用实际成交价结算决策日志，不再等定时回访。
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO positions(symbol,side,qty,entry_price,mark_price,venue_unrealized,venue_ts,\
+             leverage,margin,sl_price,tp_price,peak_price,opened_at,closed_at,exit_price,exit_reason,\
+             realized_pnl,fees,ai_confidence,ai_reason,signal_score,entry_slippage_bps,initial_sl_price,\
+             partial_taken_at,mode,status,trade_id,decision_id) \
+             VALUES('BTCUSDT','long',1,100,100,0,0,5,20,95,0,100,100,0,0,'',0,0,0,'',0,0,95,0,'demo','open',0,'demo:BTCUSDT:1:long'); \
+             INSERT INTO decision_journal(ts,symbol,direction,confidence,entry_price,target_pct,reason,\
+             snapshot,decision,signal_id,injected_experience_ids,status,outcome,actual_price,actual_pct,\
+             labeled_at,archived,mode) \
+             VALUES(100,'BTCUSDT','long',0.8,100,1,'r','{}','open_long',0,'[]','pending','',0,0,0,0,'demo');",
+        )
+        .unwrap();
+        let fill = DemoFill {
+            client_order_id: "nq-close-label".into(),
+            exchange_order_id: "e2".into(),
+            symbol: "BTCUSDT".into(),
+            side: "SELL".into(),
+            qty: 1.0,
+            price: 110.0,
+            reduce_only: true,
+            reason: "take_profit".into(),
+        };
+        apply_demo_fill(&conn, "demo", 200, 0.0005, &fill)
+            .unwrap()
+            .1
+            .expect("平仓应写入成交");
+        let (status, outcome, price, pct): (String, String, f64, f64) = conn
+            .query_row(
+                "SELECT status, outcome, actual_price, actual_pct FROM decision_journal",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "labeled");
+        assert_eq!(outcome, "correct");
+        assert!((price - 110.0).abs() < 1e-9);
+        assert!((pct - 10.0).abs() < 1e-9);
     }
 
     #[test]
