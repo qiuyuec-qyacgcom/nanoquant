@@ -92,3 +92,32 @@ export function gateTag(evidence: EvidenceLike): { text: string; cls: string } {
   if (gate.pass) return { text: '证据通过', cls: 'tag-long' }
   return { text: '证据未过', cls: 'tag-warn' }
 }
+
+export type KindLookup = (group: string, key: string) => string | undefined
+
+/**
+ * 保存前规范化数字字段：输入框清空、旧库脏值或手输字符串都可能残留 string，
+ * 后端对 number 类型是严格校验的。这里能转就转成数字，转不了就返回具体字段，
+ * 由页面提示中文名，而不是把「min_leverage 应为 number」直接甩给用户。
+ */
+export function normalizeNumericPayload(
+  group: string,
+  payload: Record<string, any>,
+  baseline: Record<string, any>,
+  kindOf: KindLookup,
+): { ok: true; value: Record<string, any> } | { ok: false; key: string } {
+  const value = { ...payload }
+  for (const [key, current] of Object.entries(value)) {
+    const numeric = kindOf(group, key) === 'number' || typeof baseline?.[key] === 'number'
+    if (!numeric || typeof current === 'number') continue
+    if (typeof current === 'string' && current.trim() !== '') {
+      const parsed = Number(current)
+      if (Number.isFinite(parsed)) {
+        value[key] = parsed
+        continue
+      }
+    }
+    return { ok: false, key }
+  }
+  return { ok: true, value }
+}

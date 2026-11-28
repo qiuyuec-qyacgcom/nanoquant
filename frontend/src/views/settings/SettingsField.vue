@@ -17,6 +17,7 @@ const emit = defineEmits<{
 const tagDraft = ref('')
 const jsonText = ref('')
 const jsonError = ref('')
+const numberText = ref('')
 
 function addTag() {
   const raw = tagDraft.value.trim()
@@ -63,10 +64,41 @@ watch(
   { immediate: true },
 )
 
+watch(
+  () => props.modelValue,
+  (value) => {
+    if (props.field.widget !== 'number') return
+    // 自己输入触发的回写不重排文本，保留 "05"、"5." 等中间输入，避免光标跳动。
+    if (
+      numberText.value !== '' &&
+      value !== null &&
+      value !== undefined &&
+      Number(numberText.value) === Number(value)
+    ) {
+      return
+    }
+    numberText.value = value === null || value === undefined ? '' : String(value)
+  },
+  { immediate: true },
+)
+
 function onNumberInput(event: Event) {
   const raw = (event.target as HTMLInputElement).value
-  const num = Number.parseFloat(raw)
-  emit('update:modelValue', Number.isNaN(num) ? raw : num)
+  numberText.value = raw
+  // 清空/非法中间态只留在输入框里，不污染待保存草稿，避免提交空字符串。
+  if (raw.trim() === '') return
+  const num = Number(raw)
+  if (Number.isFinite(num)) emit('update:modelValue', num)
+}
+
+function onNumberBlur() {
+  const raw = numberText.value.trim()
+  if (raw !== '' && Number.isFinite(Number(raw))) {
+    numberText.value = String(Number(raw))
+    return
+  }
+  numberText.value =
+    props.modelValue === null || props.modelValue === undefined ? '' : String(props.modelValue)
 }
 
 function onSelectChange(event: Event) {
@@ -150,13 +182,14 @@ const MONO_KEYS = new Set(['base_url', 'proxy', 'rsshub_base'])
 
       <div v-else-if="field.widget === 'number'" class="num-wrap">
         <input
-          :value="modelValue"
+          :value="numberText"
           type="number"
           :step="field.step ?? 'any'"
           :min="field.min"
           :max="field.max"
           class="input mono"
           @input="onNumberInput"
+          @blur="onNumberBlur"
         />
         <span v-if="field.unit" class="num-unit">{{ field.unit }}</span>
       </div>

@@ -25,6 +25,7 @@ import { BASE_META, GROUP_META, PLAIN_HINTS } from './settings/meta'
 import SettingsSection from './settings/SettingsSection.vue'
 import { SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
 import type { FieldMeta, Widget } from './settings/types'
+import { normalizeNumericPayload } from '../utils/paramSets'
 
 
 interface Row extends FieldMeta {
@@ -368,7 +369,18 @@ async function save() {
       delete payload.mode
       delete payload.enabled
     }
-    const data = await app.saveGroup(current.value, payload)
+    const normalized = normalizeNumericPayload(
+      current.value,
+      payload,
+      baseline.value,
+      (group, key) => paramCatalog.kindFor(group, key),
+    )
+    if (!normalized.ok) {
+      const meta = metaOf(current.value, normalized.key)
+      app.notify(`${meta.label || normalized.key} 需要填写数字`, 'error')
+      return
+    }
+    const data = await app.saveGroup(current.value, normalized.value)
     draft.value = clone(data)
     baseline.value = clone(data)
 

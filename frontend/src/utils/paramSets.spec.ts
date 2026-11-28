@@ -5,6 +5,7 @@ import {
   evidenceSummary,
   formatPercent,
   gateTag,
+  normalizeNumericPayload,
   regimeLabel,
   statusTag,
 } from './paramSets'
@@ -91,5 +92,44 @@ describe('paramSets formatting', () => {
     expect(gateTag({ gate: { pass: true } }).text).toBe('证据通过')
     expect(gateTag({ gate: { pass: false } }).text).toBe('证据未过')
     expect(gateTag({}).text).toBe('无证据')
+  })
+
+  it('coerces numeric strings and rejects empty numeric fields', () => {
+    const kinds = (group: string, key: string) =>
+      group === 'risk' && key === 'min_leverage' ? 'number' : undefined
+    const ok = normalizeNumericPayload(
+      'risk',
+      { min_leverage: '6', max_leverage: 20, note: 'x' },
+      { min_leverage: 5, max_leverage: 10, note: '' },
+      kinds,
+    )
+    expect(ok.ok).toBe(true)
+    if (ok.ok) {
+      expect(ok.value.min_leverage).toBe(6)
+      expect(ok.value.max_leverage).toBe(20)
+      expect(ok.value.note).toBe('x')
+    }
+
+    expect(
+      normalizeNumericPayload('risk', { min_leverage: '' }, { min_leverage: 5 }, kinds),
+    ).toEqual({ ok: false, key: 'min_leverage' })
+    expect(
+      normalizeNumericPayload('risk', { min_leverage: 'abc' }, { min_leverage: 5 }, kinds),
+    ).toEqual({ ok: false, key: 'min_leverage' })
+  })
+
+  it('falls back to baseline type when catalog is unavailable', () => {
+    const ok = normalizeNumericPayload(
+      'risk',
+      { max_leverage: '25' },
+      { max_leverage: 20 },
+      () => undefined,
+    )
+    expect(ok.ok).toBe(true)
+    if (ok.ok) expect(ok.value.max_leverage).toBe(25)
+
+    expect(
+      normalizeNumericPayload('risk', { max_leverage: null }, { max_leverage: 20 }, () => undefined),
+    ).toEqual({ ok: false, key: 'max_leverage' })
   })
 })
