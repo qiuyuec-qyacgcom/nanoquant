@@ -215,8 +215,8 @@ useSilentRefresh(() => load(true), 30000)
           <span class="muted" style="font-size: 11px">每 30s 静默刷新 · 手动操作需确认</span>
         </div>
         <div class="hint" style="margin-top: 8px">
-          AI 每周期自动调整隐藏参数。系统按 regime 保存候选快照并走证据门，approved 后仍需人工启用；
-                  这里提供唯一激活入口：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
+          AI 每周期自动调整隐藏参数。系统按 regime 保存候选快照并走证据门，通过后自动激活；
+                  这里保留手动入口：当前 regime 的 approved/manual 集可立即启用，当前 regime 的 active 集可回滚到上一套。
                   跨 regime 的切换仍由自动流程处理。
         </div>
         <div v-if="notice" class="hint" style="margin-top: 6px; color: var(--long)">{{ notice }}</div>

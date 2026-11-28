@@ -52,7 +52,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("rl-replay", "回放历史 orders/trades 训练 RL 执行 Q 表"),
     (
         "ga-tune",
-        "GA 离线参数搜索：只写候选参数集并走证据门，不自动应用",
+        "GA 离线参数搜索：写候选参数集并走证据门，通过后自动激活",
     ),
     ("mock-exec-core", "模拟执行内核"),
     ("mock-exchange", "模拟交易所 /fapi/*"),
@@ -914,7 +914,7 @@ fn ga_tune_command(options: &Options) -> Result<(i32, Value), (i32, String)> {
             "history": result.history,
             "candidate_id": candidate_id,
             "auto_activated": false,
-            "detail": "GA 候选已写入 ai_tuning_sets（source=ga），待证据门评估，不自动应用",
+            "detail": "GA 候选已写入 ai_tuning_sets（source=ga），待证据门评估，通过后自动激活",
         }),
     ))
 }

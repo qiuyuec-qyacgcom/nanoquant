@@ -239,7 +239,7 @@ if correlated >= cfg["correlation_limit"].as_i64().unwrap_or(2) {
 - 只做离线 walk-forward
 - 适应度：期望值、最大回撤、换手
 - 结果走证据门（30 笔 OOS、bootstrap、压力测试）
-- 自动启用已移除；候选只写入 `ai_tuning`，必须人工激活
+- AI/GA 候选只写入 `ai_tuning`；证据门通过后自动激活（跨 regime 候选等待切换后生效）
 
 ## 6. 参数与默认值
 
@@ -310,4 +310,4 @@ REST 兜底 ─────┘                                   ↓
 - 不做 HFT/FPGA
 - 不做网格、配对套利、做市、跨所套利
 - 不让 AI 决定方向/杠杆/止损
-- 不自动应用 GA/AI 调参结果
+- GA/AI 候选必须先通过证据门，通过后自动激活，不绕过回测门

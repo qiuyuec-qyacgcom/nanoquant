@@ -1,6 +1,6 @@
 //! 候选AI 调参证据门：按 B 期规则拉真实历史、跑固定 walk-forward 并落 approved/rejected。
 //!
-//! 只写AI 调参状态与审计事件：不激活AI 调参、不写 `app_settings.strategy`。
+//! 证据门通过后自动激活并物化 strategy；未通过或执行失败只落状态与审计事件。
 //! 历史数据不可用或回测本身出错时返回 Err 并记 `ai_tuning.evidence_failed`，
 //! 候选保持 `candidate`，绝不把「没数据」误判成「策略不达标」。
 
@@ -432,6 +432,56 @@ fn write_outcome(
         .unchecked_transaction()
         .map_err(|error| format!("开启证据门事务失败: {error}"))?;
     ai_tuning::mark_evidence(&tx, set_id, report.pass, evidence)?;
+    let mut auto_activated = false;
+    if report.pass {
+        // 证据门通过后直接激活，不再等待人工点击。
+        // 只有「当前市场有效 regime」的候选才能立即物化 strategy：
+        // trend 无独立集时按 range 回退，因此侯选 regime 为 range 也可直接生效。
+        let set = ai_tuning::load_set(&tx, set_id)?;
+        let mode = crate::journal::current_mode(&tx);
+        let current_regime: String = tx
+            .query_row(
+                "SELECT value FROM engine_state WHERE key=?1",
+                [format!("regime.current.{mode}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        let effective_for_current = current_regime.is_empty()
+            || set.regime == current_regime
+            || (current_regime == "trend" && set.regime == "range");
+        if effective_for_current {
+            match ai_tuning::activate(&tx, set_id, "evidence", &mode) {
+                Ok(()) => auto_activated = true,
+                Err(error) => {
+                    // 激活失败保留 approved，不阻断证据结果落库，之后仍可手动启用。
+                    record_event(
+                        &tx,
+                        "warn",
+                        "AI 调参自动激活失败",
+                        json!({
+                            "event": "ai_tuning.auto_activate_failed",
+                            "set_id": set_id,
+                            "error": error,
+                        }),
+                    )?;
+                }
+            }
+        } else {
+            record_event(
+                &tx,
+                "info",
+                "AI 调参候选跨 regime，等待切换后生效",
+                json!({
+                    "event": "ai_tuning.auto_activate_deferred",
+                    "set_id": set_id,
+                    "candidate_regime": set.regime,
+                    "current_regime": current_regime,
+                }),
+            )?;
+        }
+    }
     let (level, message, event) = if report.pass {
         ("info", "AI 调参证据门通过", "ai_tuning.evidence_pass")
     } else {
@@ -447,6 +497,7 @@ fn write_outcome(
             "metrics": evidence["candidate"],
             "baseline_set_id": evidence["baseline_set_id"],
             "reasons": report.reasons,
+            "auto_activated": auto_activated,
         }),
     )?;
     tx.commit()
@@ -836,6 +887,96 @@ mod tests {
         assert!(
             build_config(&params, &risk, "3d").is_err(),
             "不支持的周期必须报错，不能猜默认值"
+        );
+    }
+
+    #[test]
+    fn passing_evidence_auto_activates_candidate() {
+        let (state, candidate_id) = setup("1h");
+        let evidence = json!({
+            "gate": {"pass": true},
+            "candidate": {},
+            "baseline_set_id": null,
+        });
+        let report = EvidenceReport {
+            pass: true,
+            reasons: Vec::new(),
+        };
+
+        write_outcome(&state, candidate_id, &report, &evidence).unwrap();
+
+        let conn = state.db.lock();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "active");
+        assert!(set.activated_at.is_some(), "证据门通过后应自动激活");
+        let active = crate::ai_tuning::active_for_regime(&conn, "range")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, candidate_id, "候选应替换为当前 active 集");
+        let trigger: String = conn
+            .query_row(
+                "SELECT trigger FROM ai_tuning_activations WHERE set_id=?1 \
+                 ORDER BY id DESC LIMIT 1",
+                [candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "evidence");
+        let strategy: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let strategy: Value = serde_json::from_str(&strategy).unwrap();
+        assert_eq!(strategy["atr_pct_min"], set.params["atr_pct_min"]);
+    }
+
+    #[test]
+    fn cross_regime_evidence_pass_defers_activation() {
+        let (state, candidate_id) = setup("1h");
+        {
+            let conn = state.db.lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_state(key,value,updated_at) \
+                 VALUES('regime.current.demo','chaos',0)",
+                [],
+            )
+            .unwrap();
+        }
+        let evidence = json!({
+            "gate": {"pass": true},
+            "candidate": {},
+            "baseline_set_id": null,
+        });
+        let report = EvidenceReport {
+            pass: true,
+            reasons: Vec::new(),
+        };
+
+        write_outcome(&state, candidate_id, &report, &evidence).unwrap();
+
+        let conn = state.db.lock();
+        let set = crate::ai_tuning::load_set(&conn, candidate_id).unwrap();
+        assert_eq!(set.status, "approved", "跨 regime 候选只落证据，不物化");
+        assert!(set.activated_at.is_none());
+        let strategy: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='strategy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let strategy: Value = serde_json::from_str(&strategy).unwrap();
+        assert_eq!(strategy["atr_pct_min"], 1.5, "当前 regime 的策略不得被改写");
+        drop(conn);
+        let payloads = events(&state);
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload["event"] == "ai_tuning.auto_activate_deferred"),
+            "跨 regime 候选应记录等待切换事件"
         );
     }
 

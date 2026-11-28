@@ -13,8 +13,8 @@ export interface SettingSection {
 export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
   { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
-  { id: 'ai', label: 'AI 复核', hint: '失效价与限价开关（AI 复核行为的开关）' },
-  { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 每周期自动调整隐藏参数' },
+  { id: 'ai', label: 'AI 复核', hint: '复核分流、降仓、缓存与失效价/限价开关' },
+  { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 生成参数候选，证据门通过后自动激活' },
   { id: 'rl_exec', label: 'RL 执行', hint: '只决定下单时机、限价偏移与拆单，不改方向/杠杆/止损止盈；默认关闭' },
   { id: 'symbol_scan', label: '自动换池', hint: '按配置的间隔与数量扫描 USDT 永续，自动替换不达标且无持仓的标的' },
   { id: 'risk', label: '风控', hint: '仓位、杠杆、熔断与费用' },
@@ -40,7 +40,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
     {
       title: '出场与保护',
-      hint: 'AI 在开仓复核时给出每仓止损/止盈价；仓位止盈止损率是保证金收益率的强制平仓线',
+      hint: '趋势仓止损由 ATR 倍数计算；仓位止盈止损率是保证金收益率的强制平仓线，与保护止损先到者生效',
       fields: [
         'trailing_pct',
         'trailing_arm_r',
@@ -66,7 +66,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     },
   ],
   ai: [
-    { title: '复核行为', hint: '默认关闭；开启后生效于下一轮开仓复核；复核超时独立于模型请求超时，预算耗尽后剩余候选直接降级为量化', fields: ['use_invalidation_price', 'use_entry_price', 'review_timeout_sec', 'review_budget_sec'] },
+    { title: '复核行为', hint: '受 AI 总开关控制；开启后生效于下一轮开仓复核；复核超时独立于模型请求超时，预算耗尽后剩余候选直接降级为量化', fields: ['use_invalidation_price', 'use_entry_price', 'review_timeout_sec', 'review_budget_sec'] },
     { title: '否决与降仓', hint: 'AI 只能同意/否决/降仓，不改写方向、杠杆、保证金、止损止盈', fields: ['scale_on_confidence', 'fail_open_scale'] },
     { title: '评分分流与缓存', hint: '高分直接放行、低分直接拒绝，仅中间区调用 AI；中间区结论按标的+方向+评分桶缓存；中间区复核按并发上限并行执行', fields: ['high_score_threshold', 'low_score_threshold', 'review_cache_ttl_sec', 'review_concurrency'] },
     { title: '供应商编排与熔断', hint: '按最近 24h P95 延迟升序选择供应商；连续失败达到阈值后短路一段时间，避免反复打 503/超时', fields: ['provider_order_mode', 'circuit_breaker_failures', 'circuit_breaker_sec'] },
@@ -78,7 +78,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
     { title: '证据门', fields: ['min_oos_trades'] },
     {
       title: 'GA 离线搜索',
-      hint: '只生成候选参数集并走证据门，不自动应用；关闭时不影响手动触发',
+      hint: '生成候选参数集并走证据门，通过后自动激活；关闭时不影响手动触发',
       fields: ['ga_enabled', 'ga_population', 'ga_generations', 'ga_mutation_rate', 'ga_seed'],
     },
   ],
@@ -100,7 +100,7 @@ export const SETTINGS_SECTIONS: Record<string, readonly SettingSection[]> = {
   risk: [
     {
       title: '仓位与杠杆',
-      hint: '杠杆由本地规则按 ATR% 与信号评分计算，并夹在上下限之间；单仓保证金是中心值，AI 只能在复核时降仓',
+      hint: '杠杆由本地规则按 ATR% 与信号评分计算，并夹在上下限之间；单仓保证金是中心值，按 ATR 波动缩放；AI 只能缩下单数量',
       fields: [
         'margin_pct',
         'min_leverage',

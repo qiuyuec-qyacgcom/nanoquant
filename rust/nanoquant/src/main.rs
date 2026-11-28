@@ -358,7 +358,7 @@ async fn main() {
             ai_market::BinanceMarketSource::new(db.clone()),
         ))
     });
-    // 独立调参任务：只在有数据库时启动，只生成候选参数集，与交易引擎完全解耦。
+    // 独立调参任务：只在有数据库时启动，只生成候选参数集，与交易引擎完全解耦；证据门通过后自动激活。
     if let Some(ai) = ai_state.clone() {
         tokio::spawn(crate::tuning::spawn_tuning_task(ai, stop_tx.subscribe()));
     }

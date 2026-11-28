@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { explicitKeys, SETTINGS_GROUPS, SETTINGS_SECTIONS, visibleSettingKeys } from './settingsCatalog'
+import { BASE_META, GROUP_META } from './settings/meta'
 
 const groupIds = SETTINGS_GROUPS.map((group) => group.id)
 const sectionKeys = Object.values(SETTINGS_SECTIONS)
@@ -211,5 +212,14 @@ describe('参数配置目录', () => {
       'use_invalidation_price',
 
     ])
+  })
+
+  it('所有显式参数都有显示标签', () => {
+    for (const group of groupIds) {
+      for (const key of explicitKeys(group)) {
+        const label = GROUP_META[group]?.[key]?.label || BASE_META[key]?.label || ''
+        expect(label, `${group}.${key} 缺少显示标签`).toBeTruthy()
+      }
+    }
   })
 })

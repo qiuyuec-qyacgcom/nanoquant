@@ -764,7 +764,7 @@ fn record_event(
     Ok(())
 }
 
-/// 只写候选记录：不激活、不写配置；激活必须由人工触发。
+/// 只写候选记录：不直接激活；证据门通过后由证据任务自动激活。
 pub(crate) fn insert_candidate(
     conn: &Connection,
     name: &str,
@@ -777,7 +777,7 @@ pub(crate) fn insert_candidate(
 }
 
 /// GA 离线搜索结果同样只写候选：`source='ga'`，证据字段留空，待证据门评估。
-/// 证据门只落 approved/rejected，任何候选都必须人工激活。
+/// 证据门只落 approved/rejected；通过后由证据任务自动激活，失败保留 approved 可人工重试。
 pub(crate) fn insert_ga_candidate(
     conn: &Connection,
     name: &str,
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn ga_candidate_requires_manual_activation() {
+    fn evidence_approval_does_not_activate_by_itself() {
         let conn = conn_with_strategy("1h");
         seed_bootstrap(&conn).unwrap();
         let parent = active_for_regime(&conn, "range").unwrap().unwrap();
@@ -1460,7 +1460,10 @@ mod tests {
         let after = load_set(&conn, id).unwrap();
         assert_eq!(after.status, "approved");
         assert_eq!(after.source, "ga");
-        assert!(after.activated_at.is_none(), "证据门通过后必须等待人工激活");
+        assert!(
+            after.activated_at.is_none(),
+            "mark_evidence 只落状态；自动激活由证据任务完成"
+        );
         let active = active_for_regime(&conn, "range").unwrap().unwrap();
         assert_eq!(active.id, parent.id, "GA 候选不得替换 active");
 

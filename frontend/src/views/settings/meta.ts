@@ -7,7 +7,7 @@ export const PLAIN_HINTS: Record<string, string> = {
   scan_concurrency: '同时拉几路 K 线；只影响信号新旧，不增加请求数',
   max_positions: '最多同时持有几个仓位',
 
-  margin_pct: '单仓保证金中心值；AI 按波动率在 ±5 个百分点内调整',
+  margin_pct: '单仓保证金中心值；引擎按 ATR 波动率在 0.25–2 倍内缩放，AI 只缩下单数量',
   local_leverage_base: '波动与评分都中性时的杠杆；实际值再按 ATR 与评分加减并夹在上下限内',
   local_leverage_vol_target: 'ATR% 等于该值时杠杆不缩放；波动越小杠杆越高，波动越大杠杆越低',
   local_leverage_score_weight: '评分每高出中性值 1.0 就多加这么多倍杠杆；0=评分不影响杠杆',
@@ -77,7 +77,7 @@ export const BASE_META: Record<string, FieldMeta> = {
   margin_pct: {
     label: '单仓保证金中枢',
     unit: '%',
-    hint: '中心值 = 权益 × 该比例；AI 按波动率在 ±5 个百分点内调整（如 20% → 15%–25%），最终仍受可用余额与最小名义额约束',
+    hint: '中心值 = 权益 × 该比例；引擎按 ATR 波动率在 0.25–2 倍内缩放，最终仍受可用余额与最小名义额约束；AI 只能缩下单数量',
   },
   stop_distance_atr_mult: {
     label: '开仓止损 ATR 倍数',
@@ -159,6 +159,7 @@ export const BASE_META: Record<string, FieldMeta> = {
   ema_slow: { label: '慢线 EMA', hint: '长周期均线，用于判断中期趋势方向' },
   rsi_period: { label: 'RSI 周期', hint: 'RSI 计算使用的 K 线根数' },
   atr_period: { label: 'ATR 周期', hint: 'ATR 计算使用的 K 线根数' },
+  adx_period: { label: 'ADX 周期', hint: 'ADX 趋势强度指标使用的 K 线根数' },
   entry_threshold: { label: '开仓信号阈值', hint: '综合分绝对值高于该值才考虑开仓' },
   exit_threshold: { label: '反转平仓阈值', hint: '反向信号分超过该值就平掉当前仓位' },
   volume_ratio_min: { label: '最小量比', hint: '低于该值的信号被过滤' },
@@ -305,6 +306,7 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
       options: [['demo', 'demo 模拟盘（测试网）'], ['live', 'live 实盘（主网）']],
       hint: '与「策略 → 信号模型」的 mode 不是一回事；切换前先确认对应环境的 API 凭证',
     },
+    isolated: { label: '逐仓模式', hint: '开启后引擎会把标的保证金模式切为逐仓；需与交易所账户设置一致' },
   },
   strategy: {
     mode: {
@@ -318,6 +320,94 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
   },
   ai: {
     mode: { label: '模型编排', hint: 'single=单模型；多模型编排由供应商列表决定' },
+    scale_on_confidence: {
+      label: '按置信度降仓',
+      hint: 'AI 同意时按置信度把下单数量缩放到 50%–100%；关闭则保持满仓',
+    },
+    fail_open_scale: {
+      label: 'AI 不可用时仓位',
+      unit: '×',
+      min: 0, max: 1, step: 0.05,
+      hint: 'AI 超时、报错或预算耗尽时仍按量化信号开仓，但仓位乘该系数；0.5=半仓；AI 明确否决/观望仍不开仓',
+    },
+    high_score_threshold: {
+      label: '高分免复核线',
+      min: 0.5, max: 1, step: 0.01,
+      hint: '量化评分达到该值的正式信号跳过 AI 复核，按满仓执行',
+    },
+    low_score_threshold: {
+      label: '低分直接拒绝线',
+      min: 0, max: 0.7, step: 0.01,
+      hint: '量化评分低于该值的正式信号直接拒绝，不消耗 AI 调用',
+    },
+    review_cache_ttl_sec: {
+      label: '复核结果缓存',
+      unit: '秒',
+      min: 0, max: 600, step: 1,
+      hint: '同一标的、方向与评分桶的 AI 结论在该时间内复用；0=关闭缓存',
+    },
+    review_concurrency: {
+      label: '复核并发',
+      unit: '路',
+      min: 1, max: 16, step: 1,
+      hint: '中间区候选并行调用 AI 的上限；越高越快，也更容易触发供应商限频',
+    },
+    review_timeout_sec: {
+      label: '单次复核超时',
+      unit: '秒',
+      min: 5, max: 120, step: 1,
+      hint: '单次 AI 复核的最长等待；超时按 AI 不可用降仓处理',
+    },
+    review_budget_sec: {
+      label: '每轮复核预算',
+      unit: '秒',
+      min: 5, max: 120, step: 1,
+      hint: '一轮扫描的 AI 复核总预算；耗尽后剩余候选不再调用 AI，直接降仓执行',
+    },
+    provider_id: {
+      label: '默认模型',
+      hint: 'AI 复核优先使用的供应商 ID；0=按供应商编排自动选择',
+    },
+    fallback_provider_ids: {
+      label: '备用模型',
+      hint: '主模型失败时按顺序尝试的供应商 ID 列表',
+    },
+    max_calls_per_hour: {
+      label: '每小时调用上限',
+      unit: '次',
+      min: 1, max: 10000, step: 1,
+      hint: 'AI 调用的小时预算；仍需受每轮复核预算约束',
+    },
+    monthly_budget_usd: {
+      label: '每月费用上限',
+      unit: 'USD',
+      min: 0, max: 1000000, step: 0.1,
+      hint: '估算调用费用达到该值后停止 AI 复核；0=不限制',
+    },
+    timeout_sec: {
+      label: '模型请求超时',
+      unit: '秒',
+      hint: '单次供应商 HTTP 请求超时；复核路径另受「单次复核超时」约束',
+    },
+    temperature: {
+      label: '模型温度',
+      min: 0, max: 2, step: 0.1,
+      hint: '越低输出越稳定；复核建议 0.1–0.3',
+    },
+    inject_news: { label: '注入资讯', hint: '把最近资讯与情绪摘要放进 AI 复核上下文' },
+    inject_mantras: { label: '注入心法', hint: '把自进化心法放进 AI 复核上下文' },
+    personas: {
+      label: '评审角色',
+      hint: '多角色权重配置（名称 / 权重 / 关注点 / 是否启用）；单次调用按权重综合，不拆多次请求',
+    },
+    decision_schema_version: {
+      label: '决策协议版本',
+      hint: 'AI 输出协议版本；当前为 2，通常不要修改',
+    },
+    allow_param_tuning: {
+      label: '允许 AI 调参',
+      hint: '允许 AI 在参数注册表范围内生成调参候选；候选通过证据门后自动激活',
+    },
     min_confidence: { label: 'AI 最低置信度', hint: '低于该值的模型裁决不采纳' },
     use_invalidation_price: { label: '启用 AI 失效价平仓', hint: '开启后持仓触及 AI 失效价即平仓' },
     use_entry_price: { label: '启用 AI 建议限价', hint: '仅只做 Maker 模式生效；偏离现价超过 0.5% 或方向不符（BUY 高于现价 / SELL 低于现价）时忽略' },
@@ -361,11 +451,16 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     keep_days: { label: '行情保留天数', unit: '天', hint: '落库的 K 线保留多久；超期自动清理，0=不清理' },
   },
   ai_tuning: {
-    enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择与无候选回滚；候选始终需要人工激活' },
+    enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择与无候选回滚；候选通过证据门后自动激活' },
     no_candidate_rollback_sec: { label: '无候选回滚时长', unit: '秒', min: 60, max: 86400, hint: '生效后连续无 gate 候选的实跑时长，到期回滚上一套' },
     regime_confirm_sec: { label: 'regime 确认时长', unit: '秒', min: 60, max: 86400, hint: 'market_regime 连续一致达到该时长才切换' },
     regime_cooldown_sec: { label: 'regime 冷却', unit: '秒', min: 0, max: 86400, hint: '两次 regime 切换的最小间隔' },
     min_oos_trades: { label: '样本外成交下限', unit: '笔', min: 1, max: 1000, hint: '证据门中目标 regime 的样本外成交数下限' },
+    ga_enabled: { label: '启用遗传算法搜索', hint: '离线搜索参数候选；通过证据门后自动激活' },
+    ga_population: { label: '遗传算法种群规模', unit: '个', min: 10, max: 100, step: 1, hint: '每代保留的候选参数集数量' },
+    ga_generations: { label: '遗传算法迭代代数', unit: '代', min: 5, max: 100, step: 1, hint: '搜索迭代轮数；越大越慢' },
+    ga_mutation_rate: { label: '遗传算法变异率', min: 0, max: 1, step: 0.01, hint: '0.1 = 10% 基因随机变异' },
+    ga_seed: { label: '遗传算法随机种子', unit: '', min: 0, max: 1000000, step: 1, hint: '固定种子可复现同一轮搜索结果；0=每次不同' },
   },
   symbol_scan: {
     enabled: { label: '启用自动换池', widget: 'switch', hint: '开启后按间隔自动扫描并替换标的' },

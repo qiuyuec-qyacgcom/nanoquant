@@ -6,6 +6,11 @@
 > **出事时看 [RUNBOOK.md](./RUNBOOK.md)**（紧急全平 / 补挂保护单 / 重置基准 / 凭证丢失）。
 >
 > 本文件合并自：`STRATEGY_GLOBAL` / `STRATEGY_AOYING_MIRROR`（旧文件已删除，git 历史可查）。
+>
+> **2026-11-28 口径更新**：当前为半 AI + 半量化——方向、杠杆、保证金、止损止盈全部由量化决定，
+> AI 只做同意 / 否决 / 降仓；量化没有方向就不开仓，AI 不再补方向。下文涉及「AI 决定方向/杠杆」的
+> 章节属于 11-24 前的历史全 AI 口径，以 [README](../README.md) 与
+> [半 AI 设计](./superpowers/specs/2026-11-27-fusion-hybrid-ai-design.md) 为准。
 
 ---
 

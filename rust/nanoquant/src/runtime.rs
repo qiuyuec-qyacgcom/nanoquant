@@ -3145,6 +3145,29 @@ impl EngineRuntime {
                 risk: &cfg,
                 exchange_max_leverage: exchange_max,
             });
+            // 严格执行：量化没有方向就不开仓，也不再交给 AI 补方向。
+            // 仍写一条 flat 审计，保留预览方向/评分，便于解释“扫描过但没开仓”。
+            if signal.quant_side.is_none() {
+                let row = crate::signal_audit::AuditSignal::new(symbol)
+                    .with_direction("flat")
+                    .with_score(signal.preview_score.unwrap_or(0.0))
+                    .with_stage("evaluate")
+                    .with_features(serde_json::json!({
+                        "atr_pct": metric.atr_pct,
+                        "vol_ratio": metric.vol_ratio,
+                        "quote_volume": market.quote_volume,
+                        "spread_bps": market.spread_bps,
+                        "preview_side": signal.preview_side,
+                        "preview_score": signal.preview_score,
+                        "quant_passed": signal.quant_passed,
+                    }))
+                    .with_decision("flat")
+                    .with_reject_reason("量化无方向，不开仓");
+                if let Err(error) = crate::signal_audit::record(tx, mode, crate::now(), &[row]) {
+                    tracing::warn!(%error, "无方向信号审计写入失败，不影响本轮周期");
+                }
+                continue;
+            }
             let evolution = crate::evolution_api::evolution_cfg(tx);
             let (_mantra_text, injected_mantra_ids) =
                 crate::evolution_api::injection_payload(tx, &evolution);
@@ -6080,7 +6103,7 @@ fn apply_regime_transition_at(
     Ok(())
 }
 
-/// 周期尾AI 调参治理：只推进无候选守卫，候选必须由人工激活。
+/// 周期尾AI 调参治理：只推进无候选守卫；候选由证据门通过后自动激活。
 ///
 /// 调用方在 regime 切换处理后、同一事务内调用；错误由调用方告警，不阻断周期。
 fn apply_ai_tuning_governance(
@@ -7031,52 +7054,28 @@ mod tests {
         assert_eq!(value["stage"], "gate");
     }
 
-    struct HoldReviewer;
-
-    impl crate::review::AiReviewer for HoldReviewer {
-        fn review(
-            &self,
-            _proposal: &crate::review::EntryProposal,
-        ) -> Result<crate::review::ReviewDecision, String> {
-            Ok(crate::review::ReviewDecision {
-                action: crate::review::ReviewAction::Hold,
-
-                reason: "测试观望".to_string(),
-                confidence: 0.62,
-                invalidation_price: None,
-                valid_bars: None,
-                data_quality: None,
-                rr_target: None,
-                entry_price: None,
-                invalidation_text: None,
-                risk_text: None,
-                scale: None,
-                latency: Default::default(),
-                prompt_profile: None,
-            })
-        }
-    }
-
     #[tokio::test]
-    async fn ai_hold_keeps_preview_direction_score_and_stage() {
+    async fn flat_signal_never_reaches_ai_and_never_opens() {
         let (db, mut snapshot) = entry_fixture().await;
         let market = &mut snapshot.markets[0];
         market.funding_rate = 0.0;
         market.open_interest_change_pct = 0.0;
-        let runtime = test_runtime(&db).with_reviewer(Arc::new(HoldReviewer));
+        let reviewer = Arc::new(CountingReviewer::default());
+        let runtime = test_runtime(&db).with_reviewer(reviewer.clone());
         runtime.persist_snapshot("demo", &snapshot).unwrap();
+        assert_eq!(reviewer.calls(), 0, "无量化方向不得调用 AI");
         let conn = db.lock();
-        let (direction, score, features, ai_action, ai_confidence, decision): (
-            String,
-            f64,
+        let (direction, decision, reason, features, ai_action): (
             String,
             String,
-            f64,
+            String,
+            String,
             String,
         ) = conn
             .query_row(
-                "SELECT direction, score, features, ai_action, ai_confidence, decision \
-                 FROM signals WHERE mode='demo' AND ai_action='hold' ORDER BY id DESC LIMIT 1",
+                "SELECT direction, decision, reject_reason, features, ai_action \
+                 FROM signals WHERE mode='demo' AND reject_reason LIKE '%量化无方向%' \
+                 ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -7085,39 +7084,30 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
-                        row.get(5)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(direction, "long", "AI 观望行要保留量化预评分方向");
-        assert!(score > 0.0, "AI 观望行要保留量化预评分: {score}");
+        assert_eq!(direction, "flat");
+        assert_eq!(decision, "flat");
+        assert_eq!(ai_action, "none");
+        assert!(reason.contains("量化无方向"), "拒绝原因: {reason}");
         let value: serde_json::Value = serde_json::from_str(&features).unwrap();
         assert_eq!(value["stage"], "evaluate");
         assert_eq!(value["preview_side"], "long");
-        assert!(value["quant_side"].is_null());
         assert_eq!(value["quant_passed"], false);
         assert!(
             value["atr_pct"].as_f64().is_some_and(|v| v > 0.0),
-            "AI 复核行要带顶层 ATR"
+            "无方向审计要保留 ATR"
         );
-        assert!(
-            value["vol_ratio"].as_f64().is_some(),
-            "AI 复核行要带顶层量比"
-        );
-        assert!(
-            value["quote_volume"].as_f64().is_some(),
-            "AI 复核行要带顶层 24h 成交额"
-        );
-        assert!(
-            value["spread_bps"].as_f64().is_some(),
-            "AI 复核行要带顶层点差"
-        );
-        let preview_score = value["preview_score"].as_f64().unwrap();
-        assert!((preview_score - score).abs() < 1e-9);
-        assert_eq!(ai_action, "hold");
-        assert!((ai_confidence - 0.62).abs() < 1e-9, "AI 置信度不能被清零");
-        assert_eq!(decision, "rejected");
+        let positions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE mode='demo' AND status='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(positions, 0, "无量化方向不得开仓");
     }
 
     #[tokio::test]
