@@ -1,0 +1,184 @@
+旧分组,旧参数键,旧项目值,处理,新位置,说明
+ai,allow_ai_override,true,已移除,—,新半 AI 固定为同意/否决/降仓
+ai,allow_param_tuning,true,已隐藏,ai.allow_param_tuning,内部/高级参数，参数页不展示
+ai,decision_schema_version,2,已隐藏,ai.decision_schema_version,内部/高级参数，参数页不展示
+ai,enabled,true,已隐藏,ai.enabled,内部/高级参数，参数页不展示
+ai,fallback_provider_ids,[],已隐藏,ai.fallback_provider_ids,内部/高级参数，参数页不展示
+ai,inject_mantras,true,已隐藏,ai.inject_mantras,内部/高级参数，参数页不展示
+ai,inject_news,true,已隐藏,ai.inject_news,内部/高级参数，参数页不展示
+ai,max_calls_per_hour,1000,已隐藏,ai.max_calls_per_hour,内部/高级参数，参数页不展示
+ai,min_confidence,0.46,已隐藏,ai.min_confidence,内部/高级参数，参数页不展示
+ai,mode,"""single""",已隐藏,ai.mode,内部/高级参数，参数页不展示
+ai,monthly_budget_usd,300,已隐藏,ai.monthly_budget_usd,内部/高级参数，参数页不展示
+ai,param_tuning_min_interval_sec,86400,已隐藏,ai.param_tuning_min_interval_sec,内部/高级参数，参数页不展示
+ai,personas,"[{""enabled"":true,""focus"":""å¤å¨æè¶å¿ä¸å³é®ä»·ä½"",""name"":""è¶å¿ç å¤å®"",""weight"":0.35},{""enabled"":true,""focus"":""éä»·èç¦»ãèµéè´¹çä¸æä»éåå"",""name"":""å¨è½éåå®"",""weight"":0.35},{""enabled"":true,""focus"":""åæ¤ãçä»è·ç¦»ä¸æµå¨æ§é£é©"",""name"":""é£é©å®¡è®¡å®"",""weight"":0.3}]",已隐藏,ai.personas,内部/高级参数，参数页不展示
+ai,provider_id,1,已隐藏,ai.provider_id,内部/高级参数，参数页不展示
+ai,require_agreement,true,已移除,—,新半 AI 固定为同意/否决/降仓
+ai,temperature,0.5,已隐藏,ai.temperature,内部/高级参数，参数页不展示
+ai,timeout_sec,120,已隐藏,ai.timeout_sec,内部/高级参数，参数页不展示
+ai,use_entry_price,false,已进入新参数表,ai.use_entry_price,见新参数表
+ai,use_invalidation_price,false,已进入新参数表,ai.use_invalidation_price,见新参数表
+ai_tuning,auto_apply,true,已移除,—,改为证据门通过后自动激活
+ai_tuning,auto_apply_timeframes,"""1h""",已移除,—,改为证据门通过后自动激活
+ai_tuning,enabled,true,已进入新参数表,ai_tuning.enabled,见新参数表
+ai_tuning,max_auto_apply_per_24h,1,已移除,—,改为证据门通过后自动激活
+ai_tuning,min_oos_trades,30,已进入新参数表,ai_tuning.min_oos_trades,见新参数表
+ai_tuning,no_candidate_rollback_sec,1800,已进入新参数表,ai_tuning.no_candidate_rollback_sec,见新参数表
+ai_tuning,regime_confirm_sec,1800,已进入新参数表,ai_tuning.regime_confirm_sec,见新参数表
+ai_tuning,regime_cooldown_sec,1800,已进入新参数表,ai_tuning.regime_cooldown_sec,见新参数表
+backup,auto_daily,true,已进入新参数表,backup.auto_daily,见新参数表
+backup,encrypt,true,已进入新参数表,backup.encrypt,见新参数表
+backup,include_logs,false,已进入新参数表,backup.include_logs,见新参数表
+backup,last_run_ts,1795802861,已隐藏,backup.last_run_ts,内部/高级参数，参数页不展示
+backup,retention,10,已进入新参数表,backup.retention,见新参数表
+data,backup_base_urls,"[""https://fapi1.binance.com"",""https://fapi2.binance.com"",""https://fapi3.binance.com""]",已进入新参数表,data.backup_base_urls,见新参数表
+data,demo_api_key_enc,"""""",新项目保留但不在参数页,data.demo_api_key_enc,敏感凭证单独维护
+data,demo_api_secret_enc,"""""",新项目保留但不在参数页,data.demo_api_secret_enc,敏感凭证单独维护
+data,demo_backup_urls,[],已隐藏,data.demo_backup_urls,内部/高级参数，参数页不展示
+data,demo_base_url,"""https://testnet.binancefuture.com""",已进入新参数表,data.demo_base_url,见新参数表
+data,kline_limit,200,已隐藏,data.kline_limit,内部/高级参数，参数页不展示
+data,kline_ttl_sec,20,已隐藏,data.kline_ttl_sec,内部/高级参数，参数页不展示
+data,live_api_key_enc,"[已脱敏]",新项目保留但不在参数页,data.live_api_key_enc,敏感凭证单独维护
+data,live_api_secret_enc,"[已脱敏]",新项目保留但不在参数页,data.live_api_secret_enc,敏感凭证单独维护
+data,live_base_url,"""https://fapi.binance.com""",已进入新参数表,data.live_base_url,见新参数表
+data,max_pool_size,20,已隐藏,data.max_pool_size,内部/高级参数，参数页不展示
+data,proxy,"""""",已进入新参数表,data.proxy,见新参数表
+data,request_timeout_sec,12,已隐藏,data.request_timeout_sec,内部/高级参数，参数页不展示
+data,ticker_ttl_sec,5,已隐藏,data.ticker_ttl_sec,内部/高级参数，参数页不展示
+engine,close_on_halt,false,已进入新参数表,engine.close_on_halt,见新参数表
+engine,cycle_interval_sec,600,已进入新参数表,engine.cycle_interval_sec,见新参数表
+engine,enabled,false,由界面开关管理,engine.enabled,交易环境/引擎启停，不在参数表单
+engine,isolated,true,已隐藏,engine.isolated,内部/高级参数，参数页不展示
+engine,max_positions,3,已进入新参数表,engine.max_positions,见新参数表
+engine,max_symbols_per_cycle,12,已隐藏,engine.max_symbols_per_cycle,内部/高级参数，参数页不展示
+engine,mode,"""live""",由界面开关管理,engine.mode,交易环境/引擎启停，不在参数表单
+engine,order_type,"""market""",已进入新参数表,engine.order_type,见新参数表
+engine,recv_window_ms,5000,已隐藏,engine.recv_window_ms,内部/高级参数，参数页不展示
+engine,scan_concurrency,3,已隐藏,engine.scan_concurrency,内部/高级参数，参数页不展示
+engine,timezone_offset,8,已进入新参数表,engine.timezone_offset,见新参数表
+engine,trading_windows,"[""00:00-24:00""]",已进入新参数表,engine.trading_windows,见新参数表
+evolution,archive_health_threshold,0.45,新项目保留但不在参数页,evolution.archive_health_threshold,对应独立页面或内部配置
+evolution,auto_disable_negative,true,新项目保留但不在参数页,evolution.auto_disable_negative,对应独立页面或内部配置
+evolution,batch_review_size,5,新项目保留但不在参数页,evolution.batch_review_size,对应独立页面或内部配置
+evolution,enabled,true,新项目保留但不在参数页,evolution.enabled,对应独立页面或内部配置
+evolution,global_review_every_trades,10,新项目保留但不在参数页,evolution.global_review_every_trades,对应独立页面或内部配置
+evolution,guard_strict,true,新项目保留但不在参数页,evolution.guard_strict,对应独立页面或内部配置
+evolution,max_active_mantras,40,新项目保留但不在参数页,evolution.max_active_mantras,对应独立页面或内部配置
+evolution,max_injected,8,新项目保留但不在参数页,evolution.max_injected,对应独立页面或内部配置
+evolution,max_rule_chars,420,新项目保留但不在参数页,evolution.max_rule_chars,对应独立页面或内部配置
+evolution,min_confidence,0.5,新项目保留但不在参数页,evolution.min_confidence,对应独立页面或内部配置
+evolution,min_health_sample,10,新项目保留但不在参数页,evolution.min_health_sample,对应独立页面或内部配置
+evolution,min_lesson_sample,2,新项目保留但不在参数页,evolution.min_lesson_sample,对应独立页面或内部配置
+evolution,review_on_close,true,新项目保留但不在参数页,evolution.review_on_close,对应独立页面或内部配置
+evolution,ttl_days,7,新项目保留但不在参数页,evolution.ttl_days,对应独立页面或内部配置
+journal,correct_threshold_pct,0.15,新项目保留但不在参数页,journal.correct_threshold_pct,对应独立页面或内部配置
+journal,enabled,true,新项目保留但不在参数页,journal.enabled,对应独立页面或内部配置
+journal,inject_experiences,true,新项目保留但不在参数页,journal.inject_experiences,对应独立页面或内部配置
+journal,label_after_sec,86400,新项目保留但不在参数页,journal.label_after_sec,对应独立页面或内部配置
+journal,max_experiences,200,新项目保留但不在参数页,journal.max_experiences,对应独立页面或内部配置
+journal,min_record_confidence,0.45,新项目保留但不在参数页,journal.min_record_confidence,对应独立页面或内部配置
+journal,min_similarity,0.15,新项目保留但不在参数页,journal.min_similarity,对应独立页面或内部配置
+journal,retrieve_top_k,5,新项目保留但不在参数页,journal.retrieve_top_k,对应独立页面或内部配置
+news,ai_summary,true,已进入新参数表,news.ai_summary,见新参数表
+news,enabled,true,已进入新参数表,news.enabled,见新参数表
+news,keep_days,7,已进入新参数表,news.keep_days,见新参数表
+news,max_items_per_source,30,已隐藏,news.max_items_per_source,内部/高级参数，参数页不展示
+news,proxy,"""""",已隐藏,news.proxy,内部/高级参数，参数页不展示
+news,refresh_minutes,10,已进入新参数表,news.refresh_minutes,见新参数表
+news,request_timeout_sec,8,已隐藏,news.request_timeout_sec,内部/高级参数，参数页不展示
+news,rsshub_base,"""""",已隐藏,news.rsshub_base,内部/高级参数，参数页不展示
+news,sentiment_threshold,0.35,已进入新参数表,news.sentiment_threshold,见新参数表
+news,sources,"[""cointelegraph"",""theblock"",""decrypt"",""bitcoinmagazine"",""newsbtc"",""beincrypto"",""utoday"",""binance_square"",""binance_announcement"",""coindesk""]",已进入新参数表,news.sources,见新参数表
+public,hero_note,"""""",新项目保留但不在参数页,public.hero_note,对应独立页面或内部配置
+public,show_engine_status,true,新项目保留但不在参数页,public.show_engine_status,对应独立页面或内部配置
+public,show_mantras,true,新项目保留但不在参数页,public.show_mantras,对应独立页面或内部配置
+public,show_performance,false,新项目保留但不在参数页,public.show_performance,对应独立页面或内部配置
+public,site_enabled,true,新项目保留但不在参数页,public.site_enabled,对应独立页面或内部配置
+public,site_tagline,"""å°èµé Â· å¸å® U æ¬ä½æ°¸ç»­ Â· è¶ç­çº¿éåç»ç«¯""",新项目保留但不在参数页,public.site_tagline,对应独立页面或内部配置
+public,site_title,"""NanoQuant""",新项目保留但不在参数页,public.site_title,对应独立页面或内部配置
+risk,atr_stop_mult,1.3,重命名为新参数,risk.stop_distance_atr_mult,值 1.3 已进入新参数表
+risk,auto_protect_external,true,已进入新参数表,risk.auto_protect_external,见新参数表
+risk,category_exposure_limit_pct,500,已进入新参数表,risk.category_exposure_limit_pct,见新参数表
+risk,consecutive_loss_limit,4,已进入新参数表,risk.consecutive_loss_limit,见新参数表
+risk,cooldown_minutes,35,已进入新参数表,risk.cooldown_minutes,见新参数表
+risk,daily_loss_limit_pct,10,已进入新参数表,risk.daily_loss_limit_pct,见新参数表
+risk,fee_rate_maker,0.0002,已进入新参数表,risk.fee_rate_maker,见新参数表
+risk,fee_rate_taker,0.0005,已进入新参数表,risk.fee_rate_taker,见新参数表
+risk,global_stop_loss_pct,10,已进入新参数表,risk.global_stop_loss_pct,见新参数表
+risk,global_take_profit_pct,15,已进入新参数表,risk.global_take_profit_pct,见新参数表
+risk,margin_pct,20,已进入新参数表,risk.margin_pct,见新参数表
+risk,max_drawdown_pct,25,已进入新参数表,risk.max_drawdown_pct,见新参数表
+risk,max_exposure_pct,3000,已进入新参数表,risk.max_exposure_pct,见新参数表
+risk,max_leverage,16,已进入新参数表,risk.max_leverage,见新参数表
+risk,max_same_direction,2,已进入新参数表,risk.max_same_direction,见新参数表
+risk,min_equity_usdt,0.5,已进入新参数表,risk.min_equity_usdt,见新参数表
+risk,min_leverage,5,已进入新参数表,risk.min_leverage,见新参数表
+risk,min_notional_buffer,1.05,已进入新参数表,risk.min_notional_buffer,见新参数表
+risk,symbol_cooldown_minutes,20,已进入新参数表,risk.symbol_cooldown_minutes,见新参数表
+risk,vol_target_atr_pct,2,已进入新参数表,risk.vol_target_atr_pct,见新参数表
+security,login_fail_limit,8,已进入新参数表,security.login_fail_limit,见新参数表
+security,login_fail_window_sec,900,已进入新参数表,security.login_fail_window_sec,见新参数表
+security,password_hash,"[已脱敏]",新项目保留但不在参数页,security.password_hash,安全内部字段
+security,password_is_default,false,已隐藏,security.password_is_default,内部/高级参数，参数页不展示
+security,require_login,true,已进入新参数表,security.require_login,见新参数表
+security,session_ttl_hours,12,已进入新参数表,security.session_ttl_hours,见新参数表
+security,token_version,1,新项目保留但不在参数页,security.token_version,安全内部字段
+security,username,"""admin""",已进入新参数表,security.username,见新参数表
+signal_follow,auto_add_symbol,true,已移除,—,新项目没有跟随信号交易链路
+signal_follow,default_sl_pct,1.2,已移除,—,新项目没有跟随信号交易链路
+signal_follow,dry_run,true,已移除,—,新项目没有跟随信号交易链路
+signal_follow,enabled,false,已移除,—,新项目没有跟随信号交易链路
+signal_follow,ingest_token,"""""",已移除,—,新项目没有跟随信号交易链路
+signal_follow,jsonl_path,"""""",已移除,—,新项目没有跟随信号交易链路
+signal_follow,leverage_bonus,10,已移除,—,新项目没有跟随信号交易链路
+signal_follow,margin_pct_override,0,已移除,—,新项目没有跟随信号交易链路
+signal_follow,max_age_sec,180,已移除,—,新项目没有跟随信号交易链路
+signal_follow,max_per_hour,6,已移除,—,新项目没有跟随信号交易链路
+signal_follow,poll_sec,1,已移除,—,新项目没有跟随信号交易链路
+signal_follow,sizing_mode,"""margin_pct""",已移除,—,新项目没有跟随信号交易链路
+signal_follow,strict_events,false,已移除,—,新项目没有跟随信号交易链路
+strategy,atr_pct_max,10,已隐藏，交 AI 调参,strategy.atr_pct_max,按你的要求不进入参数表
+strategy,atr_pct_min,0.6,已隐藏，交 AI 调参,strategy.atr_pct_min,按你的要求不进入参数表
+strategy,atr_period,14,已隐藏,strategy.atr_period,整数周期参数，AI 不做整数取整，保持内部配置
+strategy,breakeven_at_r,1.5,已隐藏，交 AI 调参,strategy.breakeven_at_r,按你的要求不进入参数表
+strategy,data_stale_mult,2,已隐藏，交 AI 调参,strategy.data_stale_mult,按你的要求不进入参数表
+strategy,ema_fast,9,已隐藏,strategy.ema_fast,整数周期参数，AI 不做整数取整，保持内部配置
+strategy,ema_slow,21,已隐藏,strategy.ema_slow,整数周期参数，AI 不做整数取整，保持内部配置
+strategy,entry_threshold,0.45,已隐藏，交 AI 调参,strategy.entry_threshold,按你的要求不进入参数表
+strategy,exit_threshold,0.1,已隐藏，交 AI 调参,strategy.exit_threshold,按你的要求不进入参数表
+strategy,max_data_gaps,1,已隐藏,strategy.max_data_gaps,整数周期参数，AI 不做整数取整，保持内部配置
+strategy,max_spread_bps,16,已隐藏，交 AI 调参,strategy.max_spread_bps,按你的要求不进入参数表
+strategy,min_24h_quote_volume,100000,已隐藏，交 AI 调参,strategy.min_24h_quote_volume,按你的要求不进入参数表
+strategy,min_entry_rr,0.8,已进入新参数表,strategy.min_entry_rr,见新参数表
+strategy,mode,"""fusion""",已隐藏,strategy.mode,内部/高级参数，参数页不展示
+strategy,partial_tp_at_r,2,已隐藏，交 AI 调参,strategy.partial_tp_at_r,按你的要求不进入参数表
+strategy,partial_tp_ratio,0.3,已隐藏，交 AI 调参,strategy.partial_tp_ratio,按你的要求不进入参数表
+strategy,roi_min_r,1,已隐藏，交 AI 调参,strategy.roi_min_r,按你的要求不进入参数表
+strategy,roi_table,[],已进入新参数表,strategy.roi_table,见新参数表
+strategy,rsi_period,14,已隐藏,strategy.rsi_period,整数周期参数，AI 不做整数取整，保持内部配置
+strategy,timeframe,"""1h""",已进入新参数表,strategy.timeframe,见新参数表
+strategy,trailing_arm_r,1,已隐藏，交 AI 调参,strategy.trailing_arm_r,按你的要求不进入参数表
+strategy,trailing_pct,2,已隐藏，交 AI 调参,strategy.trailing_pct,按你的要求不进入参数表
+strategy,valid_bars,6,已进入新参数表,strategy.valid_bars,见新参数表
+strategy,volume_ratio_min,0.8,已隐藏，交 AI 调参,strategy.volume_ratio_min,按你的要求不进入参数表
+symbol_scan,enabled,true,已进入新参数表,symbol_scan.enabled,见新参数表
+symbol_scan,interval_hours,3,已进入新参数表,symbol_scan.interval_hours,见新参数表
+symbol_scan,market_limit,300,已进入新参数表,symbol_scan.market_limit,见新参数表
+system,alert_cooldown_sec,120,已进入新参数表,system.alert_cooldown_sec,见新参数表
+system,alert_digest_enabled,false,已隐藏,system.alert_digest_enabled,内部/高级参数，参数页不展示
+system,alert_digest_minutes,60,已隐藏,system.alert_digest_minutes,内部/高级参数，参数页不展示
+system,alert_enabled,false,已进入新参数表,system.alert_enabled,见新参数表
+system,alert_error_webhook_url,"""""",已进入新参数表,system.alert_error_webhook_url,见新参数表
+system,alert_min_level,"""warn""",已进入新参数表,system.alert_min_level,见新参数表
+system,alert_quiet_hours,"""""",已隐藏,system.alert_quiet_hours,内部/高级参数，参数页不展示
+system,alert_telegram_chat_id,"""""",已进入新参数表,system.alert_telegram_chat_id,见新参数表
+system,alert_telegram_token,"""""",已进入新参数表,system.alert_telegram_token,见新参数表
+system,alert_template,"""""",已隐藏,system.alert_template,内部/高级参数，参数页不展示
+system,alert_webhook_url,"""""",已进入新参数表,system.alert_webhook_url,见新参数表
+system,api_rate_limit_per_min,0,已进入新参数表,system.api_rate_limit_per_min,见新参数表
+system,equity_retention_days,30,已进入新参数表,system.equity_retention_days,见新参数表
+system,event_retention_days,14,已进入新参数表,system.event_retention_days,见新参数表
+system,log_level,"""WARNING""",已进入新参数表,system.log_level,见新参数表
+system,metrics_enabled,true,已进入新参数表,system.metrics_enabled,见新参数表
+system,risk_disclaimer_accepted,false,已隐藏,system.risk_disclaimer_accepted,内部/高级参数，参数页不展示
+system,signal_retention_days,14,已进入新参数表,system.signal_retention_days,见新参数表
