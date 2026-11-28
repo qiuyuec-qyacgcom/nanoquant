@@ -33,6 +33,18 @@ const AI_BLOCKED_KEYS: &[(&str, &str)] = &[
     ("strategy", "mr_enabled"),
 ];
 
+/// 整数语义的策略键：AI 候选不做整数取整，直接排除，避免写入 9.5 后
+/// 运行时按 `strategy_int` 回退默认值，参数看起来变了但实际没生效。
+pub(crate) const AI_TUNING_INTEGER_KEYS: &[&str] = &[
+    "ema_fast",
+    "ema_slow",
+    "rsi_period",
+    "atr_period",
+    "adx_period",
+    "max_data_gaps",
+    "valid_bars",
+];
+
 /// 软参数：只有配置默认值/审计展示语义，不参与特征或信号计算。
 ///
 /// 注册表里的整数策略参数都必须在「生效证据」里出现；软参数在此显式登记豁免，
@@ -409,6 +421,22 @@ fn is_ai_writable(group: &str, key: &str) -> bool {
     !is_visible(group, key)
 }
 
+/// AI 调参任务真正会写、且能从 `writable_parameters` 下发的字段。
+/// 与 `ai_writable` 的差别：只允许 strategy、只允许数字、排除整数键与
+/// `timeframe` 等结构字段；这些字段同时从手动参数页隐藏，由 AI 接管。
+pub(crate) fn is_ai_tuning_target(group: &str, key: &str) -> bool {
+    if group != "strategy" || !is_ai_writable(group, key) {
+        return false;
+    }
+    if key == "timeframe" || AI_TUNING_INTEGER_KEYS.contains(&key) {
+        return false;
+    }
+    defaults()
+        .get(group)
+        .and_then(|value| value.get(key))
+        .is_some_and(|value| kind_of(value) == "number")
+}
+
 /// AI 调参专用边界：prompt 展示与候选校验共用同一区间。
 pub(crate) fn ai_bounds(group: &str, key: &str) -> Option<(f64, f64)> {
     match (group, key) {
@@ -455,7 +483,8 @@ pub(crate) fn catalog() -> Value {
             if is_sensitive(group, key) {
                 continue;
             }
-            let visible = is_visible(group, key);
+            let ai_tuning = is_ai_tuning_target(group, key);
+            let visible = is_visible(group, key) && !ai_tuning;
             let ai_writable = is_ai_writable(group, key);
             let (min, max, step) = range_of(group, key);
             if !visible {
@@ -473,6 +502,7 @@ pub(crate) fn catalog() -> Value {
                     "step": step,
                     "visible": visible,
                     "ai_writable": ai_writable,
+                    "ai_tuning": ai_tuning,
                     "soft": is_soft(group, key),
                 }),
             );
@@ -498,7 +528,7 @@ pub(crate) fn find(group: &str, key: &str) -> Option<ParamMeta> {
         min,
         max,
         step,
-        visible: is_visible(group, key),
+        visible: is_visible(group, key) && !is_ai_tuning_target(group, key),
         ai_writable: is_ai_writable(group, key),
     })
 }
@@ -578,6 +608,66 @@ pub(crate) fn ema_periods(strategy: &Value) -> (usize, usize) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ai_tuning_fields_are_hidden_from_manual_page() {
+        let catalog = catalog();
+        let strategy = &catalog["groups"]["strategy"];
+        for key in [
+            "entry_threshold",
+            "exit_threshold",
+            "volume_ratio_min",
+            "atr_pct_min",
+            "atr_pct_max",
+            "min_24h_quote_volume",
+            "roi_min_r",
+            "trailing_pct",
+            "trailing_arm_r",
+            "breakeven_at_r",
+            "data_stale_mult",
+            "partial_tp_at_r",
+            "partial_tp_ratio",
+            "max_spread_bps",
+            "funding_veto_bps",
+            "mr_rsi_high",
+            "mr_rsi_low",
+            "mr_band_k",
+            "mr_sl_pct",
+            "mr_tp_pct",
+        ] {
+            assert_eq!(strategy["meta"][key]["ai_tuning"], json!(true), "{key}");
+            assert_eq!(
+                strategy["meta"][key]["visible"],
+                json!(false),
+                "{key} 应交给 AI 后从手动页隐藏"
+            );
+            assert!(
+                strategy["hidden"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == key),
+                "{key} 应进入 hidden 列表"
+            );
+        }
+        for key in [
+            "timeframe",
+            "higher_timeframe",
+            "valid_bars",
+            "min_entry_rr",
+            "mr_enabled",
+            "roi_table",
+            "ema_fast",
+            "atr_period",
+            "max_data_gaps",
+        ] {
+            assert_eq!(
+                strategy["meta"][key]["ai_tuning"],
+                json!(false),
+                "{key} 不属于 AI 调参范围"
+            );
+        }
+    }
 
     #[test]
     fn catalog_hides_sensitive_fields_and_covers_strategy() {

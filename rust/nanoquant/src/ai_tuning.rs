@@ -881,6 +881,12 @@ pub(crate) fn validate_candidate(
         let Some(meta) = crate::param_registry::find("strategy", &update.key) else {
             return Err(format!("候选键 strategy.{} 未注册", update.key));
         };
+        if !crate::param_registry::is_ai_tuning_target("strategy", &update.key) {
+            return Err(format!(
+                "候选键 strategy.{} 不在 AI 调参范围（整数/结构字段由人工维护）",
+                update.key
+            ));
+        }
         if !meta.ai_writable {
             return Err(format!("候选键 strategy.{} 不允许 AI 写入", update.key));
         }
@@ -1345,6 +1351,20 @@ mod tests {
         assert!(
             validate_candidate(&active, &patch).is_err(),
             "4 个键必须拒绝"
+        );
+    }
+
+    #[test]
+    fn candidate_rejects_integer_strategy_keys() {
+        let conn = conn_with_strategy("1h");
+        seed_bootstrap(&conn).unwrap();
+        let active = seeded_snapshot(&conn, "range");
+
+        let error =
+            validate_candidate(&active, &[param_update("ema_fast", json!(10))]).unwrap_err();
+        assert!(
+            error.contains("不在 AI 调参范围"),
+            "整数周期参数不得交给 AI: {error}"
         );
     }
 

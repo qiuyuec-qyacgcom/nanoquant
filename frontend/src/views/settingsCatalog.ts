@@ -12,7 +12,7 @@ export interface SettingSection {
 
 export const SETTINGS_GROUPS: readonly SettingGroup[] = [
   { id: 'engine', label: '交易执行', hint: '运行节奏、交易时段与下单方式' },
-  { id: 'strategy', label: '策略', hint: '信号、入场过滤与出场保护' },
+  { id: 'strategy', label: '策略', hint: '结构开关手动配置；入场阈值、ATR、止盈止损等数值由 AI 调参维护' },
   { id: 'ai', label: 'AI 复核', hint: '复核分流、降仓、缓存与失效价/限价开关' },
   { id: 'ai_tuning', label: 'AI 调参', hint: 'AI 生成参数候选，证据门通过后自动激活' },
   { id: 'rl_exec', label: 'RL 执行', hint: '只决定下单时机、限价偏移与拆单，不改方向/杠杆/止损止盈；默认关闭' },

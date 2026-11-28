@@ -362,19 +362,8 @@ fn tuning_context(
     }))
 }
 
-/// 整数语义键：模型容易写成 9.5 之类的小数并绕过校验，调参目录不提供。
-const INTEGER_STRATEGY_KEYS: &[&str] = &[
-    "ema_fast",
-    "ema_slow",
-    "rsi_period",
-    "atr_period",
-    "adx_period",
-    "max_data_gaps",
-    "valid_bars",
-];
-
-/// 只暴露 strategy 组里 AI 可写的数字字段，并附带当前值与人工范围/专用边界。
-/// 不注入 risk/engine/ai_tuning/ai，也不暴露 timeframe、字符串、数组字段。
+/// 只暴露 catalog 标记为 `ai_tuning` 的 strategy 字段，并附带当前值与人工范围/专用边界。
+/// 这些字段已从手动参数页隐藏，AI 调参是唯一入口；risk/engine/ai_tuning/ai 不注入。
 fn writable_strategy_parameters(active: &Value) -> Value {
     let catalog = crate::param_registry::catalog();
     let Some(meta) = catalog
@@ -387,10 +376,7 @@ fn writable_strategy_parameters(active: &Value) -> Value {
     };
     let mut fields = Map::new();
     for (key, field) in meta {
-        if key == "timeframe" {
-            continue;
-        }
-        if INTEGER_STRATEGY_KEYS.contains(&key.as_str()) {
+        if field.get("ai_tuning").and_then(Value::as_bool) != Some(true) {
             continue;
         }
         if field.get("kind").and_then(Value::as_str) != Some("number") {

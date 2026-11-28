@@ -152,7 +152,7 @@ const QUICK_LINKS: { label: string; group: string; key: string }[] = [
   { label: '日亏上限', group: 'risk', key: 'daily_loss_limit_pct' },
   { label: '最大回撤', group: 'risk', key: 'max_drawdown_pct' },
 
-  { label: '点差闸门', group: 'strategy', key: 'max_spread_bps' },
+  { label: '最低开仓盈亏比', group: 'strategy', key: 'min_entry_rr' },
   { label: '手续费率', group: 'risk', key: 'fee_rate_taker' },
 ]
 
