@@ -3376,31 +3376,34 @@ impl EngineRuntime {
         let mut pending: Vec<(usize, EntryDraft, Option<CachedReviewer<'_>>)> = Vec::new();
         for (idx, draft) in drafts.into_iter().enumerate() {
             let score = draft.signal_score();
+            // 评分带方向：负数是空头。分流门槛比较强度，不能拿有符号值直接比，
+            // 否则所有空头都会被判成“低于低分线”。
+            let strength = score.abs();
             // 只对量化正式信号分流；预览信号本身置信不足，仍交给 AI 判断。
             let split_enabled = required && reviewer.is_some() && draft.quant_side.is_some();
-            if split_enabled && score >= high_score_threshold {
+            if split_enabled && strength >= high_score_threshold {
                 // 高分直接放行，按满仓处理，不花 AI 调用。
                 let proposal = draft.proposal();
                 let result = crate::review::apply_review(&proposal, None, false).map(
                     |mut entry| {
                         entry.scale = Some(1.0);
                         entry.reason = format!(
-                            "ai_skip=high_score；评分 {score:.3} >= {high_score_threshold:.3}，跳过 AI 复核"
+                            "ai_skip=high_score；|评分| {strength:.3} >= {high_score_threshold:.3}，跳过 AI 复核"
                         );
                         entry
                     },
                 );
                 results[idx] = Some(ReviewedDraft { draft, result });
-            } else if split_enabled && score < low_score_threshold {
+            } else if split_enabled && strength < low_score_threshold {
                 // 低分直接拒绝，不花 AI 调用；评分保留在 confidence 里供审计。
                 results[idx] = Some(ReviewedDraft {
                     draft,
                     result: Err(crate::review::ReviewError {
                         reason: format!(
-                            "{SCORE_SPLIT_LOW_PREFIX} {score:.3} < {low_score_threshold:.3}"
+                            "{SCORE_SPLIT_LOW_PREFIX} |{score:.3}| < {low_score_threshold:.3}"
                         ),
                         action: "reject".to_string(),
-                        confidence: score.clamp(0.0, 1.0),
+                        confidence: strength.clamp(0.0, 1.0),
                         invalidation_price: None,
                         valid_bars: None,
                         data_quality: None,
@@ -8340,6 +8343,19 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
         }
     }
 
+    /// 构造空头草稿：评分保留负号，用于验证分流按绝对强度判断。
+    fn short_score_draft(score: f64) -> EntryDraft {
+        let mut draft = score_draft(score.abs());
+        draft.side = "short".to_string();
+        draft.quant_side = Some("short".to_string());
+        draft.preview_side = Some("short".to_string());
+        draft.quant_score = Some(score);
+        draft.preview_score = Some(score);
+        draft.score = score;
+        draft.decision_id = "demo:BTCUSDT:0:short".to_string();
+        draft
+    }
+
     fn split_review(
         reviewer: &dyn crate::review::AiReviewer,
         drafts: Vec<EntryDraft>,
@@ -8622,6 +8638,50 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     }
 
     #[test]
+    fn signed_short_score_uses_absolute_strength() {
+        let reviewer = CountingReviewer::default();
+        let reviewed = split_review(
+            &reviewer,
+            vec![
+                short_score_draft(-0.9),
+                short_score_draft(-0.2),
+                short_score_draft(-0.6),
+            ],
+            None,
+            1_000,
+        );
+        assert_eq!(reviewer.calls(), 1, "只有中间区的空头信号进入 AI");
+        assert_eq!(
+            reviewed[0]
+                .result
+                .as_ref()
+                .expect("空头 -0.9 应高分放行")
+                .scale,
+            Some(1.0),
+            "空头高分不能因为负号被判成低分"
+        );
+        let low = reviewed[1]
+            .result
+            .as_ref()
+            .expect_err("空头 -0.2 应低分拒绝");
+        assert_eq!(low.action, "reject");
+        assert!(
+            (low.confidence - 0.2).abs() < 1e-9,
+            "低分拒单保留绝对强度: {}",
+            low.confidence
+        );
+        assert!(
+            low.reason.contains("|-0.200|"),
+            "拒绝原因要显示带符号评分和绝对值: {}",
+            low.reason
+        );
+        assert!(
+            reviewed[2].result.is_ok(),
+            "空头 -0.6 应进入 AI，而不是被低分线拒绝"
+        );
+    }
+
+    #[test]
     fn review_cache_hits_within_ttl() {
         let reviewer = CountingReviewer::default();
         let cache = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -8661,7 +8721,9 @@ r#"ALTER TABLE positions ADD COLUMN ai_confidence REAL NOT NULL DEFAULT 0;
     #[test]
     fn low_score_rejection_uses_split_event_message() {
         assert_eq!(
-            EngineRuntime::review_event_message(&format!("{SCORE_SPLIT_LOW_PREFIX} 0.200 < 0.450")),
+            EngineRuntime::review_event_message(&format!(
+                "{SCORE_SPLIT_LOW_PREFIX} |0.200| < 0.450"
+            )),
             "评分分流拒绝（低评分）",
             "低分分流拒绝要与非 AI 可用区分"
         );

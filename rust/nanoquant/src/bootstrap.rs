@@ -403,10 +403,14 @@ mod tests {
             .unwrap()
             .flatten()
             .collect();
-        // 默认 strategy 是 4h：只留审计快照，不种子化 1h bootstrap 集。
+        // 默认 strategy 是 4h：任意周期都要种子化当前周期的 range/chaos 快照，
+        // 不再只留一条 retired 审计快照，否则 AI 调参会缺父集。
         assert_eq!(
             rows,
-            vec![("current-snapshot".to_string(), "retired".to_string())]
+            vec![
+                ("range-snapshot".to_string(), "active".to_string()),
+                ("chaos-snapshot".to_string(), "active".to_string()),
+            ]
         );
         let raw: String = conn
             .query_row(

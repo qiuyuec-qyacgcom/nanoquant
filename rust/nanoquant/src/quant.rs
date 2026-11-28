@@ -98,8 +98,13 @@ pub(crate) fn local_leverage(
     min_lev: f64,
     max_lev: f64,
 ) -> f64 {
-    // 无评分（如非 fusion 预览信号）按中性 0.5 处理，避免被当成 0 分压低杠杆。
-    let score = if score > 0.0 { score } else { 0.5 };
+    // 评分带方向：负数是空头，杠杆按强度计算；只有真正的 0 分
+    // （如非 fusion 预览信号）才按中性 0.5 处理，避免空头被当成无评分。
+    let score = if !score.is_finite() || score == 0.0 {
+        0.5
+    } else {
+        score.abs().clamp(0.0, 1.0)
+    };
     let vol = if atr_pct > 0.0 {
         (vol_target / atr_pct).clamp(0.5, 2.0)
     } else {
@@ -410,6 +415,14 @@ mod tests {
     fn local_leverage_falls_for_high_atr_low_score() {
         let leverage = local_leverage(4.0, 0.1, 10.0, 2.0, 10.0, 1.0, 100.0);
         assert_eq!(leverage, 1.0, "高波动 + 低评分应压到基准之下");
+    }
+
+    #[test]
+    fn local_leverage_treats_short_score_by_strength() {
+        let long = local_leverage(2.0, 0.8, 6.0, 2.0, 4.0, 5.0, 16.0);
+        let short = local_leverage(2.0, -0.8, 6.0, 2.0, 4.0, 5.0, 16.0);
+        assert_eq!(short, long, "同样强度的空头评分不能因为负号被当成中性 0.5");
+        assert_eq!(short, 7.0, "强度 0.8 应在基准 6x 之上");
     }
 
     #[test]
