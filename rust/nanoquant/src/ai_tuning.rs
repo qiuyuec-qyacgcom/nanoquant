@@ -3,19 +3,13 @@ use serde_json::{json, Value};
 
 const BOOTSTRAP_TIMEFRAME: &str = "1h";
 const CURRENT_SNAPSHOT_EVIDENCE: &str =
-    "{\"kind\":\"manual\",\"reason\":\"non_bootstrap_timeframe\",\"snapshot\":\"full\"}";
+    "{\"kind\":\"manual\",\"reason\":\"current_snapshot\",\"snapshot\":\"full\"}";
 const INCIDENT_EVIDENCE: &str = "{\"kind\":\"manual\",\"historical\":true,\"snapshot\":\"partial\",\"incident_date\":\"2026-11-23\",\"known_keys\":[\"atr_pct_min\",\"atr_pct_max\",\"volume_ratio_min\",\"entry_threshold\"]}";
 
 /// A 期迁移种子化：只建AI 调参记录，绝不改写 `app_settings.strategy`（C 期才物化）。
 /// 幂等：`ai_tuning` 已有任何数据即跳过；`strategy` 缺失或损坏时直接返回。
 /// 全部写入放在一个事务里：中途失败整体回滚，避免留下半套数据导致下次跳过。
 pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
-    let exists: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ai_tuning_sets", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    if exists > 0 {
-        return Ok(());
-    }
     let raw: Option<String> = conn
         .query_row(
             "SELECT value FROM app_settings WHERE key='strategy'",
@@ -30,6 +24,14 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         // 配置损坏时跳过种子化：审计种子不值得阻断整次启动。
         return Ok(());
     };
+    let exists: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ai_tuning_sets", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if exists > 0 {
+        // 周期可能在首次启动后被改过；这里按当前周期补齐 range/chaos 父集，
+        // 任意周期都生效，避免 trend 回退或 chaos 直接切换时无集可用。
+        return ensure_active_baselines_for_current_timeframe(conn, &current);
+    }
     let now = crate::now();
     let tx = conn
         .unchecked_transaction()
@@ -42,23 +44,94 @@ pub(crate) fn seed_bootstrap(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("提交AI 调参种子化事务失败: {e}"))
 }
 
+/// 已有 AI 调参数据时，确保当前周期有 active 的 range / chaos 父集。
+///
+/// 不限定 1h：旧库可能在 4h 首次启动，后来切到任意周期；这里统一按当前
+/// strategy 快照补建，保证 trend 回退 range、chaos 直接切换都能找到父集。
+/// 补出来的集直接复制当前 strategy，不套用启动期覆盖值，避免 regime 切换
+/// 把手工调好的参数改回去。
+fn ensure_active_baselines_for_current_timeframe(
+    conn: &Connection,
+    current: &Value,
+) -> Result<(), String> {
+    let timeframe = current["timeframe"].as_str().unwrap_or("4h");
+    let now = crate::now();
+    // 先退役周期不匹配的 active（含 trend）；否则它会挡住 range 回退。
+    for regime in ["trend", "range", "chaos"] {
+        let Some(set) = active_for_regime(conn, regime)? else {
+            continue;
+        };
+        if set.timeframe == timeframe {
+            continue;
+        }
+        conn.execute(
+            "UPDATE ai_tuning_sets SET status='retired' WHERE id=?1 AND status='active'",
+            [set.id],
+        )
+        .map_err(|e| format!("退役周期不匹配的 AI 调参失败: {e}"))?;
+        record_event(
+            conn,
+            "warn",
+            &format!("AI 调参 {regime} 父集周期与当前策略不一致，已退役"),
+            json!({
+                "set_id": set.id,
+                "regime": regime,
+                "set_timeframe": set.timeframe,
+                "current_timeframe": timeframe,
+            }),
+            now,
+        )?;
+    }
+    // trend 继续走 range 回退，不单独创建 trend 集。
+    for regime in ["range", "chaos"] {
+        if active_for_regime(conn, regime)?.is_some() {
+            continue;
+        }
+        let id = insert_snapshot_set(conn, regime, timeframe, current, now)?;
+        record_event(
+            conn,
+            "info",
+            &format!("AI 调参父集缺失，已按当前策略补建 {regime} 基线"),
+            json!({"set_id": id, "regime": regime, "timeframe": timeframe}),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// 按当前 strategy 快照插入一个 active 父集，并记一条 bootstrap 激活记录。
+fn insert_snapshot_set(
+    conn: &Connection,
+    regime: &str,
+    timeframe: &str,
+    current: &Value,
+    now: i64,
+) -> Result<i64, String> {
+    let name = format!("{regime}-snapshot");
+    let id = insert_set(
+        conn,
+        &name,
+        regime,
+        timeframe,
+        current,
+        "active",
+        "manual",
+        CURRENT_SNAPSHOT_EVIDENCE,
+        None,
+        now,
+    )?;
+    insert_activation(conn, id, regime, None, "bootstrap", now)?;
+    Ok(id)
+}
+
 fn seed_in_transaction(conn: &Connection, current: &Value, now: i64) -> Result<(), String> {
     let timeframe = current["timeframe"].as_str().unwrap_or("4h");
     if timeframe != BOOTSTRAP_TIMEFRAME {
-        let retired = current.clone();
-        insert_set(
-            conn,
-            "current-snapshot",
-            "range",
-            timeframe,
-            &retired,
-            "retired",
-            "manual",
-            CURRENT_SNAPSHOT_EVIDENCE,
-            None,
-            now,
-        )?;
-
+        // 非 1h 不再只落 retired 快照：直接按当前 strategy 建 active 父集，
+        // 让任意周期的 trend 回退 / chaos 切换都有集可用。
+        for regime in ["range", "chaos"] {
+            insert_snapshot_set(conn, regime, timeframe, current, now)?;
+        }
         return Ok(());
     }
     let range = with_overrides(
@@ -1032,7 +1105,86 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_seeds_range_and_chaos_only_for_1h_and_keeps_strategy() {
+    fn bootstrap_repairs_missing_baselines_for_current_timeframe() {
+        let conn = conn_with_strategy("1h");
+        insert_set(
+            &conn,
+            "current-snapshot",
+            "range",
+            "4h",
+            &json!({"timeframe": "4h"}),
+            "retired",
+            "manual",
+            CURRENT_SNAPSHOT_EVIDENCE,
+            None,
+            1,
+        )
+        .unwrap();
+        assert!(
+            active_for_regime(&conn, "range").unwrap().is_none(),
+            "前置条件：没有 active range"
+        );
+        seed_bootstrap(&conn).unwrap();
+        let range = active_for_regime(&conn, "range")
+            .unwrap()
+            .expect("应补出 active range 父集");
+        let chaos = active_for_regime(&conn, "chaos")
+            .unwrap()
+            .expect("应补出 active chaos 父集");
+        for (set, regime) in [(&range, "range"), (&chaos, "chaos")] {
+            assert_eq!(set.name, format!("{regime}-snapshot"));
+            assert_eq!(set.status, "active");
+            assert_eq!(set.timeframe, "1h");
+            assert_eq!(set.source, "manual");
+            assert_eq!(set.evidence["reason"], "current_snapshot");
+            // 必须复制当前 strategy，而不是套用 bootstrap 的覆盖值
+            assert_eq!(set.params["atr_pct_min"], 1.5);
+            assert_eq!(set.params["atr_pct_max"], 8.0);
+            assert_eq!(set.params["volume_ratio_min"], 1.1);
+            assert_eq!(set.params["entry_threshold"], 0.55);
+        }
+        let strategy: Value = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT value FROM app_settings WHERE key='strategy'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(strategy["timeframe"], "1h", "补父集不能改 strategy");
+    }
+
+    #[test]
+    fn bootstrap_repairs_missing_baselines_for_non_1h() {
+        let conn = conn_with_strategy("4h");
+        insert_set(
+            &conn,
+            "current-snapshot",
+            "range",
+            "1h",
+            &json!({"timeframe": "1h"}),
+            "retired",
+            "manual",
+            CURRENT_SNAPSHOT_EVIDENCE,
+            None,
+            1,
+        )
+        .unwrap();
+        seed_bootstrap(&conn).unwrap();
+        for regime in ["range", "chaos"] {
+            let set = active_for_regime(&conn, regime)
+                .unwrap()
+                .unwrap_or_else(|| panic!("应补出 active {regime} 父集"));
+            assert_eq!(set.name, format!("{regime}-snapshot"));
+            assert_eq!(set.timeframe, "4h");
+            assert_eq!(set.params["atr_pct_min"], 1.5);
+        }
+    }
+
+    #[test]
+    fn bootstrap_seeds_range_and_chaos_for_1h_and_keeps_strategy() {
         let conn = conn_with_strategy("1h");
         let before: String = conn
             .query_row(
@@ -1182,31 +1334,31 @@ mod tests {
     }
 
     #[test]
-    fn non_1h_seeds_only_retired_snapshot() {
+    fn non_1h_seeds_active_range_and_chaos_snapshots() {
         let conn = conn_with_strategy("4h");
         seed_bootstrap(&conn).unwrap();
         let sets = all_sets(&conn);
-        assert_eq!(sets.len(), 1);
-        let snapshot = &sets[0];
-        assert_eq!(snapshot.name, "current-snapshot");
-        assert_eq!(snapshot.status, "retired");
-        assert_eq!(snapshot.source, "manual");
-        assert_eq!(snapshot.evidence["kind"], "manual");
-        assert_eq!(snapshot.evidence["snapshot"], "full");
-        assert_eq!(snapshot.evidence["reason"], "non_bootstrap_timeframe");
-        assert!(
-            snapshot.evidence.get("historical").is_none(),
-            "非 1h 快照不是历史审计，不应带 historical"
-        );
-        assert!(snapshot.parent_id.is_none());
-        assert_eq!(snapshot.params["timeframe"], snapshot.timeframe);
-
+        assert_eq!(sets.len(), 2);
+        for (index, regime) in ["range", "chaos"].into_iter().enumerate() {
+            let snapshot = &sets[index];
+            assert_eq!(snapshot.name, format!("{regime}-snapshot"));
+            assert_eq!(snapshot.regime, regime);
+            assert_eq!(snapshot.status, "active");
+            assert_eq!(snapshot.source, "manual");
+            assert_eq!(snapshot.timeframe, "4h");
+            assert_eq!(snapshot.params["timeframe"], "4h");
+            assert_eq!(snapshot.params["atr_pct_min"], 1.5);
+            assert_eq!(snapshot.params["atr_pct_max"], 8.0);
+            assert_eq!(snapshot.evidence["kind"], "manual");
+            assert_eq!(snapshot.evidence["reason"], "current_snapshot");
+            assert!(snapshot.parent_id.is_none());
+        }
         let activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(activations, 0);
+        assert_eq!(activations, 2);
     }
 
     #[test]
@@ -1220,15 +1372,14 @@ mod tests {
         assert!(seed_bootstrap(&conn).is_ok(), "脏配置不能阻断种子化");
 
         let sets = all_sets(&conn);
-        assert_eq!(sets.len(), 1);
-        assert_eq!(sets[0].name, "current-snapshot");
-        assert_eq!(sets[0].status, "retired");
+        assert_eq!(sets.len(), 2);
+        assert!(sets.iter().all(|set| set.status == "active"));
         let activations: i64 = conn
             .query_row("SELECT COUNT(*) FROM ai_tuning_activations", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(activations, 0);
+        assert_eq!(activations, 2);
         let value: String = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key='ai_tuning'",
