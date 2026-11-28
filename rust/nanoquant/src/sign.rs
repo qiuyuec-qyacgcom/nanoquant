@@ -206,6 +206,50 @@ pub fn require_credentials(mode: &str, api_key: &str, secret: &str) -> Result<Cr
     })
 }
 
+/// 保存凭证前校验 API Key：币安 Key 固定是 64 位字母数字。
+///
+/// 从表格/记事本复制时常见的 `.`、空格、引号都会让签名必然 401；
+/// 这里直接拒绝，避免把坏 Key 加密写进数据库。
+pub fn validate_api_key(value: &str) -> Result<(), String> {
+    let key = value.trim();
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "API Key 必须是 64 位字母数字，不能包含 `.`、空格或其他符号（当前 {} 位）",
+            key.chars().count()
+        ));
+    }
+    Ok(())
+}
+
+/// 保存凭证前校验 API Secret：支持 HMAC 与 Ed25519 两种格式。
+///
+/// HMAC Secret 是 64 位字母数字；Ed25519 Secret 是 base64(PKCS#8 DER) 或 PEM。
+/// 两种格式都不含 `.`，出现点号基本是从表格/记事本复制时带了前缀。
+pub fn validate_api_secret(value: &str) -> Result<(), String> {
+    let secret = value.trim();
+    if secret.is_empty() {
+        return Err("API Secret 不能为空".to_string());
+    }
+    if secret.contains('.') {
+        return Err("API Secret 不能包含 `.`；请从币安 API 管理页直接复制原始 Secret".to_string());
+    }
+    let body = normalize_pem(secret);
+    // HMAC：64 位字母数字
+    if body.len() == 64 && body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Ok(());
+    }
+    // Ed25519：base64 或 PEM 解出的 PKCS#8 DER 必须能被解析
+    if let Ok(bytes) = STANDARD.decode(&body) {
+        if SigningKey::from_pkcs8_der(&bytes).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(
+        "API Secret 格式无法识别：应为 64 位 HMAC Secret，或 base64/PEM 的 Ed25519 私钥"
+            .to_string(),
+    )
+}
+
 /// 按密钥类型签名：能解析出 Ed25519 私钥就出 base64，否则 HMAC-SHA256 出小写 hex。
 pub fn sign_query(secret: &str, query: &str) -> String {
     let body = normalize_pem(secret);
@@ -389,6 +433,44 @@ mod tests {
         let err = require_credentials("live", "key", "  ").unwrap_err();
         assert!(err.contains("实盘"), "报错要指明是哪个环境没配");
         assert!(require_credentials("demo", "key", "secret").is_ok());
+    }
+
+    #[test]
+    fn api_key_validation_requires_64_alphanumeric() {
+        assert!(validate_api_key(&"a".repeat(64)).is_ok());
+        assert!(validate_api_key(&"a".repeat(63)).is_err(), "少一位必须拒绝");
+        assert!(
+            validate_api_key(&format!(".{}", "a".repeat(64))).is_err(),
+            "带前导点必须拒绝"
+        );
+        assert!(
+            validate_api_key(&format!("{} ", "a".repeat(63))).is_err(),
+            "trim 后不足 64 位必须拒绝"
+        );
+    }
+
+    #[test]
+    fn api_secret_validation_accepts_hmac_and_ed25519_and_rejects_dot() {
+        assert!(validate_api_secret(&"b".repeat(64)).is_ok());
+        assert!(
+            validate_api_secret(&format!(".{}", "b".repeat(64))).is_err(),
+            "带前导点必须拒绝"
+        );
+        assert!(
+            validate_api_secret("c2VjcmV0").is_err(),
+            "短 base64 不是合法 PKCS#8"
+        );
+
+        let seed = hex_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let key = SigningKey::from_bytes(&seed);
+        let der = key.to_pkcs8_der().unwrap();
+        let secret = STANDARD.encode(der.as_bytes());
+        assert!(
+            validate_api_secret(&secret).is_ok(),
+            "裸 base64 Ed25519 必须通过"
+        );
+        let one_line = format!("-----BEGIN PRIVATE KEY----- {secret} -----END PRIVATE KEY-----");
+        assert!(validate_api_secret(&one_line).is_ok(), "单行 PEM 必须通过");
     }
 
     #[test]

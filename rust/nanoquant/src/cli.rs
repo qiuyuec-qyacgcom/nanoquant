@@ -1081,6 +1081,8 @@ fn set_exchange_credentials(
                 .to_string(),
         ));
     }
+    crate::sign::validate_api_key(&api_key).map_err(|error| (2, error))?;
+    crate::sign::validate_api_secret(&api_secret).map_err(|error| (2, error))?;
     let mode = options
         .mode
         .clone()
@@ -2406,14 +2408,16 @@ mod tests {
         let mut cfg = config();
         cfg.db_path = db_path.to_string_lossy().into_owned();
         cfg.key_file = key_path.clone();
+        let api_key = "k".repeat(64);
+        let api_secret = "s".repeat(64);
         let code = run(
             &[
                 "ops".to_string(),
                 "set-exchange-credentials".to_string(),
                 "--api-key".to_string(),
-                "key-12345678".to_string(),
+                api_key.clone(),
                 "--api-secret".to_string(),
-                "secret-12345678".to_string(),
+                api_secret.clone(),
                 "--mode".to_string(),
                 "live".to_string(),
                 "--format".to_string(),
@@ -2431,7 +2435,7 @@ mod tests {
                 data["live_api_key_enc"].as_str().unwrap()
             )
             .unwrap(),
-            "key-12345678"
+            api_key
         );
         assert_eq!(
             crate::secret::decrypt_secret(
@@ -2439,7 +2443,7 @@ mod tests {
                 data["live_api_secret_enc"].as_str().unwrap()
             )
             .unwrap(),
-            "secret-12345678"
+            api_secret
         );
         let conn = db.lock();
         let mode: String = conn

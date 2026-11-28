@@ -1829,7 +1829,11 @@ async fn save_exchange_credentials(
     };
     let mut patch = Map::new();
     if let Some(api_key) = payload.api_key.filter(|value| !value.trim().is_empty()) {
-        match crate::secret::encrypt_secret(&master_key, api_key.trim()) {
+        let api_key = api_key.trim();
+        if let Err(error) = crate::sign::validate_api_key(api_key) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"detail": error}))).into_response();
+        }
+        match crate::secret::encrypt_secret(&master_key, api_key) {
             Ok(value) => {
                 patch.insert(format!("{env}_api_key_enc"), json!(value));
             }
@@ -1843,7 +1847,11 @@ async fn save_exchange_credentials(
         }
     }
     if let Some(api_secret) = payload.api_secret.filter(|value| !value.trim().is_empty()) {
-        match crate::secret::encrypt_secret(&master_key, api_secret.trim()) {
+        let api_secret = api_secret.trim();
+        if let Err(error) = crate::sign::validate_api_secret(api_secret) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"detail": error}))).into_response();
+        }
+        match crate::secret::encrypt_secret(&master_key, api_secret) {
             Ok(value) => {
                 patch.insert(format!("{env}_api_secret_enc"), json!(value));
             }
@@ -3543,11 +3551,14 @@ mod tests {
         let app = Router::new().nest("/api/v1", routes()).with_state(
             SystemState::new(db.clone(), crate::now()).with_auth(test_auth_valid_key()),
         );
+        let api_key = "a".repeat(64);
+        let api_secret = "b".repeat(64);
+        let masked = format!("{}******{}", &api_key[..4], &api_key[60..]);
         let (status, saved) = request_json_body(
             app.clone(),
             "POST",
             "/api/v1/settings/credentials/exchange",
-            json!({"env": "demo", "api_key": "abcdefghijk", "api_secret": "secret123456"}),
+            json!({"env": "demo", "api_key": &api_key, "api_secret": &api_secret}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{saved}");
@@ -3556,9 +3567,9 @@ mod tests {
             request_json(app.clone(), "GET", "/api/v1/settings/credentials/exchange").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(view["demo"]["configured"], true);
-        assert_eq!(view["demo"]["api_key_masked"], "abcd******hijk");
-        assert!(!view.to_string().contains("abcdefghijk"));
-        assert!(!view.to_string().contains("secret123456"));
+        assert_eq!(view["demo"]["api_key_masked"], masked);
+        assert!(!view.to_string().contains(&api_key));
+        assert!(!view.to_string().contains(&api_secret));
         let stored: String = db
             .lock()
             .query_row(
@@ -3567,8 +3578,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!stored.contains("abcdefghijk"));
-        assert!(!stored.contains("secret123456"));
+        assert!(!stored.contains(&api_key));
+        assert!(!stored.contains(&api_secret));
         let (status, cleared) = request_json(
             app.clone(),
             "DELETE",
@@ -3579,6 +3590,34 @@ mod tests {
         assert_eq!(cleared["env"], "demo");
         let (_, view) = request_json(app, "GET", "/api/v1/settings/credentials/exchange").await;
         assert_eq!(view["demo"]["configured"], false);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn exchange_credentials_reject_key_with_leading_dot() {
+        let path = std::env::temp_dir().join("nq-credentials-dot.db");
+        let db = dead_fixture(&path);
+        let app = Router::new().nest("/api/v1", routes()).with_state(
+            SystemState::new(db.clone(), crate::now()).with_auth(test_auth_valid_key()),
+        );
+        let bad_key = format!(".{}", "a".repeat(64));
+        let (status, body) = request_json_body(
+            app.clone(),
+            "POST",
+            "/api/v1/settings/credentials/exchange",
+            json!({"env": "demo", "api_key": bad_key, "api_secret": "b".repeat(64)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("64 位字母数字"),
+            "错误信息要说明 Key 格式: {body}"
+        );
+        let (_, view) = request_json(app, "GET", "/api/v1/settings/credentials/exchange").await;
+        assert_eq!(view["demo"]["configured"], false, "坏 Key 不能写入");
         let _ = std::fs::remove_file(&path);
     }
 
