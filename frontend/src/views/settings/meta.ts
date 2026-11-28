@@ -451,7 +451,7 @@ export const GROUP_META: Record<string, Record<string, FieldMeta>> = {
     keep_days: { label: '行情保留天数', unit: '天', hint: '落库的 K 线保留多久；超期自动清理，0=不清理' },
   },
   ai_tuning: {
-    enabled: { label: '启用参数集', hint: '关闭后停止 regime 选择与无候选回滚；候选通过证据门后自动激活' },
+    enabled: { label: '启用 AI 调参', hint: '关闭后停止 regime 选择与无候选回滚，且无法改变已隐藏的参数；候选通过证据门后自动激活' },
     no_candidate_rollback_sec: { label: '无候选回滚时长', unit: '秒', min: 60, max: 86400, hint: '生效后连续无 gate 候选的实跑时长，到期回滚上一套' },
     regime_confirm_sec: { label: 'regime 确认时长', unit: '秒', min: 60, max: 86400, hint: 'market_regime 连续一致达到该时长才切换' },
     regime_cooldown_sec: { label: 'regime 冷却', unit: '秒', min: 0, max: 86400, hint: '两次 regime 切换的最小间隔' },
